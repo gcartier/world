@@ -604,6 +604,7 @@
   (slot turtle-texture     <object> initialize #f            getter generate)
   (slot block-texture      <object> initialize #f            getter generate)
   (slot background-texture <object> initialize #f            getter generate)
+  (slot current            <object> initialize #f            getter generate)
   (slot history            <object> initialize #f            getter generate)
   (slot now                <object> initialize #f            getter generate)
   
@@ -710,7 +711,6 @@
   
   (method (tick-world)
     (unless (or paused? state)
-      (increase! now)
       (add-history)
       (start~ tps)
       (tick-actors commands)
@@ -745,12 +745,12 @@
     (- (history-end) 1))
   
   
-  (method (in-history n)
-    (max (history-first) (min n (history-last))))
-  
-  
-  (method (history-moment n)
+  (method (historical-moment n)
     (element history n))
+  
+  
+  (method (in-history n)
+    (max (history-first) (min n (history-end))))
   
   
   (method (setup-history)
@@ -759,37 +759,58 @@
   
   
   (method (add-history)
-    (axis-add history (new Moment (snapshot-world) (object-copy commands))))
+    (axis-add history (new Moment (snapshot-world) (object-copy commands)))
+    (increase! now))
   
   
   (method (backward-history)
-    (set! now (in-history (- now 1)))
-    (load-world (get-snapshot~ (history-moment now))))
+    (goto-history (- now 1)))
   
   
   (method (forward-history)
-    (set! now (in-history (+ now 1)))
-    (load-world (get-snapshot~ (history-moment now))))
+    (goto-history (+ now 1)))
   
   
-  (method (goto-history where)
-    (let ((n (fxround (* where (history-last)))))
-      (set! now (in-history n))
-      (load-world (get-snapshot~ (history-moment now)))))
+  (method (goto-history n)
+    (let ((n (in-history n)))
+      (unless (= n now)
+        (set! now n)
+        (if (= n (history-end))
+            (load-world current)
+          (load-world (get-snapshot~ (historical-moment now)))))))
+  
+  
+  (method (slide-history where)
+    (goto-history (fxround (* where (history-end)))))
+  
+  
+  (method (truncate-future)
+    (axis-adjust history now))
   
   
   (method (step-world)
     (when (< now (cardinality history))
-      (let ((commands (get-commands~ (history-moment now))))
+      (let ((commands (get-commands~ (historical-moment now))))
         (increase! now)
         (tick-actors commands))))
   
   
   (method (recalculate-future)
-    (loop (for n from now to (history-last))
-          (let ((moment (history-moment n)))
-            (let ((commands (get-commands~ moment)))
-              (tick-actors commands)))))
+    (let ((end (history-end)))
+      (loop (for n from now below end)
+            (let ((moment (historical-moment n)))
+              (let ((commands (get-commands~ moment)))
+                (tick-actors commands)
+                (let ((next (+ n 1)))
+                  (let ((moment (historical-moment next))
+                        (snapshot (snapshot-world)))
+                    (if (= next end)
+                        (set! current snapshot)
+                      (set-snapshot~ moment snapshot)))))))
+      ;; for now
+      (if (= now end)
+          (load-world current)
+        (load-world (get-snapshot~ (historical-moment now))))))
   
   
   ;;;
@@ -1024,7 +1045,7 @@
   
   
   (method (draw-character n)
-    (let ((snapshot (get-snapshot~ (history-moment n))))
+    (let ((snapshot (get-snapshot~ (historical-moment n))))
       (let ((character (find-character snapshot)))
         (when character
           (parameterize ((in-history? #t))
@@ -1045,10 +1066,10 @@
     (when rps?
       (draw~ rps))
     (when paused?
-      (draw-paused)))
+      (draw-history-slider)))
   
   
-  (method (draw-paused)
+  (method (draw-history-slider)
     (let ((cx (fxround/ width 2)))
       (gl-frame-rect (new Rect (- cx 200) (- height 30) (+ cx 200) (- height 31)) {Color Gray})
       (gl-frame-rect (new Rect (- cx 200) (- height 32) (+ cx 200) (- height 33)) {Color Light-Gray})
@@ -1268,11 +1289,14 @@
                   (set-modified? #t))
               (set! target obj)
               (set-?t obj))
-          (when (control-down?)
-            (set! down? #t)
-            (let ((class (sprite-class)))
-              (add-block-class class x y)
-              (set-modified? #t)))))))
+          (if (control-down?)
+              (begin
+                (set! down? #t)
+                (let ((class (sprite-class)))
+                  (add-block-class class x y)
+                  (set-modified? #t)))
+            (set! target #f)
+            (set-?t #f))))))
   
   
   (method (editor-mouse-move h v)
@@ -1306,12 +1330,15 @@
   
   
   (method (pause-world)
+    (set! current (snapshot-world))
     (set! paused? #t)
     (set! animate? #f)
     (reset-counters))
   
   
   (method (unpause-world)
+    (truncate-future)
+    (set! current #f)
     (set! paused? #f)
     (set! animate? #t)
     (reset-counters))
@@ -1344,7 +1371,40 @@
   
   
   (method override (evaluate-hook)
-    (recalculate-future))
+    (when paused?
+      (recalculate-future)))
+  
+  
+  (method (test-world)
+    )
+  
+  
+  ;;;
+  ;;;; Slider
+  ;;;
+  
+  
+  (method (slider-mouse-down h v)
+    (set! down? #t)
+    (slide-history (h->where h)))
+  
+  
+  (method (slider-mouse-move h v)
+    (slide-history (h->where h)))
+  
+  
+  (method (slider-mouse-up h v)
+    (set! down? #f))
+  
+  
+  (method (h->where h)
+    (let ((cx (fxround/ width 2)))
+      (let ((where (/ (+ (- h cx) 200.) 400.)))
+        (max 0. (min 1. where)))))
+  
+  
+  (method (in-slider? v)
+    (< v 60))
   
   
   ;;;
@@ -1352,22 +1412,15 @@
   ;;;
   
   
-  (method (h->where h)
-    (let ((cx (fxround/ width 2)))
-      (/ (+ (- h cx) 200.) 400.)))
-  
-  
   (method override (mouse-down h v)
-    (if (and paused? (< v 60))
-        (begin
-          (set! down? #t)
-          (goto-history (h->where h)))
+    (if (and paused? (in-slider? v))
+        (slider-mouse-down h v)
       (editor-mouse-down h v)))
   
   
   (method override (mouse-move h v)
     (if (and paused? down?)
-        (goto-history (h->where h))
+        (slider-mouse-move h v)
       (if last-point
           (nextmethod h v)
         (editor-mouse-move h v))))
@@ -1375,7 +1428,7 @@
   
   (method override (mouse-up h v)
     (if paused?
-        (set! down? #f)
+        (slider-mouse-up h v)
       (if last-point
           (nextmethod h v)
         (editor-mouse-up h v))))
@@ -1419,6 +1472,7 @@
       ((#\[) (backward-history))
       ((#\]) (forward-history))
       ((#\return) (step-world))
+      ((#\/) (test-world))
       ((#\c) (clear-terminal))
       ;; projection
       ((#\3) (toggle-3d))
@@ -1492,6 +1546,19 @@
     (define (present-boolean bool)
       (if bool "true" "false"))
     
+    (define (present-history)
+      (define (present-coordinates obj)
+        (format "{r precision: 1} {r precision: 1}" (get-x~ obj) (get-y~ obj)))
+      
+      `(,(format "c -> {a}" (present-coordinates character))
+        ,@(loop (for n from 0 to (history-last))
+                (collect
+                  (let ((moment (historical-moment n)))
+                    (let ((snapshot (get-snapshot~ moment))
+                          (commands (get-commands~ moment)))
+                      (let ((character (find-character snapshot)))
+                        (format "{a} -> {a}" n (present-coordinates character)))))))))
+    
     `(,(format "window: {a}" (present-object window))
       ,(format "width: {s}" width)
       ,(format "height: {s}" height)
@@ -1503,6 +1570,9 @@
       ""
       ,(format "history: {s}" (history-end))
       ,(format "now: {s}" now)
+      ,@(if (and paused? (< (history-end) 5))
+            (present-history)
+          '())
       ""
       ,(format "projection: {s}" projection)
       ,(format "eye: {s}" eye)
