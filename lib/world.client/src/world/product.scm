@@ -36,5 +36,5 @@
 ;;;
 
 
-(jazz:register-product 'world.client
+(jazz:register-product 'world.ffi
   build: jazz:build-world))
