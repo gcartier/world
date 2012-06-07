@@ -70,6 +70,9 @@
   (slot blue      <fl>     accessors generate)
   (slot alpha     <fl>     accessors generate)
   (slot texture   <object> accessors generate)
+  (slot vao       <object> accessors generate)
+  (slot vbo       <object> accessors generate)
+  (slot triangles <object> getter explicit)
   (slot user-data <object> accessors generate)
   
   
@@ -85,6 +88,7 @@
     (when color
       (set-color color))
     (set! texture~self texture)
+    (set! triangles #f)
     (set! user-data~self user-data)
     (update-position))
   
@@ -93,6 +97,56 @@
     (print-unreadable self output
       (lambda (output)
         (format output "{r precision: 1} {r precision: 1} {r precision: 1} {a} {a} {a}" x y z width height depth))))
+  
+  
+  (method public (get-triangles)
+    (when (not triangles)
+      (set! triangles (sprite-triangles)))
+    triangles)
+  
+  
+  (method protected virtual (sprite-triangles)
+    (let ((left (get-left))
+          (right (get-right))
+          (bottom (get-bottom))
+          (top (get-top))
+          (back (get-back))
+          (front (get-front)))
+      (let ((vertices
+              (list
+                ;; Front face
+                (vertex left top front) (vertex right top front) (vertex right bottom front) (vertex right bottom front) (vertex left bottom front) (vertex left top front)
+                ;; Back face
+                (vertex right top back) (vertex left top back) (vertex left bottom back) (vertex left bottom back) (vertex right bottom back) (vertex right top back)
+                ;; Left face
+                (vertex left top back) (vertex left top front) (vertex left bottom front) (vertex left bottom front) (vertex left bottom back) (vertex left top back)
+                ;; Right face
+                (vertex right top front) (vertex right top back) (vertex right bottom back) (vertex right bottom back) (vertex right bottom front) (vertex right top front)
+                ;; Top face
+                (vertex left top back) (vertex right top back) (vertex right top front) (vertex right top front) (vertex left top front) (vertex left top back)
+                ;; Bottom face
+                (vertex left bottom front) (vertex right bottom front) (vertex right bottom back) (vertex right bottom back) (vertex left bottom back) (vertex left bottom front))))
+        vertices)))
+  
+  
+  (method public (for-each-triangle proc)
+    (let (iter (scan (get-triangles)))
+      (when (not-null? scan)
+        (bind (v1 v2 v3 . rest) scan
+          (proc v1 v2 v3)
+          (iter rest)))))
+  
+  
+  (method public (ray-distance p <f32vector> d <f32vector>) <fl+>
+    (let ((distance #f))
+      (for-each-triangle
+        (lambda (v1 v2 v3)
+          (let ((dist (ray-triangle-distance p d v1 v2 v3)))
+            (when (and dist
+                       (or (not distance)
+                           (< dist distance)))
+              (set! distance dist)))))
+      distance))
   
   
   (method public inline (get-left) <fl>
@@ -996,7 +1050,9 @@
   (slot moved?             <bool>   initialize #f            getter generate)
   (slot preserved-mouse    <object> initialize #f            getter generate)
   (slot first-person?      <bool>   initialize #f            getter generate)
+  (slot max-distance       <fl>     initialize 37.5          getter generate)
   (slot first-distance     <fl>     initialize 7.5           getter generate)
+  (slot first-occlusion    <fl+>    initialize #f            getter generate)
   (slot first-camera       <object> initialize #f            getter generate)
   (slot textures?          <bool>   initialize #f            getter generate)
   (slot axes               <object>                          getter generate)
@@ -1814,9 +1870,50 @@
         (set-sight~ eye-lookat (get-sight~ (get-lookat~ player)))
         (set-up~ eye-lookat (if fly? (get-up~ (get-lookat~ player)) (vertex 0.0 1.0 0.0)))
         (set-right~ eye-lookat (vertex-normalize (cross-product (get-sight~ eye-lookat) (get-up~ eye-lookat)))))
-      (let ((center (vertex+ (get-center~ player) (vertex-scalar* (if fly? (get-up~ eye-lookat) world-up) (+ (get-radius-y~ player) 1.5)))))
-        (set! eye-target (vertex- center (vertex-scalar* (get-sight~ eye-lookat) first-distance)))
-        (set! eye (vertex- eye-target (get-sight~ eye-lookat))))))
+      (let ((center (player-center)))
+        (set! eye (vertex- center (vertex-scalar* (get-sight~ eye-lookat) (effective-first-distance))))
+        (set! eye-target (vertex+ eye (get-sight~ eye-lookat)))
+        (remove-eye-occlusion center))))
+  
+  
+  (method (player-center)
+    (vertex+ (get-center~ player)
+             (vertex-scalar* (if fly?
+                                 (get-up~ eye-lookat)
+                               world-up)
+                             (+ (get-radius-y~ player) 1.5))))
+  
+  
+  (method (remove-eye-occlusion center)
+    (let ((occlusion (determine-eye-occlusion center)))
+      (unless (eqv? occlusion first-occlusion)
+        (if (not occlusion)
+            (set! first-occlusion #f)
+          (set! first-occlusion (- occlusion 1.))
+          (set! eye-target (vertex- center (vertex-scalar* (get-sight~ eye-lookat) first-occlusion)))
+          (set! eye (vertex- eye-target (get-sight~ eye-lookat))))
+        (update-player-alpha))))
+  
+  
+  (method (determine-eye-occlusion center)
+    (let ((center-eye-distance (vertex-distance center eye)))
+      (let ((distance (ray-sprite-distance center (vertex-negate (get-sight~ eye-lookat)))))
+        (when (and distance
+                   (< distance center-eye-distance))
+          distance))))
+  
+  
+  (method (ray-sprite-distance p d)
+    (let ((distance #f))
+      (iterate-areas-sprites (sprite-areas-3d player)
+        (lambda (sprite)
+          (unless (eq? sprite player)
+            (let ((dist (ray-distance~ sprite p d)))
+              (when (and dist
+                         (or (not distance)
+                             (< dist distance)))
+                (set! distance dist))))))
+      distance))
   
   
   (method (strafe-camera center-x)
@@ -1836,6 +1933,10 @@
          (strafe-camera (get-center-x~ player))))))
   
   
+  (method (effective-first-distance)
+    (or first-occlusion first-distance))
+  
+  
   (method (first-distance-closer)
     (set! first-distance (* first-distance .75))
     (update-player-alpha)
@@ -1843,7 +1944,7 @@
   
   
   (method (first-distance-further)
-    (set! first-distance (/ first-distance .75))
+    (set! first-distance (min (/ first-distance .75) max-distance))
     (update-player-alpha)
     (center-camera))
   
@@ -2311,7 +2412,7 @@
   
   
   (method (prepare-editor)
-    (set! editor-mode 'rectangle)
+    (set! editor-mode 'point)
     (set! players-folio (new Folio 'player '(player pacman)))
     (set! enemies-folio (new Folio 'turtle '(turtle)))
     (set! blocks-folio (new Folio 'block '(block block-red block-green block-blue))))
@@ -2730,7 +2831,7 @@
   
   
   (method (test-world)
-    (validate-areas))
+    )
   
   
   ;;;
@@ -3215,6 +3316,7 @@
       ,(format "camera-distance: {s}" camera-distance)
       ,(format "zoom-factor: {s}" zoom-factor)
       ,(format "first-distance: {s}" first-distance)
+      ,(format "first-occlusion: {s}" first-occlusion)
       ,(format "first-camera: {s}" first-camera)
       ,(format "desired-tilt: {s}" desired-tilt)
       ""
@@ -3250,7 +3352,6 @@
               ,(format "  height: {s}" (get-height~ target))
               ,(format "  depth: {s}" (get-depth~ target))
               ,(format "  texture: {s}" (get-texture~ target))
-              ,(format "  color: {s}" (get-color~ target))
               ,(format "  user-data: {s}" (get-user-data~ target))
               "")
           '())
