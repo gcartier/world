@@ -1,0 +1,348 @@
+;;;==============
+;;;  JazzScheme
+;;;==============
+;;;
+;;;; Player
+;;;
+
+
+(module world.player jazz
+
+
+(import (jazz.geometry)
+        (jazz.graphic)
+        (jazz.graphic.opengl)
+        (jazz.graphic.opengl.platform)
+        (jazz.io)
+        (jazz.library)
+        (jazz.literals)
+        (jazz.media)
+        (jazz.network)
+        (jazz.platform)
+        (jazz.platform.cairo)
+        (jazz.runtime)
+        (jazz.system)
+        (jazz.ui)
+        (jazz.ui.dialog)
+        (jazz.ui.window)
+        (time)
+        (world.autoload)
+        (world.actor)
+        (world.block)
+        (world.client)
+        (world.foreign)
+        (world.geometry)
+        (world.history)
+        (world.object)
+        (world.sprite)
+        (world.texture)
+        (world.window))
+
+
+;;;
+;;;; Player
+;;;
+
+
+(definition player-speed
+  .5)
+
+(definition jump-impulsion
+  2.0)
+
+(definition floor-deceleration
+  .25)
+
+(definition air-deceleration
+  .05)
+
+(definition max-vy
+  -.8)
+
+(definition die-bottom
+  -6.)
+
+
+(class Player extends Actor
+  
+  
+  (slot vx       <fl>      initialize 0.    accessors generate)
+  (slot vy       <fl>      initialize 0.    accessors generate)
+  (slot vz       <fl>      initialize 0.    accessors generate)
+  (slot ready?   <bool>    initialize #f    accessors generate)
+  (slot jumping? <bool>    initialize #f    accessors generate)
+  (slot floor?   <bool>    initialize #f    accessors generate)
+  (slot facing   <symbol>  initialize 'left accessors generate)
+  (slot state    <symbol+> initialize #f    accessors generate)
+  
+  
+  (method override (initialize . rest)
+    (apply nextmethod rest)
+    (set! lookat (new LookAt (vertex 0. 0. -1.) (vertex 0. 1. 0.) (vertex 1. 0. 0.))))
+  
+  
+  (method override (tick commands elapse)
+    (continuation-capture
+      (lambda (exit)
+        (define (win-hit obj)
+          (when (eq? (get-user-data~ obj) 'win)
+            (win~ world)
+            (continuation-return exit)))
+        
+        (let ((old-x x)
+              (old-y y)
+              (old-z z)
+              (old-center (get-center))
+              (moving? #f)
+              (target-vx #f)
+              (target-vz #f)
+              (factor (* elapse 65)))
+          (when (get-move-left?~ commands)
+            (set! moving? #t)
+            (set! target-vx (- player-speed)))
+          (when (get-move-right?~ commands)
+            (set! moving? #t)
+            (set! target-vx player-speed))
+          (when (get-move-down?~ commands)
+            (if (get-first-person?~ world)
+                (move-player-backward~ world factor)
+              (set! moving? #t)
+              (set! target-vz player-speed)))
+          (when (get-move-up?~ commands)
+            (if (get-first-person?~ world)
+                (move-player-forward~ world factor)
+              (set! moving? #t)
+              (set! target-vz (- player-speed))))
+          (when (get-strafe-left?~ commands)
+            (when (get-first-person?~ world)
+              (strafe-player-left~ world factor)))
+          (when (get-strafe-right?~ commands)
+            (when (get-first-person?~ world)
+              (strafe-player-right~ world factor)))
+          (when (get-rotate-left?~ commands)
+            (when (get-first-person?~ world)
+              (rotate-player-left~ world factor)))
+          (when (get-rotate-right?~ commands)
+            (when (get-first-person?~ world)
+              (rotate-player-right~ world factor)))
+          (when (and (get-fly?~ world)
+                     (not (get-rotate-left?~ commands))
+                     (not (get-rotate-right?~ commands)))
+            (reset-player-tilt~ world))
+          (when (not moving?)
+            (set! target-vx 0.)
+            (set! target-vz 0.))
+          (when target-vx
+            (let ((deceleration (if jumping? air-deceleration floor-deceleration)))
+              (cond ((> vx target-vx)
+                     (decrease! vx deceleration)
+                     (if (< vx target-vx)
+                         (set! vx target-vx)))
+                    ((< vx target-vx)
+                     (increase! vx deceleration)
+                     (if (> vx target-vx)
+                         (set! vx target-vx))))))
+          (when target-vz
+            (let ((deceleration (if jumping? air-deceleration floor-deceleration)))
+              (cond ((> vz target-vz)
+                     (decrease! vz deceleration)
+                     (if (< vz target-vz)
+                         (set! vz target-vz)))
+                    ((< vz target-vz)
+                     (increase! vz deceleration)
+                     (if (> vz target-vz)
+                         (set! vz target-vz))))))
+          (if (not (get-jump?~ commands))
+              (set! ready? #t)
+            (when (and floor? ready? (not jumping?))
+              (set! ready? #f)
+              (set! jumping? #t)
+              (set! vy jump-impulsion)))
+          
+          (increase! x (* vx factor))
+          (increase! z (* vz factor))
+          (unless (get-fly?~ world)
+            (decrease! vy (get-gravity~ world))
+            (increase! y vy))
+          (when (< vy max-vy)
+            (set! vy max-vy))
+          (receive (hit-x hit-y hit-z) (hit-test~ world self old-x old-y old-z x y z width height depth)
+            (when hit-x
+              (bind (obj direction border reset) hit-x
+                (win-hit obj)
+                (set! x reset)))
+            (if (not hit-y)
+                (set! floor? #f)
+              (bind (obj direction border reset) hit-y
+                (win-hit obj)
+                (set! y reset)
+                (set! vy 0.)
+                (when (= direction -1)
+                  (set! jumping? #f)
+                  (set! floor? #t)
+                  (when (and (is? obj Actor) (stomp~ obj))
+                    (set! vy 3.)))))
+            (when hit-z
+              (bind (obj direction border reset) hit-z
+                (win-hit obj)
+                (set! z reset))))
+          (when (and (< y 0.) (not (get-fly?~ world)))
+            (set! y 0.)
+            (set! vy 0.)
+            (set! jumping? #f)
+            (set! floor? #t))
+          @w
+          (when (< y die-bottom)
+            (lose~ world)
+            (continuation-return exit))
+          (update-position)
+          (update-area~ world self old-center)
+          (when (or (/= x old-x)
+                    (/= y old-y)
+                    (/= z old-z))
+            (center-camera~ world))))))
+  
+  
+  (method (move-left commands)
+    (set-move-left?~ commands #t))
+  
+  
+  (method (move-right commands)
+    (set-move-right?~ commands #t))
+  
+  
+  (method (move-down commands)
+    (set-move-down?~ commands #t))
+  
+  
+  (method (move-up commands)
+    (set-move-up?~ commands #t))
+  
+  
+  (method (strafe-left commands)
+    (set-strafe-left?~ commands #t))
+  
+  
+  (method (strafe-right commands)
+    (set-strafe-right?~ commands #t))
+  
+  
+  (method (rotate-left commands)
+    (set-rotate-left?~ commands #t))
+  
+  
+  (method (rotate-right commands)
+    (set-rotate-right?~ commands #t))
+  
+  
+  (method (space commands)
+    (jump commands))
+  
+  
+  (method (jump commands)
+    (set-jump?~ commands #t))
+  
+  
+  (method (win)
+    (set! jumping? #f)
+    (set! state 'win)
+    (update-position))
+  
+  
+  (method (lose)
+    (set! jumping? #f)
+    (set! state 'lose)
+    (update-position))
+  
+  
+  (method (reset-state)
+    (set! state #f))
+  
+  
+  (method (reset-position)
+    (set! x (get-start-x~ world))
+    (set! y (get-start-y~ world))
+    (set! z (get-start-z~ world))
+    (update-position))
+  
+  
+  (method override (serialize-sprite)
+    (list 'player x y z))
+  
+  
+  (method override (draw-3d)
+    (nextmethod)
+    (when (get-fly?~ world)
+      (glPushMatrix)
+      (glTranslatef center-x center-y center-z)
+      (let ((sight (get-sight~ lookat))
+            (up (get-up~ lookat))
+            (right (get-right~ lookat)))
+        (glMultMatrixv
+          (vertex-x right) (vertex-x up) (vertex-x sight) 0.
+          (vertex-y right) (vertex-y up) (vertex-y sight) 0.
+          (vertex-z right) (vertex-z up) (vertex-z sight) 0.
+          0. 0. 0. 1.))
+      (glColor4f .4 0. 0. 1.)
+      (let ((width 16.)
+            (depth 8.))
+        (let ((x1 (- depth))
+              (x2 depth)
+              (y (- radius-y))
+              (z1 (- width))
+              (z2 width))
+          ;; flying carpet
+          (glNormal3f 0.0 -1.0 0.0)
+          (glBegin GL_QUADS)
+          (glVertex3f x2 y z2)
+          (glVertex3f x1 y z2)
+          (glVertex3f x1 y z1)
+          (glVertex3f x2 y z1)
+          (glEnd)))
+      (glPopMatrix))))
+
+
+;;;
+;;;; Pacman
+;;;
+
+
+(class Pacman extends Player
+  
+  
+  (method override (serialize-sprite)
+    (list 'pacman x y z)))
+
+
+;;;
+;;;; Commands
+;;;
+
+
+(class Commands extends Object
+  
+  
+  (slot move-left?    <bool> initialize #f accessors generate)
+  (slot move-right?   <bool> initialize #f accessors generate)
+  (slot move-down?    <bool> initialize #f accessors generate)
+  (slot move-up?      <bool> initialize #f accessors generate)
+  (slot strafe-left?  <bool> initialize #f accessors generate)
+  (slot strafe-right? <bool> initialize #f accessors generate)
+  (slot rotate-left?  <bool> initialize #f accessors generate)
+  (slot rotate-right? <bool> initialize #f accessors generate)
+  (slot jump?         <bool> initialize #f accessors generate)
+  
+  
+  (method override (print output readably)
+    (print-unreadable self output
+      (lambda (output)
+        (format output "{l}"
+          `(,@(if move-left? '(move-left) '())
+            ,@(if move-right? '(move-right) '())
+            ,@(if move-down? '(move-down) '())
+            ,@(if move-up? '(move-up) '())
+            ,@(if strafe-left? '(strafe-left) '())
+            ,@(if strafe-right? '(strafe-right) '())
+            ,@(if rotate-left? '(rotate-left) '())
+            ,@(if rotate-right? '(rotate-right) '())
+            ,@(if jump? '(jump) '()))))))))
