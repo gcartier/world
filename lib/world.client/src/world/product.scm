@@ -19,7 +19,7 @@
     (define jazz:world-units
       (let ((glew-include-path (jazz:quote-jazz-pathname "foreign/opengl/glew/include"))
             (glew-lib-path     (jazz:quote-jazz-pathname "foreign/opengl/glew/lib")))
-        `((world.foreign cc-options: ,(string-append "-I" glew-include-path) ld-options: ,(string-append "-L" glew-lib-path " -lopengl32 -lglew32"))))))
+        `((world.foreign cc-options: ,(string-append "-I" glew-include-path) ld-options: ,(string-append "-L" glew-lib-path " -lopengl32 -lglu32 -lglew32"))))))
   (else
     (define jazz:world-units
       '())))
@@ -36,5 +36,5 @@
 ;;;
 
 
-(jazz:register-product 'world.ffi
+(jazz:register-product 'world.foreign
   build: jazz:build-world))
