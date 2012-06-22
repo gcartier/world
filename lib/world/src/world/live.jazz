@@ -684,8 +684,10 @@
   
   (method (remove-eye-occlusion target)
     (define (determine-eye-occlusion target)
-      (receive (sprite distance) (ray-closest-sprite target (vertex-negate (get-sight~ eye-lookat)) first-distance ignore-player?: #t)
-        distance))
+      (let ((closest (ray-closest-sprite target (vertex-negate (get-sight~ eye-lookat)) first-distance ignore-player?: #t)))
+        (when closest
+          (bind (sprite v1 v2 v3 normal distance) closest
+            distance))))
     
     (define (closer-eye-occlusion occlusion)
       ;; heuristic for the eye being far away and almost parallel to a wall
@@ -718,8 +720,8 @@
             (new Mark (copy-vertex eye) color: {Color Blue}))))
   
   
-  (method (ray-closest-sprite p d max-distance (ignore-player?: ignore-player? #f))
-    (let ((sprite #f)
+  (method (ray-closest-sprite p d max-distance (filter: filter #f) (ignore-player?: ignore-player? #f))
+    (let ((closest #f)
           (distance #f)
           (distance-step (cast <fl> (get-area-size~ zone)))
           (visited (make-table test: eq?)))
@@ -735,21 +737,22 @@
                     (when (get-visible?~ targ)
                       (unless (and ignore-player? (eq? targ player))
                         (when (ray-intersects-sphere? p d (get-center~ targ) (get-radius~ targ))
-                          (let ((dist (ray-distance~ targ p d)))
-                            (when (and (/= dist -1.)
-                                       (or (not distance)
-                                           (< dist distance))
-                                       (or (not max-distance)
-                                           (< dist max-distance)))
-                              (set! sprite targ)
-                              (set! distance dist))))))))
+                          (let ((cls (ray-closest-triangle~ targ p d filter)))
+                            (when cls
+                              (bind (v1 v2 v3 normal dist) cls
+                                (when (and (or (not distance)
+                                               (< dist distance))
+                                           (or (not max-distance)
+                                               (< dist max-distance)))
+                                  (set! closest (cons targ cls))
+                                  (set! distance dist))))))))))
                 (table-set! visited area #t))))
           (let ((new-distance (+ position-distance distance-step)))
             (when (<= new-distance max-distance)
               (vertex+! position position position-step)
               (set! position-distance new-distance)
               (iter)))))
-      (values sprite distance)))
+      closest))
   
   
   (method (strafe-camera center-x)
@@ -1447,6 +1450,7 @@
   (slot editor-anchor <object> initialize #f  getter generate)
   (slot editor-last   <object> initialize #f  getter generate)
   (slot editor-added  <object> initialize #f  getter generate)
+  (slot editor-normal <object> initialize #f  getter generate)
   (slot adding?       <bool>   initialize #f  getter generate)
   (slot deleting?     <bool>   initialize #f  getter generate)
   (slot grid-x        <fl>     initialize 0.  getter generate)
@@ -1464,7 +1468,7 @@
   
   
   (method (prepare-editor)
-    (set! editor-mode 'point)
+    (set! editor-mode 'block)
     (set! players-folio (new Folio 'player '(player pacman)))
     (set! enemies-folio (new Folio 'turtle '(turtle monster)))
     (set! blocks-folio (new Folio 'block '(block block-red block-green block-blue)))
@@ -1472,7 +1476,7 @@
   
   
   (method (switch-editor-mode)
-    (let ((new-mode (next-element '(@wait select point @wait line rectangle) editor-mode)))
+    (let ((new-mode (next-element '(block point @wait line rectangle) editor-mode)))
       (set! editor-mode new-mode)
       (display-message (capitalize (->string new-mode)))))
   
@@ -1495,7 +1499,7 @@
             target-in-eye-space)))))
   
   
-  (method (screen->world h v)
+  (method (screen->world h v (floor-grid?: floor-grid? #f))
     (let ((ratio (/ width height))
           (ch (- h (/ width 2)))
           (cv (- (- height v) (/ height 2))))
@@ -1519,7 +1523,13 @@
       
       (case projection
         ((perspective)
-         (when grid?
+         (if (not grid?)
+             (when floor-grid?
+               (let ((vert (perspective->world (vertex 0. 1. 0.) 0.)))
+                 (and vert (vertex
+                             (vertex-x vert)
+                             grid-y
+                             (vertex-z vert)))))
            (cond (grid-x? (let ((vert (perspective->world (vertex 1. 0. 0.) grid-x)))
                             (and vert (vertex
                                         grid-x
@@ -1599,7 +1609,7 @@
                      (= (vertex-y editor-last) to-y)
                      (= (vertex-z editor-last) to-z))
           (case editor-mode
-            ((point)
+            ((block point)
              (let ((sprite (add-at to-x to-y to-z)))
                (set! last-added sprite)))
             ((line))
@@ -1784,63 +1794,97 @@
             (grid-z? (increase! grid-z dist) (display-status (format "Grid at {a}" grid-z))))))
   
   
+  (method (editor-add-at vert)
+    (let ((class (editor-sprite-class)))
+      (editor-add-sprite class vert)
+      (set-modified? #t)
+      (update-future)))
+  
+  
+  (method (editor-add-block h v target-normal)
+    (define (normal-filter sprite normal)
+      (vertex=? normal target-normal))
+    
+    (if (and adding? (not target-normal))
+        (let ((vert (screen->world h v floor-grid?: #t)))
+          (when vert
+            (editor-add-at vert)))
+      (let ((direction (screen->ray h v)))
+        (let ((closest (ray-closest-sprite eye direction (get-radius~ zone) filter: (and target-normal normal-filter))))
+          (if closest
+              (bind (sprite v1 v2 v3 normal distance) closest
+                (editor-add-at (vertex+ (get-center~ sprite) (vertex-scalar* normal 5.)))
+                normal)
+            (let ((vert (screen->world h v floor-grid?: #t)))
+              (when vert
+                (editor-add-at vert)))
+            #f)))))
+  
+  
   (method (editor-mouse-down h v)
-    (let ((vert (screen->world h v)))
-      (if (not vert)
-          (when (control-down?)
-            (unless (and grid? (or grid-x? grid-y? grid-z?))
-              (display-error "3d edition requires a grid"))
-            (bell))
-        (let ((obj (vertex->sprite~ zone vert)))
-          (if obj
+    (if (eq? editor-mode 'block)
+        (when (control-down?)
+          (let ((normal (editor-add-block h v #f)))
+            (set! editor-normal normal)
+            (set! adding? #t)))
+      (let ((vert (screen->world h v)))
+        (if (not vert)
+            (when (control-down?)
+              (unless (and grid? (or grid-x? grid-y? grid-z?))
+                (display-error "3d edition requires a grid"))
+              (bell))
+          (let ((obj (vertex->sprite~ zone vert)))
+            (if obj
+                (if (control-down?)
+                    (begin
+                      (show-cursor)
+                      (set! preserved-mouse #f)
+                      (set! deleting? #t)
+                      (set! editor-anchor #f)
+                      (set! editor-last #f)
+                      (editor-remove-sprite obj)
+                      (set-modified? #t)
+                      (update-future)))
               (if (control-down?)
                   (begin
                     (show-cursor)
                     (set! preserved-mouse #f)
-                    (set! deleting? #t)
                     (set! editor-anchor #f)
                     (set! editor-last #f)
-                    (editor-remove-sprite obj)
-                    (set-modified? #t)
-                    (update-future)))
-            (if (control-down?)
-                (begin
-                  (show-cursor)
-                  (set! preserved-mouse #f)
-                  (set! editor-anchor #f)
-                  (set! editor-last #f)
-                  (set! adding? #t)
-                  (let ((class (editor-sprite-class)))
-                    (editor-add-sprite class vert)
-                    (set-modified? #t))
-                  (update-future))))))))
+                    (set! adding? #t)
+                    (editor-add-at vert)
+                    (update-future)))))))))
   
   
   (method (editor-mouse-move h v)
     (when down?
-      (let ((vert (screen->world h v)))
-        (when vert
-          (let ((obj (vertex->sprite~ zone vert)))
-            (if (and obj (not editor-anchor))
-                (when deleting?
-                  (editor-remove-sprite obj)
-                  (set-modified? #t)
-                  (update-future))
-              (when adding?
-                (let ((class (editor-sprite-class)))
-                  (editor-add-sprite class vert)
-                  (set-modified? #t))
-                (update-future))))))))
+      (if (eq? editor-mode 'block)
+          (editor-add-block h v editor-normal)
+        (let ((vert (screen->world h v)))
+          (when vert
+            (let ((obj (vertex->sprite~ zone vert)))
+              (if (and obj (not editor-anchor))
+                  (when deleting?
+                    (editor-remove-sprite obj)
+                    (set-modified? #t)
+                    (update-future))
+                (when adding?
+                  (let ((class (editor-sprite-class)))
+                    (editor-add-sprite class vert)
+                    (set-modified? #t))
+                  (update-future)))))))))
   
   
   (method (editor-mouse-up h v)
     (when (or grid? draw-gadgets? (neq? projection 'perspective))
-      (unless (or adding? deleting?)
+      (unless (or adding? deleting? (control-down?))
         (case projection
           ((perspective)
            (let ((direction (screen->ray (get-h~ down-point) (get-v~ down-point))))
-             (receive (sprite distance) (ray-closest-sprite eye direction (get-radius~ zone) ignore-player?: #f)
-               (set-target sprite))))
+             (let ((closest (ray-closest-sprite eye direction (get-radius~ zone))))
+               (if (not closest)
+                   (set-target #f)
+                 (set-target (first closest))))))
           (else
            (let ((vert (screen->world h v)))
              (if (not vert)
@@ -2322,12 +2366,13 @@
   
   (method (toggle-fly)
     (set! fly? (not fly?))
-    (if fly?
-        (begin
-          (set-y~ player (+ (get-y~ player) 2.))
-          (update-position~ player))
-      (rotate-player-vertical (vertical-angle (get-sight~ (get-lookat~ player)) world-up)))
-    (follow-player))
+    (when player
+      (if fly?
+          (begin
+            (set-y~ player (+ (get-y~ player) 2.))
+            (update-position~ player))
+        (rotate-player-vertical (vertical-angle (get-sight~ (get-lookat~ player)) world-up)))
+      (follow-player)))
 
   
   (method (toggle-textures)
