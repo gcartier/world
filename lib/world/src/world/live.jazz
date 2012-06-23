@@ -1456,6 +1456,7 @@
   (slot editor-last   <object> initialize #f  getter generate)
   (slot editor-added  <object> initialize #f  getter generate)
   (slot editor-normal <object> initialize #f  getter generate)
+  (slot editor-from   <object> initialize #f  getter generate)
   (slot adding?       <bool>   initialize #f  getter generate)
   (slot deleting?     <bool>   initialize #f  getter generate)
   (slot grid-x        <fl>     initialize 0.  getter generate)
@@ -1480,10 +1481,11 @@
     (set! gadgets-folio (new Folio 'light '(light))))
   
   
-  (method (switch-editor-mode)
-    (let ((new-mode (next-element '(block point @wait line rectangle) editor-mode)))
-      (set! editor-mode new-mode)
-      (display-message (capitalize (->string new-mode)))))
+  (method (change-editor-mode (reversed?: reversed? #f))
+    (let ((next (if reversed? previous-element next-element)))
+      (let ((new-mode (next '(block column free crazy point @wait line rectangle) editor-mode)))
+        (set! editor-mode new-mode)
+        (display-message (capitalize (->string new-mode))))))
   
   
   (method (screen->ray h v)
@@ -1608,16 +1610,19 @@
       (if (not editor-anchor)
           (let ((sprite (add-at to-x to-y to-z)))
             (set! last-added sprite)
-            (set! editor-anchor (vertex to-x to-y to-z)))
+            (set! editor-anchor (vertex to-x to-y to-z))
+            sprite)
         (unless (and editor-last
                      (= (vertex-x editor-last) to-x)
                      (= (vertex-y editor-last) to-y)
                      (= (vertex-z editor-last) to-z)
                      (not force?))
           (case editor-mode
-            ((block point)
+            ((block column free crazy point)
              (let ((sprite (add-at to-x to-y to-z)))
-               (set! last-added sprite)))
+               (set! last-added sprite)
+               (set! editor-last (vertex to-x to-y to-z))
+               sprite))
             ((line))
             ((rectangle)
              (let ((anchor-x (vertex-x editor-anchor))
@@ -1652,8 +1657,8 @@
                      (let ((added (queue-list queue)))
                        (when editor-added
                          (for-each editor-remove-sprite (difference editor-added added)))
-                       (set! editor-added added))))))))
-          (set! editor-last (vertex to-x to-y to-z))))))
+                       (set! editor-added added)
+                       (set! editor-last (vertex to-x to-y to-z)))))))))))))
   
   
   (method (editor-sprite-class)
@@ -1803,37 +1808,62 @@
   
   (method (editor-add-at vert)
     (let ((class (editor-sprite-class)))
-      (editor-add-sprite class vert)
-      (set-modified? #t)
-      (update-future)))
+      (let ((sprite (editor-add-sprite class vert)))
+        (set-modified? #t)
+        (update-future)
+        sprite)))
   
   
-  (method (editor-add-block h v target-normal)
-    (define (normal-filter sprite normal)
-      (vertex=? normal target-normal))
+  (method (editor-add-block h v first?)
+    (define (determine-filter)
+      (when (not first?)
+        (case editor-mode
+          ((block) (block-filter))
+          ((column) column-filter)
+          ((free) free-filter)
+          ((crazy) #f))))
     
-    (if (and adding? (not target-normal))
-        (let ((vert (screen->world h v floor-grid?: #t)))
-          (when vert
-            (editor-add-at vert)))
-      (let ((direction (screen->ray h v)))
-        (let ((closest (ray-closest-sprite eye direction (get-radius~ zone) filter: (and target-normal normal-filter) ignore-player?: #t)))
-          (if closest
-              (bind (sprite v1 v2 v3 normal distance) closest
-                (editor-add-at (vertex+ (get-center~ sprite) (vertex-scalar* normal 5.)))
-                normal)
+    (define (block-filter)
+      (let ((accessor (cond ((/= (vertex-x editor-normal) 0.) vertex-x)
+                            ((/= (vertex-y editor-normal) 0.) vertex-y)
+                            ((/= (vertex-z editor-normal) 0.) vertex-z))))
+        (lambda (sprite normal)
+          (and (vertex=? normal editor-normal)
+               (or (not editor-from)
+                   (= (accessor (get-center~ sprite)) (accessor editor-from)))))))
+    
+    (define (column-filter sprite normal)
+      (and (vertex=? normal editor-normal)
+           editor-from
+           (let ((center (get-center~ sprite)))
+             (or (vertex=? center editor-from)
+                 (vertex=? (vertex-normalize (vertex- center editor-from)) editor-normal)))))
+    
+    (define (free-filter sprite normal)
+      (vertex=? normal editor-normal))
+    
+    (define (add-block vert sprite normal)
+      (let ((added (editor-add-at vert)))
+        (when first?
+          (set! editor-normal normal)
+          (set! editor-from (get-center~ (or sprite added))))))
+    
+    (let ((direction (screen->ray h v)))
+      (let ((closest (ray-closest-sprite eye direction (get-radius~ zone) filter: (determine-filter) ignore-player?: #t)))
+        (if closest
+            (bind (sprite v1 v2 v3 normal distance) closest
+              (add-block (vertex+ (get-center~ sprite) (vertex-scalar* normal 5.)) sprite normal))
+          (when (or first? (neq? editor-mode 'column))
             (let ((vert (screen->world h v floor-grid?: #t)))
               (when vert
-                (editor-add-at vert)))
-            #f)))))
+                (add-block vert #f world-up))))))))
   
   
   (method (editor-mouse-down h v)
-    (if (eq? editor-mode 'block)
+    (if (memq? editor-mode '(block column free crazy))
         (when (control-down?)
-          (let ((normal (editor-add-block h v #f)))
-            (set! editor-normal normal)
-            (set! adding? #t)))
+          (editor-add-block h v #t)
+          (set! adding? #t))
       (let ((vert (screen->world h v)))
         (if (not vert)
             (when (control-down?)
@@ -1865,8 +1895,8 @@
   
   (method (editor-mouse-move h v)
     (when down?
-      (if (eq? editor-mode 'block)
-          (editor-add-block h v editor-normal)
+      (if (memq? editor-mode '(block column free crazy))
+          (editor-add-block h v #f)
         (let ((vert (screen->world h v)))
           (when vert
             (let ((obj (vertex->sprite~ zone vert)))
@@ -2263,7 +2293,8 @@
               ((shortcut=? shortcut {Shortcut :control :shift Tab}) (backward-sprite-class))
               ((shortcut=? shortcut {Shortcut :control #\T}) (change-texture))
               ((shortcut=? shortcut {Shortcut :control :shift #\T}) (change-texture reversed?: #t))
-              ((shortcut=? shortcut {Shortcut :control #\W}) (switch-editor-mode))
+              ((shortcut=? shortcut {Shortcut :control #\W}) (change-editor-mode))
+              ((shortcut=? shortcut {Shortcut :control :shift #\W}) (change-editor-mode reversed?: #t))
               ;; debug
               ((shortcut=? shortcut {Shortcut :control #\M}) (reset-all-marks~ zone))
               ((shortcut=? shortcut {Shortcut :control :alt #\1}) (test1-world))
@@ -2392,6 +2423,9 @@
     (iterate-gadgets~ zone
       (lambda (gadget)
         (set-visible?~ gadget draw-gadgets?)))
+    (when (and (is? target Gadget)
+               (not (get-visible?~ target)))
+      (set-target #f))
     (display-on/off "Draw gadgets" draw-gadgets?))
   
   
