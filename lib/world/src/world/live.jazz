@@ -255,7 +255,8 @@
   
   
   (method (reset-commands)
-    (set! commands (new Commands)))
+    (when (or (not commands) (get-modified?~ commands))
+      (set! commands (new Commands))))
   
   
   (method (setup-world)
@@ -366,10 +367,10 @@
             (add-history elapse))
           (start~ tick-counter)
           (complete~ commands)
-          (when (not (get-world-server~ process))
-            (tick-actors commands elapse))
-          (when (and (client-side?~ process) @fix-gravity (get-modified?~ commands))
-            (tick-server~ (get-process) commands elapse))
+          (if (not (get-world-server~ process))
+              (tick-actors commands elapse)
+            (when (get-modified?~ commands)
+              (tick-server~ (get-process) commands elapse)))
           (reset-commands)
           (end~ tick-counter)
           (restore-first-distance elapse)))))
@@ -377,52 +378,105 @@
   
   (method (tick-actors commands elapse)
     (unless (and me (get-state~ me))
-      (let ((server-side? (server-side?~ (get-process))))
-        (for-each (lambda (actor)
-                    (unless (and server-side? (is? actor Player) (neq? actor me))
-                      (tick~ actor commands elapse)))
-                  (get-actors~ zone)))))
+      (for-each (lambda (actor)
+                  (tick~ actor commands elapse))
+                (get-actors~ zone))))
   
   
-  (method (world-enter player-client player-name player-avatar)
-    (let ((player (new Player name: player-name x: -123.3135757446289 y: 30. z: -118.)))
+  (method (world-update players)
+    (when (find-setting 'world.client.debug? #f)
+      (terminal (effective-player-name~ (get-application)) 'world-update players))
+    (for-each (lambda (info)
+                (bind (player-name player-avatar player-position player-sight player-up player-right) info
+                  (let ((player (find-named-player player-name)))
+                    (if (not player)
+                        (add-player player-name player-avatar player-position player-sight player-up player-right)
+                      (set-position~ player player-position)
+                      (let ((lookat (get-lookat~ player)))
+                        (set-sight~ lookat player-sight)
+                        (set-up~ lookat player-up)
+                        (set-right~ lookat player-right))))))
+              players)
+    (when (find-setting 'world.client.debug? #f)
+      (debug-players)))
+  
+  
+  (method (world-enter player-name player-avatar player-position player-lookat)
+    (when (find-setting 'world.client.debug? #f)
+      (terminal (effective-player-name~ (get-application)) 'world-enter player-name player-avatar player-position player-lookat))
+    (bind (sight up right) player-lookat
+      (add-player player-name player-avatar player-position sight up right))
+    (display-message (format "{a} entered world" player-name))
+    (when (find-setting 'world.client.debug? #f)
+      (debug-players)))
+  
+  
+  (method (add-player player-name player-avatar player-position player-sight player-up player-right)
+    (let ((player (new Player name: player-name x: 0. y: 0. z: 0.)))
+      (set-position~ player player-position)
+      (let ((lookat (get-lookat~ player)))
+        (set-sight~ lookat player-sight)
+        (set-up~ lookat player-up)
+        (set-right~ lookat player-right))
       (when player-avatar
         (set-color~ player player-avatar))
       (add-sprite~ zone player)
       (when (and (client-side?~ (get-process)) (equal? player-name (get-player-name~ (get-process))))
-        (set-me player)))
-    (display-message (format "{a} entered world" player-name)))
+        (set-me player)
+        (camera-behind-player)
+        (follow-player))))
   
   
-  (method (world-exit player-client player-name)
+  (method (world-exit player-name)
+    (when (find-setting 'world.client.debug? #f)
+      (terminal (effective-player-name~ (get-application)) 'world-exit player-name))
     (let ((player (find-named-player player-name)))
       (when player
         (remove-sprite player))
       (when (and (client-side?~ (get-process)) (equal? player-name (get-player-name~ (get-process))))
         (set-me #f))
-      (display-message (format "{a} exited world" player-name))))
+      (display-message (format "{a} exited world" player-name)))
+    (when (find-setting 'world.client.debug? #f)
+      (debug-players)))
   
   
-  (method (server-tick ticks elapse)
+  (definition empty-commands
+    (let ((commands (new Commands)))
+      (complete~ commands)
+      commands))
+  
+  
+  (method (server-tick player-commands elapse)
+    (let ((elapse (if (pair? elapse) (car elapse) elapse))
+          (sight (if (pair? elapse) (cdr elapse) #f)))
+    (unless (null? player-commands)
+      (when (find-setting 'world.client.debug? #f)
+        (terminal (effective-player-name~ (get-application)) 'server-tick player-commands elapse)))
     (start~ latency-counter)
-    (for-each (lambda (tick)
-                (bind (player-name commands elapse) tick
-                  (let ((player (find-named-player player-name)))
-                    (when player
-                      (let ((commands (deserialize-commands commands)))
-                        (tick~ player commands elapse))))))
-              ticks)
-    (let ((empty-commands (new Commands)))
-      (tick-non-player-actors empty-commands elapse))
-    (end~ latency-counter))
-  
-  
-  (method (tick-non-player-actors commands elapse)
     (unless (and me (get-state~ me))
       (for-each (lambda (actor)
-                  (unless (is? actor Player)
-                    (tick~ actor commands elapse)))
-                (get-actors~ zone))))
+                  (let ((name (and (is? actor Player) (get-name~ actor))))
+                    (let ((pair (and name (assoc name player-commands))))
+                      (let ((commands (if pair (deserialize-commands (cdr pair)) empty-commands)))
+                        (tick~ actor commands elapse)))))
+                (get-actors~ zone)))
+    (end~ latency-counter)
+    (unless (null? player-commands)
+      (when (find-setting 'world.client.debug? #f)
+        (debug-players)
+        (when (and sight (equal? (effective-player-name~ (get-application)) "Joel"))
+          (when (not (vertex=? sight (get-sight~ (get-lookat~ me))))
+            (terminal '*************************)))))))
+  
+  
+  (method (debug-players)
+    (for-each (lambda (player)
+                (unless (equal? (get-name~ player) "Server")
+                  (terminal '->
+                            (get-name~ player)
+                            (get-position~ player)
+                            (present-vertex (get-sight~ (get-lookat~ player))))))
+              (collect-players~ zone)))
   
   
   ;;;
@@ -635,14 +689,6 @@
   (method override (prepare-camera)
     (vertex-init! eye 0.0 36.25 60.0)
     (standardize!~ eye-lookat))
-  
-  
-  (method (reset-camera)
-    (when me
-      (standardize!~ (get-lookat~ me)))
-    (standardize!~ eye-lookat)
-    (follow-player)
-    (display-message "Reset"))
   
   
   (method (toggle-eye)
@@ -927,7 +973,8 @@
   
   
   (method (rotate-player-horizontal player angle (follow-player?: follow-player? #t))
-    (rotate~ (get-lookat~ player) angle world-up)
+    (let ((lookat (get-lookat~ player)))
+      (rotate~ lookat angle world-up))
     (when (eq? player me)
       (unless (and down? (not moving?))
         (rotate~ eye-lookat angle world-up))
@@ -986,28 +1033,30 @@
       (rotate~ lookat inc (get-sight~ lookat))))
   
   
-  (method (track-player player dh dv)
+  (method (track-player player dh dv eye-sight eye-up eye-right first?)
     (let ((me? (eq? player me))
-          (tilt (vertical-angle (get-right~ eye-lookat) world-up)))
+          @fix-tilt
+          (tilt (vertical-angle eye-right world-up))
+          (dh (cast <fl> dh))
+          (dv (cast <fl> dv)))
       ;; remove tilt
+      @fix-tilt
       (when (and me? (not fly?))
-        @fix-tilt
-        (rotate~ eye-lookat (- tilt) (get-sight~ eye-lookat)))
-      (let ((pitch (vertical-angle (get-sight~ eye-lookat) world-up)))
+        (rotate~ eye-lookat (- tilt) eye-sight))
+      (let ((pitch (vertical-angle eye-sight world-up)))
         ;; remove pitch
         (when (and me? (not fly?))
           (rotate-vertical pitch))
         ;; start from the eye lookat
-        (when (not moved?)
+        (when first?
           (let ((lookat (get-lookat~ player)))
-            (set-sight~ lookat (get-sight~ eye-lookat))
-            (set-up~ lookat (get-up~ eye-lookat))
-            (set-right~ lookat (get-right~ eye-lookat)))
-          (set! moved? #t))
+            (set-sight~ lookat eye-sight)
+            (set-up~ lookat eye-up)
+            (set-right~ lookat eye-right)))
         ;; remove tilt
+        @fix-tilt
         (when (and me? fly?)
-          @fix-tilt
-          (rotate~ eye-lookat (- tilt) (get-sight~ eye-lookat)))
+          (rotate~ eye-lookat (- tilt) eye-sight))
         ;; remove pitch
         (when (and me? fly?)
           (rotate-vertical pitch))
@@ -1024,9 +1073,9 @@
         ;; restore tilt
         @fix-tilt
         (when me?
-          (rotate~ eye-lookat tilt (get-sight~ eye-lookat)))
+          (rotate~ eye-lookat tilt eye-sight))
         @fix-tilt
-        (when (and fly? (/= dh 0))
+        (when (and fly? (/= dh 0.))
           (let ((speed (/ (cast <fl> dh) elapse)))
             (tilt-player player speed))))))
   
@@ -2246,7 +2295,7 @@
              actors))
   
   
-  (define (find-named-player player-name)
+  (method (find-named-player player-name)
     (find-if (lambda (actor)
                (and (is? actor Player)
                     (equal? (get-name~ actor) player-name)))
@@ -2411,7 +2460,9 @@
   (method override (mouse-track elapse dh dv)
     (when (eq? projection 'perspective)
       (if (and me moving? (not paused?))
-          (add-action~ commands 'track (list dh dv))
+          (let ((first? (not moved?)))
+            (add-action~ commands 'track (list dh dv (get-sight~ eye-lookat) (get-up~ eye-lookat) (get-right~ eye-lookat) first?))
+            (set! moved? #t))
         (nextmethod elapse dh dv))))
   
   
@@ -2518,7 +2569,6 @@
               ;; camera
               ((shortcut=? shortcut {Shortcut :alt #\1}) (first-person))
               ((shortcut=? shortcut {Shortcut :alt #\3}) (toggle-3d))
-              ((shortcut=? shortcut {Shortcut :alt #\9}) (reset-camera))
               ((shortcut=? shortcut {Shortcut :alt #\8}) (change-first-camera))
               ;; draw
               ((shortcut=? shortcut {Shortcut :control #\G}) (toggle-draw-gadgets))
@@ -2875,17 +2925,21 @@
     (define (present-boolean bool)
       (if bool "true" "false"))
     
-    (define (present-vertex vert)
-      (format "~{Vertex {r precision: 3} {r precision: 3} {r precision: 3}}"
-              (vertex-x vert)
-              (vertex-y vert)
-              (vertex-z vert)))
-    
     `(,@(if (client-side?~ (get-process))
             `(,(format "{a}" (get-player-name~ (get-process))))
          `("Server"
            ,(format "clients: {a}" (length (get-clients~ (get-process))))
            ,(format "hits: {a}" (get-hits~ (get-process)))))
+      ""
+      ,@(apply append (collect (lambda (actor)
+                                 (when (is? actor Player)
+                                   (let ((lookat (get-lookat~ actor)))
+                                     `(,(format "{a}" (get-name~ actor))
+                                       ,(format "  position: {a}" (present-vertex (get-position~ actor)))
+                                       ,(format "  sight: {a}" (present-vertex (get-sight~ lookat)))
+                                       ,(format "  up: {a}" (present-vertex (get-up~ lookat)))
+                                       ,(format "  right: {a}" (present-vertex (get-right~ lookat)))))))
+                               (get-actors~ zone)))
       ""
       ,(format "window: {a}" (present-object window))
       ,(format "width: {s}" width)
@@ -2915,7 +2969,10 @@
               ,(format "  texture: {s}" (get-texture~ target))
               ,(format "  user-data: {s}" (get-user-data~ target))
               ,@(if (is? target Player)
-                    `(,(format "  sight: {s}" (present-vertex (get-sight~ (get-lookat~ target)))))
+                    (let ((lookat (get-lookat~ target)))
+                      `(,(format "  sight: {a}" (present-vertex (get-sight~ lookat)))
+                        ,(format "  up: {a}" (present-vertex (get-up~ lookat)))
+                        ,(format "  right: {a}" (present-vertex (get-right~ lookat)))))
                   '())
               "")
           '())
