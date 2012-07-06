@@ -8,39 +8,39 @@
 #define OBJ_LINE_SIZE 500
 #define MAX_VERTEX_COUNT 4 //can only handle quads or triangles
 
-typedef struct obj_face
+typedef struct
 {
 	int vertex_index[MAX_VERTEX_COUNT];
 	int normal_index[MAX_VERTEX_COUNT];
 	int texture_index[MAX_VERTEX_COUNT];
 	int vertex_count;
 	int material_index;
-};
+} obj_face;
 
-typedef struct obj_sphere
+typedef struct
 {
 	int pos_index;
 	int up_normal_index;
 	int equator_normal_index;
 	int texture_index[MAX_VERTEX_COUNT];
 	int material_index;
-};
+} obj_sphere;
 
-typedef struct obj_plane
+typedef struct
 {
 	int pos_index;
 	int normal_index;
 	int rotation_normal_index;
 	int texture_index[MAX_VERTEX_COUNT];
 	int material_index;
-};
+} obj_plane;
 
-typedef struct obj_vector
+typedef struct
 {
 	double e[3];
-};
+} obj_vector;
 
-typedef struct obj_material
+typedef struct
 {
 	char name[MATERIAL_NAME_SIZE];
 	char texture_filename[OBJ_FILENAME_LENGTH];
@@ -53,35 +53,35 @@ typedef struct obj_material
 	double shiny;
 	double glossy;
 	double refract_index;
-};
+} obj_material;
 
-typedef struct obj_camera
+typedef struct
 {
 	int camera_pos_index;
 	int camera_look_point_index;
 	int camera_up_norm_index;
-};
+} obj_camera;
 
-typedef struct obj_light_point
+typedef struct
 {
 	int pos_index;
 	int material_index;
-};
+} obj_light_point;
 
-typedef struct obj_light_disc
+typedef struct
 {
 	int pos_index;
 	int normal_index;
 	int material_index;
-};
+} obj_light_disc;
 
-typedef struct obj_light_quad
+typedef struct
 {
 	int vertex_index[MAX_VERTEX_COUNT];
 	int material_index;
-};
+} obj_light_quad;
 
-typedef struct obj_growable_scene_data
+typedef struct
 {
 //	vector extreme_dimensions[2];
 	char scene_filename[OBJ_FILENAME_LENGTH];
@@ -102,9 +102,9 @@ typedef struct obj_growable_scene_data
 	list material_list;
 	
 	obj_camera *camera;
-};
+} obj_growable_scene_data;
 
-typedef struct obj_scene_data
+typedef struct
 {
 	obj_vector **vertex_list;
 	obj_vector **vertex_normal_list;
@@ -135,7 +135,7 @@ typedef struct obj_scene_data
 	int material_count;
 
 	obj_camera *camera;
-};
+} obj_scene_data;
 
 int parse_obj_scene(obj_scene_data *data_out, char *filename);
 void delete_obj_data(obj_scene_data *data_out);

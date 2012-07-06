@@ -26,7 +26,8 @@ int obj_convert_to_list_index(int current_max, int index)
 
 void obj_convert_to_list_index_v(int current_max, int *indices)
 {
-	for(int i=0; i<MAX_VERTEX_COUNT; i++)
+	int i;
+	for(i=0; i<MAX_VERTEX_COUNT; i++)
 		indices[i] = obj_convert_to_list_index(current_max, indices[i]);
 }
 
