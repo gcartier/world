@@ -29,6 +29,7 @@
         (world.actor)
         (world.autoload)
         (world.block)
+        (world.dye)
         (world.element)
         (world.foreign)
         (world.geometry)
@@ -49,21 +50,19 @@
 (class Sector extends Object
   
   
-  (slot index          <list>       getter generate)
-  (slot center         <f32vector>  getter generate)
-  (slot tiles          <list>       accessors generate)
-  ;; to remove when immediate mode goes away
-  (slot vbo-content    <f32vector+> getter generate)
-  (slot mesh           <object>     getter generate)
-  (slot mesh-uptodate? <bool>       accessors generate)
+  (slot index              <list>                     getter generate)
+  (slot center             <f32vector>                getter generate)
+  (slot tiles              <list>                     accessors generate)
+  (slot mesh               <object>                   getter generate)
+  (slot vertices-uptodate? <bool>       initialize #f accessors generate)
+  (slot lightmap-uptodate? <bool>       initialize #f accessors generate)
   
   
   (method override (initialize index center)
     (set! index~self index)
     (set! center~self center)
     (set! tiles~self '())
-    (set! mesh~self (new Mesh material: (get-material~ (get-tile-mesh~ world))))
-    (set! mesh-uptodate?~self #f))
+    (set! mesh~self (new Mesh material: (get-material~ (get-tile-mesh~ world)))))
   
   
   (method override (print output readably)
@@ -73,8 +72,12 @@
           (format output "{l} with {a} tile{a}" index tiles (format-plural tiles))))))
   
   
+  (method (free-mesh)
+    (free-resources~ mesh))
+  
+  
   ;;;
-  ;;;; Mesh
+  ;;;; Vertices
   ;;;
   
   
@@ -82,22 +85,8 @@
   ;; v1x v1y v1z t1x t1y t1z n1x n1y n1z v2x v2y v2z t2x t2y t2z n2x n2y n2z v3x v3y v3z t3x t3y t3z n3x n3y n3z
   
   
-  (method (update-mesh)
-    (define (collect-visible-faces)
-      (when (not-null? tiles)
-        (let ((table (make-table test: vertex=? hash: vertex-hash)))
-          (for-each (lambda (tile)
-                      (for-each (lambda (face)
-                                  (let ((center (get-center~ face)))
-                                    ;; this test only really makes sense for blocks
-                                    (if (table-ref table center #f)
-                                        (table-clear table center)
-                                      (table-set! table center face))))
-                                (get-faces~ tile)))
-                    tiles)
-          table)))
-    
-    (when (not mesh-uptodate?)
+  (method (update-vertices)
+    (when (not vertices-uptodate?)
       (let ((content
               (let ((visible-faces (collect-visible-faces)))
                 (when visible-faces
@@ -133,16 +122,99 @@
                                           (add-vertex (get-v1~ triangle)) (add-texture (get-t1~ triangle)) (add-normal normal)
                                           (add-vertex (get-v2~ triangle)) (add-texture (get-t2~ triangle)) (add-normal normal)
                                           (add-vertex (get-v3~ triangle)) (add-texture (get-t3~ triangle)) (add-normal normal)))
-                                      (get-triangles~ face)))))
+                                      (get-triangles~ face))))
+                        (assert (= n (f32vector-length f32))))
                       f32))))))
-        (if (not (get-textures?~ zone))
-            (set! vbo-content content)
+        (when (get-textures?~ zone)
           (if (not content)
-              (free-resources~ mesh)
-            (generate-buffer~ mesh)
-            (set-data~ (get-vertex-buffer~ mesh) content)))
-        (set! mesh-uptodate? #t))))
+              (free-vertices~ mesh)
+            (allocate-vertices~ mesh)
+            (set-data~ (get-vertices-buffer~ mesh) content 9)))
+        (set! vertices-uptodate? #t))))
   
   
-  (method (free-mesh)
-    (free-resources~ mesh))))
+  ;;;
+  ;;;; Lightmap
+  ;;;
+  
+  
+  (method (update-lightmap)
+    (when (not lightmap-uptodate?)
+      (let ((content
+              (let ((visible-faces (collect-visible-faces)))
+                (when visible-faces
+                  (let ((triangles-count 0)
+                        (triangle-floats (* 3 3)))
+                    (iterate-table visible-faces
+                      (lambda (center face)
+                        (increase! triangles-count (length (get-triangles~ face)))))
+                    (let ((lights (collect-lights~ zone))
+                          (f32 (make-f32vector (* triangles-count triangle-floats))))
+                      (let ((n 0))
+                        (define (add-lighting r g b)
+                          (f32vector-set! f32 n (if (> r 1.) 1. r))
+                          (f32vector-set! f32 (+ n 1) (if (> g 1.) 1. g))
+                          (f32vector-set! f32 (+ n 2) (if (> b 1.) 1. b))
+                          (set! n (+ n 3)))
+                        
+                        (define (compute-lighting v normal)
+                          (let ((lighting (dye 0. 0. 0. 1.)))
+                            (define (add-dye! dye factor)
+                              (dye-red-set! lighting (+ (dye-red lighting) (* (dye-red dye) factor)))
+                              (dye-green-set! lighting (+ (dye-green lighting) (* (dye-green dye) factor)))
+                              (dye-blue-set! lighting (+ (dye-blue lighting) (* (dye-blue dye) factor))))
+                            
+                            (for-each (lambda (light)
+                                        (let ((pos (get-position~ light))
+                                              (diffuse (get-diffuse-color~ light))
+                                              (constant-attenuation (get-constant-attenuation~ light))
+                                              (linear-attenuation (get-linear-attenuation~ light))
+                                              (quadratic-attenuation (get-quadratic-attenuation~ light)))
+                                          (let ((dir (vertex- pos v)))
+                                            (let ((L (vertex-normalize dir)))
+                                              (let ((dist (dot-product dir dir))
+                                                    (lambert (dot-product normal L)))
+                                                (when (> lambert 0.)
+                                                  (let ((atttenuation-term (+ constant-attenuation (* linear-attenuation (sqrt dist)) (* quadratic-attenuation dist))))
+                                                    (let ((attenuation (/ 1. atttenuation-term)))
+                                                      (add-dye! diffuse (* lambert attenuation))))))))))
+                                      lights)
+                            (add-lighting (dye-red lighting)
+                                          (dye-green lighting)
+                                          (dye-blue lighting))))
+                        
+                        (iterate-table visible-faces
+                          (lambda (center face)
+                            (for-each (lambda (triangle)
+                                        (let ((normal (get-normal~ triangle)))
+                                          (compute-lighting (get-v1~ triangle) normal)
+                                          (compute-lighting (get-v2~ triangle) normal)
+                                          (compute-lighting (get-v3~ triangle) normal)))
+                                      (get-triangles~ face))))
+                        (assert (= n (f32vector-length f32))))
+                      f32))))))
+        (if (not content)
+            (free-lightmap~ mesh)
+          (allocate-lightmap~ mesh)
+          (set-data~ (get-lightmap-buffer~ mesh) content 3))
+        (set! lightmap-uptodate? #t))))
+  
+  
+  ;;;
+  ;;;; Faces
+  ;;;
+  
+  
+  (method (collect-visible-faces)
+    (when (not-null? tiles)
+      (let ((table (make-table test: vertex=? hash: vertex-hash)))
+        (for-each (lambda (tile)
+                    (for-each (lambda (face)
+                                (let ((center (get-center~ face)))
+                                  ;; this test only really makes sense for blocks
+                                  (if (table-ref table center #f)
+                                      (table-clear table center)
+                                    (table-set! table center face))))
+                              (get-faces~ tile)))
+                  tiles)
+        table)))))
