@@ -1,0 +1,327 @@
+;;;==============
+;;;  JazzScheme
+;;;==============
+;;;
+;;;; MilkShape 3D
+;;;
+
+
+(module world.external.milkshape jazz
+
+
+(import (jazz.geometry)
+        (jazz.graphic)
+        (jazz.graphic.opengl.glew)
+        (jazz.io)
+        (jazz.library)
+        (world)
+        (world.binary)
+        (world.dye)
+        (world.foreign)
+        (world.geometry)
+        (world.joint)
+        (world.material)
+        (world.model))
+
+
+;;;
+;;;; Model
+;;;
+
+
+(class MS3D-Model extends Object
+  
+  
+  (slot animation-fps <fl+> initialize #f accessors generate)
+  (slot current-time  <fl+> initialize #f accessors generate)
+  (slot total-frames  <fx+> initialize #f accessors generate))
+
+
+;;;
+;;;; Triangle
+;;;
+
+
+(class MS3D-Triangle extends Object
+  
+  
+  (slot flags           <fx+>       initialize #f accessors generate)
+  (slot vertex-indices  <object>    initialize #f accessors generate)
+  (slot vertex-normals  <object>    initialize #f accessors generate)
+  (slot s               <f32vector> initialize #f accessors generate)
+  (slot t               <f32vector> initialize #f accessors generate)
+  (slot smoothing-group <fx+>       initialize #f accessors generate)
+  (slot group-index     <fx+>       initialize #f accessors generate)
+  
+  
+  (method override (initialize flags vertex-indices vertex-normals s t smoothing-group group-index)
+    (set! flags~self flags)
+    (set! vertex-indices~self vertex-indices)
+    (set! vertex-normals~self vertex-normals)
+    (set! s~self s)
+    (set! t~self t)
+    (set! smoothing-group~self smoothing-group)
+    (set! group-index~self group-index)))
+
+
+;;;
+;;;; Import
+;;;
+
+
+(definition public (load-ms3d file)
+  (let ((model (new Model)))
+    (let ((mesh (get-mesh~ model)))
+      (allocate-vertices~ mesh)
+      (set-data~ (get-vertices-buffer~ mesh) (import-ms3d file) 9)
+      ;; quicky to test
+      (set-material~ mesh (new Material texture: (find-texture~ world "dirty.png"))))
+    model))
+
+
+(definition public (import-ms3d file)
+  (call-with-input-file (path-settings file)
+    (lambda (port)
+      (let ((MAX_TEXTURE_FILENAME_SIZE 128)
+            (size (input-port-byte-position port 0 2)))
+        (input-port-byte-position port 0)
+        (let ((content (make-u8vector size))
+              (pos 0))
+          (define (<-s8)
+            (prog1 (scan-s8 content pos)
+              (increase! pos 1)))
+          
+          (define (<-u8)
+            (prog1 (scan-u8 content pos)
+              (increase! pos 1)))
+          
+          (define (<-s16)
+            (prog1 (scan-s16 content pos)
+              (increase! pos 2)))
+          
+          (define (<-u16)
+            (prog1 (scan-u16 content pos)
+              (increase! pos 2)))
+          
+          (define (<-s32)
+            (prog1 (scan-s32 content pos)
+              (increase! pos 4)))
+          
+          (define (<-float)
+            (prog1 (scan-float content pos)
+              (increase! pos float-size)))
+          
+          (define (<-string size)
+            (prog1 (scan-string content pos size)
+              (increase! pos size)))
+          
+          (define (<-vertex)
+            (let ((vertex (make-vertex)))
+              (scan-floats! content pos vertex 3)
+              (increase! pos (* 3 float-size))
+              vertex))
+          
+          (define (<-indices)
+            (list
+              (<-u16)
+              (<-u16)
+              (<-u16)))
+          
+          (define (<-normals)
+            (list
+              (<-vertex)
+              (<-vertex)
+              (<-vertex)))
+          
+          (define (<-color)
+            (let ((color (make-vertex)))
+              (scan-floats! content pos color 4)
+              (increase! pos (* 4 float-size))
+              vertex))
+          
+          (define (<-vertices)
+            (let ((num-vertices (<-u16)))
+              (let ((vertices (make-vector num-vertices)))
+                (loop (for i from 0 below num-vertices)
+                      (let ((flags (<-u8))
+                            (vertex (<-vertex))
+                            (bone-id (<-s8))
+                            (reference-count (<-u8)))
+                        (vector-set! vertices i vertex)))
+                vertices)))
+          
+          (define (<-triangles)
+            (let ((num-triangles (<-u16)))
+              (let ((triangles (make-vector num-triangles)))
+                (loop (for i from 0 below num-triangles)
+                      (let ((flags (<-u16))
+                            (vertex-indices (<-indices))
+                            (vertex-normals (<-normals))
+                            (s (<-vertex))
+                            (t (<-vertex))
+                            (smoothing-group (<-u8))
+                            (group-index (<-u8)))
+                        (let ((triangle
+                                (new MS3D-Triangle
+                                  flags
+                                  vertex-indices
+                                  vertex-normals
+                                  s
+                                  t
+                                  smoothing-group
+                                  group-index)))
+                          (vector-set! triangles i triangle))))
+                triangles)))
+          
+          (define (<-groups)
+            (let ((num-groups (<-u16)))
+              (let ((groups (make-vector num-groups)))
+                (loop (for i from 0 below num-groups)
+                      (let ((flags (<-u8))
+                            (name (<-string 32)))
+                        (let ((num-group-triangles (<-u16)))
+                          (loop (for j from 0 below num-group-triangles)
+                                (<-u16)))
+                        (let ((material-index (<-s8)))
+                          (vector-set! groups i #f))))
+                groups)))
+          
+          (define (<-materials)
+            (let ((num-materials (<-u16)))
+              (let ((materials (make-vector num-materials)))
+                (loop (for i from 0 below num-materials)
+                      (let ((name (<-string 32))
+                            (ambient (<-color))
+                            (diffuse (<-color))
+                            (specular (<-color))
+                            (emissive (<-color))
+                            (shininess (<-float))
+                            (transparency (<-float))
+                            (mode (<-u8))
+                            (texture (<-string MAX_TEXTURE_FILENAME_SIZE))
+                            (alphamap (<-string MAX_TEXTURE_FILENAME_SIZE)))
+                        ;; set alpha
+                        (dye-alpha-set! ambient transparency)
+                        (dye-alpha-set! diffuse transparency)
+                        (dye-alpha-set! specular transparency)
+                        (dye-alpha-set! emissive transparency)
+                        (let ((material
+                                (new Material
+                                  name: name
+                                  ambient: ambient
+                                  diffuse: diffuse
+                                  specular: specular
+                                  emissive: emissive
+                                  shininess: shininess
+                                  transparency: transparency
+                                  mode: mode
+                                  texture: texture
+                                  alphamap: alphamap)))
+                          (vector-set! materials i material))))
+                materials)))
+          
+          (define (<-joints)
+            (let ((num-joints (<-u16)))
+              (let ((joints (make-vector num-joints)))
+                (loop (for i from 0 below num-joints)
+                      (let ((flags (<-u8))
+                            (name (<-string 32))
+                            (parent-name (<-string 32))
+                            (rot (<-vertex))
+                            (pos (<-vertex))
+                            (num-key-frames-rot (<-u16))
+                            (num-key-frames-pos (<-u16)))
+                        (loop (for j from 0 below num-key-frames-rot)
+                              (let ((time (<-float))
+                                    (key (<-vertex)))
+                                ;; m_joints[i].rotationKeys[j].time *= m_animation-fps
+                                #f))
+                        (loop (for j from 0 below num-key-frames-pos)
+                              (let ((time (<-float))
+                                    (key (<-vertex)))
+                                ;; m_joints[i].positionKeys[j].time *= m_animation-fps
+                                #f))
+                        (let ((joint (new Joint
+                                       flags: flags
+                                       name: name
+                                       parent-name: parent-name
+                                       rot: rot
+                                       pos: pos)))
+                          (vector-set! joints i joint))))
+                joints)))
+          
+          (read-subu8vector content 0 size port)
+          
+          ;; header
+          (assert (equal? (<-string 10) "MS3D000000"))
+          (assert (= (<-s32) 4))
+          
+          ;; content
+          (let ((model (new MS3D-Model))
+                (vertices (<-vertices))
+                (triangles (<-triangles))
+                (groups (<-groups))
+                (materials (<-materials)))
+            ;; animation
+            (let ((animation-fps (max 1. (<-float)))
+                  (current-time (<-float))
+                  (total-frames (<-s32)))
+              (set-animation-fps~ model animation-fps)
+              (set-current-time~ model current-time)
+              (set-total-frames~ model total-frames))
+            (let ((joints (<-joints)))
+              (debug vertices: (vector-length vertices))
+              (debug triangles: (vector-length triangles))
+              (debug groups: (vector-length groups))
+              (debug materials: (vector-length materials))
+              (debug joints: (vector-length joints))
+              ;; mesh
+              (let ((triangle-floats (* 3 3 3))
+                    (triangles-count (vector-length triangles)))
+                (let ((content (make-f32vector (* triangles-count triangle-floats)))
+                      (n 0))
+                  (define (vertex-ref index)
+                    (vector-ref vertices index))
+                  
+                  (define (add-triangle v1 v2 v3)
+                    (add
+                      v1 (vertex 0. 1. 1.)
+                      v2 (vertex 1. 1. 1.)
+                      v3 (vertex 1. 0. 1.)))
+                  
+                  (define (add v1 t1 v2 t2 v3 t3)
+                    (let ((normal (plane-normal v1 v2 v3)))
+                      (add-vertex v1) (add-texture t1) (add-normal normal)
+                      (add-vertex v2) (add-texture t2) (add-normal normal)
+                      (add-vertex v3) (add-texture t3) (add-normal normal)))
+                  
+                  (define (add-vertex vert)
+                    (f32vector-set! content n (vertex-x vert))
+                    (f32vector-set! content (+ n 1) (vertex-y vert))
+                    (f32vector-set! content (+ n 2) (vertex-z vert))
+                    (set! n (+ n 3)))
+                  
+                  (define (add-texture tex)
+                    (f32vector-set! content n (vertex-x tex))
+                    (f32vector-set! content (+ n 1) (vertex-y tex))
+                    (f32vector-set! content (+ n 2) 0.)
+                    (set! n (+ n 3)))
+                  
+                  (define (add-normal normal)
+                    (f32vector-set! content n (vertex-x normal))
+                    (f32vector-set! content (+ n 1) (vertex-y normal))
+                    (f32vector-set! content (+ n 2) (vertex-z normal))
+                    (set! n (+ n 3)))
+                  
+                  (loop (for triangle in-vector triangles)
+                        (let ((indices (get-vertex-indices~ triangle)))
+                          (add-triangle (vertex-ref (first indices))
+                                        (vertex-ref (second indices))
+                                        (vertex-ref (third indices)))))
+                  content))))
+          
+          ;; comments
+          ;; vertex extra
+          ;; joint extra
+          ;; model extra
+          ))))))
