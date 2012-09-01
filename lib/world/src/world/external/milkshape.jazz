@@ -15,6 +15,7 @@
         (jazz.io)
         (jazz.library)
         (world)
+        (world.atlas)
         (world.binary)
         (world.dye)
         (world.foreign)
@@ -66,6 +67,27 @@
 
 
 ;;;
+;;;; Group
+;;;
+
+
+(class MS3D-Group extends Object
+  
+  
+  (slot flags          <fx+>     initialize #f accessors generate)
+  (slot name           <string+> initialize #f accessors generate)
+  (slot triangles      <object>  initialize #f accessors generate)
+  (slot material-index <fx+>     initialize #f accessors generate)
+  
+  
+  (method override (initialize flags name triangles material-index)
+    (set! flags~self flags)
+    (set! name~self name)
+    (set! triangles~self triangles)
+    (set! material-index~self material-index)))
+
+
+;;;
 ;;;; Import
 ;;;
 
@@ -74,9 +96,9 @@
   (let ((model (new Model)))
     (let ((mesh (get-mesh~ model)))
       (allocate-vertices~ mesh)
-      (set-data~ (get-vertices-buffer~ mesh) (import-ms3d file) 9)
-      ;; quicky to test
-      (set-material~ mesh (new Material texture: (make-tga-texture (new-brother~ file "Body.tga")) @w (find-texture~ world "dirty.png"))))
+      (receive (data texture) (import-ms3d file)
+        (set-data~ (get-vertices-buffer~ mesh) data 9)
+        (set-material~ mesh (new Material texture: texture))))
     model))
 
 
@@ -179,12 +201,19 @@
               (let ((groups (make-vector num-groups)))
                 (loop (for i from 0 below num-groups)
                       (let ((flags (<-u8))
-                            (name (<-string 32)))
-                        (let ((num-group-triangles (<-u16)))
-                          (loop (for j from 0 below num-group-triangles)
-                                (<-u16)))
-                        (let ((material-index (<-s8)))
-                          (vector-set! groups i #f))))
+                            (name (<-string 32))
+                            (triangles
+                              (let ((num-group-triangles (<-u16)))
+                                (loop (for j from 0 below num-group-triangles)
+                                      (collect (<-u16)))))
+                            (material-index (<-s8)))
+                        (let ((group
+                                (new MS3D-Group
+                                  flags
+                                  name
+                                  triangles
+                                  material-index)))
+                          (vector-set! groups i group))))
                 groups)))
           
           (define (<-materials)
@@ -271,58 +300,84 @@
               (set-current-time~ model current-time)
               (set-total-frames~ model total-frames))
             (let ((joints (<-joints)))
+              @debug (
               (debug vertices: (vector-length vertices))
               (debug triangles: (vector-length triangles))
               (debug groups: (vector-length groups))
               (debug materials: (vector-length materials))
-              (debug joints: (vector-length joints))
-              ;; mesh
-              (let ((triangle-floats (* 3 3 3))
-                    (triangles-count (vector-length triangles)))
-                (let ((content (make-f32vector (* triangles-count triangle-floats)))
-                      (n 0))
-                  (define (vertex-ref index)
-                    (vector-ref vertices index))
-                  
-                  (define (add-triangle triangle)
-                    (let ((indices (get-vertex-indices~ triangle))
-                          (normals (get-vertex-normals~ triangle))
-                          (s (get-s~ triangle))
-                          (t (get-t~ triangle)))
-                      (let ((v1 (vertex-ref (first indices)))
-                            (v2 (vertex-ref (second indices)))
-                            (v3 (vertex-ref (third indices))))
-                        (add
-                          v1 (vertex (vertex-x s) (- 1. (vertex-x t)) 1.) (first normals)
-                          v2 (vertex (vertex-y s) (- 1. (vertex-y t)) 1.) (second normals)
-                          v3 (vertex (vertex-z s) (- 1. (vertex-z t)) 1.) (third normals)))))
-                  
-                  (define (add v1 t1 n1 v2 t2 n2 v3 t3 n3)
-                    (add-vertex v1) (add-texture t1) (add-normal n1)
-                    (add-vertex v2) (add-texture t2) (add-normal n2)
-                    (add-vertex v3) (add-texture t3) (add-normal n3))
-                  
-                  (define (add-vertex vert)
-                    (f32vector-set! content n (vertex-x vert))
-                    (f32vector-set! content (+ n 1) (vertex-y vert))
-                    (f32vector-set! content (+ n 2) (vertex-z vert))
-                    (set! n (+ n 3)))
-                  
-                  (define (add-texture tex)
-                    (f32vector-set! content n (vertex-x tex))
-                    (f32vector-set! content (+ n 1) (vertex-y tex))
-                    (f32vector-set! content (+ n 2) 0.)
-                    (set! n (+ n 3)))
-                  
-                  (define (add-normal normal)
-                    (f32vector-set! content n (vertex-x normal))
-                    (f32vector-set! content (+ n 1) (vertex-y normal))
-                    (f32vector-set! content (+ n 2) (vertex-z normal))
-                    (set! n (+ n 3)))
-                  
-                  (loop (for triangle in-vector triangles)
-                        (add-triangle triangle))
-                  content))))
+              (debug joints: (vector-length joints)))
+              ;; atlas
+              (let ((atlas (new Atlas mipmap?: #t pad?: #f))
+                    (textures (remove-duplicates (remove-empty (map get-texture~ (vector->list materials))) test: filename=?)))
+                (for-each (lambda (texture)
+                            (add-file~ atlas (new-brother~ file texture)))
+                          textures)
+                (complete~ atlas)
+                (loop (for group in-vector groups)
+                      (let ((material (vector-ref materials (get-material-index~ group))))
+                        (let ((rect (image-rect~ atlas (extract-base (get-texture~ material)))))
+                          (let ((left (get-left~ rect))
+                                (top (get-top~ rect)))
+                            (let ((width (- (get-right~ rect) left))
+                                  (height (- (get-bottom~ rect) top)))
+                              (for-each (lambda (triangle-index)
+                                          (let ((triangle (vector-ref triangles triangle-index)))
+                                            (let ((s (get-s~ triangle))
+                                                  (t (get-t~ triangle)))
+                                              (vertex-x-set! s (+ left (* (vertex-x s) width)))
+                                              (vertex-y-set! s (+ left (* (vertex-y s) width)))
+                                              (vertex-z-set! s (+ left (* (vertex-z s) width)))
+                                              (vertex-x-set! t (+ top (* (- 1. (vertex-x t)) height)))
+                                              (vertex-y-set! t (+ top (* (- 1. (vertex-y t)) height)))
+                                              (vertex-z-set! t (+ top (* (- 1. (vertex-z t)) height))))))
+                                        (get-triangles~ group)))))))
+                ;; mesh
+                (let ((triangle-floats (* 3 3 3))
+                      (triangles-count (vector-length triangles)))
+                  (let ((content (make-f32vector (* triangles-count triangle-floats)))
+                        (n 0))
+                    (define (vertex-ref index)
+                      (vector-ref vertices index))
+                    
+                    (define (add-triangle triangle)
+                      (let ((indices (get-vertex-indices~ triangle))
+                            (normals (get-vertex-normals~ triangle))
+                            (s (get-s~ triangle))
+                            (t (get-t~ triangle)))
+                        (let ((v1 (vertex-ref (first indices)))
+                              (v2 (vertex-ref (second indices)))
+                              (v3 (vertex-ref (third indices))))
+                          (add
+                            v1 (vertex (vertex-x s) (vertex-x t) 1.) (first normals)
+                            v2 (vertex (vertex-y s) (vertex-y t) 1.) (second normals)
+                            v3 (vertex (vertex-z s) (vertex-z t) 1.) (third normals)))))
+                    
+                    (define (add v1 t1 n1 v2 t2 n2 v3 t3 n3)
+                      (add-vertex v1) (add-texture t1) (add-normal n1)
+                      (add-vertex v2) (add-texture t2) (add-normal n2)
+                      (add-vertex v3) (add-texture t3) (add-normal n3))
+                    
+                    (define (add-vertex vert)
+                      (f32vector-set! content n (vertex-x vert))
+                      (f32vector-set! content (+ n 1) (vertex-y vert))
+                      (f32vector-set! content (+ n 2) (vertex-z vert))
+                      (set! n (+ n 3)))
+                    
+                    (define (add-texture tex)
+                      (f32vector-set! content n (vertex-x tex))
+                      (f32vector-set! content (+ n 1) (vertex-y tex))
+                      (f32vector-set! content (+ n 2) 0.)
+                      (set! n (+ n 3)))
+                    
+                    (define (add-normal normal)
+                      (f32vector-set! content n (vertex-x normal))
+                      (f32vector-set! content (+ n 1) (vertex-y normal))
+                      (f32vector-set! content (+ n 2) (vertex-z normal))
+                      (set! n (+ n 3)))
+                    
+                    (loop (for triangle in-vector triangles)
+                          (add-triangle triangle))
+                    (values content (get-texture~ atlas)))))))
           
           ;; comments
           ;; vertex extra
