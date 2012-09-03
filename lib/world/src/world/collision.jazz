@@ -55,17 +55,17 @@
 (class Collision extends Object
   
   
-  (slot element  <Element> initialize #f getter generate)
-  (slot collider <Polygon> initialize #f getter generate)
-  (slot plane    <Plane>   initialize #f getter generate)
-  (slot distance <fl>      initialize #f getter generate)
-  (slot type     <symbol>  initialize #f getter generate)
+  (slot element   <Element> initialize #f getter generate)
+  (slot colliders <object>  initialize #f accessors generate)
+  (slot plane     <Plane>   initialize #f getter generate)
+  (slot distance  <fl>      initialize #f getter generate)
+  (slot type      <symbol>  initialize #f getter generate)
   
   
-  (method override (initialize element collider plane distance type)
+  (method override (initialize element colliders plane distance type)
     (nextmethod)
     (set! element~self element)
-    (set! collider~self collider)
+    (set! colliders~self colliders)
     (set! plane~self plane)
     (set! distance~self distance)
     (set! type~self type))
@@ -74,7 +74,7 @@
   (method override (print output readably)
     (print-unreadable self output
       (lambda (output)
-        (format output "{a} {a} {a} {a} {a}" element collider plane distance type)))))
+        (format output "{a} {a} {a} {a} {a}" element colliders plane distance type)))))
 
 
 ;;;
@@ -105,19 +105,19 @@
             (let ((collision-distance (get-distance~ collision))
                   (result0 <Collision> (car (queue-list result))))
               (let ((d <fl> (abs (- collision-distance (get-distance~ result0)))))
-                (when (> d EPSILON)
-                  (cond ((< collision-distance (get-distance~ result0))
-                         (reset-queue result)
-                         (enqueue result collision))
-                        ((> collision-distance (get-distance~ result0))
-                         )
-                        (else
-                         ;; Make sure it's not already in the list (this plane's normal)
-                         (let ((collision-normal (get-normal~ (get-plane~ collision))))
-                           (unless (some? (lambda (coll <Collision>)
-                                            (> (f32-ref (dot-product& (get-normal~ (get-plane~ coll)) collision-normal)) 1-EPSILON))
-                                          (queue-list result))
-                             (enqueue result collision)))))))))))))
+                (if (> d EPSILON)
+                    (when (< collision-distance (get-distance~ result0))
+                      (reset-queue result)
+                      (enqueue result collision))
+                  ;; Make sure it's not already in the list (this plane's normal)
+                  (let ((collision-normal (get-normal~ (get-plane~ collision))))
+                    (let ((old-coll (find-if (lambda (coll <Collision>)
+                                               (when (> (f32-ref (dot-product& (get-normal~ (get-plane~ coll)) collision-normal)) 1-EPSILON)
+                                                 coll))
+                                             (queue-list result))))
+                      (if old-coll
+                          (set-colliders~ old-coll (cons polygon (get-colliders~ old-coll)))
+                        (enqueue result collision))))))))))))
   
   ;; Go through our list of potential colliders
   (travel-ray-elements~ world
@@ -125,10 +125,14 @@
       (let ((result (new-queue)))
         (iterate
           (lambda (targ <Element>)
-            (for-each-triangle~ targ
-              (lambda (face <Face> triangle <Triangle>)
-                (let ((polygon triangle))
-                  (collide targ polygon result))))))
+            (when (let ((lst (queue-list result)))
+                    (or (null? lst)
+                        (>= (+ sphere-radius (get-radius~ targ) (get-distance~ (car lst)) EPSILON)
+                            (vertex-distance (get-origin~ mvt) (get-position~ targ)))))
+              (for-each-triangle~ targ
+                (lambda (face <Face> triangle <Triangle>)
+                  (let ((polygon triangle))
+                    (collide targ polygon result)))))))
         (let ((result (queue-list result)))
           (and (not-null? result) result))))
     (get-origin~ mvt)
@@ -259,7 +263,7 @@
               ;; Ignore collision planes that we're traveling away from
               (when (and (neq? collision-type 'CT_EMBEDDED) (>= (f32-ref (dot-product& (get-normal~ collision-plane) (get-normal~ mvt))) 0.)) (continue))
               ;; Is it closer farther away or the same distance as what we've found so far?
-              (new Collision element poly collision-plane collision-distance collision-type))))))))
+              (new Collision element (list poly) collision-plane collision-distance collision-type))))))))
 
 
 ;;;
@@ -274,6 +278,10 @@
   #f)
 
 
+(definition public debug-slides-max
+  -1)
+
+
 (definition public (collide&stop sphere-radius <fl> mvt <Movement> filter-pulse-jumps)
   (let ((cl <list> (or (calculate-colliders sphere-radius mvt '()) '())))
     (values (if (null? cl)
@@ -286,22 +294,47 @@
 
 
 (definition public (collide&slide sphere-radius <fl> mvt <Movement> filter-pulse-jumps (debug-collisions?: debug-collisions? debug-collisions?))
-  (let ((last-direction (vertex 0. 0. 0.))
+  (let ((max-loops 30)
+        (last-direction (vertex 0. 0. 0.))
         (last-cl #f)
         (input-ray <Movement> mvt)
         (output-ray <Movement> mvt)
         (skip-list '()))
+    (define (skip-polygons coll <Collision>)
+      (for-each (lambda (poly)
+                  (set! skip-list (cons poly skip-list)))
+                (get-colliders~ coll)))
+    
     ;; Sliding is an iterative process
-    (let (iter (max-loops 30))
+    (let (iter (loop-no 0))
       (when debug-collisions?
         (add-mark~ zone (new Mark (get-origin~ output-ray))))
-      (when (and (> max-loops 0)
+      (when (and (< loop-no max-loops)
                  (not (vertex-zero? (get-vector~ output-ray)))
                  (> (get-length~ output-ray) EPSILON))
+        @w
+        (when (> loop-no 2)
+          (terminal skip-list))
+        @w
+        (when (> loop-no 5)
+          (terminal loop-no (get-length~ output-ray)))
+        @debug-slides
+        (when (> loop-no debug-slides-max)
+          (terminal 'slide loop-no)
+          (if (>= loop-no (- max-loops 1))
+              (set! debug-slides-max -1)
+            (set! debug-slides-max loop-no)))
         ;; This is handy
-        (set! last-direction (get-vector~ output-ray))
+        (vertex-copy! last-direction (get-vector~ output-ray))
         (let (;; Get the colliders
               (cl <list> (or (calculate-colliders sphere-radius output-ray skip-list) '())))
+          @debug
+          (when (= loop-no 20)
+            (debug (map object->serial skip-list))
+            (debug (map (lambda (c) (list (map object->serial (get-colliders~ c)) (get-distance~ c))) cl)))
+          @debug
+          (when (= loop-no 24)
+            (break))
           (set! last-cl cl)
           ;; We can consider these polygons again
           (set! skip-list '())
@@ -315,7 +348,7 @@
             (if (eq? (get-type~ cl0) 'CT_EMBEDDED)
                 ;; If it's embedded back up along the collision plane normal
                 (set-origin~ output-ray (vertex-& (get-origin~ output-ray) (vertex-scalar*& (get-normal~ (get-plane~ cl0)) (get-distance~ cl0))))
-              (begin
+              (let ((slide-dst (plane-closest& (get-plane~ cl0) (movement-end output-ray))))
                 ;; We hit something -- move as far as we can
                 (set-origin~ output-ray (vertex+& (get-origin~ output-ray) (vertex-scalar*& (get-normal~ output-ray) (get-distance~ cl0))))
                 ;; If we hit two or more find the two with the most "pressure"
@@ -342,7 +375,7 @@
                                                                  (get-normal~ (get-plane~ (cast <Collision> (element hit-list c0))))))))
                           (set! temp-v (vertex* temp-v perp))
                           (if (< (f32-ref (vertex-norm& temp-v)) EPSILON)
-                              (iter (- max-loops 1))
+                              (iter (+ loop-no 1))
                             (vertex-normalize! temp-v temp-v)
                             (vertex-scalar*! temp-v temp-v (f32-ref (vertex-norm& (get-vector~ output-ray))))
                             ;; Find out how much to scale our vector that points along the crease
@@ -353,27 +386,26 @@
                                 (set-vector~ output-ray (vertex-scalar*& temp-v scalar))))
                             (when (and filter-pulse-jumps (< (f32-ref (dot-product& (get-vector~ output-ray) (get-vector~ input-ray))) 0.))
                               (set-vector~ output-ray (static (vertex 0. 0. 0.))))
-                            (set! last-direction (get-vector~ output-ray))
+                            (vertex-copy! last-direction (get-vector~ output-ray))
                             ;; Don't collide with these next time
-                            (set! skip-list (cons (get-collider~ (cast <Collision> (element hit-list c0))) skip-list))
-                            (set! skip-list (cons (get-collider~ (cast <Collision> (element hit-list c1))) skip-list))
-                            (iter (- max-loops 1))))))
+                            (skip-polygons (cast <Collision> (element hit-list c0)))
+                            (skip-polygons (cast <Collision> (element hit-list c1)))
+                            (iter (+ loop-no 1))))))
                   ;; Otherwise we slide
-                  (let ((slide-src (plane-closest& (get-plane~ cl0) (get-origin~ output-ray)))
-                        (slide-dst (plane-closest& (get-plane~ cl0) (movement-end output-ray))))
+                  (let ((slide-src (plane-closest& (get-plane~ cl0) (get-origin~ output-ray))))
                     (set-vector~ output-ray (vertex-& slide-dst slide-src)))
                   (when (and filter-pulse-jumps (< (f32-ref (dot-product& (get-vector~ output-ray) (get-vector~ input-ray))) 0.))
                     (set-vector~ output-ray (static (vertex 0. 0. 0.))))
-                  (set! last-direction (get-vector~ output-ray))
+                  (vertex-copy! last-direction (get-vector~ output-ray))
                   ;; Don't collide with this one next time
-                  (set! skip-list (cons (get-collider~ cl0) skip-list))
-                  (iter (- max-loops 1))))))))))
+                  (skip-polygons cl0)
+                  (iter (+ loop-no 1))))))))))
     (when debug-collisions?
       (add-mark~ zone (new Mark (get-origin~ output-ray))))
     (when debug-polygons?
       (when (and last-cl (not-null? last-cl))
-        (set-?p (get-collider~ (cast <Collision> (car last-cl)))))
-      (set-target-polygons~ (get-interface~ world) (map get-collider~ last-cl))
+        (set-?p (get-colliders~ (cast <Collision> (car last-cl)))))
+      (set-target-polygons~ (get-interface~ world) (map get-colliders~ last-cl))
       (invalidate-view~ (get-interface~ world)))
     (values (get-origin~ output-ray) last-direction)))
 
