@@ -1,0 +1,321 @@
+;;;==============
+;;;  JazzScheme
+;;;==============
+;;;
+;;;; Minecraft
+;;;
+
+
+(module world.external.minecraft jazz
+
+
+(import (jazz.geometry)
+        (jazz.graphic)
+        (jazz.graphic.opengl.glew)
+        (jazz.io)
+        (jazz.library)
+        (zlib)
+        (world)
+        (world.animation)
+        (world.atlas)
+        (world.autoload)
+        (world.binary)
+        (world.block)
+        (world.dye)
+        (world.external)
+        (world.foreign)
+        (world.geometry)
+        (world.homogeneous)
+        (world.material)
+        (world.model)
+        (world.syntax (phase syntax))
+        (world.texture))
+
+
+(proclaim (warn optimizations))
+
+
+;;;
+;;;; NBT
+;;;
+
+
+(constant TAG_End 0)
+(constant TAG_Byte 1)
+(constant TAG_Short 2)
+(constant TAG_Int 3)
+(constant TAG_Long 4)
+(constant TAG_Float 5)
+(constant TAG_Double 6)
+(constant TAG_Byte_Array 7)
+(constant TAG_String 8)
+(constant TAG_List 9)
+(constant TAG_Compound 10)
+(constant TAG_Int_Array 11)
+
+
+(class NBT-Stream extends Binary-Stream
+  
+  
+  (method (read-tag)
+    (define (read-tag)
+      (let ((type (<-u8)))
+        (if (= type TAG_End)
+            #f
+          (let ((name (read-name))
+                (data (read-data type)))
+            `(,name ,data)))))
+    
+    (define (read-name)
+      (let ((size (read-short)))
+        (if (= size 0)
+            ""
+          (<-utf-8-string size))))
+    
+    (define (read-data type)
+      (ecase type
+        ((TAG_End)        (read-end))
+        ((TAG_Byte)       (read-byte))
+        ((TAG_Short)      (read-short))
+        ((TAG_Int)        (read-int))
+        ((TAG_Long)       (read-long))
+        ((TAG_Float)      (read-float))
+        ((TAG_Double)     (read-double))
+        ((TAG_Byte_Array) (read-byte-array))
+        ((TAG_String)     (read-name))
+        ((TAG_List)       (read-list))
+        ((TAG_Compound)   (read-compound))
+        ((TAG_Int_Array)  (read-int-array))
+        (else (error "Unknown NBT tag: {s}" type))))
+    
+    (define (read-end)
+      (error "Invalid NBT tag: TAG_End"))
+    
+    (define (read-byte)
+      (<-s8))
+    
+    (define (read-short)
+      (<-s16-big-endian))
+    
+    (define (read-int)
+      (<-s32-big-endian))
+    
+    (define (read-long)
+      (<-s64-big-endian))
+    
+    (define (read-float)
+      (<-float-big-endian))
+    
+    (define (read-double)
+      (<-double-big-endian))
+    
+    (define (read-byte-array)
+      (let ((size (read-int)))
+        (let ((data (make-s8vector size)))
+          (loop (for i from 0 below size)
+                (s8vector-set! data i (read-byte)))
+          data)))
+    
+    (define (read-int-array)
+      (let ((size (read-int)))
+        (let ((data (make-vector size)))
+          (loop (for i from 0 below size)
+                (vector-set! data i (read-int)))
+          data))
+      ;; temp
+      '())
+    
+    (define (read-list)
+      (let ((type (read-byte))
+            (size (read-int)))
+        (loop (repeat size)
+              (collect (read-data type)))))
+    
+    (define (read-compound)
+      (let ((tag (read-tag)))
+        (if (not tag)
+            '()
+          (cons tag (read-compound)))))
+    
+    (read-tag)))
+
+
+;;;
+;;;; Level
+;;;
+
+
+(definition public (import-minecraft-level file)
+  (let ((s (new NBT-Stream file)))
+    (read-tag~ s)))
+
+
+;;;
+;;;; Region
+;;;
+
+
+(definition public (import-minecraft-region file region-x region-z x-min x-max z-min z-max y-min y-max max-blocks proc)
+  (let ((content (load-file-content file)))
+    (let ((header (subu8vector content 0 (* 8 1024))))
+      (let ((count 0)
+            (total 0)
+            (table (make-table test: eqv?)))
+        (loop (for n from 0 below 1024)
+              (let ((offset (* n 4)))
+                (let ((b1 (u8vector-ref header offset))
+                      (b2 (u8vector-ref header (+ offset 1)))
+                      (b3 (u8vector-ref header (+ offset 2)))
+                      (b4 (u8vector-ref header (+ offset 3))))
+                  (unless (and (= b1 0)
+                               (= b2 0)
+                               (= b3 0)
+                               (= b4 0))
+                    (let ((offset (* (+ (arithmetic-shift b1 16)
+                                        (arithmetic-shift b2 8)
+                                        b3)
+                                     (* 4 1024))))
+                      (let ((size (scan-u32-big-endian content offset))
+                            (compression-type (u8vector-ref content (+ offset 4))))
+                        (let ((chunk-data (inflate-u8vector (subu8vector content (+ offset 7) (+ offset 4 size)))))
+                          (let ((s (new NBT-Stream (cons chunk-data 0))))
+                            (let ((chunk (read-tag~ s)))
+                              (let ((chunk-alist (cadr chunk)))
+                                (let ((level (assoc "Level" chunk-alist)))
+                                  (when level
+                                    (let ((level-alist (cadr level)))
+                                      (let ((sections (assoc "Sections" level-alist)))
+                                        (when sections
+                                          (let ((xPos (cadr (assoc "xPos" level-alist)))
+                                                (zPos (cadr (assoc "zPos" level-alist)))
+                                                (section-list (cadr sections)))
+                                            (when (and (>= xPos x-min) (<= xPos x-max)
+                                                       (>= zPos z-min) (<= zPos z-max))
+                                            (for-each (lambda (section)
+                                                        (let ((yPos (cadr (assoc "Y" section))))
+                                                          (let ((x (+ (* region-x 32 16) (* xPos 16)))
+                                                                (y (* yPos 16))
+                                                                (z (+ (* region-z 32 16) (* zPos 16)))
+                                                                (blocks (cadr (assoc "Blocks" section))))
+                                                            (if proc
+                                                                (proc x y z blocks)
+                                                              (loop (for j from 0 below 16)
+                                                                    (loop (for k from 0 below 16)
+                                                                          (loop (for i from 0 below 16)
+                                                                                (let ((block-y (+ y j)))
+                                                                                  (let ((block-id (s8vector-ref blocks (+ (* j 256) (* k 16) i))))
+                                                                                    (when (/= block-id 0)
+                                                                                      (increase! total)
+                                                                                      (when (and (< count max-blocks)
+                                                                                                 (>= block-y y-min)
+                                                                                                 (<= block-y y-max))
+                                                                                        (increase! count)
+                                                                                        (table-add table block-id (list (+ x i) block-y (+ z k))))))))))))))
+                                                      section-list))))))))))))))))))
+        (values total table)))))
+
+
+(definition public (populate-minecraft-region file region-x region-z x-min x-max z-min z-max y-cutoff y-min y-max y-adjust max-blocks)
+  (define texture-unit
+    (/ 1. 16.))
+  
+  (define (determine-texture-coords block-id)
+    (define (effective-block-id)
+      (case block-id
+        ((1) #x00)
+        ((2) #x03)
+        ((3) #x02)
+        ((4) #x11)
+        ((5) #x14)
+        ((7) #x25)
+        ((8 9) #x18)
+        ((10 11) #xFF)
+        ((12) #x12)
+        ((13) #x01)
+        ((14) #x20)
+        ((15) #x10)
+        ((16) #x11)
+        ((17) #x04)
+        ((18) #x45)
+        ((20) #x31)
+        ((24) #xB0)
+        ((27) #xB3)
+        ((30) #x0B)
+        ((31) #x5C)
+        ((32) #x37)
+        ((37) #x0D)
+        ((38) #x0C)
+        ((40) #x1C)
+        ((50) #x63)
+        ((52) #x41)
+        ((55) #xA6)
+        ((58) #x4A)
+        ((59) #x5F)
+        ((64) #x51)
+        ((65) #x53)
+        ((66) #x80)
+        ((73) #x33)
+        ((75) #x73)
+        ((76) #x63)
+        ((77) #x9F)
+        ((81) #x46)
+        ((83) #x49)
+        ((85) #x55)
+        ((102) #x42)
+        ((106) #x1E)
+        ;; dont care
+        ((21 26 35 39 43 44 47 48 49 54 56 60 61 67 68 82 86 116 127) #x17)
+        (else (debug 'missing block-id) #x1A)))
+    
+    (let ((block-id (effective-block-id)))
+      (let ((x (modulo block-id 16)))
+        (let ((y (/ (- block-id x) 16)))
+          (let ((h (/ (cast <fl> x) 16.))
+                (v (/ (cast <fl> y) 16.)))
+            (list h v (+ h texture-unit) (+ v texture-unit)))))))
+  
+  (let* ((zone (current-zone))
+         (block-size 5.)
+         (block-radius (/ block-size 2.))
+         (block-radiuses (vertex block-radius block-radius block-radius))
+         (textures (make-table))
+         (count 0))
+    (import-minecraft-region file region-x region-z x-min x-max z-min z-max y-min y-max max-blocks
+      (lambda (section-x section-y section-z blocks)
+        (let ((x (* block-size (cast <fl> section-x)))
+              (y (* block-size (cast <fl> (- section-y y-cutoff))))
+              (z (* block-size (cast <fl> section-z))))
+          (let ((index (position-sector-index~ zone (vertex x y z))))
+            (let ((sector (index-sector~ zone index))
+                  (queue (new-queue)))
+              (loop (for j from 0 below 16)
+                    (loop (for k from 0 below 16)
+                          (loop (for i from 0 below 16)
+                                (let ((block-y (+ section-y j)))
+                                  (let ((block-id (s8vector-ref blocks (+ (* j 256) (* k 16) i))))
+                                    (when (/= block-id 0)
+                                      (when (and (< count max-blocks)
+                                                 (>= block-y y-min)
+                                                 (<= block-y y-max))
+                                        (increase! count)
+                                        (let ((x (+ section-x i))
+                                              (y (+ block-y y-adjust))
+                                              (z (+ section-z k))
+                                              (texture-coords (or (table-ref textures block-id #f)
+                                                                  (let ((coords (determine-texture-coords block-id)))
+                                                                    (table-set! textures block-id coords)
+                                                                    coords))))
+                                          (let ((brick
+                                                  (new Brick
+                                                    position: (vertex (+ block-radius (* block-size (cast <fl> x)))
+                                                                      (+ block-radius (* block-size (cast <fl> y)))
+                                                                      (+ block-radius (* block-size (cast <fl> z))))
+                                                    radiuses: block-radiuses
+                                                    texture-coordinates: texture-coords)))
+                                            (enqueue queue brick))))))))))
+              (let ((bricks (queue-list queue)))
+                (let ((faces (tiles-apparent-faces~ sector bricks)))
+                  (fill-faces-vertices~ sector faces)
+                  (fill-faces-lightmap~ sector faces)
+                  (set-vertices-uptodate?~ sector #t))))))))
+        count)))
