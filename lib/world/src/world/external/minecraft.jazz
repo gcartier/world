@@ -27,12 +27,300 @@
         (world.geometry)
         (world.homogeneous)
         (world.material)
+        (world.mesh)
         (world.model)
         (world.syntax (phase syntax))
         (world.texture))
 
 
 (proclaim (warn optimizations))
+
+
+(constant region-size
+  32)
+
+
+;;;
+;;;; World
+;;;
+
+
+(class Minecraft-World extends World
+  
+  
+  (method override (prepare-tile)
+    (define (make-terrain-texture)
+      (let ((dir (new-directory~ user-assets "pack")))
+        (let ((file (new-file~ dir "terrain.png")))
+          (make-file-texture file))))
+      
+    (nextmethod)
+    (let ((texture (make-terrain-texture)))
+      (set! tile-texture texture)
+      (set! tile-mesh (new Mesh material: (new Material texture: texture))))))
+
+
+;;;
+;;;; Zone
+;;;
+
+
+(class Minecraft-Zone extends Zone
+  
+  
+  (property level-dir initialize #f accessors generate)
+  
+  
+  (slot regions-dir initialize #f                        getter explicit)
+  (slot regions     initialize (make-table test: equal?) getter generate)
+  
+  
+  (method (get-regions-dir)
+    (or regions-dir (let ((dir (new-directory~ level-dir "region")))
+                      (set! regions-dir dir)
+                      dir)))
+  
+  
+  (method (get-region region-index)
+    (define (region-name)
+      (bind (region-x . region-z) region-index
+        (format "r.{a}.{a}.mca" region-x region-z)))
+    
+    (let ((value (table-ref regions region-index #t)))
+      (if (neq? value #t)
+          value
+        (let ((dir (get-regions-dir))
+              (name (region-name)))
+          (let ((file (new-file~ dir name)))
+            (let ((region (if (exists?~ file)
+                              (bind (region-x . region-z) region-index
+                                (let ((port (open-input-file (path-settings file))))
+                                  (new Minecraft-Region region-x region-z port)))
+                            #f)))
+              (table-set! regions region-index region)
+              region))))))
+  
+  
+  (method (sector-region sector-index)
+    (define (region-index)
+      (bind (sector-x sector-y sector-z) sector-index
+        (cons (fxfloor/ sector-x region-size)
+              (fxfloor/ sector-z region-size))))
+    
+    (get-region (region-index)))
+  
+  
+  (method override (generate-sector sector)
+    (define texture-unit
+      (/ 1. 16.))
+    
+    (define (determine-texture-coords block-id)
+      (let ((block-id (effective-block-id block-id)))
+        (let ((x (modulo block-id 16)))
+          (let ((y (/ (- block-id x) 16)))
+            (let ((h (/ (cast <fl> x) 16.))
+                  (v (/ (cast <fl> y) 16.)))
+              (list h v (+ h texture-unit) (+ v texture-unit)))))))
+    
+    (let ((sector-index (get-index~ sector)))
+      (bind (sector-x sector-y sector-z) sector-index
+        (let ((region (sector-region sector-index)))
+          (when region
+            (let ((region-x (get-x~ region))
+                  (region-z (get-z~ region))
+                  (blocks (get-blocks~ region sector-x sector-y sector-z))
+                  (chunk-index (chunk-index~ region sector-x sector-z)))
+              (assert (= region-x (fxfloor/ sector-x region-size)))
+              (assert (= region-z (fxfloor/ sector-z region-size)))
+              (when blocks
+                (let* ((yPos (fxfloor/ sector-y region-size))
+                       (section-x (+ (* region-x 32 16) (* (car chunk-index) 16)))
+                       (section-y (* sector-y 16))
+                       (section-z (+ (* region-z 32 16) (* (cdr chunk-index) 16)))
+                       (block-size 5.)
+                       (block-radius (/ block-size 2.))
+                       (block-radiuses (vertex block-radius block-radius block-radius))
+                       (textures (make-table)))
+                  (let ((x (* block-size (cast <fl> section-x)))
+                        (y (* block-size (cast <fl> section-y)))
+                        (z (* block-size (cast <fl> section-z))))
+                    (loop (for j from 0 below 16 by 2)
+                          (loop (for k from 0 below 16 by 2)
+                                (loop (for i from 0 below 16 by 2)
+                                      (let ((block-y (+ section-y j)))
+                                        (let ((block-id (s8vector-ref blocks (+ (* j 256) (* k 16) i))))
+                                          (when (/= block-id 0)
+                                            (let ((x (+ section-x i))
+                                                  (y block-y)
+                                                  (z (+ section-z k))
+                                                  (texture-coords (or (table-ref textures block-id #f)
+                                                                      (let ((coords (determine-texture-coords block-id)))
+                                                                        (table-set! textures block-id coords)
+                                                                        coords))))
+                                              (let ((brick
+                                                      (new Brick
+                                                        position: (vertex (+ block-radius (* block-size (cast <fl> x)))
+                                                                          (+ block-radius (* block-size (cast <fl> y)))
+                                                                          (+ block-radius (* block-size (cast <fl> z))))
+                                                        radiuses: block-radiuses
+                                                        texture-coordinates: texture-coords)))
+                                                (sector-add-element sector brick)))))))))))))))))))
+
+
+;;;
+;;;; Region
+;;;
+
+
+(class Minecraft-Region extends Object
+  
+  
+  (slot x      <fx>                                 getter generate)
+  (slot z      <fx>                                 getter generate)
+  (slot port                                        getter generate)
+  (slot header                                      getter generate)
+  (slot chunks initialize (make-table test: equal?) getter generate)
+  
+  
+  (method override (initialize x z port)
+    (set! x~self x)
+    (set! z~self z)
+    (set! port~self port)
+    (set! header (read-header)))
+  
+  
+  (method override (print output readably)
+    (print-unreadable self output
+      (lambda (output)
+        (format output "{a} {a}" x z))))
+  
+  
+  (method (read-header)
+    (let ((size (* 8 1024)))
+      (let ((content (make-u8vector size)))
+        (read-subu8vector content 0 size port)
+        content)))
+  
+  
+  (method (get-chunk x <fx> z <fx>)
+    (let ((chunk-index (chunk-index x z)))
+      (or (table-ref chunks chunk-index #f)
+          (let ((chunk (read-chunk chunk-index)))
+            (table-set! chunks chunk-index chunk)
+            chunk))))
+  
+  
+  (method (chunk-index x <fx> z <fx>)
+    ;; need to adjust for negative values!?
+    (cons (modulo x 32)
+          (modulo z 32)))
+  
+  
+  (method (read-chunk chunk-index)
+    (bind (x . z) chunk-index
+      (let ((offset (* 4 (+ x (* z 32)))))
+        (assert (<= offset 4092))
+        (let ((b1 (u8vector-ref header offset))
+              (b2 (u8vector-ref header (+ offset 1)))
+              (b3 (u8vector-ref header (+ offset 2)))
+              (b4 (u8vector-ref header (+ offset 3))))
+          (if (and (= b1 0)
+                   (= b2 0)
+                   (= b3 0)
+                   (= b4 0))
+              #f
+            (let ((offset (* (+ (arithmetic-shift b1 16)
+                                (arithmetic-shift b2 8)
+                                b3)
+                             (* 4 1024))))
+              (input-port-byte-position port offset)
+              (let ((chunk-header (make-u8vector 5)))
+                (read-subu8vector chunk-header 0 5 port)
+                (let ((size (scan-u32-big-endian chunk-header 0))
+                      (compression-type (u8vector-ref chunk-header 4)))
+                  ;; skip two bytes for deflate
+                  (read-u8 port)
+                  (read-u8 port)
+                  (let ((chunk-raw (make-u8vector size)))
+                    (read-subu8vector chunk-raw 0 size port)
+                    (let ((chunk-data (inflate-u8vector chunk-raw)))
+                      (let ((s (new NBT-Stream (cons chunk-data 0))))
+                        (let ((chunk (read-tag~ s)))
+                          chunk))))))))))))
+  
+  
+  (method (get-section x <fx> y <fx> z <fx>)
+    (let ((chunk (get-chunk x z)))
+      (let ((chunk-alist (cadr chunk)))
+        (let ((level (assoc "Level" chunk-alist)))
+          (when level
+            (let ((level-alist (cadr level)))
+              (let ((sections (assoc "Sections" level-alist)))
+                (when sections
+                  (let ((section-list (cadr sections)))
+                    (find-if (lambda (section)
+                               (let ((yPos (cadr (assoc "Y" section))))
+                                 (= yPos y)))
+                             section-list))))))))))
+  
+  
+  (method (get-blocks x <fx> y <fx> z <fx>)
+    (let ((section (get-section x y z)))
+      (when section
+        (cadr (assoc "Blocks" section))))))
+
+
+;;;
+;;;; Block
+;;;
+
+
+(definition (effective-block-id id)
+  (case id
+    ((1) #x00)
+    ((2) #x03)
+    ((3) #x02)
+    ((4) #x11)
+    ((5) #x14)
+    ((7) #x25)
+    ((8 9) #x18)
+    ((10 11) #xFF)
+    ((12) #x12)
+    ((13) #x01)
+    ((14) #x20)
+    ((15) #x10)
+    ((16) #x11)
+    ((17) #x04)
+    ((18) #x45)
+    ((20) #x31)
+    ((24) #xB0)
+    ((27) #xB3)
+    ((30) #x0B)
+    ((31) #x5C)
+    ((32) #x37)
+    ((37) #x0D)
+    ((38) #x0C)
+    ((40) #x1C)
+    ((50) #x63)
+    ((52) #x41)
+    ((55) #xA6)
+    ((58) #x4A)
+    ((59) #x5F)
+    ((64) #x51)
+    ((65) #x53)
+    ((66) #x80)
+    ((73) #x33)
+    ((75) #x73)
+    ((76) #x63)
+    ((77) #x9F)
+    ((81) #x46)
+    ((83) #x49)
+    ((85) #x55)
+    ((102) #x42)
+    ((106) #x1E)
+    ;; dont care
+    ((21 26 35 39 43 44 47 48 49 54 56 60 61 67 68 82 86 116 127) #x17)
+    (else (debug 'missing id) #x1A)))
 
 
 ;;;
@@ -197,20 +485,7 @@
                                                                 (y (* yPos 16))
                                                                 (z (+ (* region-z 32 16) (* zPos 16)))
                                                                 (blocks (cadr (assoc "Blocks" section))))
-                                                            (if proc
-                                                                (proc x y z blocks)
-                                                              (loop (for j from 0 below 16)
-                                                                    (loop (for k from 0 below 16)
-                                                                          (loop (for i from 0 below 16)
-                                                                                (let ((block-y (+ y j)))
-                                                                                  (let ((block-id (s8vector-ref blocks (+ (* j 256) (* k 16) i))))
-                                                                                    (when (/= block-id 0)
-                                                                                      (increase! total)
-                                                                                      (when (and (< count max-blocks)
-                                                                                                 (>= block-y y-min)
-                                                                                                 (<= block-y y-max))
-                                                                                        (increase! count)
-                                                                                        (table-add table block-id (list (+ x i) block-y (+ z k))))))))))))))
+                                                            (proc x y z blocks))))
                                                       section-list))))))))))))))))))
         (values total table)))))
 
@@ -220,54 +495,7 @@
     (/ 1. 16.))
   
   (define (determine-texture-coords block-id)
-    (define (effective-block-id)
-      (case block-id
-        ((1) #x00)
-        ((2) #x03)
-        ((3) #x02)
-        ((4) #x11)
-        ((5) #x14)
-        ((7) #x25)
-        ((8 9) #x18)
-        ((10 11) #xFF)
-        ((12) #x12)
-        ((13) #x01)
-        ((14) #x20)
-        ((15) #x10)
-        ((16) #x11)
-        ((17) #x04)
-        ((18) #x45)
-        ((20) #x31)
-        ((24) #xB0)
-        ((27) #xB3)
-        ((30) #x0B)
-        ((31) #x5C)
-        ((32) #x37)
-        ((37) #x0D)
-        ((38) #x0C)
-        ((40) #x1C)
-        ((50) #x63)
-        ((52) #x41)
-        ((55) #xA6)
-        ((58) #x4A)
-        ((59) #x5F)
-        ((64) #x51)
-        ((65) #x53)
-        ((66) #x80)
-        ((73) #x33)
-        ((75) #x73)
-        ((76) #x63)
-        ((77) #x9F)
-        ((81) #x46)
-        ((83) #x49)
-        ((85) #x55)
-        ((102) #x42)
-        ((106) #x1E)
-        ;; dont care
-        ((21 26 35 39 43 44 47 48 49 54 56 60 61 67 68 82 86 116 127) #x17)
-        (else (debug 'missing block-id) #x1A)))
-    
-    (let ((block-id (effective-block-id)))
+    (let ((block-id (effective-block-id block-id)))
       (let ((x (modulo block-id 16)))
         (let ((y (/ (- block-id x) 16)))
           (let ((h (/ (cast <fl> x) 16.))
