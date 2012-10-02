@@ -35,7 +35,8 @@
         (world.model)
         (world.sector)
         (world.syntax (phase syntax))
-        (world.texture))
+        (world.texture)
+        (world.triangle))
 
 
 (proclaim (warn optimizations))
@@ -181,20 +182,24 @@
 ;;;
 
 
-(class Minecraft-Block extends Object
+(class Minecraft-Block-Model extends Object
   
   
-  (slot name    getter generate)
-  (slot id      getter generate)
-  (slot subid   getter generate)
-  (slot texture getter generate)
+  (slot name                getter generate)
+  (slot id                  getter generate)
+  (slot subid               getter generate)
+  (slot texture             getter generate)
+  (slot texture-coordinates accessors generate)
+  (slot transparent?        getter generate)
   
   
-  (method override (initialize name id subid texture)
+  (method override (initialize name id subid texture transparent?)
     (set! name~self name)
     (set! id~self id)
     (set! subid~self subid)
-    (set! texture~self texture))
+    (set! texture~self texture)
+    (set! texture-coordinates~self #f)
+    (set! transparent?~self transparent?))
   
   
   (method override (print output readably)
@@ -207,25 +212,31 @@
   (make-table test: eq?))
 
 (definition blockids
-  (make-table))
+  (make-vector 256 #f))
 
 
-(definition (register-block name id (texture #f))
+(definition dont-care-texture
+  #x17)
+
+(definition unknown-texture
+  #x1A)
+
+
+(definition (register-block name id (texture #f) (transparent? #f))
   (let ((id (if (pair? id) (car id) id))
         (subid (if (pair? id) (cadr id) #f)))
     (when (not subid)
-      (let ((block (new Minecraft-Block name id subid texture)))
-        (table-set! blocks name block)
-        (table-set! blockids id block)))))
+      (let ((texture (case texture
+                       ((#t) dont-care-texture)
+                       ((#f) unknown-texture)
+                       (else texture))))
+        (let ((block (new Minecraft-Block-Model name id subid texture transparent?)))
+          (table-set! blocks name block)
+          (vector-set! blockids id block))))))
 
 
-(definition (effective-block-id id <fx>) <fx>
-  (let ((block (table-ref blockids id)))
-    (let ((texture (get-texture~ block)))
-      (case texture
-        ((#t) #x17) ;; don't care
-        ((#f) (debug 'missing id) #x1A) ;; not specified
-        (else texture)))))
+(definition inline (blockid->block id <fx>) <Minecraft-Block-Model>
+  (vector-ref blockids id))
 
 
 (definition tile-resolution <fx>
@@ -243,13 +254,10 @@
 (definition texture-pack
   (format "terrain{a}x{a}.png" tile-resolution tile-resolution))
 
-(definition texture-coordinates
-  (make-table))
-
 
 (definition (block-texture-coordinates block-id <fx>)
-  (define (determine-coordinates)
-    (let ((block-id (effective-block-id block-id)))
+  (define (determine-coordinates block)
+    (let ((block-id (get-texture~ block)))
       (let ((x (modulo block-id tile-period)))
         (let ((y (/ (- block-id x) tile-period)))
           (let ((l (* (cast <fl> x) tile-size))
@@ -261,10 +269,11 @@
                     (/ (- r .5) texture-size)
                     (/ (- b .5) texture-size))))))))
   
-  (or (table-ref texture-coordinates block-id #f)
-      (let ((coords (determine-coordinates)))
-        (table-set! texture-coordinates block-id coords)
-        coords)))
+  (let ((block (blockid->block block-id)))
+    (or (get-texture-coordinates~ block)
+        (let ((coords (determine-coordinates block)))
+          (set-texture-coordinates~ block coords)
+          coords))))
 
 
 ;;;
@@ -408,7 +417,8 @@
 
 (define-block DeadShrub
   31
-  #x5C)
+  #x5C
+  #t)
 
 (define-block TallGrass
   (31 1))
@@ -477,11 +487,13 @@
 
 (define-block Dandelion
   37
-  #x0D)
+  #x0D
+  #t)
 
 (define-block Rose
   38
-  #x0C)
+  #x0C
+  #t)
 
 (define-block BrownMushroom
   39
@@ -588,7 +600,8 @@
 
 (define-block WheatCrops
   59
-  #x5F)
+  #x5F
+  #t)
 
 (define-block Soil
   60
@@ -876,10 +889,9 @@
   143)
 
 
-;; fix me
-(define-block Unknown
-  -127
-  #t)
+(loop (for id from 0 below 256)
+      (unless (vector-ref blockids id)
+        (register-block 'Unknown id)))
 
 
 ;;;
@@ -1001,10 +1013,10 @@
                           (let ((alist (car tag-data)))
                             (let ((entities (assoc "Entities" alist))
                                   (sections (assoc "Sections" alist)))
-                              (let ((sections-table (and sections (make-table))))
+                              (let ((sections-table (and sections (make-table test: eq?))))
                                 (when sections-table
                                   (for-each (lambda (section)
-                                              (let ((yPos (- (cdr (assoc "Y" section)) 4))
+                                              (let ((yPos (- (cdr (assoc "Y" section)) 4)) ;; lower everything by 64
                                                     (blocks (cdr (assoc "Blocks" section))))
                                                 (table-set! sections-table yPos blocks)))
                                             (cdr sections)))
@@ -1046,6 +1058,17 @@
 ;;;
 ;;;; Zone
 ;;;
+
+
+(definition generate-count <fl>
+  0.)
+
+(definition generate-total <fl>
+  0.)
+
+
+(definition public (generate-average)
+  (/ generate-total generate-count))
 
 
 (class Minecraft-Zone extends Zone
@@ -1116,7 +1139,12 @@
       (set-lightmap-uptodate?~ sector #t))
     (post-content
       (lambda ()
-        (generate-content-threaded sector))))
+        (let ((before (real-time)))
+          (generate-content-threaded sector)
+          (let ((after (real-time)))
+            (let ((duration (- after before)))
+              (set! generate-count (+ generate-count 1.))
+              (set! generate-total (+ generate-total duration))))))))
   
   
   (method (generate-content-threaded sector <Minecraft-Sector>)
@@ -1139,10 +1167,15 @@
                      (block-radiuses (vertex block-radius block-radius block-radius))
                      (faces (make-table test: vertex=? hash: vertex-hash)))
                 (define (block-ref i <fx> j <fx> k <fx>)
-                  (s8vector-ref blocks (+ (* j 256) (* k 16) i)))
+                  (normalize-id (s8vector-ref blocks (+ (* j 256) (* k 16) i))))
                 
                 (define (blocks-ref blocks <s8vector> i <fx> j <fx> k <fx>)
-                  (s8vector-ref blocks (+ (* j 256) (* k 16) i)))
+                  (normalize-id (s8vector-ref blocks (+ (* j 256) (* k 16) i))))
+                
+                (define (normalize-id id <fx>)
+                  (if (>= id 0)
+                      id
+                    (+ 256 id)))
                 
                 (define (left-ref i <fx> j <fx> k <fx>)
                   (if (> i 0)
@@ -1213,12 +1246,18 @@
                                                   (let ((center (get-center~ face)))
                                                     (table-set! faces center face)))
                                                 
-                                                (unless (/= (cast <fx> (left-ref   i j k)) 0) (add-face (left-face   x y z block-radius tl tt tr tb)))
-                                                (unless (/= (cast <fx> (right-ref  i j k)) 0) (add-face (right-face  x y z block-radius tl tt tr tb)))
-                                                (unless (/= (cast <fx> (bottom-ref i j k)) 0) (add-face (bottom-face x y z block-radius tl tt tr tb)))
-                                                (unless (/= (cast <fx> (top-ref    i j k)) 0) (add-face (top-face    x y z block-radius tl tt tr tb)))
-                                                (unless (/= (cast <fx> (back-ref   i j k)) 0) (add-face (back-face   x y z block-radius tl tt tr tb)))
-                                                (unless (/= (cast <fx> (front-ref  i j k)) 0) (add-face (front-face  x y z block-radius tl tt tr tb)))))))))))))
+                                                (define (opaque? block-id <fx>)
+                                                  (and (/= block-id 0)
+                                                       (not (get-transparent?~ (blockid->block block-id)))))
+                                                
+                                                (if (get-transparent?~ (blockid->block block-id))
+                                                    (add-cross-faces x y z block-radius tl tt tr tb add-face)
+                                                  (unless (opaque? (left-ref   i j k)) (add-face (left-face   x y z block-radius tl tt tr tb)))
+                                                  (unless (opaque? (right-ref  i j k)) (add-face (right-face  x y z block-radius tl tt tr tb)))
+                                                  (unless (opaque? (bottom-ref i j k)) (add-face (bottom-face x y z block-radius tl tt tr tb)))
+                                                  (unless (opaque? (top-ref    i j k)) (add-face (top-face    x y z block-radius tl tt tr tb)))
+                                                  (unless (opaque? (back-ref   i j k)) (add-face (back-face   x y z block-radius tl tt tr tb)))
+                                                  (unless (opaque? (front-ref  i j k)) (add-face (front-face  x y z block-radius tl tt tr tb))))))))))))))
                 (receive (vertices neighbors) (prepare-vertices/neighbors~ sector faces)
                   (let ((lightmap (prepare-lightmap~ sector faces)))
                     (delay-event
@@ -1228,6 +1267,42 @@
                         (set-vertices-uptodate?~ sector #t)
                         (fill-lightmap~ sector lightmap)
                         (set-lightmap-uptodate?~ sector #t)))))))))))))
+
+
+(definition cross-normal1
+  (vertex-normalize (vertex -1. 0. -1.)))
+
+(definition cross-normal2
+  (vertex-normalize (vertex 1. 0. -1.)))
+
+
+(definition public (add-cross-faces x <fl> y <fl> z <fl> radius <fl> tl <fl> tt <fl> tr <fl> tb <fl> add-face)
+  (let ((l (- x radius))
+        (r (+ x radius))
+        (b (- y radius))
+        (t (+ y radius))
+        (f (- z radius))
+        (n (+ z radius)))
+    ;; FIX normals
+    (add-face
+      (make-face #f
+                 (vertex x y z)
+                 (make-triangle cross-normal1
+                                (vertex r t f) (vertex l t n) (vertex l b n)
+                                (vertex tl tt 1.) (vertex tr tt 1.) (vertex tr tb 1.))
+                 (make-triangle cross-normal1
+                                (vertex l b n) (vertex r b f) (vertex r t f)
+                                (vertex tr tb 1.) (vertex tl tb 1.) (vertex tl tt 1.))))
+    (add-face
+      (make-face #f
+                 ;; QUICK HACK
+                 (vertex (+ x 0.0001) y z)
+                 (make-triangle cross-normal2
+                                (vertex r t n) (vertex l t f) (vertex l b f)
+                                (vertex tl tt 1.) (vertex tr tt 1.) (vertex tr tb 1.))
+                 (make-triangle cross-normal2
+                                (vertex l b f) (vertex r b n) (vertex r t n)
+                                (vertex tr tb 1.) (vertex tl tb 1.) (vertex tl tt 1.))))))
 
 
 ;;;
