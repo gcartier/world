@@ -51,6 +51,14 @@
 (proclaim (warn optimizations))
 
 
+(definition debug?
+  #f)
+
+(definition (debugging . rest)
+  (when debug?
+    (apply debug rest)))
+
+
 ;;;
 ;;;; Collision
 ;;;
@@ -79,7 +87,7 @@
   (method override (print output readably)
     (print-unreadable self output
       (lambda (output)
-        (format output "{a} {a} {a} {a} {a}" element colliders plane distance type)))))
+        (format output "{a} {a} {a} {a}" colliders plane distance type)))))
 
 
 ;;;
@@ -88,7 +96,7 @@
 
 
 (definition EPSILON <fl>
-  1e-3)
+  1e-5)
 
 (definition -EPSILON <fl>
   (- EPSILON))
@@ -102,18 +110,21 @@
 
 (definition public (calculate-colliders sphere-radius <fl> mvt <Movement> skip-list <list>) <list+>
   (define (collide element <Element> polygon <Polygon> result)
+    (define (add-collision collision)
+      (enqueue result collision))
+    
     (unless (memq? polygon skip-list)
       (let ((collision (collide-polygon sphere-radius element polygon mvt)))
         (when collision
           (if (null? (queue-list result))
-              (enqueue result collision)
+              (add-collision collision)
             (let ((collision-distance (get-distance~ collision))
                   (result0 <Collision> (car (queue-list result))))
               (let ((d <fl> (abs (- collision-distance (get-distance~ result0)))))
                 (if (> d EPSILON)
                     (when (< collision-distance (get-distance~ result0))
                       (reset-queue result)
-                      (enqueue result collision))
+                      (add-collision collision))
                   ;; Make sure it's not already in the list (this plane's normal)
                   (let ((collision-normal (get-normal~ (get-plane~ collision))))
                     (let ((old-coll <Collision+>
@@ -123,7 +134,7 @@
                                      (queue-list result))))
                       (if old-coll
                           (set-colliders~ old-coll (cons polygon (get-colliders~ old-coll)))
-                        (enqueue result collision))))))))))))
+                        (add-collision collision))))))))))))
   
   ;; Go through our list of potential colliders
   (let ((world (current-world))
@@ -162,6 +173,17 @@
         (define (continue)
           (continuation-return return #f))
         
+        (define (find-edge/point-collision)
+          (let ((edge-collision (find-edge-collision element poly sphere-radius mvt))
+                (point-collision (find-point-collision element poly sphere-radius mvt)))
+            (cond ((not edge-collision) point-collision)
+                  ((not point-collision) edge-collision)
+                  (else
+                   (if (< (get-distance~ edge-collision) (get-distance~ point-collision))
+                       edge-collision
+                     point-collision)))))
+                   
+        
         ;; Ignore back-facing polygons
         (if (<= (plane-to-point-distance (get-plane~ poly) (get-origin~ mvt)) 0.) (continue))
         ;; Find the point on the sphere that will eventually collide with the polygon's plane
@@ -171,107 +193,36 @@
           (let ((sphere-intersection-ray (make-movement& sphere-intersection-point (get-normal~ mvt))))
             (receive (dist intersect?) (intersect-plane (get-plane~ poly) sphere-intersection-ray)
               (set! collision-distance dist)
-              (when (not intersect?)
-                (continue))
-              ;; If the polygon is embedded set the collision type and define a collision plane that is perpendicular
-              ;; to the direction that the sphere must travel to be un-embedded
-              (let ((inner-most-point (is-embedded sphere-radius poly (get-origin~ mvt))))
-                (if inner-most-point
-                    (begin
-                      (set! collision-distance (- (f32-ref (vertex-distance& inner-most-point (get-origin~ mvt))) sphere-radius))
-                      (set-origin~ collision-plane inner-most-point)
-                      (set-vector~ collision-plane (vertex-& (get-origin~ mvt) inner-most-point))
-                      (set! collision-type 'CT_EMBEDDED))
-                  ;; Surface/Edge/Point collision
-                  (let (;; The plane intersection point
-                        (plane-intersection-point (vertex+& sphere-intersection-point (vertex-scalar*& (get-normal~ mvt) collision-distance))))
-                    ;; Surface collision?
-                    (if (inside?~ poly plane-intersection-point EPSILON)
-                        (begin
-                          ;; Is this a valid collision?
-                          (when (< collision-distance -2*EPSILON) (continue))
-                          ;; Our collision plane is our polygon's plane
-                          (set! collision-plane (get-plane~ poly))
-                          (set! collision-type 'CT_SURFACE))
-                      ;; Edge/Point collision
-                      (let ((origin (make-vertex&))
-                            (e0 (make-vertex&))
-                            (e1 (make-vertex&)))
-                        ;; New collision plane origin
-                        (let ((edge-flag (closest-point-on-perimeter!~ poly plane-intersection-point origin e0 e1)))
-                          (set-origin~ collision-plane origin)
-                          ;; Point collision?
-                          (if (not edge-flag)
-                              (let ((to-sphere (make-movement& (get-origin~ collision-plane) (vertex-negate& (get-normal~ mvt)))))
-                                (receive (dist intersection?) (unit-sphere-intersection sphere-radius (get-origin~ mvt) to-sphere)
-                                  (set! collision-distance dist)
-                                  (when (not intersection?) (continue))
-                                  ;; The collision plane
-                                  (let ((sphere-intersection-point (vertex-& (get-origin~ collision-plane) (vertex-scalar*& (get-normal~ mvt) collision-distance))))
-                                    (set-vector~ collision-plane (vertex-& (get-origin~ mvt) sphere-intersection-point))
-                                    ;; Generate a vector that points from the vertex at the sphere
-                                    (let ((at-sphere (vertex-& (get-origin~ mvt) (get-origin~ collision-plane))))
-                                      ;; We must be headed at the collision plane
-                                      (when (> (f32-ref (dot-product& (get-vector~ mvt) at-sphere)) 0.) (continue))
-                                      ;; The plane is not allowed to face away from the normal of the polygon
-                                      (when (< (f32-ref (dot-product& (get-normal~ collision-plane) (get-normal~ (get-plane~ poly)))) 0.) (continue))
-                                      ;; The plane is not allowed to face the interior of the polygon
-                                      (when (> (plane-to-point-distance collision-plane e0) 0.) (continue))
-                                      (when (> (plane-to-point-distance collision-plane e1) 0.) (continue))
-                                      (set! collision-type 'CT_POINT)))))
-                            ;; Edge collision
-                            (let ;; Find the plane defined by the edge and the velocity vector (cross product)
-                                 ;; This plane will be used to bisect the sphere
-                                 ((edge-normal (vertex-normalize& (vertex-& e1 e0))))
-                              (let ((edge-dot <fl> (abs (f32-ref (dot-product& (get-normal~ mvt) edge-normal)))))
-                                (when (> edge-dot 1-EPSILON) (continue))
-                                (let ((bisection-plane (make-plane& e1 (cross-product& (get-normal~ mvt) edge-normal))))
-                                  ;; The intersection of a plane and a sphere is a disc. We want to find the center
-                                  ;; of that disc. The center of that disc is the closest point on the bisection plane
-                                  ;; to the center of the sphere.
-                                  (let ((disc-center (plane-closest& bisection-plane (get-origin~ mvt))))
-                                    ;; If the center of the disc is outside the sphere then the sphere does not intersect
-                                    ;; the bisection plane and therefore will never collide with the edge
-                                    (when (> (f32-ref (vertex-distance& disc-center (get-origin~ mvt))) (- sphere-radius EPSILON)) (continue))
-                                    ;; Find the closest point on the edge to the center of the disc
-                                    (let ((edge-point (closest-point-on-line& e0 e1 disc-center)))
-                                      ;; Generate a ray that traces back toward the sphere
-                                      (let ((to-sphere (make-movement& edge-point (vertex-& disc-center edge-point))))
-                                        ;; Trace from the edge-point back to the sphere.
-                                        ;; This will be the sphere-intersection-point
-                                        (receive (t intersection?) (unit-sphere-intersection sphere-radius (get-origin~ mvt) to-sphere)
-                                          (when (not intersection?) (continue))
-                                          (let ((sphere-intersection-point (movement-end-to to-sphere t)))
-                                            ;; Will the sphere intersection point when travelling along 'mvt' ever intersect the actual edge?
-                                            ;; In order to determine this we'll start by defining a plane that lies on the edge but is perpendicular to 'mvt'.
-                                            (let ((edge-vect (vertex-normalize& (cross-product& (cross-product& (vertex-& e1 e0) (get-normal~ mvt)) (vertex-& e1 e0)))))
-                                              (let ((edge-plane (make-plane& e0 edge-vect)))
-                                                ;; Next we'll intersect the edge-vect ray with the plane
-                                                (let ((to-line (make-movement& sphere-intersection-point (get-normal~ mvt))))
-                                                  (receive (t intersect?) (intersect-plane edge-plane to-line)
-                                                    ;; Finally does the result end up with a point inside the line segment defined by the
-                                                    ;; two edge points? If not then the sphere won't intersect the edge.
-                                                    (when (not (is-point-inside-edge? e0 e1 (movement-end-to to-line t))) (continue))))
-                                                ;; Our collision plane is the tangent plane at the sphere-intersection-point
-                                                (set-vector~ collision-plane (vertex-& (get-origin~ mvt) sphere-intersection-point))
-                                                ;; The plane is not allowed to face the interior of the polygon...
-                                                (when (> (plane-to-point-distance collision-plane (get-center~ poly)) -0.) (continue))
-                                                ;; The plane is not allowed to face away from the normal of the polygon
-                                                (when (< (f32-ref (dot-product& (get-normal~ collision-plane) (get-normal~ (get-plane~ poly)))) 0.) (continue))
-                                                ;; Trace from the sphere-intersection-point to the plane to find the collision-distance
-                                                (let ((from-sphere (make-movement& sphere-intersection-point (get-normal~ mvt))))
-                                                  (receive (dist intersect?) (intersect-plane collision-plane from-sphere)
-                                                    (set! collision-distance dist)
-                                                    (assert intersect?)))
-                                                ;; Don't allow collisions behind us
-                                                (when (< collision-distance -1.) (continue))
-                                                (set! collision-type 'CT_EDGE))))))))))))))))))
-              ;; Was it an actual collision?
-              (when (and (neq? collision-type 'CT_EMBEDDED) (> collision-distance (get-length~ mvt))) (continue))
-              ;; Ignore collision planes that we're traveling away from
-              (when (and (neq? collision-type 'CT_EMBEDDED) (>= (f32-ref (dot-product& (get-normal~ collision-plane) (get-normal~ mvt))) 0.)) (continue))
-              ;; Is it closer farther away or the same distance as what we've found so far?
-              (new Collision element (list poly) collision-plane collision-distance collision-type))))))))
+              (if (not intersect?)
+                  (find-edge/point-collision)
+                ;; If the polygon is embedded set the collision type and define a collision plane that is perpendicular
+                ;; to the direction that the sphere must travel to be un-embedded
+                (let ((inner-most-point (is-embedded sphere-radius poly (get-origin~ mvt))))
+                  (if inner-most-point
+                      (begin
+                        (set! collision-distance (- (f32-ref (vertex-distance& inner-most-point (get-origin~ mvt))) sphere-radius))
+                        (set-origin~ collision-plane inner-most-point)
+                        (set-vector~ collision-plane (vertex-& (get-origin~ mvt) inner-most-point))
+                        (new Collision element (list poly) collision-plane collision-distance 'CT_EMBEDDED))
+                    ;; Surface/Edge/Point collision
+                    (let (;; The plane intersection point
+                          (plane-intersection-point (vertex+& sphere-intersection-point (vertex-scalar*& (get-normal~ mvt) collision-distance))))
+                      ;; Surface collision?
+                      (if (inside?~ poly plane-intersection-point EPSILON)
+                          (begin
+                            ;; Is this a valid collision?
+                            (when (< collision-distance -2*EPSILON) (continue))
+                            ;; Our collision plane is our polygon's plane
+                            (set! collision-plane (get-plane~ poly))
+                            (set! collision-type 'CT_SURFACE)
+                            ;; Was it an actual collision?
+                            (when (and (neq? collision-type 'CT_EMBEDDED) (> collision-distance (get-length~ mvt))) (continue))
+                            ;; Ignore collision planes that we're traveling away from
+                            (when (and (neq? collision-type 'CT_EMBEDDED) (>= (f32-ref (dot-product& (get-normal~ collision-plane) (get-normal~ mvt))) 0.)) (continue))
+                            ;; Is it closer farther away or the same distance as what we've found so far?
+                            (new Collision element (list poly) collision-plane collision-distance collision-type))
+                        ;; Edge/Point collision
+                        (find-edge/point-collision)))))))))))))
 
 
 ;;;
@@ -298,7 +249,7 @@
 (definition public (collide&slide sphere-radius <fl> mvt <Movement> filter-pulse-jumps (debug-collisions?: debug-collisions? debug-collisions?))
   (let ((world (current-world))
         (zone (current-zone))
-        (max-loops 3)
+        (max-loops 10)
         (last-direction (vertex 0. 0. 0.))
         (last-cl <list> '())
         (input-ray <Movement> mvt)
@@ -313,8 +264,6 @@
       (reset-marks~ zone))
     ;; Sliding is an iterative process
     (let (iter (loop-no 0))
-      (when debug-collisions?
-        (add-mark~ zone (new Mark (get-origin~ output-ray))))
       (when (and (< loop-no max-loops)
                  (not (vertex-zero? (get-vector~ output-ray)))
                  (> (get-length~ output-ray) EPSILON))
@@ -322,6 +271,13 @@
         (vertex-copy! last-direction (get-vector~ output-ray))
         (let (;; Get the colliders
               (cl <list> (or (calculate-colliders sphere-radius output-ray skip-list) '())))
+          (when debug-collisions?
+            (add-mark~ zone (new Mark (copy-vertex (get-origin~ output-ray))))
+            (add-mark~ zone
+              (new Mark
+                (let ((cl cl))
+                  (lambda ()
+                    (draw-collisions cl))))))
           (set! last-cl cl)
           ;; We can consider these polygons again
           (set! skip-list '())
@@ -331,85 +287,87 @@
             (let ((hit-count <fx> (length cl))
                   (hit-list cl)
                   (cl0 <Collision> (car cl)))
-            ;; If it was embedded push away
-            (if (eq? (get-type~ cl0) 'CT_EMBEDDED)
-                ;; If it's embedded back up along the collision plane normal
-                (set-origin~ output-ray (vertex-& (get-origin~ output-ray) (vertex-scalar*& (get-normal~ (get-plane~ cl0)) (get-distance~ cl0))))
-              (let ((slide-dst (plane-closest& (get-plane~ cl0) (movement-end output-ray))))
-                ;; We hit something -- move as far as we can
-                (set-origin~ output-ray (vertex+& (get-origin~ output-ray) (vertex-scalar*& (get-normal~ output-ray) (get-distance~ cl0))))
-                ;; If we hit two or more find the two with the most "pressure"
-                (if (>= hit-count 2)
-                    (let ((c0 0)
-                          (d0 2.))
-                      (loop (for i from 0 below hit-count)
-                            (let ((dot (f32-ref (dot-product& (get-normal~ (get-plane~ (cast <Collision> (element hit-list i)))) (get-normal~ output-ray)))))
-                              (when (< dot d0)
-                                (set! d0 dot)
-                                (set! c0 i))))
-                      (let ((c1 0)
-                            (d1 2.))
-                        (loop (for j from 0 below hit-count)
-                              (when (/= j c0)
-                                (let ((dot (f32-ref (dot-product& (get-normal~ (get-plane~ (cast <Collision> (element hit-list j)))) (get-normal~ output-ray)))))
-                                  (when (< dot d1)
-                                    (set! d1 dot)
-                                    (set! c1 j)))))
-                        ;; Temp vector
-                        (let ((temp-v (get-vector~ output-ray))
-                              ;; Point along the crease
-                              (perp (vertex-abs& (cross-product& (get-normal~ (get-plane~ (cast <Collision> (element hit-list c1))))
-                                                                 (get-normal~ (get-plane~ (cast <Collision> (element hit-list c0))))))))
-                          (set! temp-v (vertex* temp-v perp))
-                          (if (< (f32-ref (vertex-norm& temp-v)) EPSILON)
-                              (iter (+ loop-no 1))
-                            (vertex-normalize! temp-v temp-v)
-                            (vertex-scalar*! temp-v temp-v (f32-ref (vertex-norm& (get-vector~ output-ray))))
-                            ;; Find out how much to scale our vector that points along the crease
-                            (let ((n1 (vertex-normalize& temp-v))
-                                  (n2 (vertex-normalize& (get-vector~ output-ray))))
-                              (let ((scalar (f32-ref (dot-product& n1 n2))))
-                                ;; New vector is new direction vector scaled
-                                (set-vector~ output-ray (vertex-scalar*& temp-v scalar))))
-                            (when (and filter-pulse-jumps (< (f32-ref (dot-product& (get-vector~ output-ray) (get-vector~ input-ray))) 0.))
-                              (set-vector~ output-ray (static (vertex 0. 0. 0.))))
-                            (vertex-copy! last-direction (get-vector~ output-ray))
-                            ;; Don't collide with these next time
-                            (skip-polygons (cast <Collision> (element hit-list c0)))
-                            (skip-polygons (cast <Collision> (element hit-list c1)))
-                            (iter (+ loop-no 1))))))
-                  ;; Otherwise we slide
-                  (let ((slide-src (plane-closest& (get-plane~ cl0) (get-origin~ output-ray))))
-                    (set-vector~ output-ray (vertex-& slide-dst slide-src)))
-                  (when (and filter-pulse-jumps (< (f32-ref (dot-product& (get-vector~ output-ray) (get-vector~ input-ray))) 0.))
-                    (set-vector~ output-ray (static (vertex 0. 0. 0.))))
-                  (vertex-copy! last-direction (get-vector~ output-ray))
-                  ;; Don't collide with this one next time
-                  (skip-polygons cl0)
-                  (iter (+ loop-no 1))))))))))
+              ;; If it was embedded push away
+              (if (eq? (get-type~ cl0) 'CT_EMBEDDED)
+                  ;; If it's embedded back up along the collision plane normal
+                  (set-origin~ output-ray (vertex-& (get-origin~ output-ray) (vertex-scalar*& (get-normal~ (get-plane~ cl0)) (get-distance~ cl0))))
+                (let ((slide-dst (plane-closest& (get-plane~ cl0) (movement-end output-ray))))
+                  ;; We hit something -- move as far as we can
+                  (set-origin~ output-ray (vertex+& (get-origin~ output-ray) (vertex-scalar*& (get-normal~ output-ray) (get-distance~ cl0))))
+                  ;; If we hit two or more find the two with the most "pressure"
+                  (if (>= hit-count 2)
+                      (let ((c0 0)
+                            (d0 2.))
+                        (loop (for i from 0 below hit-count)
+                              (let ((dot (f32-ref (dot-product& (get-normal~ (get-plane~ (cast <Collision> (element hit-list i)))) (get-normal~ output-ray)))))
+                                (when (< dot d0)
+                                  (set! d0 dot)
+                                  (set! c0 i))))
+                        (let ((c1 0)
+                              (d1 2.))
+                          (loop (for j from 0 below hit-count)
+                                (when (/= j c0)
+                                  (let ((dot (f32-ref (dot-product& (get-normal~ (get-plane~ (cast <Collision> (element hit-list j)))) (get-normal~ output-ray)))))
+                                    (when (< dot d1)
+                                      (set! d1 dot)
+                                      (set! c1 j)))))
+                          ;; Temp vector
+                          (let ((temp-v (get-vector~ output-ray))
+                                ;; Point along the crease
+                                (perp (vertex-abs& (cross-product& (get-normal~ (get-plane~ (cast <Collision> (element hit-list c1))))
+                                                                   (get-normal~ (get-plane~ (cast <Collision> (element hit-list c0))))))))
+                            (set! temp-v (vertex* temp-v perp))
+                            (if (< (f32-ref (vertex-norm& temp-v)) EPSILON)
+                                (iter (+ loop-no 1))
+                              (vertex-normalize! temp-v temp-v)
+                              (vertex-scalar*! temp-v temp-v (f32-ref (vertex-norm& (get-vector~ output-ray))))
+                              ;; Find out how much to scale our vector that points along the crease
+                              (let ((n1 (vertex-normalize& temp-v))
+                                    (n2 (vertex-normalize& (get-vector~ output-ray))))
+                                (let ((scalar (f32-ref (dot-product& n1 n2))))
+                                  ;; New vector is new direction vector scaled
+                                  (set-vector~ output-ray (vertex-scalar*& temp-v scalar))))
+                              (when (and filter-pulse-jumps (< (f32-ref (dot-product& (get-vector~ output-ray) (get-vector~ input-ray))) 0.))
+                                (set-vector~ output-ray (static (vertex 0. 0. 0.))))
+                              (vertex-copy! last-direction (get-vector~ output-ray))
+                              ;; Don't collide with these next time
+                              (skip-polygons (cast <Collision> (element hit-list c0)))
+                              (skip-polygons (cast <Collision> (element hit-list c1)))
+                              (iter (+ loop-no 1))))))
+                    ;; Otherwise we slide
+                    (let ((slide-src (plane-closest& (get-plane~ cl0) (get-origin~ output-ray))))
+                      (set-vector~ output-ray (vertex-& slide-dst slide-src)))
+                    (when (and filter-pulse-jumps (< (f32-ref (dot-product& (get-vector~ output-ray) (get-vector~ input-ray))) 0.))
+                      (set-vector~ output-ray (static (vertex 0. 0. 0.))))
+                    (vertex-copy! last-direction (get-vector~ output-ray))
+                    ;; Don't collide with this one next time
+                    (skip-polygons cl0)
+                    (iter (+ loop-no 1))))))))))
     (when debug-collisions?
-      (add-mark~ zone (new Mark (get-origin~ output-ray)))
-      (add-mark~ zone
-        (new Mark
-          (let ((cl last-cl))
-            (lambda ()
-              (draw-collisions cl)))))
-      (set-% last-cl))
+      (add-mark~ zone (new Mark (copy-vertex (get-origin~ output-ray)))))
     (values (get-origin~ output-ray) last-direction last-cl)))
 
 
+(definition highlighted-polygon
+  #f)
+
+
 (definition (draw-collisions cl)
+  (define (draw-polygon polygon)
+    (glBegin GL_LINE_LOOP)
+    (loop (for vert in-vector (get-vertices~ polygon))
+          (glVertex3f (vertex-x vert) (vertex-y vert) (vertex-z vert)))
+    (glEnd))
+  
   (define (draw-polygons)
     (let ((polygons (apply append (map get-colliders~ cl))))
-      (glLineWidth 5.)
+      (glLineWidth 3.)
       (glDisable GL_LIGHTING)
       (gl-colorize-dye green-dye)
-      (for-each (lambda (polygon)
-                  (glBegin GL_LINE_LOOP)
-                  (loop (for vert in-vector (get-vertices~ polygon))
-                        (glVertex3f (vertex-x vert) (vertex-y vert) (vertex-z vert)))
-                  (glEnd))
-                polygons)
+      (for-each draw-polygon polygons)
+      (gl-colorize-dye blue-dye)
+      (when highlighted-polygon
+        (draw-polygon highlighted-polygon))
       (glEnable GL_LIGHTING)
       (glLineWidth 1.)))
   
@@ -417,8 +375,25 @@
     (gl-colorize-dye red-dye)
     (for-each (lambda (collision)
                 (let ((plane (get-plane~ collision)))
-                  (let ((origin (get-origin~ plane)))
-                    (gl-horizontal-circle origin .5 {Color Red}))))
+                  (let ((origin (get-origin~ plane))
+                        (normal (get-normal~ plane)))
+                    (let ((other (vertex (vertex-y origin) (vertex-z origin) (vertex-x origin))))
+                      (let ((right (vertex-normalize (cross-product other normal))))
+                        (let ((sight (vertex-normalize (cross-product right normal))))
+                          (glPushMatrix)
+                          (glMultMatrixv
+                            (vertex-x right) (vertex-x normal) (vertex-x sight) (vertex-x origin)
+                            (vertex-y right) (vertex-y normal) (vertex-y sight) (vertex-y origin)
+                            (vertex-z right) (vertex-z normal) (vertex-z sight) (vertex-z origin)
+                            0. 0. 0. 1.)
+                          (glLineWidth 2.)
+                          (gl-horizontal-circle (vertex 0. 0. 0.) .5 {Color Red})
+                          (glBegin GL_LINES)
+                          (glVertex3f 0.0 0.0 0.0)
+                          (glVertex3f 0.0 .75 0.0)
+                          (glEnd)
+                          (glLineWidth 1.)
+                          (glPopMatrix)))))))
               cl))
   
   (draw-polygons)
@@ -428,6 +403,101 @@
 ;;;
 ;;;; Utility
 ;;;
+
+
+(definition (find-edge-collision element <Element> poly <Polygon> sphere-radius <fl> mvt <Movement>) <Collision+>
+  (let ((closest-contact-point #f)
+        (closest-contact-position #f)
+        (closest-distance +inf.0 @w (get-length~ mvt))
+        (vertices (get-vertices~ poly)))
+    (let ((vertex-count <fx> (length vertices)))
+      (loop (for i from 0 below vertex-count)
+            (let ((p1 (vector-ref vertices i))
+                  (p0 (vector-ref vertices (let ((j (- i 1))) (if (< j 0) (- vertex-count 1) j)))))
+              (let ((info (edge-sphere-collision p0 p1 sphere-radius mvt)))
+                (when info
+                  (receive (contact-dist contact-point contact-position) info
+                    (when (< contact-dist closest-distance)
+                      (set! closest-contact-point contact-point)
+                      (set! closest-contact-position contact-position)
+                      (set! closest-distance contact-dist))))))))
+    (and closest-contact-point
+         (< closest-distance (get-length~ mvt))
+         (new Collision element (list poly) (new Plane closest-contact-point (vertex-normalize (vertex- closest-contact-position closest-contact-point))) closest-distance 'CT_EDGE))))
+
+
+(definition (edge-sphere-collision p1 <f32vector> p2 <f32vector> sphere-radius <fl> mvt <Movement>) <fl+>
+  ;; finds the time of collision of the sphere with the edge
+  ;; if the sphere is moving towards the edge line in the working plane (*).
+  ;; and if the sphere intersects this plane (there is obviously no collision if the later condition doesn't hold)
+  ;; #f otherwise
+  ;; (*) the plane parallel to the movement and where the edge lies is called the working plane
+  ;; the case where the sphere would collide with an edge is not covered here (yet)
+  ;; edge or movement line refers to the infinite line covering the edge or the movement respectively.
+  (let ((normal (vertex-normalize-safe (cross-product (vertex- p1 p2) (get-vector~ mvt)))) ;; normal to the working plane
+        (origin (get-origin~ mvt)))
+    (let ((line-dist (let ((dist (dot-product normal (vertex- p1 origin)))) ;; minimal distance between the movement line and the edge line.
+                       (if (<= (- sphere-radius EPSILON) (abs dist) (+ sphere-radius EPSILON))
+                           (* sphere-radius (cast <fl> (sign dist)))
+                         dist))))
+      (if (or (vertex-zero? normal)
+              (> (abs line-dist) sphere-radius)) ;; testing for the second condition
+          #f
+        (let ((radius-secant (sqrt (- (* sphere-radius sphere-radius) (* line-dist line-dist)))) ;; radius of the cercle : intersection of the sphere and the working plane
+              (origin-secant (vertex+ origin (vertex-scalar* normal line-dist))) ;; projection of the origin of the movement on the working-plane
+              (perpendicular (vertex-normalize-safe (cross-product normal (vertex- p1 p2))))) ;; perpendicular to the edge in the working plane
+          (let ((distance-secant (dot-product perpendicular (vertex- origin-secant p1))) ;; distance between the edge line and the projection of the origin
+                (closing-speed (dot-product perpendicular (get-vector~ mvt)))) ;; component of vector (displacement) moving towards the edge line.
+            (if (or (and (> closing-speed 0.) (< distance-secant (- EPSILON radius-secant)))
+                    (and (< closing-speed 0.) (> distance-secant (- radius-secant EPSILON))))
+                (let ((contact-time (/ (- (abs distance-secant) radius-secant) (abs closing-speed)))
+                      (radius-direction (if (> distance-secant 0.) (- radius-secant) radius-secant)))
+                  (let ((contact-position (movement-end-to mvt contact-time)))
+                    (let ((contact-point (vertex+ (vertex- contact-position origin)
+                                                  (vertex+ origin-secant (vertex-scalar* perpendicular radius-direction)))))
+                      (if (is-point-inside-edge? p1 p2 contact-point)
+                          (values (* contact-time (get-length~ mvt)) contact-point contact-position)
+                        #f))))
+              ;; the first condition doesn't hold, the circle is not moving toward the edge line
+              ;; either it is moving away or the cercle is already touching the edge line - the later is not yet covered here
+              #f)))))))
+
+
+(definition (find-point-collision element <Element> poly <Polygon> sphere-radius <fl> mvt <Movement>) <Collision+>
+  (let ((closest-contact-point #f)
+        (closest-contact-position #f)
+        (closest-distance (get-length~ mvt))
+        (vertices (get-vertices~ poly)))
+    ;; MYSTERE
+    (let ((vertex-count <fx> (length vertices)))
+      (loop (for i from 0 below vertex-count)
+            (let ((p1 (vector-ref vertices i)))
+              (let ((info (point-sphere-collision p1 sphere-radius mvt)))
+                (when info
+                  (receive (contact-dist contact-point contact-position) info
+                    (when (< contact-dist closest-distance)
+                      (set! closest-contact-point contact-point)
+                      (set! closest-contact-position contact-position)
+                      (set! closest-distance contact-dist))))))))
+    (and closest-contact-point
+         (new Collision element (list poly) (new Plane closest-contact-point (vertex-normalize (vertex- closest-contact-position closest-contact-point))) closest-distance 'CT_POINT))))
+
+
+(definition (point-sphere-collision p1 <f32vector> sphere-radius <fl> mvt <Movement>)
+  (let ((mvt-normalized (get-normal~ mvt))
+        (origin (get-origin~ mvt)))
+    (let ((perpendicular-position (vertex+ origin (vertex-scalar* mvt-normalized (dot-product mvt-normalized (vertex- p1 origin))))))
+      (let ((perpendicular-radius (vertex- p1 perpendicular-position)))
+        (let ((perpendicular-distance (vertex-norm perpendicular-radius)))
+          (cond ((< (+ sphere-radius EPSILON) perpendicular-distance)
+                 #f)
+                ((<=  (- sphere-radius EPSILON) perpendicular-distance (+ sphere-radius EPSILON))
+                 (values (vertex-norm (vertex- perpendicular-position origin)) p1 perpendicular-position))
+                (else 
+                 (let ((contact-position (vertex- perpendicular-position (vertex-scalar* mvt-normalized
+                                                                                         (sqrt (- (* sphere-radius sphere-radius)
+                                                                                                  (* perpendicular-distance perpendicular-distance)))))))
+                   (values (vertex-norm (vertex- contact-position origin)) p1 contact-position)))))))))
 
 
 (definition (unit-sphere-intersection sphere-radius <fl> center <f32vector> mvt <Movement>) <values>
