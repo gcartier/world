@@ -62,6 +62,7 @@
         (world.geometry)
         (world.gravity)
         (world.history)
+        (world.homogeneous)
         (world.interface)
         (world.interface.bindings)
         (world.interface.counters)
@@ -1419,10 +1420,10 @@
   
   (method (remove-eye-occlusion target)
     (define (determine-eye-occlusion target)
-      (let ((closest (ray-closest-element target (vertex-negate (get-sight~ eye-lookat)) first-distance ignore-players?: #t)))
+      (let ((closest (ray-closest-face target (vertex-negate (get-sight~ eye-lookat)) first-distance ignore-players?: #t)))
         (if (not closest)
             (values #f #f)
-          (bind (element face triangle distance) closest
+          (bind (face triangle distance) closest
             (values distance (get-normal~ triangle))))))
     
     (define (closer-eye-occlusion occlusion normal)
@@ -1458,7 +1459,7 @@
     -1)
   
   
-  (method (travel-ray-elements proc orig <f32vector> dir <f32vector> radius <fl> breadth <fx> max-distance <fl> (filter: filter #f) (ignore-players?: ignore-players? #f))
+  (method (travel-ray-faces proc orig <f32vector> dir <f32vector> radius <fl> breadth <fx> max-distance <fl> (filter: filter #f) (ignore-players?: ignore-players? #f))
     (let ((zone (current-zone)))
       (increase! current-area-visit)
       (let ((step (cast <fl> (get-area-size~ zone))))
@@ -1471,12 +1472,12 @@
                     (iterate-position-neighbor-areas~ zone position breadth
                       (lambda (area <Area>)
                         (unless (= (get-visit~ area) current-area-visit)
-                          (iterate-area-elements~ zone area
-                            (lambda (targ <Element>)
-                              (when (get-visible?~ targ)
-                                (unless (and ignore-players? (is? targ Player))
-                                  (when (ray-intersects-sphere? orig dir (get-position~ targ) (+ radius (get-radius~ targ)))
-                                    (proc targ))))))
+                          (let ((faces (get-faces~ area)))
+                            (when faces
+                              (loop (for i from 0 below (vector-length faces))
+                                    (let ((face (vector-ref faces i)))
+                                      (when (ray-intersects-sphere? orig dir (get-center~ face) (+ radius (get-radius~ face)))
+                                        (proc face))))))
                           (set-visit~ area current-area-visit))))))
                 (let ((new-distance (+ position-distance step)))
                   (when (<= new-distance max-distance)
@@ -1485,20 +1486,20 @@
                     (iter)))))))))
   
   
-  (method (ray-closest-element orig <f32vector> dir <f32vector> max-distance <fl> (filter: filter #f) (ignore-players?: ignore-players? #f))
-    (travel-ray-elements
+  (method (ray-closest-face orig <f32vector> dir <f32vector> max-distance <fl> (filter: filter #f) (ignore-players?: ignore-players? #f))
+    (travel-ray-faces
       (lambda (iterate)
         (let ((closest #f)
               (distance #f))
           (iterate
-            (lambda (targ)
-              (let ((cls (ray-closest-triangle~ targ orig dir filter)))
+            (lambda (face)
+              (let ((cls (ray-closest-triangle~ face orig dir filter)))
                 (when cls
-                  (bind (face triangle dist) cls
+                  (bind (triangle dist) cls
                     (when (and (or (not distance)
                                    (< dist distance))
                                (< dist max-distance))
-                      (set! closest (cons targ cls))
+                      (set! closest (cons face cls))
                       (set! distance dist)))))))
           closest))
       orig
@@ -1867,9 +1868,23 @@
         (draw-history))
       (when draw-atlas?
         (draw-atlas))
-      (when target
-        (draw-target~ target)
-        (draw-editor-target))))
+      (cond (target
+             (draw-target~ target)
+             (draw-editor-target))
+            (target-face
+             (draw-face target-face)))))
+  
+  
+  (method (draw-face face)
+    (gl-colorize-dye red-dye)
+    (glLineWidth 2.)
+    (for-each (lambda (polygon)
+                (glBegin GL_LINE_LOOP)
+                (loop (for vert in-vector (get-vertices~ polygon))
+                      (glVertex3f (vertex-x vert) (vertex-y vert) (vertex-z vert)))
+                (glEnd))
+              (get-triangles~ face))
+    (glLineWidth 1.))
   
   
   (method (draw-neighbors proc)
@@ -1879,7 +1894,7 @@
         (iterate-position-outward-neighbor-sectors~ zone eye view-distance
           (lambda (sector)
             ;; frustum cull sectors that are behind the camera
-            (when (<= (inner-product (vertex- eye (get-center~ sector)) sight)
+            (when (<= (f32-ref (inner-product& (vertex-& eye (get-center~ sector)) sight))
                       radius)
               (proc sector)))))))
   
@@ -2974,41 +2989,42 @@
                              (cond ((/= (vertex-x editor-normal) 0.) vertex-x)
                                    ((/= (vertex-y editor-normal) 0.) vertex-y)
                                    ((/= (vertex-z editor-normal) 0.) vertex-z)))))
-          (lambda (element normal)
+          (lambda (face normal)
             (and editor-normal
                  (vertex=? normal editor-normal)
                  (or (not editor-from)
-                     (= (accessor (get-position~ element)) (accessor editor-from)))))))
+                     (= (accessor (get-center~ face)) (accessor editor-from)))))))
       
-      (define (column-filter element normal)
+      (define (column-filter face normal)
         (and (vertex=? normal editor-normal)
              editor-from
-             (let ((center (get-position~ element)))
+             (let ((center (get-center~ face)))
                (or (vertex=? center editor-from)
                    (vertex=? (vertex-normalize (vertex- center editor-from)) editor-normal)))))
       
-      (define (free-filter element normal)
+      (define (free-filter face normal)
         (vertex=? normal editor-normal))
       
-      (define (add-block vert element normal)
+      (define (add-block vert face normal)
         (unless (vertex->element~ zone vert)
           (let ((added (editor-add-at mode vert)))
             (when first?
               (set! editor-normal normal)
-              (set! editor-from (if element
-                                    (get-position~ element)
+              (set! editor-from (if face
+                                    (get-center~ face)
                                   (vertex+ (get-position~ added) (vertex-scalar* normal -5.))))
-              (set! editor-floor? (boolean (not element)))))))
+              (set! editor-floor? (boolean (not face)))))))
       
-      (let ((closest (ray-closest-element eye direction (get-radius~ zone) filter: (determine-filter) ignore-players?: #t)))
+      (let ((closest (ray-closest-face eye direction (get-radius~ zone) filter: (determine-filter) ignore-players?: #t)))
         (if closest
-            (bind (element face triangle distance) closest
-              (if (and brush-mode? brush)
+            (bind (face triangle distance) closest
+              (let ((element (get-element~ face)))
+                (if (and brush-mode? brush)
+                    (let ((normal (get-normal~ triangle)))
+                      (set-face-texture element face brush)
+                      (set! editor-normal normal))
                   (let ((normal (get-normal~ triangle)))
-                    (set-face-texture element face brush)
-                    (set! editor-normal normal))
-                (let ((normal (get-normal~ triangle)))
-                  (add-block (vertex+ (get-position~ element) (vertex-scalar* normal 5.)) element normal))))
+                    (add-block (vertex+ (get-center~ face) (vertex-scalar* normal 5.)) face normal)))))
           (when (or first? (memq? mode '(free crazy)) (and editor-floor? (neq? mode 'column)))
             (let ((vert (ray-plane-intersection eye direction grid? grid-plane grid-position floor-grid?: #t)))
               (when vert
@@ -3116,11 +3132,12 @@
               (add-action~ commands 'edit (list editor-mode grid? grid-plane grid-position eye direction 'up)))
           (case projection
             ((perspective)
-             (let ((closest (ray-closest-element eye direction (get-radius~ zone) ignore-players?: #t)))
+             (let ((closest (ray-closest-face eye direction (get-radius~ zone) ignore-players?: #t)))
                (if (not closest)
                    (set-target #f)
-                 (bind (element face) closest
-                   (set-target element face)))))
+                 (bind (face triangle distance) closest
+                   (let ((element (get-element~ face)))
+                     (set-target element face))))))
             (else
              (let ((vert (ray-plane-intersection eye direction grid? grid-plane grid-position)))
                (if (not vert)
@@ -4195,6 +4212,7 @@
         ,(format "zone: {s}" zone)
         ,(format "sectors: {s}, {s} non empty" (table-length (get-sectors~ zone)) (count-sectors-with-tiles~ zone))
         ,(format "areas: {s}" (table-length (get-areas~ zone)))
+        ,(format "faces: {s}" (count-faces~ zone))
         ,(format "tiles: {s}" (length (get-tiles~ zone)))
         ,(format "entities: {s}" (length (get-entities~ zone)))
         ,(format "actors: {s}" (length (get-actors~ zone)))
