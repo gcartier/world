@@ -108,6 +108,10 @@
   (set! animations-acceleration acceleration))
 
 
+(definition transition-duration
+  .2)
+
+
 (class Animation extends Object
   
   
@@ -136,7 +140,7 @@
   
   
   (method (find-joint-index name) <fx>
-    (loop (for i <fx> iterate (set! i 0) (< i (cast <fx> (vector-length joints))) (increase! i))
+    (loop (for i from 0 below (vector-length joints))
           (when (equal? (get-name~ (cast <Joint> (vector-ref joints i))) name)
             (return i))
           (finally -1)))
@@ -228,10 +232,12 @@
 (class Morphing extends Object
   
   
-  (slot animation     <object> accessors generate)
-  (slot current-time  <fl>     accessors generate)
-  (slot morphs        <object> initialize #f getter generate)
-  (slot bone-matrices <object> initialize #f getter generate)
+  (slot animation        <object> accessors generate)
+  (slot current-time     <fl>     accessors generate)
+  (slot morphs           <object> initialize #f getter generate)
+  (slot bone-matrices    <object> initialize #f getter generate)
+  (slot transition       <object> initialize #f accessors generate)
+  (slot transition-frame <fl+>    initialize #f accessors generate)
   
   
   (method override (initialize animation)
@@ -271,13 +277,15 @@
   
   (method (evaluate-morph index <fx> frame <fl>) <void>
     (declare (optimize-dead-local-variables))
-    (let ((morph <Morph> (vector-ref morphs index)))
-      (let ((joint (get-joint~ morph)))
+    (let ((morph <Morph> (vector-ref morphs index))
+          (transition-morph <Morph+> (and transition (vector-ref (get-morphs~ transition) index))))
+      (let ((joint (get-joint~ morph))
+            (transition-joint (and transition-morph (get-joint~ transition-morph))))
         ;; calculate joint animation matrix, this matrix will animate local-skeleton-matrix
         (let ((pos (vertex& 0. 0. 0.)))
           (let ((position-keys (get-position-keys~ joint)))
             (let ((num-position-keys <fx> (vector-length position-keys)))
-              (when (> num-position-keys 0)
+              (when (and (> num-position-keys 0) (or (not transition-joint) (> (vector-length (get-position-keys~ transition-joint)) 0)))
                 (let ((i1 (fx& -1))
                       (i2 (fx& -1)))
                   ;; find the two keys, where "frame" is in between for the position channel
@@ -301,13 +309,19 @@
                               (vertex-copy! pos (get-key~ last-key))))))
                     ;; there are such keys, so interpolate using hermite interpolation
                     (let ((key1 <KeyFrame> (vector-ref position-keys (fx-ref i1)))
-                          (key2 <KeyFrame> (vector-ref position-keys (fx-ref i2)))
+                          (key2 <KeyFrame> (if (not transition)
+                                               (vector-ref position-keys (fx-ref i2))
+                                             (vector-ref (get-position-keys~ transition-joint) 0)))
                           (tan1 <Tangent> (vector-ref (get-tangents~ joint) (fx-ref i1)))
-                          (tan2 <Tangent> (vector-ref (get-tangents~ joint) (fx-ref i2))))
+                          (tan2 <Tangent> (if (not transition)
+                                              (vector-ref (get-tangents~ joint) (fx-ref i2))
+                                            (vector-ref (get-tangents~ transition-joint) 0))))
                       ;; normalize the time between the keys into [0..1]
                       (let ((t <fl>
-                              (/ (- frame (get-time~ key1))
-                                 (- (get-time~ key2) (get-time~ key1)))))
+                              (if transition
+                                  (/ transition-frame transition-duration)
+                                (/ (- frame (get-time~ key1))
+                                   (- (get-time~ key2) (get-time~ key1))))))
                         (let ((t2 <fl> (* t t)))
                           (let ((t3 <fl> (* t2 t)))
                             ;; calculate hermite basis
@@ -322,7 +336,7 @@
               (let ((quat (quaternion& 0. 0. 0. 1.))
                     (rotation-keys (get-rotation-keys~ joint)))
                 (let ((num-rotation-keys <fx> (vector-length rotation-keys)))
-                  (when (> num-rotation-keys 0)
+                  (when (and (> num-rotation-keys 0) (or (not transition-joint) (> (vector-length (get-rotation-keys~ transition-joint)) 0)))
                     (let ((i1 (fx& -1))
                           (i2 (fx& -1)))
                       ;; find the two keys, where "frame" is in between for the rotation channel
@@ -346,10 +360,14 @@
                                   (angle-quaternion! quat (get-key~ last-key))))))
                         ;; there are such keys, so do the quaternion slerp interpolation
                         (let ((key1 <KeyFrame> (vector-ref rotation-keys (fx-ref i1)))
-                              (key2 <KeyFrame> (vector-ref rotation-keys (fx-ref i2))))
+                              (key2 <KeyFrame> (if (not transition)
+                                                   (vector-ref rotation-keys (fx-ref i2))
+                                                 (vector-ref (get-rotation-keys~ transition-joint) 0))))
                           (let ((t <fl>
-                                  (/ (- frame (get-time~ key1))
-                                     (- (get-time~ key2) (get-time~ key1)))))
+                                  (if transition
+                                      (/ transition-frame transition-duration)
+                                    (/ (- frame (get-time~ key1))
+                                       (- (get-time~ key2) (get-time~ key1))))))
                             (let ((q1 (make-quaternion&)))
                               (angle-quaternion! q1 (get-key~ key1))
                               (let ((q2 (make-quaternion&)))
@@ -399,8 +417,11 @@
   
   (method public (animate elapse)
     (declare (optimize-dead-local-variables))
-    (let ((new-time (flmodulo (+ current-time (* elapse (get-animation-fps~ animation) animations-acceleration)) (cast <fl> (get-total-frames~ animation)))))
-      (goto-time new-time)))
+    (if transition
+        (let ((new-time (+ transition-frame (* elapse animations-acceleration))))
+          (goto-transition new-time))
+      (let ((new-time (flmodulo (+ current-time (* elapse (get-animation-fps~ animation) animations-acceleration)) (cast <fl> (get-total-frames~ animation)))))
+        (goto-time new-time))))
   
   
   (method public (goto-time time)
@@ -408,6 +429,16 @@
     (set! current-time time)
     (evaluate-frame current-time)
     (set! bone-matrices (extract-bone-matrices)))
+  
+  
+  (method (goto-transition time)
+    (set! transition-frame time)
+    (evaluate-frame current-time)
+    (set! bone-matrices (extract-bone-matrices)))
+  
+  
+  (method (transition-done?)
+    (and transition (>= transition-frame transition-duration)))
   
   
   (method (extract-bone-matrices)
