@@ -193,17 +193,17 @@
   (slot texture             getter generate)
   (slot texture-coordinates accessors generate)
   (slot transparent?        getter generate)
-  (slot render              getter generate)
+  (slot generate            getter generate)
   
   
-  (method override (initialize name id subid texture transparent? render)
+  (method override (initialize name id subid texture transparent? generate)
     (set! name~self name)
     (set! id~self id)
     (set! subid~self subid)
     (set! texture~self texture)
     (set! texture-coordinates~self #f)
     (set! transparent?~self transparent?)
-    (set! render~self render))
+    (set! generate~self generate))
   
   
   (method override (print output readably)
@@ -226,7 +226,7 @@
   #x1A)
 
 
-(definition (register-block name id (texture #f) (transparent? #f) (render #f))
+(definition (register-block name id (texture #f) (transparent? #f) (generate #f))
   (let ((id (if (pair? id) (car id) id))
         (subid (if (pair? id) (cadr id) #f)))
     (when (not subid)
@@ -234,7 +234,7 @@
                        ((#t) dont-care-texture)
                        ((#f) unknown-texture)
                        (else texture))))
-        (let ((block (new Minecraft-Block-Model name id subid texture transparent? render)))
+        (let ((block (new Minecraft-Block-Model name id subid texture transparent? generate)))
           (table-set! blocks name block)
           (vector-set! blockids id block))))))
 
@@ -1111,6 +1111,19 @@
 
 
 ;;;
+;;;; Sector
+;;;
+
+
+(class Minecraft-Sector extends Sector
+  
+  
+  (method override (initialize index center)
+    (nextmethod index center)
+    (set! physical-uptodate? #f)))
+
+
+;;;
 ;;;; Zone
 ;;;
 
@@ -1126,6 +1139,10 @@
   (/ generate-total generate-count))
 
 
+(definition generate-mutex
+  (make-mutex 'generate))
+
+
 (class Minecraft-Zone extends Zone
   
   
@@ -1139,6 +1156,10 @@
   
   (form
     (<install> floor-level: -500.))
+  
+  
+  (method override (sector-class)
+    Minecraft-Sector)
   
   
   (method (close-regions)
@@ -1195,7 +1216,7 @@
   (method override (generate-content sector <Sector>)
     (define (generate)
       (let ((before (real-time)))
-        (generate-content-threaded sector)
+        (generate-sector sector 'render)
         (let ((after (real-time)))
           (let ((duration (- after before)))
             (set! generate-count (+ generate-count 1.))
@@ -1216,14 +1237,25 @@
       (generate)))
   
   
-  (method (generate-content-threaded sector <Sector>)
+  (method override (generate-physical sector <Sector>)
+    (generate-sector sector 'physical))
+  
+  
+  (method (generate-sector sector <Sector> what)
+    (mutex-lock! generate-mutex)
+    (generate-sector-safe sector what)
+    (mutex-unlock! generate-mutex))
+  
+  
+  (method (generate-sector-safe sector <Sector> what)
     (let ((sector-index (get-index~ sector)))
       (let ((sector-x (vector-ref sector-index 0))
             (sector-y (vector-ref sector-index 1))
             (sector-z (vector-ref sector-index 2)))
         (let ((region (sector-region sector-x sector-y sector-z)))
           (if (not region)
-              (decrease-sectors-generating)
+              (when (eq? what 'render)
+                (decrease-sectors-generating))
             (let ((region-x (get-x~ region))
                   (region-z (get-z~ region))
                   (section (get-section~ region sector-x sector-y sector-z))
@@ -1231,7 +1263,8 @@
               (assert (= region-x (fxfloor/ sector-x region-size)))
               (assert (= region-z (fxfloor/ sector-z region-size)))
               (if (not section)
-                  (decrease-sectors-generating)
+                  (when (eq? what 'render)
+                    (decrease-sectors-generating))
                 (let* ((yPos (fxfloor/ sector-y region-size))
                        (blocks (get-blocks~ section))
                        (data (get-data~ section))
@@ -1332,11 +1365,12 @@
                                                    (y (+ block-radius (* block-size (cast <fl> y))))
                                                    (z (+ block-radius (* block-size (cast <fl> z))))
                                                    (transparent? (get-transparent?~ block))
-                                                   (render (get-render~ block)))
+                                                   (generate (get-generate~ block)))
                                                (define (add-face center <f32vector> face <Face>)
                                                  (set! faces (cons face faces))
-                                                 (let ((area (index-area (position-area-index center))))
-                                                   (table-add areas area (get-polygon~ face))))
+                                                 (when (eq? what 'physical)
+                                                   (let ((area (index-area (position-area-index center) #f)))
+                                                     (table-add areas area (get-polygon~ face)))))
                                                
                                                (define (add-transparent-face center <f32vector> face <Face>)
                                                  (set! faces (cons face faces)))
@@ -1354,25 +1388,28 @@
                                                       (not (get-transparent?~ (blockid->block block-id)))))
                                                
                                                (let ((center (vertex x y z)))
-                                                 (cond (render
-                                                        (render block-id (data-ref i j k) center x y z block-radius uv add-face add-transparent-face add-block))
+                                                 (cond (generate
+                                                        (generate block-id (data-ref i j k) center x y z block-radius uv add-face add-transparent-face add-block))
                                                        (transparent?
                                                         (add-cross-faces x y z block-radius uv center add-transparent-face))
                                                        (else
                                                         (add-block center uv uv uv uv uv uv))))))))))))))
-                  (iterate-table areas
-                    (lambda (area polygons)
-                      (add-polygons~ area #f polygons)))
-                  (let ((faces (list->vector faces)))
-                    (receive (vertices neighbors) (prepare-vertices/neighbors~ sector faces)
-                      (let ((lightmap (prepare-lightmap~ sector faces)))
-                        (post-event
-                          (lambda ()
-                            (fill-vertices/neighbors~ sector vertices neighbors)
-                            (set-vertices-uptodate?~ sector #t)
-                            (fill-lightmap~ sector lightmap)
-                            (set-lightmap-uptodate?~ sector #t)
-                            (decrease-sectors-generating))))))))))))))
+                  (case what
+                    ((physical)
+                     (iterate-table areas
+                       (lambda (area polygons)
+                         (add-polygons~ area #f polygons))))
+                    ((render)
+                     (let ((faces (list->vector faces)))
+                       (receive (vertices neighbors) (prepare-vertices/neighbors~ sector faces)
+                         (let ((lightmap (prepare-lightmap~ sector faces)))
+                           (post-event
+                             (lambda ()
+                               (fill-vertices/neighbors~ sector vertices neighbors)
+                               (set-vertices-uptodate?~ sector #t)
+                               (fill-lightmap~ sector lightmap)
+                               (set-lightmap-uptodate?~ sector #t)
+                               (decrease-sectors-generating))))))))))))))))
   
   
   ;;;
