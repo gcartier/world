@@ -41,7 +41,8 @@
         (world.sector)
         (world.syntax (phase syntax))
         (world.texture)
-        (world.triangle))
+        (world.triangle)
+        (profiler))
 
 
 (proclaim (warn optimizations))
@@ -1603,6 +1604,10 @@
                 (decrease-sectors-generating sector priority)
               (let ((before (real-time)))
                 (generate-sector sector priority 'render)
+                @profile
+                (with-profile 'generate
+                  (lambda ()
+                    (generate-sector sector priority 'render)))
                 (let ((after (real-time)))
                   (let ((duration (- after before)))
                     (set! generate-count (+ generate-count 1.))
@@ -1646,6 +1651,7 @@
                         (section-y (* sector-y 16))
                         (section-z (+ (* region-z 32 16) (* (cast <fx> (cdr chunk-index)) 16)))
                         (sections <vector> (make-vector 27 #t))
+                        (cache <s8vector> (make-s8vector (* 18 18 18 2) -1))
                         (block-size 5.)
                         (block-radius 2.5)
                         (faces '())
@@ -1670,6 +1676,9 @@
                     (define (section-index a <fx> b <fx> c <fx>) <fx>
                       (+ (* (+ b 1) 9) (* (+ c 1) 3) (+ a 1)))
                     
+                    (define (cache-index i <fx> j <fx> k <fx>) <fx>
+                      (* (+ (* (+ j 1) 324) (* (+ k 1) 18) (+ i 1)) 2))
+                    
                     (define (blocks-get section <Minecraft-Section>) <s8vector>
                       (get-blocks~ section))
                     
@@ -1693,11 +1702,34 @@
                     (define (data-ref i <fx> j <fx> k <fx>) <fx>
                       (field-ref i j k data-get s4vector-ref 0 0))
                     
+                    (define (effective-block-ref i <fx> j <fx> k <fx>) <fx>
+                      (let ((index (cache-index i j k)))
+                        (let ((value (s8vector-ref cache index)))
+                          (if (/= value -1)
+                              value
+                            ;; need to use data information here
+                            (let ((value (block-ref i j k)))
+                              (s8vector-set! cache index value)
+                              value)))))
+                    
                     (define (blocklight-ref i <fx> j <fx> k <fx>) <fx>
                       (field-ref i j k blocklight-get s4vector-ref 0 0))
                     
                     (define (skylight-ref i <fx> j <fx> k <fx>) <fx>
                       (field-ref i j k skylight-get s4vector-ref 0 0))
+                    
+                    (define (light-ref i <fx> j <fx> k <fx>) <fx>
+                      (let ((index (+ (cache-index i j k) 1)))
+                        (let ((value (s8vector-ref cache index)))
+                          (if (/= value -1)
+                              value
+                            (let ((value (max (blocklight-ref i j k)
+                                              (cast <fx> (let ((skylight (skylight-ref i j k)))
+                                                           (if (eq? day-cycle 'day)
+                                                               skylight
+                                                             (- skylight 11)))))))
+                              (s8vector-set! cache index value)
+                              value)))))
                     
                     (define (s4vector-ref field <s8vector> index <fx>) <fx>
                       (let ((byte (s8vector-ref field (quotient index 2))))
@@ -1733,7 +1765,7 @@
                            (for (k 0 16)
                                 (for (i 0 16)
                                      (let ((block-y (+ section-y j)))
-                                       (let ((block-id <fx> (block-ref i j k)))
+                                       (let ((block-id <fx> (effective-block-ref i j k)))
                                          (when (/= block-id 0)
                                            (let ((x (+ section-x i))
                                                  (y block-y)
@@ -1755,32 +1787,22 @@
                                                    (set! faces (cons face faces)))
                                                  
                                                  (define (add-block center <f32vector> left-uv <f32vector> right-uv <f32vector> bottom-uv <f32vector> top-uv <f32vector> back-uv <f32vector> front-uv <f32vector> lighting)
-                                                   (unless (opaque? (block-ref (- i 1) j k)) (add-face center (left-side   x y z block-radius left-uv lighting)))
-                                                   (unless (opaque? (block-ref (+ i 1) j k)) (add-face center (right-side  x y z block-radius right-uv lighting)))
-                                                   (unless (opaque? (block-ref i (- j 1) k)) (add-face center (bottom-side x y z block-radius bottom-uv lighting)))
-                                                   (unless (opaque? (block-ref i (+ j 1) k)) (add-face center (top-side    x y z block-radius top-uv lighting)))
-                                                   (unless (opaque? (block-ref i j (- k 1))) (add-face center (back-side   x y z block-radius back-uv lighting)))
-                                                   (unless (opaque? (block-ref i j (+ k 1))) (add-face center (front-side  x y z block-radius front-uv lighting))))
+                                                   (unless (opaque? (effective-block-ref (- i 1) j k)) (add-face center (left-side   x y z block-radius left-uv lighting)))
+                                                   (unless (opaque? (effective-block-ref (+ i 1) j k)) (add-face center (right-side  x y z block-radius right-uv lighting)))
+                                                   (unless (opaque? (effective-block-ref i (- j 1) k)) (add-face center (bottom-side x y z block-radius bottom-uv lighting)))
+                                                   (unless (opaque? (effective-block-ref i (+ j 1) k)) (add-face center (top-side    x y z block-radius top-uv lighting)))
+                                                   (unless (opaque? (effective-block-ref i j (- k 1))) (add-face center (back-side   x y z block-radius back-uv lighting)))
+                                                   (unless (opaque? (effective-block-ref i j (+ k 1))) (add-face center (front-side  x y z block-radius front-uv lighting))))
                                                  
                                                  (define (opaque? block-id <fx>)
                                                    (and (/= block-id 0)
                                                         (not (get-transparent?~ (blockid->block block-id)))))
                                                  
                                                  (define (compute-lighting ax <fx> ay <fx> az <fx> bx <fx> by <fx> bz <fx> cx <fx> cy <fx> cz <fx> dx <fx> dy <fx> dz <fx>)
-                                                   (define (light x <fx> y <fx> z <fx>) <fx>
-                                                     (let ((i (+ i x))
-                                                           (j (+ j y))
-                                                           (k (+ k z)))
-                                                       (max (blocklight-ref i j k)
-                                                            (cast <fx> (let ((skylight (skylight-ref i j k)))
-                                                                         (if (eq? day-cycle 'day)
-                                                                             skylight
-                                                                           (- skylight 11)))))))
-                                                   
-                                                   (+ (light ax ay az)
-                                                      (light bx by bz)
-                                                      (light cx cy cz)
-                                                      (light dx dy dz)))
+                                                   (+ (light-ref (+ i ax) (+ j ay) (+ k az))
+                                                      (light-ref (+ i bx) (+ j by) (+ k bz))
+                                                      (light-ref (+ i cx) (+ j cy) (+ k cz))
+                                                      (light-ref (+ i dx) (+ j dy) (+ k dz))))
                                                  
                                                  (define (no-lighting from-a <fx> to-a <fx> from-b <fx> to-b <fx> from-c <fx> to-c <fx>)
                                                    0.)
