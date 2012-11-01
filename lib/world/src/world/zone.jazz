@@ -42,6 +42,7 @@
         (world.element)
         (world.enemy)
         (world.entity)
+        (world.face)
         (world.folio)
         (world.foreign)
         (world.foreign.triangulate)
@@ -65,6 +66,7 @@
         (world.syntax (phase syntax))
         (world.texture)
         (world.tile)
+        (world.triangle)
         (world.window)
         (world.client.window))
 
@@ -1407,38 +1409,57 @@
     #t)
   
   
-  (method override (generate-content sector)
+  (method override (generate-content sector <Sector>)
+    (define (generate)
+      (let ((index (get-index~ sector)))
+        (let ((x (vector-ref index 0))
+              (y (vector-ref index 1))
+              (z (vector-ref index 2)))
+          (when (= y 0)
+            (let ((size (/ sector-size 5)))
+              (let ((from-x (* x size))
+                    (width size)
+                    (from-z (* z size))
+                    (depth size))
+                (generate-procedural sector from-x width from-z depth 'render))))))
+      (set-content-revision~ sector (get-current-content-revision))
+      (set-content-uptodate?~ sector #t)
+      (decrease-sectors-generating sector))
+    
+    (if (find-setting 'world.generate-threaded? #t)
+        (post-content generate)
+      (generate)))
+  
+  
+  (method override (generate-physical sector <Sector>)
     (let ((index (get-index~ sector)))
       (let ((x (vector-ref index 0))
             (y (vector-ref index 1))
             (z (vector-ref index 2)))
-        (when (and (= y 0)
-                   (let ((max-size (find-setting 'world.procedural-size #f)))
-                     (or (not max-size)
-                         (let ((from (- max-size))
-                               (to (- max-size 1)))
-                           (and (between? x from to)
-                                (between? z from to))))))
+        (when (= y 0)
           (let ((size (/ sector-size 5)))
             (let ((from-x (* x size))
                   (width size)
                   (from-z (* z size))
                   (depth size))
-              (generate-procedural from-x width from-z depth))))))
-    (set-content-revision~ sector (get-current-content-revision))
-    (set-content-uptodate?~ sector #t)
-    (decrease-sectors-generating sector))
+              (generate-procedural sector from-x width from-z depth 'physical)))))))
   
   
-  (method (generate-procedural from-x <fx> width <fx> from-z <fx> depth <fx>)
-    (let ((x-count (+ width 1))
+  (method (generate-procedural sector <Sector> from-x <fx> width <fx> from-z <fx> depth <fx> what)
+    (define (generate-done)
+      (set-content-revision~ sector (get-current-content-revision))
+      (set-content-uptodate?~ sector #t)
+      (decrease-sectors-generating sector))
+    
+    (let ((world (current-world))
+          (x-count (+ width 1))
           (z-count (+ depth 1)))
       (define (generate-heightmap)
         (let ((heightmap <f32vector> (make-f32vector (* x-count z-count))))
           (for (x 0 x-count)
                (for (z 0 z-count)
                     (f32vector-set! heightmap (+ (* x z-count) z)
-                      ;; max and min are quick hack until perlin generator is fixed
+                      ;; max and min are quick hacks until perlin generator is fixed
                       (max 0. (min 50. (get-value~ generator (cast <fl> (+ from-x x)) (cast <fl> (+ from-z z))))))))
           heightmap))
       
@@ -1461,67 +1482,112 @@
                             (vector-set! vertices index (vertex x y z))
                             (vector-set! normals index (vertex 0. 0. 0.)))))))
             ;; add triangles
-            (let ((squares (make-vector (* width depth))))
-              (define (safe-square x <fx> z <fx>)
-                (and
-                  (>= x 0) (< x width)
-                  (>= z 0) (< z depth)
-                  (get-square x z)))
-              (define (get-square x <fx> z <fx>)
-                (vector-ref squares (+ (* x depth) z)))
-              (define (set-square x <fx> z <fx> square)
-                (vector-set! squares (+ (* x depth) z) square))
-              (define (make-square t1 t2)
-                (cons t1 t2))
-              (define (square-t1 square)
-                (car square))
-              (define (square-t2 square)
-                (cdr square))
-              (for (x 0 width)
-                   (for (z 0 depth)
-                        (let ((v1 (get-vertex x (+ z 1)))
-                              (v2 (get-vertex (+ x 1) (+ z 1)))
-                              (v3 (get-vertex (+ x 1) z))
-                              (v4 (get-vertex x z)))
-                          (let ((triangle1
-                                  (add-element
-                                    (new Triangle-Tile
-                                      v1: v1
-                                      v2: v2
-                                      v3: v3
-                                      parent: self)))
-                                (triangle2
-                                  (add-element
-                                    (new Triangle-Tile
-                                      v1: v3
-                                      v2: v4
-                                      v3: v1
-                                      parent: self))))
-                            (set-square x z (make-square triangle1 triangle2))))))
-              (for (x 0 x-count)
-                   (for (z 0 z-count)
-                        (let ((normal (get-normal x z))
-                              (tl (safe-square (- x 1) (- z 1)))
-                              (tr (safe-square x (- z 1)))
-                              (bl (safe-square (- x 1) z))
-                              (br (safe-square x z)))
-                          (when tl
-                            (vertex-increase! normal (get-normal~ (square-t1 tl))))
-                          (when tr
-                            (vertex-increase! normal (get-normal~ (square-t1 tr)))
-                            (vertex-increase! normal (get-normal~ (square-t2 tr))))
-                          (when bl
-                            (vertex-increase! normal (get-normal~ (square-t1 bl)))
-                            (vertex-increase! normal (get-normal~ (square-t2 bl))))
-                          (when br
-                            (vertex-increase! normal (get-normal~ (square-t2 br))))
-                          (vertex-normalize! normal normal))))
-              (for (x 0 width)
-                   (for (z 0 depth)
-                        (let ((square (get-square x z)))
-                          (set-n1~ (square-t1 square) (get-normal x (+ z 1)))
-                          (set-n2~ (square-t1 square) (get-normal (+ x 1) (+ z 1)))
-                          (set-n3~ (square-t1 square) (get-normal (+ x 1) z))
-                          (set-n1~ (square-t2 square) (get-normal (+ x 1) z))
-                          (set-n2~ (square-t2 square) (get-normal x z))
-                          (set-n3~ (square-t2 square) (get-normal x (+ z 1))))))))))))))
+            (let ((squares (make-vector (* width depth)))
+                  (faces '())
+                  (areas (make-table test: eq?))
+                  (default-image (get-default-image~ world)))
+              (let ((uv (image-rect~ (get-tile-atlas~ world) default-image)))
+                (let ((tl (uv-left uv))
+                      (tt (uv-top uv))
+                      (tr (uv-right uv))
+                      (tb (uv-bottom uv))
+                      (texture-depth (uv-depth uv)))
+                  (define (safe-square x <fx> z <fx>)
+                    (and
+                      (>= x 0) (< x width)
+                      (>= z 0) (< z depth)
+                      (get-square x z)))
+                  (define (get-square x <fx> z <fx>)
+                    (vector-ref squares (+ (* x depth) z)))
+                  (define (set-square x <fx> z <fx> square)
+                    (vector-set! squares (+ (* x depth) z) square))
+                  (define (make-square t1 t2)
+                    (cons t1 t2))
+                  (define (square-t1 square) <Smooth-Triangle>
+                    (get-polygon~ (cast <Face> (car square))))
+                  (define (square-t2 square) <Smooth-Triangle>
+                    (get-polygon~ (cast <Face> (cdr square))))
+                  (define (add-face face <Face>)
+                    (set! faces (cons face faces))
+                    (when (eq? what 'physical)
+                      (let ((center (get-center~ (get-polygon~ face))))
+                        (let ((area (index-area (position-area-index center) #f)))
+                          (table-add areas area (get-polygon~ face))))))
+                  (define (add-triangle v1 v2 v3)
+                    (let ((normal (plane-normal v1 v2 v3)))
+                      (let ((face
+                              (if (> (vertex-x v1) (vertex-x v2))
+                                  (make-face #f
+                                             (f32vector tl tb tr tb tr tt)
+                                             texture-depth
+                                             (make-smooth-triangle self
+                                                                   normal
+                                                                   v1 v2 v3
+                                                                   normal normal normal))
+                                (make-face #f
+                                           (f32vector tr tt tl tt tl tb)
+                                           texture-depth
+                                           (make-smooth-triangle self
+                                                                 normal
+                                                                 v1 v2 v3
+                                                                 normal normal normal)))))
+                        (add-face face)
+                        face)))
+                  ;; add triangles
+                  (for (x 0 width)
+                       (for (z 0 depth)
+                            (let ((v1 (get-vertex x (+ z 1)))
+                                  (v2 (get-vertex (+ x 1) (+ z 1)))
+                                  (v3 (get-vertex (+ x 1) z))
+                                  (v4 (get-vertex x z)))
+                              (let ((triangle1 (add-triangle v1 v2 v3))
+                                    (triangle2 (add-triangle v3 v4 v1)))
+                                (set-square x z (make-square triangle1 triangle2))))))
+                  ;; smooth normals
+                  (for (x 0 x-count)
+                       (for (z 0 z-count)
+                            (let ((normal (get-normal x z))
+                                  (tl (safe-square (- x 1) (- z 1)))
+                                  (tr (safe-square x (- z 1)))
+                                  (bl (safe-square (- x 1) z))
+                                  (br (safe-square x z)))
+                              (when tl
+                                (vertex-increase! normal (get-normal~ (square-t1 tl))))
+                              (when tr
+                                (vertex-increase! normal (get-normal~ (square-t1 tr)))
+                                (vertex-increase! normal (get-normal~ (square-t2 tr))))
+                              (when bl
+                                (vertex-increase! normal (get-normal~ (square-t1 bl)))
+                                (vertex-increase! normal (get-normal~ (square-t2 bl))))
+                              (when br
+                                (vertex-increase! normal (get-normal~ (square-t2 br))))
+                              (vertex-normalize! normal normal))))
+                  ;; update normals
+                  (for (x 0 width)
+                       (for (z 0 depth)
+                            (let ((square (get-square x z)))
+                              (set-n1~ (square-t1 square) (get-normal x (+ z 1)))
+                              (set-n2~ (square-t1 square) (get-normal (+ x 1) (+ z 1)))
+                              (set-n3~ (square-t1 square) (get-normal (+ x 1) z))
+                              (set-n1~ (square-t2 square) (get-normal (+ x 1) z))
+                              (set-n2~ (square-t2 square) (get-normal x z))
+                              (set-n3~ (square-t2 square) (get-normal x (+ z 1))))))
+                  (case what
+                    ((physical)
+                     (when (eq? self (current-zone))
+                       (iterate-table areas
+                         (lambda (area <Area> polygons)
+                           (add-polygons~ area #f polygons)))))
+                    ((render)
+                     (let ((faces (list->vector faces)))
+                       (receive (vertices neighbors) (prepare-vertices/neighbors~ sector faces)
+                         (let ((lightmap (prepare-lightmap~ sector faces)))
+                           (post-event
+                             (lambda ()
+                               (when (eq? self (current-zone))
+                                 (free-mesh~ sector)
+                                 (fill-vertices/neighbors~ sector vertices neighbors)
+                                 (set-vertices-uptodate?~ sector #t)
+                                 (fill-lightmap~ sector lightmap)
+                                 (set-lightmap-uptodate?~ sector #t)
+                                 (generate-done)))))))))))))))))))
