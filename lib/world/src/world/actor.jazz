@@ -65,7 +65,9 @@
 (class Actor extends Entity
   
   
-  (slot lookat                  <LookAt>     initialize (make-standard-lookat) getter generate)
+  (property lookat              <LookAt>     initialize (make-standard-lookat) getter generate setter explicit)
+  
+  
   (slot velocity                <f64vector>  initialize (make-zero-vertex)     getter generate)
   (slot fall-velocity           <f64vector>  initialize (make-zero-vertex)     getter generate)
   (slot direction               <f64vector+> initialize #f                     accessors generate)
@@ -256,6 +258,65 @@
   ;;;
   
   
+  (definition public missile-speed <fl>
+    1.)
+  
+  (definition public missile-delay <fl>
+    .1)
+
+  
+  ;(method (maybe-add-action name arguments)
+  ;  (if (<= global-cooldown 0.)
+  ;      (add-action~ commands name (arguments))
+  ;    (set! global-cooldown (- global-cooldown 0.))))
+  
+  
+  (method (maybe-fire commands kind)
+    (let ((seconds (time->seconds (current-time))))
+      (when (or (not last-missile)
+                (> (- seconds last-missile) (/ missile-delay rapid-fire-acceleration)))
+        (fire commands kind)
+        (set! last-missile seconds))))
+  
+  
+  (method (fire commands kind)
+    (let ((world (current-world))
+          (fire-direction (find-setting 'world.fire-direction 'eye)))
+      (let ((direction (case fire-direction
+                         ((eye) (get-sight~ (get-eye-lookat~ world)))
+                         ((player) (get-sight~ (get-lookat~ (current-me))))
+                         (else (error "Invalid world.fire-direction: {s}" fire-direction)))))
+        (add-action~ commands 'fire (list direction kind)))))
+  
+  
+  (method (fire-missile direction kind)
+    (let ((world (current-world))
+          (zone (current-zone)))
+      (when (< missiles-count max-missiles)
+        (let ((target (player-target~ world self)))
+          (let ((pos (vertex+ target (vertex-scalar* direction (- radius .1)))))
+            (let ((missile (new (missile-class~ world) parent: world position: pos actor: self kind: kind)))
+              (increase-missiles)
+              (set-velocity~ missile (vertex-scalar* direction missile-speed))
+              (add-element~ zone missile)))))))
+  
+  
+  (method (start-rapid-fire)
+    (set! rapid-fire-acceleration 3.)
+    (set! rapid-fire-duration 15.)
+    (set! rapid-fire-cooldown 45.))
+  
+  
+  (method (blink (reversed? #f))
+    (let ((world (current-world)))
+      (set-position (vertex+ position (vertex-scalar* (get-sight~ (get-eye-lookat~ world)) (if reversed? -2. 2.))))
+      (follow-player~ world)))
+  
+  
+  (method (sprint)
+    (set! acceleration 5.))
+  
+  
   (method public virtual (wound)
     (let ((world (current-world)))
       (let ((critical? (> (random-real) .5)))
@@ -287,7 +348,7 @@
     #f)
   
   
-  (method (tick-controlled commands elapse exit)
+  (method (tick-actor controller commands elapse exit)
     (let ((world (current-world))
           (zone (current-zone))
           (me (current-me)))
@@ -324,9 +385,13 @@
           (when (and (get-strafe-down?~ commands) fly?)
             (strafe-player-down~ world self factor))
           (when (and (get-rotate-left?~ commands) first-person?)
-            (rotate-player-left~ world self factor))
+            (rotate-player-left~ world self factor)
+            (when (neq? controller self)
+              (set-property 'lookat lookat)))
           (when (and (get-rotate-right?~ commands) first-person?)
-            (rotate-player-right~ world self factor))
+            (rotate-player-right~ world self factor)
+            (when (neq? controller self)
+              (set-property 'lookat lookat)))
           (when (and fly?
                      (not (get-rotate-left?~ commands))
                      (not (get-rotate-right?~ commands)))
@@ -334,8 +399,8 @@
         (cond ((or floor? fly?)
                (vertex-copy! velocity target-velocity))
               (grace-over?
-                (vertex-copy! velocity target-velocity)
-                (set! jump-grace? #f))
+               (vertex-copy! velocity target-velocity)
+               (set! jump-grace? #f))
               ((or (not jumping?)
                    (> (- (time->seconds (current-time)) jump-time) 1.))
                (let ((reduce (* .2 elapse)))
@@ -349,7 +414,8 @@
             (set! jumping? #t)
             (set! jump-grace? (vertex-zero? velocity))
             (set! jump-time (time->seconds (current-time)))
-            (vertex-y-set! fall-velocity (get-jump-impulsion~ world))))
+            (vertex-y-set! fall-velocity (get-jump-impulsion~ world))
+            (context-animation "JumpStart")))
         (when (< (vertex-y fall-velocity) max-fall-vy)
           (vertex-y-set! fall-velocity max-fall-vy))
         (receive (sphere-matrix inverse-matrix) (sphere-matrices)
@@ -377,7 +443,9 @@
                           (set! jumping? #f)
                           (set! floor? #t)))))
                   (let ((old-position (copy-vertex position)))
-                    (set-position new-fall)
+                    (if (eq? self controller)
+                        (set-position new-fall)
+                      (set-property 'position new-fall))
                     @wait
                     (when (< (get-y) die-bottom)
                       (lose~ world self)
@@ -385,7 +453,7 @@
                     (update-area~ zone self old-position)
                     (update-sector~ zone self old-position)
                     (vertex-! movement position old-position)
-                    (when (and @gazoum (eq? self me)
+                    (when (and @to-redo-was-commented-after-conversion-for-mind-control (eq? self me)
                                (not (vertex=? old-position new-fall)))
                       (camera-center-player~ world)))))))))))
   
@@ -399,34 +467,36 @@
     )
   
   
-  (method (tick-actions-controlled commands)
+  (method (tick-actor-actions controller commands)
     (let ((world (current-world)))
       (when (get-modified?~ commands)
-        (let ((first-person? (get-first-person?~ world)))
-          (for-each (lambda (action)
-                      (bind (name . arguments) action
-                        (case name
-                          ((track)
-                           (bind (dh dv eye-sight eye-up eye-right first?) arguments
-                             (track-actor~ world self dh dv eye-sight eye-up eye-right first?)))
-                          ((edit)
-                           (bind (mode grid? grid-plane grid-position eye direction stage) arguments
-                             (editor-edit~ world mode grid? grid-plane grid-position eye direction stage)))
-                          ((delete)
-                           (bind (position) arguments
-                             (editor-delete~ world position)))
-                          @w
-                          ((fire)
-                           (bind (direction kind) arguments
-                             (when first-person?
-                               (fire-missile direction kind))))
-                          @w
-                          ((rapid-fire)
-                           (start-rapid-fire))
-                          @w
-                          ((sit)
-                           (sit-down)))))
-                    (get-actions~ commands))))))
+        (for-each (lambda (action)
+                    (bind (name . arguments) action
+                      (tick-actor-action controller name arguments)))
+                  (get-actions~ commands)))))
+  
+  
+  (method protected virtual (tick-actor-action controller name arguments)
+    (let ((world (current-world)))
+      (case name
+        ((track)
+         (bind (dh dv eye-sight eye-up eye-right first?) arguments
+           (track-actor~ world self dh dv eye-sight eye-up eye-right first?)
+           (when (neq? controller self)
+              (set-property 'lookat lookat))))
+        ((edit)
+         (bind (mode grid? grid-plane grid-position eye direction stage) arguments
+           (editor-edit~ world mode grid? grid-plane grid-position eye direction stage)))
+        ((delete)
+         (bind (position) arguments
+           (editor-delete~ world position)))
+        ((fire)
+         (let ((first-person? (get-first-person?~ world)))
+           (bind (direction kind) arguments
+             (when first-person?
+               (fire-missile direction kind)))))
+        ((rapid-fire)
+         (start-rapid-fire)))))
   
   
   (method protected virtual (hit collisions exit)
@@ -442,26 +512,27 @@
     #f)
   
   
-  (method (idle-controlled)
+  (method (idle-actor)
     (when floor?
       (set-velocity (make-zero-vertex)))
     (context-animation #f))
   
   
   (method protected virtual (context-animation name (duration: duration #f) (next: next #f))
-    (let ((minimum-delay .15))
-      (let ((elapsed (and animation-start (- (time->seconds (current-time)) animation-start))))
-        (unless (and elapsed (< elapsed minimum-delay))
-          (let ((proposed-animation (cond (jumping? (if (and elapsed (< elapsed 1.)) "JumpStart" "Jump"))
-                                          ((not floor?) "Fall")
-                                          (else name))))
-            (let ((effective-animation (and (find-animation~ model proposed-animation) proposed-animation)))
-              (unless (equal? animation-active effective-animation)
-                (set! animation-active effective-animation)
-                (set! animation-start (time->seconds (current-time)))
-                (if (equal? animation-active "JumpStart")
-                    (change-morphing animation-active frame: .5)
-                  (transition-morphing animation-active)))))))))
+    (when model
+      (let ((minimum-delay .15))
+        (let ((elapsed (and animation-start (- (time->seconds (current-time)) animation-start))))
+          (unless (and elapsed (< elapsed minimum-delay))
+            (let ((proposed-animation (cond (jumping? (if (and elapsed (< elapsed 1.)) "JumpStart" "Jump"))
+                                            ((not floor?) "Fall")
+                                            (else name))))
+              (let ((effective-animation (and (find-animation~ model proposed-animation) proposed-animation)))
+                (unless (equal? animation-active effective-animation)
+                  (set! animation-active effective-animation)
+                  (set! animation-start (time->seconds (current-time)))
+                  (if (equal? animation-active "JumpStart")
+                      (change-morphing animation-active frame: .5)
+                    (transition-morphing animation-active))))))))))
   
   
   ;;;
