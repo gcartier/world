@@ -41,6 +41,8 @@
         (world.texture)
         (world.tile))
 
+(native vector-shrink!)
+(native append-vectors)
 
 (proclaim (warn optimizations))
 
@@ -510,7 +512,7 @@
                 (loop-y (+ y 1)))
               (loop-x (+ x 1)))))))
 
-(definition public (ico-sphere-generator N <fx> uv <f32vector>)
+(definition public (ico-sphere-generator-old N <fx> uv <f32vector>)
   (lambda (setup-proc triangle-proc quad-proc)
     (let ((nb-tiles (* 20 N N))
           (vertices (make-ico-sphere-vertices N)))
@@ -531,5 +533,197 @@
              v2 #f tr tb
              v3 #f tr tt
             texture-depth)))))))
+
+;;-----------------------------------------------------------------------------
+
+;; Planet stuff.
+
+(define (make-planet N radius vertices voxels)
+  (vector N radius vertices voxels))
+
+(define (planet-N p) (vector-ref p 0))
+(define (planet-radius p) (vector-ref p 1))
+(define (planet-vertices p) (vector-ref p 2))
+(define (planet-voxels p) (vector-ref p 3))
+
+#;
+(define-type planet
+  N
+  radius
+  vertices
+  voxels
+)
+
+(define empty-voxel #b000)
+(define full-voxel  #b111)
+
+(define (planet-create N radius max-alt)
+  (let* ((nb-tiles (* 20 N N))
+         (vertices (make-ico-sphere-vertices N))
+         (voxels (list->vector
+                  (map (lambda (x)
+                         (make-u8vector nb-tiles empty-voxel))
+                       (vector->list (make-vector max-alt))))))
+    (make-planet N
+                 radius
+                 vertices
+                 voxels)))
+
+(define (planet-init planet)
+  (let* ((N (planet-N planet))
+         (vertices (planet-vertices planet))
+         (voxels (planet-voxels planet)))
+
+    (define (voxel-set! x y z type)
+      (u8vector-set! (vector-ref voxels z) (trix->tile x y N) type))
+
+    (voxel-set! 0 0 0 full-voxel)
+
+    (voxel-set! 5 5 0 #b101)
+
+    (voxel-set! 2 5 0 #b001)
+))
+
+(define (planet-draw planet setup triangle)
+  (let* ((N (planet-N planet))
+         (radius (planet-radius planet))
+         (vertices (planet-vertices planet))
+         (voxels (planet-voxels planet))
+         (tri-buf (make-vector 4000))
+         (tri-buf-len 0)
+         (tri-bufs '()))
+
+    (define (tri v1 v2 v3 texture)
+      (if (= tri-buf-len (vector-length tri-buf))
+          (begin
+            (set! tri-bufs (cons tri-buf tri-bufs))
+            (set! tri-buf (make-vector tri-buf-len))
+            (set! tri-buf-len 0)))
+      (vector-set! tri-buf (+ tri-buf-len 0) v1)
+      (vector-set! tri-buf (+ tri-buf-len 1) v2)
+      (vector-set! tri-buf (+ tri-buf-len 2) v3)
+      (vector-set! tri-buf (+ tri-buf-len 3) texture)
+      (set! tri-buf-len (+ tri-buf-len 4)))
+
+    ;; draw ground
+
+    (for-each-ico-sphere-tile
+     N
+     vertices
+     (lambda (x y v1 v2 v3)
+       (tri v1 v2 v3 0)))
+
+    ;; draw voxels
+
+    (let loop ((alt 0))
+      (if (< alt (vector-length voxels))
+          (let ((vox (vector-ref voxels alt)))
+
+            (define (scale v s)
+              (vertex (fl* (vertex-x v) s)
+                      (fl* (vertex-y v) s)
+                      (fl* (vertex-z v) s)))
+
+            (define (scale-alt v alt)
+              (scale v (fl/ (exact->inexact (+ radius alt))
+                            (exact->inexact radius))))
+
+            (for-each-ico-sphere-tile
+             N
+             vertices
+             (lambda (x y v1 v2 v3)
+               (let ((type (u8vector-ref vox (trix->tile x y N))))
+                 (if (not (= type empty-voxel))
+                     (let ((zv1 (modulo (quotient type 1) 2))
+                           (zv2 (modulo (quotient type 2) 2))
+                           (zv3 (modulo (quotient type 4) 2)))
+
+                       (define (face v1 v2 v3 alt1 alt2 alt3 texture)
+                         (tri (scale-alt v1 (+ alt alt1))
+                              (scale-alt v2 (+ alt alt2))
+                              (scale-alt v3 (+ alt alt3))
+                              texture))
+
+                       ;; bottom face
+                       (face v3 v2 v1   0   0   0 0)
+
+                       ;; top face
+                       (face v1 v2 v3 zv1 zv2 zv3 type)
+
+                       ;; side faces
+
+                       (case (+ zv1 zv2)
+                         ((2)
+                          (face v1 v1 v2   0 zv1 zv2 8)
+                          (face v1 v2 v2   0   0 zv2 8))
+                         ((1)
+                          (if (= zv1 1)
+                              (face v1 v1 v2   0 zv1 zv2 8)
+                              (face v1 v2 v2 zv1 zv2   0 8))))
+
+                       (case (+ zv1 zv3)
+                         ((2)
+                          (face v1 v1 v3   0 zv1 zv3 8)
+                          (face v1 v3 v3   0   0 zv3 8))
+                         ((1)
+                          (if (= zv1 1)
+                              (face v1 v1 v3   0 zv1 zv3 8)
+                              (face v1 v3 v3 zv1 zv3   0 8))))
+
+                       (case (+ zv2 zv3)
+                         ((2)
+                          (face v2 v2 v3   0 zv2 zv3 8)
+                          (face v2 v3 v3   0   0 zv3 8))
+                         ((1)
+                          (if (= zv2 1)
+                              (face v2 v2 v3   0 zv2 zv3 8)
+                              (face v2 v3 v3 zv2 zv3   0 8))))
+
+                       )))))
+
+            (loop (+ alt 1)))))
+
+    (vector-shrink! tri-buf tri-buf-len)
+
+    (let* ((tris (append-vectors
+                  (reverse
+                   (cons tri-buf
+                         tri-bufs))))
+           (nb-tris (quotient (vector-length tris) 4)))
+      (setup nb-tris)
+      (let loop ((i 0))
+        (if (< i nb-tris)
+            (begin
+              (triangle (vector-ref tris (+ (* i 4) 0))
+                        (vector-ref tris (+ (* i 4) 1))
+                        (vector-ref tris (+ (* i 4) 2))
+                        (vector-ref tris (+ (* i 4) 3)))
+              (loop (+ i 1))))))))
+
+(definition public (ico-sphere-generator N <fx> uv <f32vector>)
+  (lambda (setup-proc triangle-proc quad-proc)
+    (let ((planet (planet-create N N 10))) ;; N, radius, max-altitude
+
+      (planet-init planet) ;; add a few prisms
+
+      (planet-draw planet
+
+                   (lambda (nb-tris)
+                     (setup-proc nb-tris 0))
+
+                   (lambda (v1 v2 v3 texture)
+                     ;;texture is 0 for ground, 1 to 7 for top of prism, and 8 for sides
+                     (let ((tl (uv-left uv))
+                           (tt (uv-top uv))
+                           (tr (uv-right uv))
+                           (tb (uv-bottom uv))
+                           (texture-depth (uv-depth uv)))
+                       (triangle-proc
+                        v1 #f tl tb
+                        v2 #f tr tb
+                        v3 #f tr tt
+                        texture-depth)))))))
+
+;;-----------------------------------------------------------------------------
 
 )
