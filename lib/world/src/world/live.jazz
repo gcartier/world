@@ -190,7 +190,7 @@
   (slot projection             <symbol>          initialize 'orthographic   getter generate)
   (slot zoom-factor            <fl>              initialize 0.              getter generate)
   (slot desired-tilt           <fl>              initialize 0.              getter generate)
-  (slot tilt-speed             <fl>              initialize 0.              getter generate)
+  (slot tilt-speed             <fl+>             initialize #f              getter generate)
   (slot last-tilt-time         <fl+>             initialize #f              getter generate)
   (slot 3d?                    <bool>            initialize #f              getter generate)
   (slot eye?                   <bool>            initialize #f              getter generate)
@@ -632,7 +632,9 @@
               (for-each (lambda (proc)
                           (proc elapse))
                         tick-procedures))
-            (restore-first-distance elapse))))))
+            (restore-first-distance elapse)
+            (when me
+              (process-tilt me)))))))
   
   
   (method (tick-actors commands elapse)
@@ -1865,14 +1867,16 @@
   
   (method (rotate-player-left player factor)
     (rotate-player-horizontal player (* player-rotation-speed factor))
+    @buggy
     (when fly?
-      (tilt-player player -1.)))
+      (tilt-player player 1.)))
   
   
   (method (rotate-player-right player factor)
     (rotate-player-horizontal player (- (* player-rotation-speed factor)))
+    @buggy
     (when fly?
-      (tilt-player player 1.)))
+      (tilt-player player -1.)))
   
   
   (method (rotate-player-horizontal player angle (follow-player?: follow-player? #t))
@@ -1899,91 +1903,95 @@
           (follow-player)))))
   
   
-  (method (tilt-player player speed)
-    @fix-tilt
-    (let ((lookat (get-lookat~ player))
-          (max-tilt PI/8)
-          (max-speed 0.4))
-      (let ((current (vertical-angle (get-right~ lookat) (get-up~ lookat)))
-            (desired (* (sign speed) max-tilt)))
+  (method (reset-tilt player)
+    (set! desired-tilt 0.)
+    (set! tilt-speed .25)
+    (process-tilt player))
+  
+  
+  (method (tilt-player player angle)
+    (let ((max-tilt PI/4))
+      (let ((desired (max (- max-tilt) (min max-tilt (* (- angle) 25.)))))
         (set! desired-tilt desired)
-        (set! tilt-speed (min (/ (abs speed) 50000.) max-speed))
-        (set! last-tilt-time (current-seconds))
+        (set! tilt-speed .25)
         (process-tilt player))))
   
   
-  (method (reset-player-tilt player)
-    @fix-tilt
-    (when (or (not last-tilt-time)
-              (> (- (current-seconds) last-tilt-time) .1))
-      (set! desired-tilt 0.)
-      (set! tilt-speed .015)
-      (process-tilt player)))
-  
-  
   (method (process-tilt player)
-    @fix-tilt
-    (let ((lookat (get-lookat~ player)))
-      (let ((current (vertical-angle (get-right~ lookat) (get-up~ lookat))))
-        (unless (near? current desired-tilt .001)
-          (let ((direction (sign (- desired-tilt current))))
-            (let ((new-tilt (+ current (* direction tilt-speed))))
-              (case direction
-                ((1) (when (> new-tilt desired-tilt) (set! new-tilt desired-tilt)))
-                ((-1) (when (< new-tilt desired-tilt) (set! new-tilt desired-tilt))))
-              (let ((inc (- new-tilt current)))
-                (increase-player-tilt player inc))))))))
+    (when (and tilt-speed (or (not last-tilt-time) (> (- (current-seconds) last-tilt-time) .01)))
+      (let ((lookat (get-lookat~ player)))
+        (let ((current (vertical-angle (get-right~ lookat) world-up)))
+          (if (near? current desired-tilt .001)
+              (set! tilt-speed #f)
+            (let ((damper 10.))
+              (let ((target-tilt (/ (+ desired-tilt (* damper current)) (+ 1. damper))))
+                (increase-tilt player (max (- tilt-speed) (min tilt-speed (- target-tilt current)))))))))))
   
   
-  (method (increase-player-tilt player inc)
-    @fix-tilt
+  (method (increase-tilt player inc)
     (let ((lookat (get-lookat~ player)))
-      (rotate-lookat! lookat inc (get-sight~ lookat))))
+      (when (or (> (abs inc) .01)
+                (> (- (current-seconds) last-tilt-time) .05))
+        (set! last-tilt-time (current-seconds))
+        (rotate-lookat! lookat inc (get-sight~ lookat)))))
   
   
   (method (track-actor actor dh dv local-sight local-up local-right first?)
+    (if fly?
+        (track-actor-fly actor dh dv local-sight local-up local-right first?)
+      (track-actor-floor actor dh dv local-sight local-up local-right first?)))
+  
+  
+  (method (track-actor-floor actor dh dv camera-sight camera-up camera-right first?)
     (let ((me (current-controlled)))
       (let ((me? (eq? actor me))
-            (local-lookat (make-lookat))
-            @fix-tilt
-            (tilt (vertical-angle right world-up))
-            (dh (cast <fl> dh))
-            (dv (cast <fl> dv)))
-        (set-sight~ local-lookat local-sight)
-        (set-up~ local-lookat local-up)
-        (set-right~ local-lookat local-right)
-        ;; remove tilt
-        @fix-tilt
-        (when (and me? (not fly?) (not paused?))
-          (rotate-lookat! local-lookat (- tilt) local-sight))
-        (let ((pitch (vertical-angle local-sight world-up)))
+            (angleh (/ (- (cast <fl> dh)) track-sensitivity))
+            (anglev (/ (- (cast <fl> dv)) track-sensitivity))
+            (actor-lookat (get-lookat~ actor))
+            (camera-lookat (lookat camera-sight camera-up camera-right)))
+        (let ((pitch (vertical-angle camera-sight world-up)))
           ;; remove pitch
-          (when (and me? (not fly?) (not paused?))
-            (rotate-lookat-vertical! local-lookat pitch))
-          ;; start from the eye lookat
-          (when first?
-            (let ((lookat (get-lookat~ actor)))
-              (set-sight~ lookat (get-sight~ local-lookat))
-              (set-up~ lookat (get-up~ local-lookat))
-              (set-right~ lookat (get-right~ local-lookat))))
-          ;; restore tilt
-          @fix-tilt
-          (when (and me? fly? (not paused?))
-            (rotate-lookat! local-lookat (- tilt) sight))
-          ;; restore pitch
-          (when (and me? fly? (not paused?))
-            (rotate-lookat-vertical! local-lookat (- pitch)))
-          (rotate-player-horizontal actor (/ (- dh) track-sensitivity) follow-player?: #f)
-          (if fly?
-              (rotate-player-vertical actor (/ (- dv) track-sensitivity) follow-player?: #f)
-            (when (and me? (not paused?))
-              (rotate-vertical-up (/ (- dv) track-sensitivity) (get-up~ (get-lookat~ actor)))))
           (when (and me? (not paused?))
-            (follow-actor actor))
-          @fix-tilt
-          (when (and fly? (/= dh 0.))
-            (let ((speed (/ (cast <fl> dh) elapse)))
-              (tilt-player actor speed)))))))
+            (rotate-lookat-vertical! camera-lookat pitch))
+          ;; start from the camera lookat
+          (when first?
+            (lookat-copy! actor-lookat camera-lookat))
+          (rotate-player-horizontal actor angleh follow-player?: #f)
+          (when (and me? (not paused?))
+            (rotate-vertical-up anglev (get-up~ (get-lookat~ actor))))
+          (when (and me? (not paused?))
+            (follow-actor actor))))))
+  
+  
+  (method (track-actor-fly actor dh dv camera-sight camera-up camera-right first?)
+    (let ((me (current-controlled)))
+      (let ((me? (eq? actor me))
+            (angleh (/ (- (cast <fl> dh)) track-sensitivity))
+            (anglev (/ (- (cast <fl> dv)) track-sensitivity))
+            (actor-lookat (get-lookat~ actor))
+            (camera-lookat (lookat camera-sight camera-up camera-right)))
+        ;; start from the camera lookat
+        (when first?
+          (lookat-copy! actor-lookat camera-lookat))
+        
+        ;; adjust pitch
+        (let ((actor-horizon (vertex-normalize (cross-product (get-sight~ actor-lookat) world-up))))
+          (rotate-lookat! actor-lookat anglev actor-horizon)
+          (rotate-lookat! eye-lookat anglev actor-horizon))
+        
+        ;; adjust tilt
+        (tilt-player actor angleh)
+        
+        ;; adjust rotation
+        (rotate-lookat! actor-lookat angleh world-up)
+        (rotate-lookat! eye-lookat angleh world-up)
+
+        ;; update matrix
+        (update-matrix~ me)
+        
+        ;; eye follows player
+        (when (and me? (not paused?))
+          (follow-actor actor)))))
   
   
   (method (mind-control)
@@ -4425,7 +4433,7 @@
     
     (when (eq? projection 'perspective)
       (let ((me (current-me)))
-        (if (and me moving? (or (not paused?) (neq? projection 'perspective)))
+        (if (and me moving? first-person? (or (not paused?) (neq? projection 'perspective)))
             (let ((first? (not moved?)))
               (add-action~ commands 'track (list dh dv (copy-vertex (get-sight~ eye-lookat)) (copy-vertex (get-up~ eye-lookat)) (copy-vertex (get-right~ eye-lookat)) first?))
               (set! moved? #t))
@@ -4459,7 +4467,7 @@
   (method protected virtual (right-mouse-up h v)
     (let ((me (current-me)))
       (when me
-        (reset-player-tilt me))
+        (reset-tilt me))
       (restore/show-cursor)
       (set! moving? #f)
       (reset-viewing)))
