@@ -3227,6 +3227,7 @@
   (slot editing?         <bool>   initialize #f  getter generate)
   (slot adding?          <bool>   initialize #f  getter generate)
   (slot deleting?        <bool>   initialize #f  getter generate)
+  (slot removing?        <bool>   initialize #f  getter generate)
   (slot widget-down      <object> initialize #f  getter generate)
   (slot widget-part      <object> initialize #f  getter generate)
   (slot template-mode?   <bool>   initialize #f  getter generate)
@@ -4004,7 +4005,7 @@
                     (add-block vert #f normal))))))))))
   
   
-  (method (editor-edit mode grid? grid-plane grid-position eye direction stage)
+  (method (editor-add mode grid? grid-plane grid-position eye direction stage)
     (let ((zone (current-zone)))
       (case stage
         ((down)
@@ -4070,16 +4071,53 @@
          (set! editor-floor? #f)))))
   
   
-  (method (warn-non-editable)
+  (method (editor-remove mode eye direction stage)
     (let ((zone (current-zone)))
-      (unless (get-editable-warned?~ zone)
-        (set-editable-warned?~ zone #t)
-        (open-message "Zone is not editable"
-                      caption: "Edition"
-                      type: 'message
-                      execute: (lambda (evt)
-                                 (let ((dialog (find-ascendant~ (get-sender~ evt) World-Dialog)))
-                                   (close~ dialog)))))))
+      (define (determine-filter)
+        (case mode
+          ((block) (block-filter))
+          ((column) column-filter)
+          ((free) #f)))
+      
+      (define (block-filter)
+        (let ((accessor (and editor-normal
+                             (cond ((/= (vertex-x editor-normal) 0.) vertex-x)
+                                   ((/= (vertex-y editor-normal) 0.) vertex-y)
+                                   ((/= (vertex-z editor-normal) 0.) vertex-z)))))
+          (lambda (poly normal)
+            (and editor-normal
+                 (vertex=? normal editor-normal)
+                 (or (not editor-from)
+                     (= (accessor (get-center~ poly)) (accessor editor-from)))))))
+      
+      (define (column-filter poly normal)
+        (and (vertex=? normal editor-normal)
+             editor-from
+             (let ((center (get-center~ poly)))
+               (or (vertex=? center editor-from)
+                   (vertex=? (vertex-normalize& (vertex-& editor-from center)) editor-normal)))))
+      
+      (case stage
+        ((down)
+         (let ((closest (ray-closest-polygon eye direction view-radius ignore-players?: #t)))
+           (when closest
+             (bind (poly distance) closest
+               (let ((element (get-element~ poly))
+                     (normal (get-normal~ poly)))
+                 (editor-remove-element element)
+                 (set! editor-normal normal)
+                 (set! editor-from (get-center~ poly)))))))
+        ((move)
+         (let ((closest (ray-closest-polygon eye direction view-radius filter: (determine-filter) ignore-players?: #t)))
+           (when closest
+             (bind (poly distance) closest
+               (let ((element (get-element~ poly)))
+                 (editor-remove-element element))))))
+        ((up)
+         (set! editing? #f)
+         (set! removing? #f)
+         (set! editor-normal #f)
+         (set! editor-from #f)))))
   
   
   (method (editor-delete position)
@@ -4095,47 +4133,62 @@
   
   (method (editor-mouse-down h v)
     (let ((zone (current-zone)))
-      (if (control-down?)
-          (if (or (zone-editable?~ zone)
-                  ;; quick hack
-                  (and (control-down?)
-                       (shift-down?)
-                       (alt-down?)))
-              (let ((me (current-me)))
-                (receive (eye direction) (screen->ray h v)
-                  (if paused?
-                      (editor-edit editor-mode grid? grid-plane grid-position eye direction 'down)
-                    (add-action~ commands 'edit (list editor-mode grid? grid-plane grid-position eye direction 'down)))
-                  (set! editing? #t)))
-            (warn-non-editable))
-        (when target-widget
-          (receive (eye direction) (screen->ray h v)
-            (let ((closest (ray-closest-widget eye direction target-widget)))
-              (when closest
-                (bind (poly distance) closest
-                  (bind (widget . part) (get-element~ poly)
-                    (set! widget-down widget)
-                    (set! widget-part part)
-                    (widget-mouse-down~ widget-down h v))))))))))
+      (cond ;; add
+            ((control-down?)
+             (if (or (zone-editable?~ zone)
+                     ;; quick hack
+                     (and (control-down?)
+                          (shift-down?)
+                          (alt-down?)))
+                 (receive (eye direction) (screen->ray h v)
+                   (if paused?
+                       (editor-add editor-mode grid? grid-plane grid-position eye direction 'down)
+                     (add-action~ commands 'add (list editor-mode grid? grid-plane grid-position eye direction 'down)))
+                   (set! editing? #t))
+               (warn-non-editable)))
+            ;; remove
+            ((alt-down?)
+             (if (zone-editable?~ zone)
+                 (receive (eye direction) (screen->ray h v)
+                   (editor-remove editor-mode eye direction 'down)
+                   (set! editing? #t)
+                   (set! removing? #t))
+               (warn-non-editable)))
+            ;; widget
+            (else
+             (when target-widget
+               (receive (eye direction) (screen->ray h v)
+                 (let ((closest (ray-closest-widget eye direction target-widget)))
+                   (when closest
+                     (bind (poly distance) closest
+                       (bind (widget . part) (get-element~ poly)
+                         (set! widget-down widget)
+                         (set! widget-part part)
+                         (widget-mouse-down~ widget-down h v)))))))))))
   
   
   (method (editor-mouse-move h v)
     (when editing?
-      (let ((me (current-me)))
-        (receive (eye direction) (screen->ray h v)
-          (if paused?
-              (editor-edit editor-mode grid? grid-plane grid-position eye direction 'move)
-            (add-action~ commands 'edit (list editor-mode grid? grid-plane grid-position eye direction 'move)))))))
+      (cond (removing?
+             (receive (eye direction) (screen->ray h v)
+               (editor-remove editor-mode eye direction 'move)))
+            (else
+             (receive (eye direction) (screen->ray h v)
+               (if paused?
+                   (editor-add editor-mode grid? grid-plane grid-position eye direction 'move)
+                 (add-action~ commands 'add (list editor-mode grid? grid-plane grid-position eye direction 'move))))))))
   
   
   (method (editor-mouse-up h v)
-    (let ((zone (current-zone))
-          (me (current-me)))
+    (let ((zone (current-zone)))
       (receive (eye direction) (screen->ray (get-h~ down-point) (get-v~ down-point))
         (if editing?
-            (if paused?
-                (editor-edit editor-mode grid? grid-plane grid-position eye direction 'up)
-              (add-action~ commands 'edit (list editor-mode grid? grid-plane grid-position eye direction 'up)))
+            (cond (removing?
+                   (editor-remove editor-mode eye direction 'up))
+                  (else
+                   (if paused?
+                       (editor-add editor-mode grid? grid-plane grid-position eye direction 'up)
+                     (add-action~ commands 'add (list editor-mode grid? grid-plane grid-position eye direction 'up)))))
           (case projection
             ((perspective)
              (let ((closest (ray-closest-polygon eye direction view-radius ignore-entities?: #f ignore-players?: #t)))
@@ -4158,9 +4211,22 @@
       (set! editing? #f)
       (set! adding? #f)
       (set! deleting? #f)
+      (set! removing? #f)
       (set! editor-anchor #f)
       (set! editor-last #f)
       (set! editor-added #f)))
+  
+  
+  (method (warn-non-editable)
+    (let ((zone (current-zone)))
+      (unless (get-editable-warned?~ zone)
+        (set-editable-warned?~ zone #t)
+        (open-message "Zone is not editable"
+                      caption: "Edition"
+                      type: 'message
+                      execute: (lambda (evt)
+                                 (let ((dialog (find-ascendant~ (get-sender~ evt) World-Dialog)))
+                                   (close~ dialog)))))))
   
   
   ;;;
