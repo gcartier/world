@@ -1,0 +1,424 @@
+;;;==============
+;;;  JazzScheme
+;;;==============
+;;;
+;;;; Cameras
+;;;
+;;;  The Initial Developer of the Original Code is Guillaume Cartier.
+;;;  Portions created by the Initial Developer are Copyright (C) 2012-2013
+;;;  the Initial Developer. All Rights Reserved.
+;;;
+;;;  Contributor(s):
+
+
+(module world.camera jazz
+
+
+(import (jazz.geometry)
+        (jazz.graphic)
+        (jazz.graphic.opengl.glew)
+        (world)
+        (world.autoload)
+        (world.dye)
+        (world.dyes)
+        (world.geometry)
+        (world.homogeneous)
+        (world.lookat)
+        (world.opengl)
+        (world.syntax (phase syntax)))
+
+
+(definition public (make-camera)
+  (new Camera))
+
+
+;;;
+;;;; Camera
+;;;
+
+
+(class Camera extends Object
+  
+  
+  ;; camera
+  (slot position           <f64vector>       initialize (make-vertex) getter generate)
+  (slot target             <f64vector>       initialize (make-vertex) getter generate)
+  (slot lookat             <LookAt>          initialize (make-lookat) getter generate)
+  
+  ;; screen
+  (slot width              <fl>              initialize #f            accessors generate)
+  (slot height             <fl>              initialize #f            accessors generate)
+    
+  ;; projection
+  (slot projection         <symbol>          initialize 'orthographic getter generate)
+  
+  ;; perspective
+  (slot perspective-fov    <fl>              initialize 45.           accessors generate)
+  (slot perspective-near   <fl>              initialize 0.1           accessors generate)
+  (slot perspective-far    <fl>              initialize 10000.0       accessors generate)
+  (slot camera-distance    <fl>              initialize 60.           accessors generate)
+  
+  ;; orthographic
+  (slot zoom-factor        <fl>              initialize 0.            accessors generate)
+
+  ;; frustum
+  (slot frustum-left       <f64vector>       initialize (make-vertex) getter generate)
+  (slot frustum-bottom     <f64vector>       initialize (make-vertex) getter generate)
+  (slot frustum-right      <f64vector>       initialize (make-vertex) getter generate)
+  (slot frustum-top        <f64vector>       initialize (make-vertex) getter generate)
+  (slot frustum-left-dot   <fl>              initialize 0.            getter generate)
+  (slot frustum-bottom-dot <fl>              initialize 0.            getter generate)
+  (slot frustum-right-dot  <fl>              initialize 0.            getter generate)
+  (slot frustum-top-dot    <fl>              initialize 0.            getter generate)
+  
+  ;; movement
+  (slot move-speed         <fl>              initialize .2            accessors generate)
+  (slot blink-speed        <fl>              initialize .5            accessors generate)
+  (slot strafe-speed       <fl>              initialize 0.1           accessors generate)
+  (slot rotate-speed       <fl>              initialize 0.03          accessors generate)
+  
+  
+  ;;;
+  ;;;; Projection
+  ;;;
+  
+  
+  (method (prepare-projection)
+    (let ((ratio (/ width height)))
+      (glMatrixMode GL_PROJECTION)
+      (glLoadIdentity)
+      (case projection
+        ((perspective)
+         (gluPerspective perspective-fov ratio perspective-near perspective-far))
+        ((orthographic)
+         (let ((width zoom-factor))
+           (let ((height (/ width ratio)))
+             (glOrtho (- width) width (- height) height perspective-near perspective-far)))))))
+  
+  
+  (method (activate-perspective)
+    (set! projection 'perspective))
+  
+  
+  (method (activate-orthographic)
+    (reset-camera)
+    (set! projection 'orthographic))
+  
+  
+  (method (toggle-projection)
+    (case projection
+      ((perspective) (activate-orthographic))
+      ((orthographic) (activate-perspective))))
+  
+  
+  (method (setup-camera)
+    (let ((up (get-up~ lookat)))
+      (gluLookAt
+        (vertex-x position) (vertex-y position) (vertex-z position)
+        (vertex-x target) (vertex-y target) (vertex-z target)
+        (vertex-x up) (vertex-y up) (vertex-z up))))
+  
+  
+  (definition camera-limit <fl>
+    5.)
+  
+  
+  (method (strafe-camera center-x)
+    (let ((x (vertex-x position)))
+      (if (> center-x (+ x camera-limit))
+          (strafe-horizontally (- center-x (+ x camera-limit))))
+      (if (< center-x (- x camera-limit))
+          (strafe-horizontally (- center-x (- x camera-limit))))))
+    
+  
+  ;;;
+  ;;;; Screen
+  ;;;
+  
+  
+  (method (world->screen vertex)
+    (camera->screen position lookat vertex))
+  
+  
+  (method (camera->screen pos lookat vertex)
+    (let ((projection (make-projection-matrix& perspective-fov (/ width height) perspective-near perspective-far))
+          (view (make-view-matrix& pos lookat)))
+      (let ((projection/view (matrix-multiply& projection view)))
+        (let ((vert (matrix-transform& projection/view vertex)))
+          (new Point
+            (fxround (* (+ (vertex-x vert) 1.) (/ width 2.)))
+            (fxround (* (- 1. (vertex-y vert)) (/ height 2.))))))))
+  
+  
+  (method (screen->ray h v)
+    (let ((ratio (/ width height))
+          (ch (- h (/ width 2)))
+          (cv (- (- height v) (/ height 2))))
+      (case projection
+        ((perspective)
+         (let ((half-fov (/ (degree->radian perspective-fov) 2.))
+               (up (get-up~ lookat)))
+           (let ((cone (tan half-fov))
+                 (d (vertex-distance position target))
+                 (right (cross-product& (vertex-& target position) up)))
+             (let ((target-in-eye-space (vertex+& (vertex-scalar*& up (/ (* cv d cone 2.) height))
+                                                  (vertex+& (vertex-scalar*& right (/ (* ch d cone 2. ratio) width))
+                                                            target))))
+               (values (copy-vertex position) (vertex-normalize (vertex-& target-in-eye-space position)))))))
+        ((orthographic)
+         (let ((x (+ (/ (* 2. ch zoom-factor) width) (vertex-x position)))
+               (y (+ (/ (* 2. cv zoom-factor) height ratio) (vertex-y position))))
+           (values (vertex x y (vertex-z position)) (vertex 0. 0. -1.)))))))
+  
+  
+  ;;;
+  ;;;; Update
+  ;;;
+  
+  
+  (method (reset-camera)
+    (standardize-lookat! lookat)
+    (update-target))
+  
+  
+  (method (update-target)
+    (vertex+! target position (get-sight~ lookat))
+    (update-frustum))
+  
+  
+  ;;;
+  ;;;; Frustum
+  ;;;
+  
+  
+  (proclaim (warn optimizations))
+  
+  
+  (method (update-frustum)
+    (let ((zone (current-zone+)))
+      ;; quick hack around initialization order
+      (let ((radius (if (not zone) 13.856406460551018 (get-sector-radius~ zone))))
+        (frustum-normals! frustum-left frustum-bottom frustum-right frustum-top)
+        (set! frustum-left-dot (- (f64-ref (dot-product& frustum-left position)) radius))
+        (set! frustum-bottom-dot (- (f64-ref (dot-product& frustum-bottom position)) radius))
+        (set! frustum-right-dot (- (f64-ref (dot-product& frustum-right position)) radius))
+        (set! frustum-top-dot (- (f64-ref (dot-product& frustum-top position)) radius)))))
+  
+  
+  (method (frustum-normals! left-normal <f64vector> bottom-normal <f64vector> right-normal <f64vector> top-normal <f64vector>) <void>
+    ;; copied from screen->ray for performance
+    (let ((ratio (/ width height))
+          (half-fov (/ (degree->radian perspective-fov) 2.))
+          (up (get-up~ lookat)))
+      (let ((cone (tan half-fov))
+            (d (f64-ref (vertex-distance& position target)))
+            (right (cross-product& (vertex-& target position) up)))
+        (define (compute-normal! res <f64vector> h <fl> v <fl>) <void>
+          (let ((ch (- h (/ width 2.)))
+                (cv (- (- height v) (/ height 2.))))
+            (let ((target-in-eye-space (vertex+& (vertex-scalar*& up (/ (* cv d cone 2.) height))
+                                                 (vertex+& (vertex-scalar*& right (/ (* ch d cone 2. ratio) width))
+                                                           target))))
+              (vertex-normalize! res (vertex-& target-in-eye-space position)))))
+        
+        (let ((r00 (make-vertex&))
+              (r01 (make-vertex&))
+              (r10 (make-vertex&))
+              (r11 (make-vertex&)))
+          (compute-normal! r00 0. 0.)
+          (compute-normal! r01 0. height)
+          (compute-normal! r10 width 0.)
+          (compute-normal! r11 width height)
+          (cross-product! left-normal r01 r00)
+          (cross-product! bottom-normal r00 r10)
+          (cross-product! right-normal r10 r11)
+          (cross-product! top-normal r11 r01)))))
+  
+  
+  (method (in-frustum? center <f64vector>) <bool>
+    (and (>= (f64-ref (dot-product& frustum-left center)) frustum-left-dot)
+         (>= (f64-ref (dot-product& frustum-bottom center)) frustum-bottom-dot)
+         (>= (f64-ref (dot-product& frustum-right center)) frustum-right-dot)
+         (>= (f64-ref (dot-product& frustum-top center)) frustum-top-dot)))
+  
+  
+  (proclaim (not warn optimizations))
+
+  
+  ;;;
+  ;;;; Zoom
+  ;;;
+  
+  
+  (method (zoom-speed)
+    10.)
+
+  
+  (method (zoom-in)
+    (case projection
+      ((perspective)
+       (let ((me (get-camera-me)))
+         (increase! camera-distance (- (zoom-speed)))
+         (vertex+! position me (vertex-scalar*& (get-sight~ lookat) (- camera-distance)))
+         (update-target)))
+      ((orthographic)
+       (set! zoom-factor (* zoom-factor .75)))))
+  
+  
+  (method (zoom-out)
+    (case projection
+      ((perspective)
+       (let ((me (get-camera-me)))
+         (increase! camera-distance (zoom-speed))
+         (vertex+! position me (vertex-scalar*& (get-sight~ lookat) (- camera-distance)))
+         (update-target)))
+      ((orthographic)
+       (set! zoom-factor (/ zoom-factor .75)))))
+  
+  
+  (method (get-camera-me)
+    (vertex+ position (vertex-scalar*& (get-sight~ lookat) camera-distance)))
+  
+  
+  ;;;
+  ;;;; Movement
+  ;;;
+  
+  
+  (method (move-forward)
+    (vertex-copy! position (vertex+& position (vertex-scalar*& (get-sight~ lookat) move-speed)))
+    (update-target))
+  
+  
+  (method (move-backward)
+    (vertex-copy! position (vertex+& position (vertex-scalar*& (get-sight~ lookat) (- move-speed))))
+    (update-target))
+  
+  
+  (method (blink-forward)
+    (vertex-copy! position (vertex+& position (vertex-scalar*& (get-sight~ lookat) blink-speed)))
+    (update-target))
+  
+  
+  (method (blink-backward)
+    (vertex-copy! position (vertex+& position (vertex-scalar*& (get-sight~ lookat) (- blink-speed))))
+    (update-target))
+  
+  
+  (method (warp-forward speed distance)
+    (vertex-copy! position (vertex+& position (vertex-scalar*& (get-sight~ lookat) distance)))
+    (update-target))
+  
+  
+  (method (warp-backward speed distance)
+    (vertex-copy! position (vertex+& position (vertex-scalar*& (get-sight~ lookat) (- distance))))
+    (update-target))
+  
+  
+  (method (strafe-left)
+    (strafe-horizontally (- (* strafe-speed 2))))
+  
+  
+  (method (strafe-right)
+    (strafe-horizontally (* strafe-speed 2)))
+  
+  
+  (method (strafe-horizontally d)
+    (vertex-copy! position (vertex+& position (vertex-scalar*& (get-right~ lookat) d)))
+    (update-target))
+  
+  
+  (method (strafe-up)
+    (vertex-copy! position (vertex+& position (vertex-scalar*& (get-up~ lookat) (* strafe-speed 2))))
+    (update-target))
+  
+  
+  (method (strafe-down)
+    (vertex-copy! position (vertex+& position (vertex-scalar*& (get-up~ lookat) (- (* strafe-speed 2)))))
+    (update-target))
+  
+  
+  (method (rotate-left)
+    (rotate-horizontal rotate-speed))
+  
+  
+  (method (rotate-right)
+    (rotate-horizontal (- rotate-speed)))
+  
+  
+  (method (rotate-horizontal angle)
+    (let ((world (current-world)))
+      (rotate-lookat! lookat angle (get-world-up~ world))
+      (update-target)))
+  
+  
+  (method (rotate-up)
+    @wrong-number-of-parameters???
+    (rotate-vertical rotate-speed (get-right~ lookat) (get-sight~ lookat)))
+  
+  
+  (method (rotate-down)
+    (rotate-vertical (- rotate-speed)))
+  
+  
+  (method (rotate-vertical angle)
+    (let ((world (current-world)))
+      (rotate-lookat-vertical-up! lookat angle (get-world-up~ world))
+      (update-target)))
+  
+  
+  (method (rotate-vertical-up angle up)
+    (rotate-lookat-vertical-up! lookat angle up)
+    (update-target))
+  
+  
+  ;;;
+  ;;;; Orientation
+  ;;;
+  
+  
+  (method (draw-orientation)
+    (let ((center (vertex-& (vertex-& (vertex+& position (vertex-scalar*& (get-sight~ lookat) 5.)) (vertex-scalar*& (get-right~ lookat) 1.5)) (get-up~ lookat))))
+      (let ((sight (vertex+& center (get-sight~ lookat)))
+            (up (vertex+& center (get-up~ lookat)))
+            (right (vertex+& center (get-right~ lookat)))
+            (axis-x (vertex+& center (vertex 1. 0. 0.)))
+            (axis-y (vertex+& center (vertex 0. 1. 0.)))
+            (axis-z (vertex+& center (vertex 0. 0. 1.))))
+        (let ((cx (vertex-x center))
+              (cy (vertex-y center))
+              (cz (vertex-z center)))
+          (glLineWidth 2.)
+          (glDisable GL_LIGHTING)
+          (gl-colorize-dye white-dye)
+          (glBegin GL_LINES)
+          (glVertex3f cx cy cz)
+          (glVertex3f (vertex-x sight) (vertex-y sight) (vertex-z sight))
+          (glEnd)
+          (gl-colorize-dye white-dye)
+          (glBegin GL_LINES)
+          (glVertex3f cx cy cz)
+          (glVertex3f (vertex-x right) (vertex-y right) (vertex-z right))
+          (glEnd)
+          (gl-colorize-dye white-dye)
+          (glBegin GL_LINES)
+          (glVertex3f cx cy cz)
+          (glVertex3f (vertex-x up) (vertex-y up) (vertex-z up))
+          (glEnd)
+          (gl-colorize-dye red-dye)
+          (glBegin GL_LINES)
+          (glVertex3f cx cy cz)
+          (glVertex3f (vertex-x axis-x) (vertex-y axis-x) (vertex-z axis-x))
+          (glEnd)
+          (gl-colorize-dye green-dye)
+          (glBegin GL_LINES)
+          (glVertex3f cx cy cz)
+          (glVertex3f (vertex-x axis-y) (vertex-y axis-y) (vertex-z axis-y))
+          (glEnd)
+          (gl-colorize-dye blue-dye)
+          (glBegin GL_LINES)
+          (glVertex3f cx cy cz)
+          (glVertex3f (vertex-x axis-z) (vertex-y axis-z) (vertex-z axis-z))
+          (glEnd)
+          (glEnable GL_LIGHTING)
+          (glLineWidth 1.)))))))
