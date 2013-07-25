@@ -63,6 +63,7 @@
   (let ((generate/model (table-ref tiles name #f)))
     (if (procedure? generate/model)
         (let ((model (generate/model)))
+          (set-name~ model name)
           (table-set! tiles name model)
           model)
       generate/model)))
@@ -91,8 +92,12 @@
 (class Tile extends Element
   
   
-  (slot model              initialize #f getter generate)
-  (slot matrix <f64vector> initialize (make-identity-matrix) getter generate)
+  (property model  initialize #f accessors generate)
+  (property images initialize #f accessors generate)
+  
+  
+  (slot model-cache             initialize #f)
+  (slot matrix      <f64vector> initialize (make-identity-matrix) getter generate)
   
   
   (method override (prepare rest)
@@ -100,9 +105,11 @@
     (set-color (dye .525 .321 .004 1.)))
   
   
-  (method public (set-model mdl)
-    (set! model mdl)
-    (update-radiuses))
+  (method (cache-model)
+    (or model-cache
+        (let ((model (registered-tile model)))
+          (set! model-cache model)
+          model)))
   
   
   (method override (position-update)
@@ -117,10 +124,11 @@
   
   
   (method (update-radiuses)
-    (when model
-      (let ((bounds (get-bounds~ model)))
-        (when bounds
-          (set-radiuses (vertex* (cuboid-radiuses bounds) scale))))))
+    (let ((model (cache-model)))
+      (when model
+        (let ((bounds (get-bounds~ model)))
+          (when bounds
+            (set-radiuses (vertex* (cuboid-radiuses bounds) scale)))))))
   
   
   (method override (update-matrix)
@@ -130,127 +138,70 @@
   
   
   (method override (element-faces)
-    (if (not model)
-        (nextmethod)
-      (map (lambda (face poly)
-             (make-face (get-texture~ face) (get-texture-coordinates~ face) (get-texture-depth~ face) poly))
-           (get-faces~ model)
-           (element-polygons))))
+    (let ((model (cache-model)))
+      (if (not model)
+          (nextmethod)
+        (let ((rank 0))
+          (map (lambda (face poly)
+                 (prog1 (if (not images)
+                            (make-face (get-texture~ face) (get-texture-coordinates~ face) (get-texture-depth~ face) poly)
+                          (let ((image (list-ref images rank)))
+                            (if (not image)
+                                (make-face (get-texture~ face) (get-texture-coordinates~ face) (get-texture-depth~ face) poly)
+                              (let ((uv (image-coordinates image)))
+                                (let ((tl (uv-left uv))
+                                      (tt (uv-top uv))
+                                      (tr (uv-right uv))
+                                      (tb (uv-bottom uv))
+                                      (depth (uv-depth uv)))
+                                  (let ((coordinates (f32vector tl tt tl tb tr tb tr tt)))
+                                    ;; putting uv instead of coordinates
+                                    ;; gives rise to a really nice looking bug!
+                                    (make-face image coordinates depth poly)))))))
+                   (increase! rank)))
+               (get-faces~ model)
+               (element-polygons))))))
   
   
   (method override (element-polygons)
-    (if (not model)
-        (nextmethod)
-      (let ((polygons (get-polygons~ model))
-            (queue (new-queue)))
-        (for (i 0 (/ (f64vector-length polygons) polygon-float-size))
-             (let ((offset (* i polygon-float-size)))
-               (let ((poly (if (nan? (f64vector-ref polygons (+ offset 12)))
-                               (make-triangle self (make-zero-vertex) (make-zero-vertex) (make-zero-vertex))
-                             (make-quad self (make-zero-vertex) (make-zero-vertex) (make-zero-vertex) (make-zero-vertex)))))
-                 (enqueue queue (polygon-extract!~ poly self polygons offset matrix)))))
-        (queue-list queue))))
+    (let ((model (cache-model)))
+      (if (not model)
+          (nextmethod)
+        (let ((polygons (get-polygons~ model)))
+          (let ((queue (new-queue)))
+            (for (i 0 (/ (f64vector-length polygons) polygon-float-size))
+                 (let ((offset (* i polygon-float-size)))
+                   (let ((poly (if (nan? (f64vector-ref polygons (+ offset 12)))
+                                   (make-triangle self (make-zero-vertex) (make-zero-vertex) (make-zero-vertex))
+                                 (make-quad self (make-zero-vertex) (make-zero-vertex) (make-zero-vertex) (make-zero-vertex)))))
+                     (enqueue queue (polygon-extract!~ poly self polygons offset matrix)))))
+            (queue-list queue))))))
   
   
   #; ;; are we modyfing one tile or the model???
   (method override (update-face-texture face face-rank texture)
-    (let ((faces (get-faces~ model)))
-      (let ((face (list-ref faces face-rank)))
-        )))
+    (let ((model (cache-model)))
+      (let ((faces (get-faces~ model)))
+        (let ((face (list-ref faces face-rank)))
+          ))))
   
   
   (method (draw-tile)
     (let ((world (current-world)))
-      (let ((mesh (get-mesh~ model))
-            (program (find-mesh-program~ world (entity-program))))
-        (use~ program)
-        (bind-render-uniforms~ program (get-material~ mesh) matrix)
-        (bind-uniforms~ program mesh matrix #f)
-        (draw-mesh~ program mesh)
-        (unbind-uniforms~ program)
-        (unbind-render-uniforms~ program)
-        (unuse~ program))))
+      (let ((model (cache-model)))
+        (let ((mesh (get-mesh~ model))
+              (program (find-mesh-program~ world (entity-program))))
+          (use~ program)
+          (bind-render-uniforms~ program (get-material~ mesh) matrix)
+          (bind-uniforms~ program mesh matrix #f)
+          (draw-mesh~ program mesh)
+          (unbind-uniforms~ program)
+          (unbind-render-uniforms~ program)
+          (unuse~ program)))))
   
   
   (method protected virtual (entity-program)
     'dynamic-phong))
-
-
-;;;
-;;;; Triangle Tile
-;;;
-
-
-(class Triangle-Tile extends Tile
-  
-  
-  (property v1     initialize #f accessors generate)
-  (property v2     initialize #f accessors generate)
-  (property v3     initialize #f accessors generate)
-  (property image  initialize #f accessors generate)
-  
-  
-  (method override (prepare rest)
-    (nextmethod rest)
-    (set-radiuses (vertex .5 .5 .5))
-    (set-color (dye .525 .321 .004 1.)))
-  
-  
-  (method override (finish rest)
-    (nextmethod rest)
-    (set-position (triangle-center v1 v2 v3)))
-  
-  
-  (method override (element-faces)
-    (let ((world (current-world)))
-      (let ((default-image (get-default-image~ world)))
-        (let ((image (or image default-image)))
-          (let ((uv (image-coordinates image)))
-            (let ((tl (uv-left uv))
-                  (tt (uv-top uv))
-                  (tr (uv-right uv))
-                  (tb (uv-bottom uv))
-                  (texture-depth (uv-depth uv)))
-              (list
-                (if (> (vertex-x v1) (vertex-x v2))
-                    (make-face image
-                               (f32vector tl tb tr tb tr tt)
-                               texture-depth
-                               (make-triangle self
-                                              v1 v2 v3))
-                  (make-face image
-                             (f32vector tr tt tl tt tl tb)
-                             texture-depth
-                             (make-triangle self
-                                            v1 v2 v3))))))))))
-  
-  
-  (method override (update-face-texture face face-rank texture)
-    (let ((zone (current-zone)))
-      (let ((designer (get-designer~ zone)))
-        (set-property~ designer self 'image texture))))
-  
-  
-  (method override (draw-3d)
-    (gl-colorize-dye color)
-    (glBegin GL_TRIANGLES)
-    (glVertex3f (vertex-x v1) (vertex-y v1) (vertex-z v1))
-    (glVertex3f (vertex-x v2) (vertex-y v2) (vertex-z v2))
-    (glVertex3f (vertex-x v3) (vertex-y v3) (vertex-z v3))
-    (glEnd))
-  
-  
-  (method override (draw-target dye)
-    (gl-colorize-dye dye)
-    (glLineWidth 2.)
-    (glDisable GL_LIGHTING)
-    (glBegin GL_LINE_LOOP)
-    (glVertex3f (vertex-x v1) (vertex-y v1) (vertex-z v1))
-    (glVertex3f (vertex-x v2) (vertex-y v2) (vertex-z v2))
-    (glVertex3f (vertex-x v3) (vertex-y v3) (vertex-z v3))
-    (glEnd)
-    (glEnable GL_LIGHTING)
-    (glLineWidth 1.)))
 
 
 ;;;
