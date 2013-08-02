@@ -33,19 +33,56 @@
         (time)
         (world)
         (world.autoload)
-        (world.draw)
         (world.dye)
+        (world.dyes)
         (world.element)
+        (world.entity)
         (world.face)
         (world.foreign)
         (world.geometry)
-        (world.model)
-        (world.object)
+        (world.opengl)
+        (world.polygon)
         (world.quad)
         (world.syntax (phase syntax))
         (world.texture)
-        (world.tile)
         (world.triangle))
+
+
+;;;
+;;;; Blocks
+;;;
+
+
+(definition blocks <table>
+  (make-table test: eq?))
+
+
+(definition public (registered-blocks)
+  blocks)
+
+(definition public (registered-block name)
+  (let ((generate/model (table-ref blocks name #f)))
+    (if (procedure? generate/model)
+        (let ((model (generate/model)))
+          (set-name~ model name)
+          (table-set! blocks name model)
+          model)
+      generate/model)))
+
+(definition public (register-block name generate)
+  (table-set! blocks name generate))
+
+
+;;;
+;;;; Image
+;;;
+
+
+(definition public (image-coordinates image)
+  (let ((world (current-world)))
+    (if (get-block-program-atlas?~ world)
+        (image-rect~ (get-block-atlas~ world) image)
+      (uv 0. 0. 1. 1. 0.))))
 
 
 ;;;
@@ -53,49 +90,134 @@
 ;;;
 
 
-(class Block extends Tile
+(class Block extends Entity
   
   
-  (property left-image   initialize #f accessors generate)
-  (property right-image  initialize #f accessors generate)
-  (property bottom-image initialize #f accessors generate)
-  (property top-image    initialize #f accessors generate)
-  (property back-image   initialize #f accessors generate)
-  (property front-image  initialize #f accessors generate)
+  (property images initialize #f accessors generate)
   
   
   (method override (prepare rest)
     (nextmethod rest)
-    (set! path 'Block)
     (set-color (dye .525 .321 .004 1.)))
+  
+  
+  (method override (resolve-model)
+    (registered-block (or path 'Dirty)))
+  
+  
+  (method override (update-matrix)
+    (matrix-multiply! matrix (make-translation-matrix& (get-x) (get-y) (get-z))
+                             (make-scaling-matrix& (vertex-x scales) (vertex-y scales) (vertex-z scales))
+                             @w
+                             (matrix-multiply& (make-lookat-matrix& lookat)
+                                               (make-scaling-matrix& (vertex-x scales) (vertex-y scales) (vertex-z scales)))))
+  
+  
+  (method override (element-faces)
+    (let ((model (cache-model)))
+      (if (not model)
+          (nextmethod)
+        (let ((rank 0))
+          (map (lambda (face poly)
+                 (prog1 (if (not images)
+                            (make-face (get-texture~ face) (get-texture-coordinates~ face) (get-texture-depth~ face) poly)
+                          (let ((image (list-ref images rank)))
+                            (if (not image)
+                                (make-face (get-texture~ face) (get-texture-coordinates~ face) (get-texture-depth~ face) poly)
+                              (let ((uv (image-coordinates image)))
+                                (let ((tl (uv-left uv))
+                                      (tt (uv-top uv))
+                                      (tr (uv-right uv))
+                                      (tb (uv-bottom uv))
+                                      (depth (uv-depth uv)))
+                                  (let ((coordinates (f32vector tl tt tl tb tr tb tr tt)))
+                                    ;; putting uv instead of coordinates
+                                    ;; gives rise to a really nice looking bug!
+                                    (make-face image coordinates depth poly)))))))
+                   (increase! rank)))
+               (get-faces~ model)
+               (element-polygons))))))
+  
+  
+  (method override (element-polygons)
+    (let ((model (cache-model)))
+      (if (not model)
+          (nextmethod)
+        (let ((polygons (get-polygons~ model)))
+          (let ((queue (new-queue)))
+            (for (i 0 (/ (f64vector-length polygons) polygon-float-size))
+                 (let ((offset (* i polygon-float-size)))
+                   (let ((poly (if (nan? (f64vector-ref polygons (+ offset 12)))
+                                   (make-triangle self (make-zero-vertex) (make-zero-vertex) (make-zero-vertex))
+                                 (make-quad self (make-zero-vertex) (make-zero-vertex) (make-zero-vertex) (make-zero-vertex)))))
+                     (enqueue queue (polygon-extract!~ poly self polygons offset matrix)))))
+            (queue-list queue))))))
+  
+  
+  #; ;; are we modyfing one block or the model???
+  (method override (update-face-texture face face-rank texture)
+    (let ((model (cache-model)))
+      (let ((faces (get-faces~ model)))
+        (let ((face (list-ref faces face-rank)))
+          ))))
+  
+  
+  (method override (draw-3d)
+    (draw-block))
+  
+  
+  (method (draw-block)
+    (let ((world (current-world)))
+      (let ((model (cache-model)))
+        (let ((mesh (get-mesh~ model))
+              (program (find-mesh-program~ world (entity-program))))
+          (use~ program)
+          (bind-render-uniforms~ program (get-material~ mesh) matrix)
+          (bind-uniforms~ program mesh matrix #f)
+          (draw-mesh~ program mesh)
+          (unbind-uniforms~ program)
+          (unbind-render-uniforms~ program)
+          (unuse~ program)))))
+  
+  
+  (method override (entity-program)
+    'dynamic-phong))
+
+
+;;;
+;;;; Quad Block
+;;;
+
+
+(class Quad-Block extends Block
+  
+  
+  (property v1    initialize #f accessors generate)
+  (property v2    initialize #f accessors generate)
+  (property v3    initialize #f accessors generate)
+  (property v4    initialize #f accessors generate)
+  (property image initialize #f accessors generate)
+  
+  
+  (method override (prepare rest)
+    (nextmethod rest)
+    (set-color (dye .525 .321 .004 1.)))
+  
+  
+  (method override (finish rest)
+    (nextmethod rest)
+    (set-position (quad-center v1 v2 v3 v4)))
   
   
   (method override (element-radiuses)
     (vertex .5 .5 .5))
   
   
-  ;;;
-  ;;;; Faces
-  ;;;
-  
-  
   (method override (element-faces)
-    (let ((world (current-world))
-          (bounds (make-cuboid&)))
-      (get-bounds! bounds)
-      (let ((x (get-x))
-            (y (get-y))
-            (z (get-z))
-            (left (cuboid-left bounds))
-            (right (cuboid-right bounds))
-            (bottom (cuboid-bottom bounds))
-            (top (cuboid-top bounds))
-            (back (cuboid-back bounds))
-            (front (cuboid-front bounds))
-            (default-image (get-default-image~ world)))
+    (let ((world (current-world)))
+      (let ((default-image (get-default-image~ world)))
         (list
-          ;; front face
-          (let ((image (or front-image default-image)))
+          (let ((image (or image default-image)))
             (let ((uv (image-coordinates image)))
               (let ((tl (uv-left uv))
                     (tt (uv-top uv))
@@ -103,12 +225,67 @@
                     (tb (uv-bottom uv))
                     (texture-depth (uv-depth uv)))
                 (make-face image
-                           (f32vector tl tt tl tb tr tb tr tt)
+                           (f32vector tl tb tr tb tr tt tl tt)
                            texture-depth
                            (make-quad self
-                                      (vertex left top front) (vertex left bottom front) (vertex right bottom front) (vertex right top front))))))
-          ;; back face
-          (let ((image (or back-image default-image)))
+                                      v1 v2 v3 v4)))))))))
+  
+  
+  (method override (update-face-texture face face-rank texture)
+    (let ((zone (current-zone)))
+      (let ((designer (get-designer~ zone)))
+        (set-property~ designer self 'image texture))))
+  
+  
+  (method override (draw-3d)
+    (gl-colorize-dye color)
+    (glBegin GL_QUADS)
+    (glVertex3f (vertex-x v1) (vertex-y v1) (vertex-z v1))
+    (glVertex3f (vertex-x v2) (vertex-y v2) (vertex-z v2))
+    (glVertex3f (vertex-x v3) (vertex-y v3) (vertex-z v3))
+    (glVertex3f (vertex-x v4) (vertex-y v4) (vertex-z v4))
+    (glEnd))
+  
+  
+  (method override (draw-target dye)
+    (gl-colorize-dye dye)
+    (glLineWidth 2.)
+    (glDisable GL_LIGHTING)
+    (glBegin GL_LINE_LOOP)
+    (glVertex3f (vertex-x v1) (vertex-y v1) (vertex-z v1))
+    (glVertex3f (vertex-x v2) (vertex-y v2) (vertex-z v2))
+    (glVertex3f (vertex-x v3) (vertex-y v3) (vertex-z v3))
+    (glVertex3f (vertex-x v4) (vertex-y v4) (vertex-z v4))
+    (glEnd)
+    (glEnable GL_LIGHTING)
+    (glLineWidth 1.)))
+
+
+;;;
+;;;; Square Block
+;;;
+
+
+(class Square-Block extends Quad-Block
+  
+  
+  (method override (element-faces)
+    (let ((world (current-world)))
+      (let ((default-image (get-default-image~ world)))
+        (list
+          (let ((image (or image default-image)))
+            (let ((uv (image-coordinates image)))
+              (let ((tl (uv-left uv))
+                    (tt (uv-top uv))
+                    (tr (uv-right uv))
+                    (tb (uv-bottom uv))
+                    (texture-depth (uv-depth uv)))
+                (make-face image
+                           (f32vector tl tb tr tb tr tt tl tt)
+                           texture-depth
+                           (make-quad self
+                                      v1 v2 v3 v4)))))
+          (let ((image (or image default-image)))
             (let ((uv (image-coordinates image)))
               (let ((tl (uv-left uv))
                     (tt (uv-top uv))
@@ -119,68 +296,4 @@
                            (f32vector tr tt tr tb tl tb tl tt)
                            texture-depth
                            (make-quad self
-                                      (vertex right top back) (vertex right bottom back) (vertex left bottom back) (vertex left top back))))))
-          ;; left face
-          (let ((image (or left-image default-image)))
-            (let ((uv (image-coordinates image)))
-              (let ((tl (uv-left uv))
-                    (tt (uv-top uv))
-                    (tr (uv-right uv))
-                    (tb (uv-bottom uv))
-                    (texture-depth (uv-depth uv)))
-                (make-face image
-                           (f32vector tl tt tl tb tr tb tr tt)
-                           texture-depth
-                           (make-quad self
-                                      (vertex left top back) (vertex left bottom back) (vertex left bottom front) (vertex left top front))))))
-          ;; right face
-          (let ((image (or right-image default-image)))
-            (let ((uv (image-coordinates image)))
-              (let ((tl (uv-left uv))
-                    (tt (uv-top uv))
-                    (tr (uv-right uv))
-                    (tb (uv-bottom uv))
-                    (texture-depth (uv-depth uv)))
-                (make-face image
-                           (f32vector tl tt tl tb tr tb tr tt)
-                           texture-depth
-                           (make-quad self
-                                      (vertex right top front) (vertex right bottom front) (vertex right bottom back) (vertex right top back))))))
-          ;; top face
-          (let ((image (or top-image default-image)))
-            (let ((uv (image-coordinates image)))
-              (let ((tl (uv-left uv))
-                    (tt (uv-top uv))
-                    (tr (uv-right uv))
-                    (tb (uv-bottom uv))
-                    (texture-depth (uv-depth uv)))
-                (make-face image
-                           (f32vector tl tb tl tt tr tt tr tb)
-                           texture-depth
-                           (make-quad self
-                                      (vertex left top back) (vertex left top front) (vertex right top front) (vertex right top back))))))
-          ;; bottom face
-          (let ((image (or bottom-image default-image)))
-            (let ((uv (image-coordinates image)))
-              (let ((tl (uv-left uv))
-                    (tt (uv-top uv))
-                    (tr (uv-right uv))
-                    (tb (uv-bottom uv))
-                    (texture-depth (uv-depth uv)))
-                (make-face image
-                           (f32vector tl tt tl tb tr tb tr tt)
-                           texture-depth
-                           (make-quad self
-                                      (vertex left bottom front) (vertex left bottom back) (vertex right bottom back) (vertex right bottom front))))))))))
-  
-  
-  (method override (update-face-texture face face-rank texture)
-    (let ((zone (current-zone)))
-      (let ((designer (get-designer~ zone)))
-        (case face-rank
-          ((0) (set-property~ designer self 'front-image texture))
-          ((1) (set-property~ designer self 'back-image texture))
-          ((2) (set-property~ designer self 'left-image texture))
-          ((3) (set-property~ designer self 'right-image texture))
-          ((4) (set-property~ designer self 'top-image texture))
-          ((5) (set-property~ designer self 'bottom-image texture))))))))
+                                      v4 v3 v2 v1)))))))))))
