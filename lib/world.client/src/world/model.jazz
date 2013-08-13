@@ -17,6 +17,7 @@
 (import (jazz.jml)
         (jazz.graphic)
         (jazz.graphic.opengl.glew)
+        (jazz.library)
         (world)
         (world.autoload)
         (world.draw)
@@ -32,42 +33,79 @@
 
 
 ;;;
+;;;; Models
+;;;
+
+
+(definition models <table>
+  (make-table test: eq?))
+
+(definition model-id <fx>
+  0)
+
+
+(definition public (registered-models)
+  models)
+
+(definition public (registered-model name)
+  (let ((generate/model (table-ref models name)))
+    (if (is? generate/model Model)
+        generate/model
+      (bind (id . generate) generate/model
+        (let ((model (generate)))
+          (set-name~ model name)
+          (set-id~ model id)
+          (table-set! models name model)
+          model)))))
+
+(definition public (register-model name generate showcase?)
+  (if (not showcase?)
+      (table-set! models name (cons #f generate))
+    (table-set! models name (cons model-id generate))
+    (increase! model-id)))
+
+
+;;;
 ;;;; Model
 ;;;
 
 
-(class Model extends Object
+(class Model extends Component
   
   
-  (slot file        <object> initialize #f      accessors generate)
-  (slot path        <object> initialize #f      accessors generate)
-  (slot path-time   <object> initialize #f      accessors generate)
-  (slot name        <object>                    accessors generate)
-  (slot faces       <object>                    accessors generate)
-  (slot orientation <object> initialize #f      accessors generate)
-  (slot matrix      <object> initialize #f      accessors generate)
-  (slot polygons    <vector+>                   accessors generate)
-  (slot mesh        <object>                    accessors generate)
-  (slot bounds      <object> initialize #f      getter generate setter explicit)
-  (slot anchor      <object> initialize 'center accessors generate)
-  (slot center      <object> initialize #f      getter generate)
-  (slot animation   <object> initialize #f      accessors generate)
-  (slot animations  <object> initialize #f      accessors generate)
+  (property position  <f64vector> initialize (vertex 0. 0. 0.) getter generate setter explicit)
+  (property rotation  <f64vector> initialize (vertex 0. 0. 0.) getter generate setter explicit)
+  (property scale     <f64vector> initialize (vertex 1. 1. 1.) getter generate setter explicit)
+  (property faces     <object>    initialize #f                accessors generate)
+  (property material  <object>    initialize #f                accessors generate)
+  (property mesh      <object>    initialize #f                accessors generate)
+  (property program   <object>    initialize #f                accessors generate)
   
   
-  (method override (initialize (name: name #f) (faces: faces #f) (orientation: orientation #f) (material: material #f) (mesh: mesh #f))
-    (set! name~self name)
-    (set! faces~self faces)
-    (set! orientation~self orientation)
-    (set! matrix~self (make-model-matrix))
+  (slot file          <object>    initialize #f                     accessors generate)
+  (slot path          <object>    initialize #f                     accessors generate)
+  (slot path-time     <object>    initialize #f                     accessors generate)
+  (slot matrix        <f64vector> initialize (make-identity-matrix) accessors generate)
+  (slot global-matrix <f64vector> initialize (make-identity-matrix) accessors generate)
+  (slot polygons      <vector+>   initialize #f                     accessors generate)
+  (slot bounds        <object>    initialize #f                     getter generate setter explicit)
+  (slot anchor        <object>    initialize 'center                accessors generate)
+  (slot center        <object>    initialize #f                     getter generate)
+  (slot animation     <object>    initialize #f                     accessors generate)
+  (slot animations    <object>    initialize #f                     accessors generate)
+  (slot entity-class  <object>    initialize #f                     accessors generate)
+  (slot id            <fx+>       initialize #f                     accessors generate)
+  
+  
+  (method override (finish initargs)
+    (nextmethod initargs)
     (set! polygons~self (and faces (faces-polygons faces)))
     (set! mesh~self (or mesh (if faces (generate-mesh (faces-generator faces) matrix: matrix material: material) (new Mesh)))))
   
   
-  (method override (print output readably)
-    (print-unreadable self output
-      (lambda (output)
-        (format output "{a}" name))))
+  (method override (install-in-parent)
+    (nextmethod)
+    (update-matrix))
   
   
   (method meta override (marshall-object obj)
@@ -82,8 +120,33 @@
         (find-model~ world (deserialize path)))))
   
   
-  (method (make-model-matrix)
-    (and orientation (make-y-rotation-matrix& orientation)))
+  (method public (set-position pos <f64vector>) <void>
+    (vertex-copy! position pos)
+    (update-matrix))
+  
+  
+  (method public (set-rotation rot <f64vector>) <void>
+    (vertex-copy! rotation rot)
+    (update-matrix))
+  
+  
+  (method public (set-scale s <f64vector>) <void>
+    (vertex-copy! scale s)
+    (update-matrix))
+  
+  (method public (set-scaling s <fl>) <void>
+    (vertex-init! scale s s s)
+    (update-matrix))
+  
+  
+  (method (update-matrix)
+    (matrix-multiply! matrix (make-translation-matrix& (vertex-x position) (vertex-y position) (vertex-z position))
+                             (matrix-multiply& (make-rotation-matrix& (vertex-x rotation) (vertex-y rotation) (vertex-z rotation))
+                                               (make-scaling-matrix& (vertex-x scale) (vertex-y scale) (vertex-z scale))))
+    (if (not parent)
+        (matrix-copy! global-matrix matrix)
+      (matrix-multiply! global-matrix (get-global-matrix~ parent) matrix))
+    (for-each update-matrix~ children))
   
   
   (method (faces-polygons faces)
@@ -105,6 +168,48 @@
   (method public (set-bounds bnd)
     (set! bounds bnd)
     (set! center (cuboid-center bnd)))
+  
+  
+  (method public (determine-bounds)
+    (let ((left +inf.0)
+          (bottom +inf.0)
+          (back +inf.0)
+          (right -inf.0)
+          (top -inf.0)
+          (front -inf.0))
+      (for-each (lambda (face)
+                  (let ((vertices (get-vertices~ (get-polygon~ face))))
+                    (loop (for n from 0 below (vector-length vertices))
+                          (let ((vert (vector-ref vertices n)))
+                            (let ((x (vertex-x vert))
+                                  (y (vertex-y vert))
+                                  (z (vertex-z vert)))
+                              (when (< x left) (set! left x))
+                              (when (< y bottom) (set! bottom y))
+                              (when (< z back) (set! back z))
+                              (when (> x right) (set! right x))
+                              (when (> y top) (set! top y))
+                              (when (> z front) (set! front z)))))))
+                faces)
+      (cuboid left bottom back right top front)))
+  
+  
+  (method protected virtual (model-bind-uniforms entity program mesh matrix)
+    (bind-uniforms~ program mesh matrix #f))
+  
+  
+  (method protected virtual (model-unbind-uniforms entity program)
+    (unbind-uniforms~ program))
+  
+  
+  ;; quick hack
+  (method protected virtual (model-mode)
+    'transparent)
+  
+  
+  ;; quick hack
+  (method protected virtual (model-polygon-mode)
+    #f)
   
   
   (method public (add-animation name anim)
