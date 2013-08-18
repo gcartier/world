@@ -25,6 +25,7 @@
         (jazz.graphic.opengl.glew)
         (jazz.io)
         (jazz.library)
+        (jazz.system)
         (world)
         (world.animation)
         (world.atlas)
@@ -35,7 +36,9 @@
         (world.geometry)
         (world.homogeneous)
         (world.material)
+        (world.mesh)
         (world.model)
+        (world.renderer)
         (world.texture)
         (world.triangle))
 
@@ -152,26 +155,25 @@
                   (let ((width (- (uv-right uv) left))
                         (height (- (uv-bottom uv) top)))
                     ;; adjust texture coordinates
-                    (for-each (lambda (triangle-index)
-                                (let ((triangle (triangle-ref triangle-index)))
-                                  (let ((s (get-s~ triangle))
-                                        (t (get-t~ triangle))
-                                        (d (get-d~ triangle)))
-                                    (vertex-x-set! s (+ left (* (vertex-x s) width)))
-                                    (vertex-y-set! s (+ left (* (vertex-y s) width)))
-                                    (vertex-z-set! s (+ left (* (vertex-z s) width)))
-                                    (vertex-x-set! t (+ top (* (- 1. (vertex-x t)) height)))
-                                    (vertex-y-set! t (+ top (* (- 1. (vertex-y t)) height)))
-                                    (vertex-z-set! t (+ top (* (- 1. (vertex-z t)) height)))
-                                    (vertex-x-set! d texture-depth)
-                                    (vertex-y-set! d texture-depth)
-                                    (vertex-z-set! d texture-depth))))
-                              (get-triangles~ group)))))))
+                    (loop (for triangle-index in-vector (get-triangles~ group))
+                          (let ((triangle (triangle-ref triangle-index)))
+                            (let ((s (get-s~ triangle))
+                                  (t (get-t~ triangle))
+                                  (d (get-d~ triangle)))
+                              (vertex-x-set! s (+ left (* (vertex-x s) width)))
+                              (vertex-y-set! s (+ left (* (vertex-y s) width)))
+                              (vertex-z-set! s (+ left (* (vertex-z s) width)))
+                              (vertex-x-set! t (+ top (* (- 1. (vertex-x t)) height)))
+                              (vertex-y-set! t (+ top (* (- 1. (vertex-y t)) height)))
+                              (vertex-z-set! t (+ top (* (- 1. (vertex-z t)) height)))
+                              (vertex-x-set! d texture-depth)
+                              (vertex-y-set! d texture-depth)
+                              (vertex-z-set! d texture-depth)))))))))
       (get-texture~ atlas)))
   
   
   @w
-  (method public (extract-mesh)
+  (method public (extract-geometry group-index)
     (generate-mesh
       (lambda (setup-proc triangle-proc quad-proc)
         (define (add-triangle triangle)
@@ -193,7 +195,7 @@
               (add triangle)))))
   
   
-  (method public (extract-mesh)
+  (method public (extract-geometry group-index)
     (let ((vertex-floats 10))
       (let ((triangle-floats (* 3 vertex-floats))
             (triangle-neighbors-floats (* 3 7))
@@ -258,8 +260,11 @@
             (f32vector-set! neighbors (+ m 2) (vertex-z n2))
             (set! m (+ m 3)))
           
-          (loop (for triangle in-vector triangles)
-                (add-triangle triangle))
+          (if (not group-index)
+              (loop (for triangle in-vector triangles)
+                    (add-triangle triangle))
+            (loop (for triangle-index in-vector (get-triangles~ (vector-ref groups group-index)))
+                  (add-triangle (vector-ref triangles triangle-index))))
           (values content neighbors)))))
   
   
@@ -303,7 +308,7 @@
 ;;;
 
 
-(definition public (load-ms3d file)
+(definition public (load-ms3d file (metadata: metadata #f))
   (let ((name (get-base~ file)))
     (define (add-animations model)
       (let ((dir (get-parent~ file)))
@@ -320,20 +325,32 @@
           directories?: #f)))
     
     (let ((model (new Model name: name rotation: (vertex 0. PI/2 0.))))
-      (let ((mesh (get-mesh~ model)))
-        (let ((ms3d (load-model file)))
-          ;; order is important as extract-texture adjusts texture coordinates
-          (let ((texture (extract-texture~ ms3d file)))
-            (set-material~ mesh (new Material texture: texture))
-            (receive (data neighbors) (extract-mesh~ ms3d)
-              (allocate-vertices~ mesh)
-              (set-data~ (get-vertices-buffer~ mesh) data 10)
-              (allocate-neighbors~ mesh)
-              (set-data~ (get-neighbors-buffer~ mesh) neighbors 6)))
-          (set-bounds~ model (extract-bounds~ ms3d))
-          (set-anchor~ model 'origin)
-          (set-animation~ model (extract-animation~ ms3d #f))
-          (add-animations model)))
+      (set-metadata~ model metadata)
+      (let ((ms3d (load-model file)))
+        (when (find-setting 'world.debug-ms3d? #f)
+          (set-native~ model ms3d))
+        ;; order is important as extract-texture adjusts texture coordinates
+        (let ((texture (extract-texture~ ms3d file)))
+          (define (extract-mesh group-index renderer)
+            (let ((mesh (new Mesh)))
+              (set-material~ mesh (new Material texture: texture renderer: renderer))
+              (receive (data neighbors) (extract-geometry~ ms3d group-index)
+                (allocate-vertices~ mesh)
+                (set-data~ (get-vertices-buffer~ mesh) data 10)
+                (allocate-neighbors~ mesh)
+                (set-data~ (get-neighbors-buffer~ mesh) neighbors 6))
+              mesh))
+          
+          (let ((render (model-metadata-render metadata)))
+            (if (not render)
+                (set-meshes~ model (vector (extract-mesh #f transparent-renderer)))
+              (set-meshes~ model (list->vector (loop (for renderer in render)
+                                                     (for group-index from 0 below (length render))
+                                                     (collect (extract-mesh group-index (find-renderer renderer)))))))))
+        (set-bounds~ model (extract-bounds~ ms3d))
+        (set-anchor~ model 'origin)
+        (set-animation~ model (extract-animation~ ms3d #f))
+        (add-animations model))
       model)))
 
 
@@ -466,8 +483,10 @@
                            (name (<-string 32))
                            (triangles
                              (let ((num-group-triangles (<-u16)))
-                               (loop (for j from 0 below num-group-triangles)
-                                     (collect (<-u16)))))
+                               (let ((group-triangles (make-vector num-group-triangles)))
+                                 (loop (for j from 0 below num-group-triangles)
+                                       (vector-set! group-triangles j (<-u16)))
+                                 group-triangles)))
                            (material-index (<-s8)))
                        (let ((group
                                (new MS3D-Group
