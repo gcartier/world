@@ -45,6 +45,7 @@
         (world.mesh)
         (world.renderer)
         (world.settings)
+        (world.support)
         (world.syntax (phase syntax))
         (world.texture)
         (world.triangle)
@@ -96,10 +97,11 @@
   (slot blocks              <list>                     accessors generate)
   (slot entities            <list>                     accessors generate)
   (slot faces               <object>                   accessors generate)
-  (slot faces-transparent   <object>                   accessors generate)
+  (slot other-faces         <object>                   accessors generate)
   (slot faces-queue         <object>                   accessors generate)
-  (slot mesh                <Mesh>                     getter generate)
-  (slot mesh-transparent    <object>     initialize #f accessors generate)
+  (slot other-faces-queues  <object>                   accessors generate)
+  (slot mesh                <Mesh+>      initialize #f getter generate)
+  (slot other-meshes        <table+>     initialize #f accessors generate)
   (slot queued?             <bool>       initialize #f accessors generate)
   (slot physical-uptodate?  <bool>       initialize #f accessors generate)
   (slot content-uptodate?   <bool>       initialize #f accessors generate)
@@ -115,8 +117,9 @@
     (set! blocks~self '())
     (set! entities~self '())
     (set! faces~self #f)
+    (set! other-faces~self #f)
     (set! faces-queue~self #f)
-    (set! mesh~self (new Mesh material: (get-block-opaque~ (current-world)))))
+    (set! other-faces-queues~self #f))
   
   
   (method override (print output readably)
@@ -128,14 +131,19 @@
   
   
   (method (free-mesh)
-    (free-resources~ mesh)
-    (when mesh-transparent
-      (free-resources~ mesh-transparent)))
+    (when mesh
+      (free-resources~ mesh)
+      (set! mesh #f))
+    (when other-meshes
+      (iterate-table other-meshes
+        (lambda (renderer mesh)
+          (free-resources~ mesh)))
+      (set! other-meshes #f)))
   
   
   (method public (empty?)
-    (and (empty?~ mesh)
-         (not mesh-transparent)
+    (and (not mesh)
+         (not other-meshes)
          (null? entities)))
   
   
@@ -147,9 +155,13 @@
   (method (update)
     (update-content)
     (update-vertices)
-    (update-lightmap mesh faces)
-    (when mesh-transparent
-      (update-lightmap mesh-transparent faces-transparent)))
+    (when mesh
+      (update-lightmap mesh faces))
+    (when other-meshes
+      (iterate-table other-meshes
+        (lambda (renderer mesh)
+          (let ((faces (table-ref other-faces renderer)))
+            (update-lightmap mesh faces))))))
   
   
   ;;;
@@ -193,29 +205,73 @@
   
   
   ;;;
+  ;;;; Faces
+  ;;;
+  
+  
+  (method (add-face face)
+    (let ((material (get-material~ face)))
+      (let ((renderer (or (and material (get-renderer~ material)) opaque-renderer)))
+        (cond ((eq? renderer opaque-renderer)
+               (when (not faces-queue)
+                 (set! faces-queue (new-queue)))
+               (enqueue faces-queue face))
+              (else
+               (when (not other-faces-queues)
+                 (set! other-faces-queues (make-table test: eq?)))
+               (let ((queue (table-ref other-faces-queues renderer #f)))
+                 (when (not queue)
+                   (set! queue (new-queue))
+                   (table-set! other-faces-queues renderer queue))
+                 (enqueue queue face)))))))
+  
+  
+  (method (add-block-faces)
+    (let ((cube-faces #f))
+      (for-each (lambda (block)
+                  (let ((faces (element-faces~ block))
+                        (model (cache-model~ block)))
+                    (if (opaque-cube?~ model)
+                        (for-each (lambda (face)
+                                    (let ((center (get-center~ (get-polygon~ face))))
+                                      (when (not cube-faces)
+                                        (set! cube-faces (make-table test: vertex=? hash: vertex-hash)))
+                                      (if (table-ref cube-faces center #f)
+                                          (table-clear cube-faces center)
+                                        (table-set! cube-faces center face)
+                                        (add-face face))))
+                                  faces)
+                      (for-each add-face faces))))
+                blocks)))
+  
+  
+  ;;;
   ;;;; Vertices
   ;;;
   
   
-  (method (cache-mesh-transparent)
-    (or mesh-transparent
-        (let ((mesh (new Mesh material: (get-block-transparent~ (current-world)))))
-          (set! mesh-transparent mesh)
-          mesh)))
-  
-  
   (method (update-vertices)
     (when (not vertices-uptodate?)
-      (let ((all-faces (collect-apparent-faces)))
-        (when all-faces
-          (bind (opaque-faces . transparent-faces) all-faces
-            (when opaque-faces
-              (set! faces opaque-faces)
-              (fill-faces-vertices mesh opaque-faces))
-            (when transparent-faces
-              (set! faces-transparent transparent-faces)
-              (fill-faces-vertices (cache-mesh-transparent) transparent-faces)))))
+      (add-block-faces)
+      (when faces-queue
+        (when (not mesh)
+          (set! mesh (new Mesh material: (get-block-opaque~ (current-world)))))
+        (set! faces (list->vector (queue-list faces-queue)))
+        (fill-faces-vertices mesh faces))
+      (when other-faces-queues
+        (iterate-table other-faces-queues
+          (lambda (renderer queue)
+            (when (not other-faces)
+              (set! other-faces (make-table test: eq?)))
+            (when (not other-meshes)
+              (set! other-meshes (make-table test: eq?)))
+            (table-set! other-faces renderer (list->vector (queue-list queue)))
+            (when (not (table-ref other-meshes renderer #f))
+              ;; quick try
+              (table-set! other-meshes renderer (new Mesh material: (new Material texture: (get-texture~ (get-block-atlas~ (current-world))) renderer: renderer))))
+            (fill-faces-vertices (table-ref other-meshes renderer) (table-ref other-faces renderer)))))
       (set! faces-queue #f)
+      (set! other-faces-queues #f)
       (set! vertices-uptodate? #t)))
   
   
@@ -231,6 +287,8 @@
           (free-neighbors~ mesh))
       (allocate-vertices~ mesh)
       (set-data~ (get-vertices-buffer~ mesh) vertices 10)
+      (when (get-debug-meshes?)
+        (set-vertices-data~ mesh vertices))
       (allocate-neighbors~ mesh)
       (set-data~ (get-neighbors-buffer~ mesh) neighbors 6)))
   
@@ -389,56 +447,4 @@
             f32)))))
   
   
-  (proclaim (not warn optimizations))
-  
-  
-  ;;;
-  ;;;; Faces
-  ;;;
-  
-  
-  (method (add-face face)
-    (when (not faces-queue)
-      (set! faces-queue (new-queue)))
-    (enqueue faces-queue face))
-  
-  
-  (method (collect-apparent-faces)
-    (when (or (not-null? blocks) faces-queue)
-      (let ((cube-faces (make-table test: vertex=? hash: vertex-hash)))
-        (for-each (lambda (block)
-                    (let ((faces (element-faces~ block))
-                          (model (cache-model~ block)))
-                      (if (opaque-cube?~ model)
-                          (for-each (lambda (face)
-                                      (let ((center (get-center~ (get-polygon~ face))))
-                                        (if (table-ref cube-faces center #f)
-                                            (table-clear cube-faces center)
-                                          (table-set! cube-faces center face)
-                                          (add-face face))))
-                                    faces)
-                        (for-each add-face faces))))
-                  blocks)
-        (let ((queued (if faces-queue (queue-list faces-queue) '()))
-              (opaque 0)
-              (transparent 0))
-          (for-each (lambda (face)
-                      (let ((material (get-material~ face)))
-                        (if (and material (eq? (get-renderer~ material) transparent-renderer))
-                            (increase! transparent)
-                          (increase! opaque))))
-                    queued)
-          (let ((opaque (and (> opaque 0) (make-vector opaque)))
-                (transparent (and (> transparent 0) (make-vector transparent)))
-                (i 0)
-                (j 0))
-            (for-each (lambda (face)
-                        (let ((material (get-material~ face)))
-                          (cond ((and material (eq? (get-renderer~ material) transparent-renderer))
-                                 (vector-set! transparent j face)
-                                 (increase! j))
-                                (else
-                                 (vector-set! opaque i face)
-                                 (increase! i)))))
-                      queued)
-            (cons opaque transparent))))))))
+  (proclaim (not warn optimizations))))
