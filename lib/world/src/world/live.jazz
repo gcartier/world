@@ -1879,7 +1879,8 @@
     (new Quad #f (vector (vertex 0. 0. 0.) (vertex 0. 0. 0.) (vertex 0. 0. 0.) (vertex 0. 0. 0.))))
   
   
-  (method (travel-ray-polygons& proc orig <f64vector> dir <f64vector> radius <fl> breadth <fx> max-distance <fl> sphere-matrix (ignore-entities?: ignore-entities? #t) (ignore-players?: ignore-players? #f))
+  (method (travel-ray-polygons& proc orig <f64vector> dir <f64vector> radius <fl> breadth <fx> max-distance <fl> sphere-matrix (filter: filter #f) (ignore-entities?: ignore-entities? #t) (ignore-players?: ignore-players? #f))
+    (validate-vertex-normalized dir)
     (let ((zone (current-zone)))
       (increase! current-area-visit)
       (let ((step (cast <fl> (get-area-size~ zone))))
@@ -1900,8 +1901,12 @@
                                   (let ((poly (if (nan? (f64vector-ref polygons (+ offset 12)))
                                                   travel-triangle
                                                 travel-quad)))
-                                    (polygon-extract!~ poly element polygons offset sphere-matrix)
-                                    (proc poly))))))
+                                    (when (or (not filter)
+                                              (begin
+                                                (polygon-extract!~ poly element polygons offset #f)
+                                                (filter poly)))
+                                      (polygon-extract!~ poly element polygons offset sphere-matrix)
+                                      (proc poly)))))))
                           (unless ignore-entities?
                             (iterate-entities~ area
                               (lambda (entity)
@@ -3278,9 +3283,8 @@
   (slot designer         <object> initialize #f     accessors generate)
   (slot edition?         <bool>   initialize #f     getter generate)
   (slot editor-mode      <object> initialize 'plane getter generate)
-  (slot editor-last      <object> initialize #f     getter generate)
+  (slot editor-origin    <object> initialize #f     getter generate)
   (slot editor-normal    <object> initialize #f     getter generate)
-  (slot editor-from      <object> initialize #f     getter generate)
   (slot editor-floor?    <object> initialize #f     getter generate)
   (slot editing?         <bool>   initialize #f     getter generate)
   (slot adding?          <bool>   initialize #f     getter generate)
@@ -3765,14 +3769,38 @@
          (set! editing? #f)
          (set! adding? #f)
          (set! deleting? #f)
+         (set! editor-origin #f)
          (set! editor-normal #f)
-         (set! editor-from #f)
          (set! editor-floor? #f)))))
   
   
   (method (editor-add-at mode class grid? grid-plane grid-position floor-grid? position direction first?)
     (let ((zone (current-zone)))
       (define (determine-filter)
+        (define (plane-filter)
+          (let ((accessor (and editor-normal
+                               (cond ((/= (vertex-x editor-normal) 0.) vertex-x)
+                                     ((/= (vertex-y editor-normal) 0.) vertex-y)
+                                     ((/= (vertex-z editor-normal) 0.) vertex-z)))))
+            (lambda (poly)
+              (let ((normal (get-normal~ poly)))
+                (and editor-normal
+                     (vertex=? normal editor-normal)
+                     (or (not editor-origin)
+                         (= (accessor (get-center~ poly)) (accessor editor-origin))))))))
+        
+        (define (column-filter poly)
+          (let ((normal (get-normal~ poly)))
+            (and (vertex=? normal editor-normal)
+                 editor-origin
+                 (let ((center (get-center~ poly)))
+                   (or (vertex=? center editor-origin)
+                       (vertex=? (vertex-normalize& (vertex-& center editor-origin)) editor-normal))))))
+        
+        (define (free-filter poly)
+          (let ((normal (get-normal~ poly)))
+            (vertex=? normal editor-normal)))
+        
         (when (not first?)
           (case mode
             ((plane) (plane-filter))
@@ -3780,116 +3808,102 @@
             ((free) free-filter)
             ((crazy) #f))))
       
-      (define (plane-filter)
-        (let ((accessor (and editor-normal
-                             (cond ((/= (vertex-x editor-normal) 0.) vertex-x)
-                                   ((/= (vertex-y editor-normal) 0.) vertex-y)
-                                   ((/= (vertex-z editor-normal) 0.) vertex-z)))))
-          (lambda (poly normal)
-            (and editor-normal
-                 (vertex=? normal editor-normal)
-                 (or (not editor-from)
-                     (= (accessor (get-center~ poly)) (accessor editor-from)))))))
+      (define (add-at origin normal floor?)
+        (define (collision-quad origin normal)
+          (let ((inside (vertex+ origin (vertex-scalar* normal -.01))))
+            (let ((cube (unit-cube inside)))
+              (ray-closest-cuboid-inner-quad inside normal cube))))
+        
+        (let ((closest (collision-quad origin normal)))
+          (when closest
+            (bind (quad dist) closest
+              (let ((origin (get-origin~ quad))
+                    (normal (vertex-scalar* (get-normal~ quad) -1.)))
+                (let ((center (vertex+ origin (vertex-scalar*& normal .5))))
+                  (let ((actual (element-near~ zone center)))
+                    (unless actual
+                      (let ((added (editor-add-element mode class center)))
+                        (when first?
+                          (set! editor-origin origin)
+                          (set! editor-normal normal)
+                          (set! editor-floor? floor?))
+                        added)))))))))
       
-      (define (column-filter poly normal)
-        (and (vertex=? normal editor-normal)
-             editor-from
-             (let ((center (get-center~ poly)))
-               (or (vertex=? center editor-from)
-                   (vertex=? (vertex-normalize& (vertex-& center editor-from)) editor-normal)))))
-      
-      (define (free-filter poly normal)
-        (vertex=? normal editor-normal))
-      
-      (define (add-block vert poly normal)
-        (let ((actual (vertex->element~ zone (vertex+ vert (vertex-scalar*& normal .5)))))
-          (unless (and (is? actual Block) (vertex=? vert (get-position~ actual)))
-            (let ((added (editor-add-element mode class vert normal: normal)))
-              (when first?
-                (set! editor-normal normal)
-                (set! editor-from (if poly
-                                      (get-center~ poly)
-                                    (vertex+ (get-position~ added) (vertex-scalar*& normal -1.))))
-                (set! editor-floor? (boolean (not poly))))
-              added))))
-      
-      (let ((poly-closest (ray-closest-polygon position direction view-radius filter: (determine-filter) ignore-players?: #t))
-            (grid-closest (when (or first? (memq? mode '(free crazy)) (and editor-floor? (neq? mode 'column)))
-                            (receive (vert normal) (ray-plane-intersection position direction grid? grid-plane grid-position floor-grid?: floor-grid?)
-                              (when vert
-                                (cons vert normal))))))
-        (let ((poly-distance (and poly-closest (second poly-closest)))
-              (grid-distance (and grid-closest (vertex-distance position (car grid-closest)))))
-          (if (and poly-closest (or (not grid-closest) (<= poly-distance grid-distance)))
-              (bind (poly distance) poly-closest
-                (let ((element (get-element~ poly))
-                      (normal (get-normal~ poly)))
-                  (cond ((and (is? showcase Tiles-Showcase) (get-selection~ showcase))
-                         (let ((texture (get-user-data~ (get-selection~ showcase))))
-                           (receive (face face-rank) (find-face~ element poly)
-                             (set-face-texture element face face-rank texture)
-                             (set! editor-normal normal)
-                             #f)))
-                        ((and (is? showcase Shaders-Showcase) (get-selection~ showcase))
-                         (let ((shader (get-user-data~ (get-selection~ showcase))))
-                           (let ((effective-shader (if (eq? shader 'phong) #f shader)))
+      (let ((filter (determine-filter)))
+        (let ((poly-closest (ray-closest-polygon position direction view-radius filter: filter ignore-players?: #t))
+              (grid-closest (when (or first? (memq? mode '(free crazy)) (and editor-floor? (neq? mode 'column)))
+                              (receive (vert normal) (ray-plane-intersection position direction grid? grid-plane grid-position floor-grid?: floor-grid?)
+                                (when vert
+                                  (cons vert normal))))))
+          (let ((poly-distance (and poly-closest (second poly-closest)))
+                (grid-distance (and grid-closest (vertex-distance position (car grid-closest)))))
+            (if (and poly-closest (or (not grid-closest) (<= poly-distance grid-distance)))
+                (bind (poly distance) poly-closest
+                  (let ((element (get-element~ poly))
+                        (normal (get-normal~ poly)))
+                    (cond ((and (is? showcase Tiles-Showcase) (get-selection~ showcase))
+                           (let ((texture (get-user-data~ (get-selection~ showcase))))
                              (receive (face face-rank) (find-face~ element poly)
-                               (set-face-shader element face face-rank effective-shader)
+                               (set-face-texture element face face-rank texture)
                                (set! editor-normal normal)
-                               #f))))
-                        (else
-                         (add-block (vertex+ (get-center~ poly) (vertex-scalar*& normal .5)) poly normal)))))
-            (when grid-closest
-              (bind (vert . normal) grid-closest
-                (let ((normal (if (and (is? class Block)
-                                       (get-flat?~ (cache-model~ class)))
-                                  (vertex-negate normal)
-                                normal)))
-                  (let ((pos (vertex+ vert (vertex-scalar*& normal .5))))
-                    (unless (vertex->element~ zone pos)
-                      (add-block pos #f normal)))))))))))
+                               #f)))
+                          ((and (is? showcase Shaders-Showcase) (get-selection~ showcase))
+                           (let ((shader (get-user-data~ (get-selection~ showcase))))
+                             (let ((effective-shader (if (eq? shader 'phong) #f shader)))
+                               (receive (face face-rank) (find-face~ element poly)
+                                 (set-face-shader element face face-rank effective-shader)
+                                 (set! editor-normal normal)
+                                 #f))))
+                          (else
+                           (let ((target (vertex+ position (vertex-scalar* direction view-radius)))
+                                 (lookat (get-lookat~ eye))
+                                 (radiuses (vertex .001 .001 .001)))
+                             (receive (new-position new-direction collisions) (collide&stop position target lookat radiuses max-distance: view-radius polygon-filter: filter ignore-entities?: #t ignore-players?: #t)
+                               (when (not-null? collisions)
+                                 (let ((coll (car collisions)))
+                                   (let ((plane (get-plane~ coll)))
+                                     (add-at (get-origin~ plane) (get-normal~ plane) #f))))))))))
+              (when grid-closest
+                (bind (vert . normal) grid-closest
+                  (let ((normal (if (and (is? class Block)
+                                         (get-flat?~ (cache-model~ class)))
+                                    (vertex-negate normal)
+                                  normal)))
+                    (add-at vert normal #t))))))))))
   
   
-  (method (editor-add-element mode class vert (normal: normal #f) (force?: force? #f))
+  (method (editor-add-element mode class vert)
     (let ((zone (current-zone))
           (me (current-me)))
       (let ((to-x (floor (vertex-x vert)))
             (to-y (floor (vertex-y vert)))
             (to-z (floor (vertex-z vert))))
-        (unless (and editor-last
-                     (= (vertex-x editor-last) to-x)
-                     (= (vertex-y editor-last) to-y)
-                     (= (vertex-z editor-last) to-z)
-                     (not force?))
-          (let ((actual (vertex->element~ zone vert)))
-            (unless actual
-              (let ((element (add-element-class class to-x to-y to-z))
-                    (designer (get-designer~ zone)))
-                (let ((pos (get-position~ element))
-                      (model (and (is? element Entity) (cache-model~ element))))
-                  (case (get-anchor~ model)
-                    ((center)
-                     (let ((bounds (get-bounds~ element)))
-                       (let ((base (vertex (cuboid-left bounds)
-                                           (cuboid-bottom bounds)
-                                           (cuboid-back bounds))))
-                         (set-position~ element (vertex+& pos (vertex-& pos base))))))
-                    ((origin))))
-                (unless (is? element Player)
-                  (set-property~ designer element 'position (get-position~ element)))
-                (add-element~ zone element)
-                (when (and (is? element Player) (not (get-world-server~ (get-process))))
-                  (let ((preserved-lookat (and first-person? (get-lookat~ me))))
-                    (remove-element me)
-                    (when (server-side?~ (get-process))
-                      (set-color~ element white-dye))
-                    (set-current-me element)
-                    (set-lookat~ element (or preserved-lookat (get-eye-lookat)))))
-                (when (eq? element (current-me))
-                  (follow-player))
-                (update-future)
-                (set! editor-last (vertex to-x to-y to-z))
-                element)))))))
+        (let ((element (add-element-class class to-x to-y to-z))
+              (designer (get-designer~ zone)))
+          (let ((pos (get-position~ element))
+                (model (and (is? element Entity) (cache-model~ element))))
+            (case (get-anchor~ model)
+              ((center)
+               (let ((bounds (get-bounds~ element)))
+                 (let ((base (vertex (cuboid-left bounds)
+                                     (cuboid-bottom bounds)
+                                     (cuboid-back bounds))))
+                   (set-position~ element (vertex+& pos (vertex-& pos base))))))
+              ((origin))))
+          (unless (is? element Player)
+            (set-property~ designer element 'position (get-position~ element)))
+          (add-element~ zone element)
+          (when (and (is? element Player) (not (get-world-server~ (get-process))))
+            (let ((preserved-lookat (and first-person? (get-lookat~ me))))
+              (remove-element me)
+              (when (server-side?~ (get-process))
+                (set-color~ element white-dye))
+              (set-current-me element)
+              (set-lookat~ element (or preserved-lookat (get-eye-lookat)))))
+          (when (eq? element (current-me))
+            (follow-player))
+          (update-future)
+          element))))
   
   
   (method (add-element-class class x y z)
@@ -3944,28 +3958,30 @@
   (method (editor-remove mode position direction stage)
     (let ((zone (current-zone)))
       (define (determine-filter)
+        (define (plane-filter)
+          (let ((accessor (and editor-normal
+                               (cond ((/= (vertex-x editor-normal) 0.) vertex-x)
+                                     ((/= (vertex-y editor-normal) 0.) vertex-y)
+                                     ((/= (vertex-z editor-normal) 0.) vertex-z)))))
+            (lambda (poly)
+              (let ((normal (get-normal~ poly)))
+                (and editor-normal
+                     (vertex=? normal editor-normal)
+                     (or (not editor-origin)
+                         (= (accessor (get-center~ poly)) (accessor editor-origin))))))))
+        
+        (define (column-filter poly)
+          (let ((normal (get-normal~ poly)))
+            (and (vertex=? normal editor-normal)
+                 editor-origin
+                 (let ((center (get-center~ poly)))
+                   (or (vertex=? center editor-origin)
+                       (vertex=? (vertex-normalize& (vertex-& editor-origin center)) editor-normal))))))
+        
         (case mode
           ((plane) (plane-filter))
           ((column) column-filter)
           ((free) #f)))
-      
-      (define (plane-filter)
-        (let ((accessor (and editor-normal
-                             (cond ((/= (vertex-x editor-normal) 0.) vertex-x)
-                                   ((/= (vertex-y editor-normal) 0.) vertex-y)
-                                   ((/= (vertex-z editor-normal) 0.) vertex-z)))))
-          (lambda (poly normal)
-            (and editor-normal
-                 (vertex=? normal editor-normal)
-                 (or (not editor-from)
-                     (= (accessor (get-center~ poly)) (accessor editor-from)))))))
-      
-      (define (column-filter poly normal)
-        (and (vertex=? normal editor-normal)
-             editor-from
-             (let ((center (get-center~ poly)))
-               (or (vertex=? center editor-from)
-                   (vertex=? (vertex-normalize& (vertex-& editor-from center)) editor-normal)))))
       
       (case stage
         ((down)
@@ -3975,8 +3991,8 @@
                (let ((element (get-element~ poly))
                      (normal (get-normal~ poly)))
                  (editor-remove-element element)
-                 (set! editor-normal normal)
-                 (set! editor-from (get-center~ poly)))))))
+                 (set! editor-origin (get-center~ poly))
+                 (set! editor-normal normal))))))
         ((move)
          (let ((closest (ray-closest-polygon position direction view-radius filter: (determine-filter) ignore-players?: #t)))
            (when closest
@@ -3986,8 +4002,8 @@
         ((up)
          (set! editing? #f)
          (set! removing? #f)
-         (set! editor-normal #f)
-         (set! editor-from #f)))))
+         (set! editor-origin #f)
+         (set! editor-normal #f)))))
   
   
   (method (editor-delete position)
@@ -4051,7 +4067,7 @@
   (method (change-class element class)
     (let ((vert (vertex- (get-position~ element) (get-radiuses~ element))))
       (editor-remove-element element)
-      (editor-add-element editor-mode class vert force?: #t)))
+      (editor-add-element editor-mode class vert)))
   
   
   (method (editor-element-class)
@@ -4156,8 +4172,7 @@
       (set! editing? #f)
       (set! adding? #f)
       (set! deleting? #f)
-      (set! removing? #f)
-      (set! editor-last #f)))
+      (set! removing? #f)))
   
   
   (method (warn-non-editable)

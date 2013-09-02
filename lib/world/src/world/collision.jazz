@@ -196,7 +196,7 @@
   1.)
 
 
-(definition public (calculate-colliders sphere-matrix <f64vector> inverse-matrix <f64vector> mvt <Movement> travel-breadth <fx> skip-list <list> ignore-entities? <bool> ignore-players? <bool>) <list+>
+(definition public (calculate-colliders sphere-matrix <f64vector> inverse-matrix <f64vector> mvt <Movement> travel-breadth <fx> max-distance <fl+> polygon-filter <procedure+> skip-list <list> ignore-entities? <bool> ignore-players? <bool>) <list>
   (define (collide poly <Polygon> result)
     (define (add-collision collision)
       (enqueue result collision))
@@ -233,27 +233,29 @@
   ;; Go through our list of potential colliders
   (let ((world (current-world))
         (zone (current-zone)))
-    (receive (orig dir) (inverse-movement inverse-matrix (get-origin~ mvt) (get-vector~ mvt))
-      (travel-ray-polygons&~ world
-        (lambda (iterate)
-          (let ((result (new-queue)))
-            (iterate
-              (lambda (poly <Polygon>)
-                (when (let ((lst (queue-list result)))
-                        (or (null? lst)
-                            (>= (+ sphere-radius (get-radius~ poly) (get-distance~ (cast <Collision> (car lst))) EPSILON)
-                                (vertex-distance (get-origin~ mvt) (get-center~ poly)))))
-                  (collide poly result))))
-            (let ((result (queue-list result)))
-              (and (not-null? result) result))))
-        orig
-        dir
-        sphere-radius
-        travel-breadth
-        (+ (get-area-size~ zone) sphere-radius)
-        sphere-matrix
-        ignore-entities?: ignore-entities?
-        ignore-players?: ignore-players?))))
+    (receive (orig dir) (inverse-ray inverse-matrix (get-origin~ mvt) (get-vector~ mvt))
+      (or (travel-ray-polygons&~ world
+            (lambda (iterate)
+              (let ((result (new-queue)))
+                (iterate
+                  (lambda (poly <Polygon>)
+                    (when (let ((lst (queue-list result)))
+                            (or (null? lst)
+                                (>= (+ sphere-radius (get-radius~ poly) (get-distance~ (cast <Collision> (car lst))) EPSILON)
+                                    (vertex-distance (get-origin~ mvt) (get-center~ poly)))))
+                      (collide poly result))))
+                (let ((result (queue-list result)))
+                  (and (not-null? result) result))))
+            orig
+            dir
+            sphere-radius
+            travel-breadth
+            (or max-distance (+ (get-area-size~ zone) sphere-radius))
+            sphere-matrix
+            filter: polygon-filter
+            ignore-entities?: ignore-entities?
+            ignore-players?: ignore-players?)
+          '()))))
 
 
 (definition (collide-polygon poly <Polygon> mvt <Movement>) <Collision+>
@@ -321,11 +323,11 @@
     (make-movement& origin (vertex-& target origin))))
 
 
-(definition (inverse-movement inverse-matrix <f64vector> origin <f64vector> dir <f64vector>)
+(definition (inverse-ray inverse-matrix <f64vector> origin <f64vector> dir <f64vector>)
   (let ((origin (matrix-transform-3x4 inverse-matrix origin))
         (target (matrix-transform-3x4 inverse-matrix (vertex+& origin dir))))
     (values origin
-            (vertex- target origin))))
+            (vertex-normalize (vertex- target origin)))))
 
 
 (definition (determine-travel-breadth radiuses <f64vector>) <fx>
@@ -336,31 +338,31 @@
   (min 2 (fxceiling (vertex-norm radiuses))))
 
 
-(definition public (collide&stop origin <f64vector> target <f64vector> lookat <LookAt> radiuses <f64vector> (ignore-entities?: ignore-entities? #t) (ignore-players?: ignore-players? #f) (filter-pulse-jumps: filter-pulse-jumps #f))
+(definition public (collide&stop origin <f64vector> target <f64vector> lookat <LookAt> radiuses <f64vector> (max-distance: max-distance #f) (polygon-filter: polygon-filter #f) (ignore-entities?: ignore-entities? #t) (ignore-players?: ignore-players? #f))
   (let ((sphere-matrix (make-matrix&))
         (inverse-matrix (make-matrix&))
         (travel-breadth (determine-travel-breadth radiuses)))
-    ;; quick for tests
+    ;; quicky for tests
     (if (vertex=? origin target)
         (values origin (get-sight~ lookat) '())
-    (sphere-matrices! sphere-matrix inverse-matrix origin lookat radiuses)
-    (let ((mvt (collide-movement& sphere-matrix origin target)))
-      (let ((cl <list> (or (calculate-colliders sphere-matrix inverse-matrix mvt travel-breadth '() ignore-entities? ignore-players?) '())))
-        (let ((dest (if (null? cl)
-                        (movement-end mvt)
-                      (let ((cl0 (car cl)))
-                        ;; quick hack for a case that should only happen if actor is moved without
-                        ;; going through collide&slide logic which is the case when we rotate the player
-                        (if (eq? (get-type~ cl0) 'CT_EMBEDDED)
-                            (vertex- (get-origin~ mvt) (vertex-scalar*& (get-normal~ (get-plane~ cl0)) (get-distance~ cl0)))
-                          (let ((dist (get-distance~ (cast <Collision> cl0))))
-                            (if (< dist (get-length~ mvt))
-                                (movement-end-to mvt dist)
-                              (movement-end mvt))))))))
-          (receive (dest dir) (inverse-movement inverse-matrix dest (get-normal~ mvt))
-            (values dest
-                    dir
-                    (transform-collisions cl inverse-matrix)))))))))
+      (sphere-matrices! sphere-matrix inverse-matrix origin lookat radiuses)
+      (let ((mvt (collide-movement& sphere-matrix origin target)))
+        (let ((cl (calculate-colliders sphere-matrix inverse-matrix mvt travel-breadth max-distance polygon-filter '() ignore-entities? ignore-players?)))
+          (let ((dest (if (null? cl)
+                          (movement-end mvt)
+                        (let ((cl0 (car cl)))
+                          ;; quick hack for a case that should only happen if actor is moved without
+                          ;; going through collide&slide logic which is the case when we rotate the player
+                          (if (eq? (get-type~ cl0) 'CT_EMBEDDED)
+                              (vertex- (get-origin~ mvt) (vertex-scalar*& (get-normal~ (get-plane~ cl0)) (get-distance~ cl0)))
+                            (let ((dist (get-distance~ (cast <Collision> cl0))))
+                              (if (< dist (get-length~ mvt))
+                                  (movement-end-to mvt dist)
+                                (movement-end mvt))))))))
+            (receive (dest dir) (inverse-ray inverse-matrix dest (get-normal~ mvt))
+              (values dest
+                      dir
+                      (transform-collisions cl inverse-matrix)))))))))
 
 
 (definition collide-max-slide <fx>
@@ -383,7 +385,7 @@
   (set! debug-collisions? flag))
 
 
-(definition public (collide&slide origin <f64vector> target <f64vector> lookat <LookAt> radiuses <f64vector> (ignore-entities?: ignore-entities? #t) (ignore-players?: ignore-players? #f) (filter-pulse-jumps: filter-pulse-jumps #f))
+(definition public (collide&slide origin <f64vector> target <f64vector> lookat <LookAt> radiuses <f64vector> (max-distance: max-distance #f) (polygon-filter: polygon-filter #f) (ignore-entities?: ignore-entities? #t) (ignore-players?: ignore-players? #f))
   (let ((world (current-world))
         (zone (current-zone))
         (sphere-matrix (make-matrix&))
@@ -421,7 +423,7 @@
               (sphere-matrices! sphere-matrix inverse-matrix (get-origin~ output-ray) lookat radiuses)
               (movement-transform-3x4! output-ray sphere-matrix))
             (let (;; Get the colliders
-                  (cl <list> (or (calculate-colliders sphere-matrix inverse-matrix output-ray travel-breadth skip-list ignore-entities? ignore-players?) '())))
+                  (cl (calculate-colliders sphere-matrix inverse-matrix output-ray travel-breadth max-distance polygon-filter skip-list ignore-entities? ignore-players?)))
               (when (and debug-collisions? (not-null? cl))
                 (add-mark~ zone
                   (new Collisions-Mark inverse-matrix (copy-collisions cl) loop-no)))
@@ -510,8 +512,6 @@
                                         (let ((scalar (f64-ref (dot-product& n1 n2))))
                                           ;; New vector is new direction vector scaled
                                           (set-vector~ output-ray (vertex-scalar*& temp-v scalar))))
-                                      (when (and filter-pulse-jumps (< (f64-ref (dot-product& (get-vector~ output-ray) (get-vector~ input-ray))) 0.))
-                                        (set-vector~ output-ray (static (vertex 0. 0. 0.))))
                                       (vertex-copy! last-direction (get-vector~ output-ray))
                                       ;; Don't collide with these next time
                                       (skip-polygons (cast <Collision> (element hit-list c0)))
@@ -520,13 +520,11 @@
                             ;; Otherwise we slide
                             (let ((slide-src (plane-closest& (get-plane~ cl0) (get-origin~ output-ray))))
                               (set-vector~ output-ray (vertex-& slide-dst slide-src)))
-                            (when (and filter-pulse-jumps (< (f64-ref (dot-product& (get-vector~ output-ray) (get-vector~ input-ray))) 0.))
-                              (set-vector~ output-ray (static (vertex 0. 0. 0.))))
                             (vertex-copy! last-direction (get-vector~ output-ray))
                             ;; Don't collide with this one next time
                             (skip-polygons cl0)
                             (iter (+ loop-no 1))))))))))))
-        (receive (dest dir) (inverse-movement inverse-matrix (get-origin~ output-ray) last-direction)
+        (receive (dest dir) (inverse-ray inverse-matrix (get-origin~ output-ray) last-direction)
           (values dest
                   dir
                   (transform-collisions last-cl inverse-matrix))))))))
