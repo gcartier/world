@@ -3769,7 +3769,9 @@
          (set! deleting? #f)
          (set! editor-origin #f)
          (set! editor-normal #f)
-         (set! editor-floor? #f)))))
+         (set! editor-floor? #f)
+         (set! adding #f)
+         (set! adding-properties #f)))))
   
   
   (method (editor-add-at mode class grid? grid-plane grid-position floor-grid? position direction first?)
@@ -3812,20 +3814,35 @@
             (let ((cube (unit-cube inside)))
               (ray-closest-cuboid-inner-quad inside normal cube))))
         
+        (define (determine-anchor origin normal)
+          (let ((bounds (transformed-bounds~ adding)))
+            (let ((radiuses (cuboid-radiuses bounds)))
+              (cond ((= (vertex-y normal) 1.)
+                     origin)
+                    ((= (vertex-y normal) -1.)
+                     (vertex- origin (vertex 0. (cuboid-height bounds) 0.)))
+                    (else
+                     (vertex+ (vertex- origin (vertex 0. .5 0.))
+                              (vertex-scalar* normal (if (/= (vertex-x normal) 0.)
+                                                         (vertex-x radiuses)
+                                                       (vertex-z radiuses)))))))))
+        
         (let ((closest (collision-quad origin normal)))
           (when closest
             (bind (quad dist) closest
               (let ((origin (get-origin~ quad))
                     (normal (vertex-scalar* (get-normal~ quad) -1.)))
-                (let ((center (vertex+ origin (vertex-scalar*& normal .5))))
-                  (let ((actual (element-near~ zone center)))
-                    (unless actual
-                      (let ((added (editor-add-element mode class center)))
-                        (when first?
-                          (set! editor-origin origin)
-                          (set! editor-normal normal)
-                          (set! editor-floor? floor?))
-                        added)))))))))
+                (instantiate-element-class class)
+                (let ((anchor (determine-anchor origin normal)))
+                  (let ((position (anchor->position~ adding anchor)))
+                    (let ((actual (element-near~ zone position)))
+                      (unless actual
+                        (let ((added (editor-add-element mode class anchor)))
+                          (when first?
+                            (set! editor-origin origin)
+                            (set! editor-normal normal)
+                            (set! editor-floor? floor?))
+                          added))))))))))
       
       (let ((filter (determine-filter)))
         (let ((poly-closest (ray-closest-polygon position direction view-radius filter: filter ignore-players?: #t))
@@ -3870,49 +3887,41 @@
                     (add-at vert normal #t))))))))))
   
   
-  (method (editor-add-element mode class vert)
+  (method (editor-add-element mode class anchor)
     (let ((zone (current-zone))
           (me (current-me)))
-      (let ((to-x (floor (vertex-x vert)))
-            (to-y (floor (vertex-y vert)))
-            (to-z (floor (vertex-z vert))))
-        (instantiate-element-class class to-x to-y to-z)
-        (let ((element adding)
-              (designer (get-designer~ zone)))
-          (unless (is? element Player)
-            (add-child~ designer element zone import: '(world.data) properties: adding-properties))
-          (let ((pos (get-position~ element))
-                (model (and (is? element Entity) (cache-model~ element))))
-            (case (get-anchor~ model)
-              ((center)
-               (let ((bounds (get-bounds~ element)))
-                 (set-position~ element (vertex+& pos (cuboid-radiuses bounds)))))
-              ((origin))))
-          (unless (is? element Player)
-            (set-property~ designer element 'position (get-position~ element)))
-          (add-element~ zone element)
-          (when (and (is? element Player) (not (get-world-server~ (get-process))))
-            (let ((preserved-lookat (and first-person? (get-lookat~ me))))
-              (remove-element me)
-              (when (server-side?~ (get-process))
-                (set-color~ element white-dye))
-              (set-current-me element)
-              (set-lookat~ element (or preserved-lookat (get-eye-lookat)))))
-          (when (eq? element (current-me))
-            (follow-player))
-          (update-future)
-          element))))
+      (let ((element adding)
+            (position (anchor->position~ adding anchor))
+            (designer (get-designer~ zone)))
+        (set-position~ element position)
+        (unless (is? element Player)
+          (add-child~ designer element zone import: '(world.data) properties: (cons position: (cons position adding-properties))))
+        (unless (is? element Player)
+          (set-property~ designer element 'position position))
+        (add-element~ zone element)
+        (when (and (is? element Player) (not (get-world-server~ (get-process))))
+          (let ((preserved-lookat (and first-person? (get-lookat~ me))))
+            (remove-element me)
+            (when (server-side?~ (get-process))
+              (set-color~ element white-dye))
+            (set-current-me element)
+            (set-lookat~ element (or preserved-lookat (get-eye-lookat)))))
+        (when (eq? element (current-me))
+          (follow-player))
+        (update-future)
+        (set! adding #f)
+        (set! adding-properties #f)
+        element)))
   
   
-  (method (instantiate-element-class class x y z)
+  (method (instantiate-element-class class)
     (let ((zone (current-zone)))
       (define (instantiate class/new (properties '()))
-        (let ((properties (append (list position: (vertex x y z)) properties)))
-          (let ((elem (if (procedure? class/new) (class/new) (apply new class/new parent: zone properties))))
-            (when (is? elem Player)
-              (set-name~ elem (effective-player-name~ (get-application))))
-            (set! adding elem)
-            (set! adding-properties properties))))
+        (let ((elem (if (procedure? class/new) (class/new) (apply new class/new parent: zone properties))))
+          (when (is? elem Player)
+            (set-name~ elem (effective-player-name~ (get-application))))
+          (set! adding elem)
+          (set! adding-properties properties)))
       
       (define (instantiate-block block)
         (define (determine-rotation)
@@ -3926,7 +3935,7 @@
         (let ((model (get-model~ block))
               (rotation (determine-rotation)))
           (instantiate (lambda ()
-                         (new (class-of block)))
+                         (new (class-of block) model: model))
                        (list model: model rotation: rotation))))
       
       (define (instantiate-entity entity)
@@ -3935,18 +3944,19 @@
               (animation (get-animation~ entity))
               (animate? (get-animate?~ entity)))
           (instantiate (lambda ()
-                         (new (class-of entity)))
+                         (new (class-of entity) model: model))
                        (list model: model meshes-mask: meshes-mask animation: animation animate?: animate?))))
       
-      (typecase class
-        ((Block)
-         (instantiate-block class))
-        ((Entity)
-         (instantiate-entity class))
-        (else
-         (case class
-           ((player) (instantiate (player-class)))
-           ((block) (instantiate Block)))))))
+      (when (not adding)
+        (typecase class
+          ((Block)
+           (instantiate-block class))
+          ((Entity)
+           (instantiate-entity class))
+          (else
+           (case class
+             ((player) (instantiate (player-class)))
+             ((block) (instantiate Block))))))))
   
   
   (method (editor-remove mode position direction stage)
@@ -4059,9 +4069,10 @@
   
   
   (method (change-class element class)
-    (let ((vert (vertex- (get-position~ element) (get-radiuses~ element))))
+    (let ((anchor (position->anchor~ element (get-position~ element))))
       (editor-remove-element element)
-      (editor-add-element editor-mode class vert)))
+      (instantiate-element-class class)
+      (editor-add-element editor-mode class anchor)))
   
   
   (method (editor-element-class)
