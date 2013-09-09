@@ -15,7 +15,19 @@
 
 
 (import (profiler)
-        (time))
+        (time)
+        (world))
+
+
+;;;
+;;;; Site
+;;;
+
+
+(definition public (iterate-sites proc)
+  (iterate-table (registered-sites)
+    (lambda (name site)
+      (proc (symbol->enumerator name)))))
 
 
 ;;;
@@ -23,15 +35,16 @@
 ;;;
 
 
-(definition public (advise-profile name)
-  (advise name
-          (lambda (field locator original set)
-            (let ((original (original)))
-              (when (procedure? original)
-                (set (lambda rest
-                       (with-profile name
-                         (lambda ()
-                           (apply original rest))))))))))
+(definition public (advise-profile what)
+  (let ((name (enumerator->symbol what)))
+    (advise what
+            (lambda (field locator original set)
+              (let ((original (original)))
+                (when (procedure? original)
+                  (set (lambda rest
+                         (with-profile name
+                           (lambda ()
+                             (apply original rest)))))))))))
 
 
 ;;;
@@ -39,15 +52,17 @@
 ;;;
 
 
-(definition public (advise-memory name)
-  (advise name
-          (lambda (field locator original set)
-            (let ((original (original)))
-              (when (procedure? original)
-                (set (lambda rest
-                       (with-memory name
-                         (lambda ()
-                           (apply original rest))))))))))
+(definition public (advise-memory what)
+  (let ((name (enumerator->symbol what)))
+    (setup-memory name)
+    (advise what
+            (lambda (field locator original set)
+              (let ((original (original)))
+                (when (procedure? original)
+                  (set (lambda (thunk)
+                         ;; pass original and thunk as parameters instead of
+                         ;; using a closure that would allocate some memory
+                         (with-memory name original thunk)))))))))
 
 
 (definition protected memory-allocated
@@ -57,26 +72,57 @@
   (make-table test: eq?))
 
 
-(definition public with-memory
-  (let ((before (make-f64vector 1))
+(definition protected (setup-memory name)
+  (table-set! memory-allocated name (make-f64vector 1 0.))
+  (table-set! memory-called name 0))
+
+
+(proclaim (warn optimizations))
+
+
+(definition with-memory-internal
+  (let ((allocated-top 0)
+        (allocated-stack (make-f64vector 1024))
+        (before (make-f64vector 1))
         (after (make-f64vector 1)))
-    (lambda (name thunk)
+    (lambda (name procedure thunk vec <f64vector>)
       (bytes-allocated! before)
-      (thunk)
-      (bytes-allocated! after)
-      (let ((allocated (- (f64vector-ref after 0) (f64vector-ref before 0))))
-        (table-set! memory-allocated name (+ (table-ref memory-allocated name 0.) allocated))
-        (table-set! memory-called name (+ (table-ref memory-called name 0) 1))))))
+      (f64vector-set! allocated-stack allocated-top (f64vector-ref before 0))
+      (increase! allocated-top)
+      (prog1 (procedure thunk)
+        (decrease! allocated-top)
+        (bytes-allocated! after)
+        (table-set! memory-called name (+ (cast <fx> (table-ref memory-called name 0)) 1))
+        (let ((allocated (- (f64vector-ref after 0) (f64vector-ref allocated-stack allocated-top))))
+          (f64vector-set! vec 0 (+ (f64vector-ref vec 0) allocated)))))))
+
+
+;; strangely doing the table-ref inside with-memory-internal allocates memory
+(definition public (with-memory name procedure thunk)
+  (with-memory-internal name procedure thunk (table-ref memory-allocated name)))
+
+
+(proclaim (not warn optimizations))
 
 
 (definition public (reset-memory)
-  (set! memory-allocated (make-table test: eq?))
-  (set! memory-called (make-table test: eq?)))
+  (iterate-table memory-allocated
+    (lambda (name allocated)
+      (f64vector-set! allocated 0 0.)))
+  (iterate-table memory-called
+    (lambda (name called)
+      (table-set! memory-called name 0))))
 
 
 (definition public (report-memory)
+  (define (present-memory allocated called)
+    (format ", {a}k, {a}m"
+            (fxround (/ allocated (cast <fl> called) 1024.))
+            (fxround (/ allocated 1024. 1024.))))
+  
   (for-each (lambda (name)
-              (let ((allocated (table-ref memory-allocated name))
+              (let ((allocated (f64vector-ref (table-ref memory-allocated name) 0))
                     (called (table-ref memory-called name)))
-                (format :console "{s} {r precision: 3}{%}" name (/ allocated called))))
+                (when (> called 0)
+                  (format :console "{a}{a}{%}" name (present-memory allocated called)))))
             (sort nu<? (table-keys memory-allocated) key: ->string))))
