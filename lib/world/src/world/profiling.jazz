@@ -48,84 +48,99 @@
 
 
 ;;;
-;;;; Memory
+;;;; Site
 ;;;
-
-
-(declare (optimize-dead-local-variables))
-
-
-(definition public (advise-memory what)
-  (let ((name (enumerator->symbol what)))
-    (setup-memory name)
-    (advise what
-            (lambda (field locator original set)
-              (let ((original (original)))
-                (when (procedure? original)
-                  (set (lambda (thunk)
-                         ;; pass original and thunk as parameters instead of
-                         ;; using a closure that would allocate some memory
-                         (with-memory name original thunk)))))))))
-
-
-(definition protected memory-allocated
-  (make-table test: eq?))
-
-(definition protected memory-called
-  (make-table test: eq?))
-
-
-(definition protected (setup-memory name)
-  (table-set! memory-allocated name (make-f64vector 1 0.))
-  (table-set! memory-called name 0))
 
 
 (proclaim (warn optimizations))
 
+(declare (optimize-dead-local-variables))
 
-(definition with-memory-internal
-  (let ((allocated-top 0)
-        (allocated-stack (make-f64vector 1024))
+
+(definition inline (make-site-profile)
+  (f64vector (current-seconds) 0. 0.))
+
+
+(definition inline (site-profile-started profile)
+  (f64vector-ref profile 0))
+
+(definition inline (site-profile-allocated profile)
+  (f64vector-ref profile 1))
+
+(definition inline (site-profile-called profile)
+  (f64vector-ref profile 2))
+
+
+(definition inline (site-profile-started-set! profile started)
+  (f64vector-set! profile 0 started))
+
+(definition inline (site-profile-allocated-set! profile allocated)
+  (f64vector-set! profile 1 allocated))
+
+(definition inline (site-profile-called-set! profile called)
+  (f64vector-set! profile 2 called))
+
+
+(definition public (advise-site what)
+  (let ((name (enumerator->symbol what)))
+    (let ((site (registered-site name)))
+      (set-profile~ site (make-site-profile)))
+    (advise what
+            (lambda (field locator original set)
+              (let ((original (original)))
+                (when (procedure? original)
+                  (set (lambda (site thunk)
+                         ;; pass original and thunk as parameters instead of
+                         ;; using a closure that would allocate some memory
+                         (with-site name site original thunk)))))))))
+
+
+(definition public with-site
+  (let ((before-top 0)
+        (before-stack (make-f64vector 1024))
         (before (make-f64vector 1))
         (after (make-f64vector 1)))
-    (lambda (name procedure thunk vec <f64vector>)
-      (bytes-allocated! before)
-      (f64vector-set! allocated-stack allocated-top (f64vector-ref before 0))
-      (increase! allocated-top)
-      (prog1 (procedure thunk)
-        (decrease! allocated-top)
-        (bytes-allocated! after)
-        (table-set! memory-called name (+ (cast <fx> (table-ref memory-called name 0)) 1))
-        (let ((allocated (- (f64vector-ref after 0) (f64vector-ref allocated-stack allocated-top))))
-          (f64vector-set! vec 0 (+ (f64vector-ref vec 0) allocated)))))))
-
-
-;; strangely doing the table-ref inside with-memory-internal allocates memory
-(definition public (with-memory name procedure thunk)
-  (with-memory-internal name procedure thunk (table-ref memory-allocated name)))
+    (lambda (name site <Call-Site> procedure thunk)
+      (let ((profile (get-profile~ site)))
+        (bytes-allocated! before)
+        (f64vector-set! before-stack before-top (f64vector-ref before 0))
+        (increase! before-top)
+        (prog1 (procedure site thunk)
+          (decrease! before-top)
+          (bytes-allocated! after)
+          (let ((allocated (- (f64vector-ref after 0) (f64vector-ref before-stack before-top))))
+            (site-profile-allocated-set! profile (+ (site-profile-allocated profile) allocated)))
+          (site-profile-called-set! profile (+ (site-profile-called profile) 1)))))))
 
 
 (proclaim (not warn optimizations))
 
 
-(definition public (reset-memory)
-  (iterate-table memory-allocated
-    (lambda (name allocated)
-      (f64vector-set! allocated 0 0.)))
-  (iterate-table memory-called
-    (lambda (name called)
-      (table-set! memory-called name 0))))
+(definition public (reset-sites)
+  (iterate-table (registered-sites)
+    (lambda (name site)
+      (let ((profile (get-profile~ site)))
+        (site-profile-started-set! profile (current-seconds))
+        (site-profile-allocated-set! profile 0.)
+        (site-profile-called-set! profile 0.)))))
 
 
-(definition public (report-memory)
-  (define (present-memory allocated called)
-    (format ", {a}k, {a}m"
-            (fxround (/ allocated (cast <fl> called) 1024.))
-            (fxround (/ allocated 1024. 1024.))))
+(definition public (report-sites)
+  (define (present-memory started allocated called)
+    (let ((average (fxround (/ allocated called 1024.)))
+          (rate (fxround (/ allocated (- (current-seconds) started) 1024. 1024.))))
+      (format ", {a}k, {a}m"
+              average
+              rate)))
   
-  (for-each (lambda (name)
-              (let ((allocated (f64vector-ref (table-ref memory-allocated name) 0))
-                    (called (table-ref memory-called name)))
-                (when (> called 0)
-                  (format :console "{a}{a}{%}" name (present-memory allocated called)))))
-            (sort nu<? (table-keys memory-allocated) key: ->string))))
+  (let ((sites (registered-sites)))
+    (for-each (lambda (site)
+                (let ((name (get-name~ site))
+                      (profile (get-profile~ site)))
+                  (when profile
+                    (let ((started (site-profile-started profile))
+                          (allocated (site-profile-allocated profile))
+                          (called (site-profile-called profile)))
+                      (when (> called 0.)
+                        (format :console "{a}{a}{%}" name (present-memory started allocated called)))))))
+              (sort nu<? (table-values sites) key: get-name~)))))
