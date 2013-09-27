@@ -67,6 +67,7 @@
   
   
   (slot id          <object> accessors generate)
+  (slot parent      <object> accessors generate)
   (slot translation <object> accessors generate)
   (slot rotation    <object> accessors generate)
   (slot scale       <object> accessors generate)
@@ -74,24 +75,19 @@
   (slot children    <object> accessors generate)
   
   
-  (method override (initialize id translation rotation scale parts children)
+  (method override (initialize id parent translation rotation scale parts)
     (set! id~self id)
+    (set! parent~self parent)
     (set! translation~self translation)
     (set! rotation~self rotation)
     (set! scale~self scale)
-    (set! parts~self parts)
-    (set! children~self children))
+    (set! parts~self parts))
   
   
   (method override (print output readably)
     (print-unreadable self output
       (lambda (output)
         (format output "{a}" id))))
-  
-  
-  (method (bone?)
-    ;; need to improve this heuristic
-    (starts-with? id "Bone"))
   
   
   (method (transformation-matrix)
@@ -313,6 +309,40 @@
   (slot animations <object> accessors generate)
   
   
+  (slot nodes-table initialize (make-table test: equal?))
+  
+  
+  (method override (initialize meshes materials nodes animations)
+    (set! meshes~self meshes)
+    (set! materials~self materials)
+    (set! nodes~self nodes)
+    (set! animations~self animations)
+    (setup-tables))
+  
+  
+  (method (setup-tables)
+    (define (process-node node)
+      (let ((id (get-id~ node)))
+        (if (table-ref nodes-table id #f)
+            (table-set! nodes-table id #t)
+          (table-set! nodes-table id node)))
+      (let ((children (get-children~ node)))
+        (when children
+          (for-each process-node children))))
+    
+    (for-each process-node nodes))
+  
+  
+  (method (find-node id)
+    (let ((value (table-ref nodes-table id #f)))
+      (cond ((not value)
+             (error "Unable to find node id: {a}" id))
+            ((eq? value #t)
+             (error "Duplicate node id: {a}" id))
+            (else
+             value))))
+  
+  
   (method (find-mesh-part part-id)
     (continuation-capture
       (lambda (return)
@@ -462,37 +492,36 @@
   (method (extract-bounds)
     (let ((bounds #f))
       (define (process-node node)
-        (unless (bone?~ node)
-          (let ((parts (get-parts~ node)))
-            (when parts
-              (let ((matrix (transformation-matrix~ node)))
-                (loop (for part in parts)
-                      (receive (mesh mesh-part) (find-mesh-part (get-meshpartid~ part))
-                        (let ((vertices (get-vertices~ mesh))
-                              (indices (get-indices~ mesh-part)))
-                          (loop (for index in-vector indices)
-                                (let ((vertex (list-ref vertices index)))
-                                  (let ((position (matrix-transform matrix (get-position~ vertex))))
-                                    (let ((x (vertex-x position))
-                                          (y (vertex-y position))
-                                          (z (vertex-z position)))
-                                      (if (not bounds)
-                                          (set! bounds (cuboid x y z x y z))
-                                        (when (< x (cuboid-left bounds))
-                                          (cuboid-left-set! bounds x))
-                                        (when (> x (cuboid-right bounds))
-                                          (cuboid-right-set! bounds x))
-                                        (when (< y (cuboid-bottom bounds))
-                                          (cuboid-bottom-set! bounds y))
-                                        (when (> y (cuboid-top bounds))
-                                          (cuboid-top-set! bounds y))
-                                        (when (< z (cuboid-back bounds))
-                                          (cuboid-back-set! bounds z))
-                                        (when (> z (cuboid-front bounds))
-                                          (cuboid-front-set! bounds z)))))))))))))
-          (let ((children (get-children~ node)))
-            (when children
-              (for-each process-node children)))))
+        (let ((parts (get-parts~ node)))
+          (when parts
+            (let ((matrix (transformation-matrix~ node)))
+              (loop (for part in parts)
+                    (receive (mesh mesh-part) (find-mesh-part (get-meshpartid~ part))
+                      (let ((vertices (get-vertices~ mesh))
+                            (indices (get-indices~ mesh-part)))
+                        (loop (for index in-vector indices)
+                              (let ((vertex (list-ref vertices index)))
+                                (let ((position (matrix-transform matrix (get-position~ vertex))))
+                                  (let ((x (vertex-x position))
+                                        (y (vertex-y position))
+                                        (z (vertex-z position)))
+                                    (if (not bounds)
+                                        (set! bounds (cuboid x y z x y z))
+                                      (when (< x (cuboid-left bounds))
+                                        (cuboid-left-set! bounds x))
+                                      (when (> x (cuboid-right bounds))
+                                        (cuboid-right-set! bounds x))
+                                      (when (< y (cuboid-bottom bounds))
+                                        (cuboid-bottom-set! bounds y))
+                                      (when (> y (cuboid-top bounds))
+                                        (cuboid-top-set! bounds y))
+                                      (when (< z (cuboid-back bounds))
+                                        (cuboid-back-set! bounds z))
+                                      (when (> z (cuboid-front bounds))
+                                        (cuboid-front-set! bounds z)))))))))))))
+        (let ((children (get-children~ node)))
+          (when children
+            (for-each process-node children))))
       
       (for-each process-node nodes)
       bounds))
@@ -525,30 +554,23 @@
     (define (first-animation)
       (and animations (not-null? animations) (first animations)))
     
-    (let ((animation (first-animation))
-          (queue (new-queue)))
-      (define (process-node parent-bone node)
-        (let ((id (get-id~ node))
-              (children (get-children~ node))
-              (bone? (bone?~ node)))
-          (when bone?
-            (let ((translation (or (get-translation~ node) (vertex 0. 0. 0.)))
-                  (rotation (or (get-rotation~ node) (quaternion 0. 0. 0. 1.)))
-                  (scale (or (get-scale~ node) (vertex 1. 1. 1.))))
-              (let ((scaled-translation (vertex/ translation scale)))
-                (let ((translation-keys (extract-keys animation id get-translation~ (lambda (pos) (vertex- pos scaled-translation))))
-                      (rotation-keys (extract-keys animation id get-rotation~ identity)))
-                  (enqueue queue (new Bone 0 id parent-bone rotation scaled-translation rotation-keys translation-keys))))))
-          (when children
-            (let ((parent-bone (and bone? id)))
-              (for-each (lambda (node)
-                          (process-node parent-bone node))
-                        children)))))
-      
-      (for-each (lambda (node)
-                  (process-node #f node))
-                nodes)
-      (list->vector (queue-list queue))))
+    (let ((animation (first-animation)))
+      (list->vector
+        (if (not animation)
+            '()
+          (map (lambda (bone)
+                 (let ((id (get-boneid~ bone)))
+                   (let ((node (find-node id)))
+                     (let ((parent (get-parent~ node))
+                           (translation (or (get-translation~ node) (vertex 0. 0. 0.)))
+                           (rotation (or (get-rotation~ node) (quaternion 0. 0. 0. 1.)))
+                           (scale (or (get-scale~ node) (vertex 1. 1. 1.))))
+                       (let ((parent-id (and parent (get-id~ parent)))
+                             (scaled-translation (vertex/ translation scale)))
+                         (let ((translation-keys (extract-keys animation id get-translation~ (lambda (pos) (vertex- pos scaled-translation))))
+                               (rotation-keys (extract-keys animation id get-rotation~ identity)))
+                           (new Bone 0 id parent-id rotation scaled-translation rotation-keys translation-keys)))))))
+               (get-bones~ animation))))))
   
   
   (method (extract-keys animation bone-id key adjust)
@@ -634,17 +656,12 @@
 
 
 (definition (load-model file)
-  (define (process w3ds)
-    (let ((model (new W3D-Model))
-          (meshes (getp w3ds "meshes"))
-          (materials (getp w3ds "materials"))
-          (nodes (getp w3ds "nodes"))
-          (animations (getp w3ds "animations")))
-      (set-meshes~ model (process-meshes meshes))
-      (set-materials~ model (process-materials materials))
-      (set-nodes~ model (process-nodes nodes))
-      (set-animations~ model (process-animations animations))
-      model))
+  (define (process-model w3ds)
+    (let ((meshes (process-meshes (getp w3ds "meshes")))
+          (materials (process-materials (getp w3ds "materials")))
+          (nodes (process-nodes #f (getp w3ds "nodes")))
+          (animations (process-animations (getp w3ds "animations"))))
+      (new W3D-Model meshes materials nodes animations)))
   
   (define (process-meshes meshes)
     (define (process-vertices attributes vertices)
@@ -727,7 +744,7 @@
     (loop (for material in-vector materials)
           (collect (process-material material))))
   
-  (define (process-nodes nodes)
+  (define (process-nodes parent nodes)
     (define (process-node node)
       (define (process-parts parts)
         (when parts
@@ -743,7 +760,9 @@
             (scale (process-vertex (getp node "scale")))
             (parts (process-parts (getp node "parts")))
             (children (getp node "children")))
-        (new W3D-Node id translation rotation scale parts (and children (process-nodes children)))))
+        (let ((node (new W3D-Node id parent translation rotation scale parts)))
+          (set-children~ node (and children (process-nodes node children)))
+          node)))
     
     (loop (for node in-vector nodes)
           (collect (process-node node))))
@@ -786,4 +805,4 @@
     (getf expr prop test: equal?))
   
   (let ((w3ds (call-with-input-file (path-settings file) read)))
-    (process w3ds))))
+    (process-model w3ds))))
