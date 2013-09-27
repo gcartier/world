@@ -89,6 +89,11 @@
         (format output "{a}" id))))
   
   
+  (method (bone?)
+    ;; need to improve this heuristic
+    (starts-with? id "Bone"))
+  
+  
   (method (transformation-matrix)
     (let ((translation (if translation (make-translation-matrix& translation) (make-identity-matrix&)))
           (rotation (if rotation (make-quaternion-matrix& rotation) (make-identity-matrix&)))
@@ -308,6 +313,18 @@
   (slot animations <object> accessors generate)
   
   
+  (method (find-mesh-part part-id)
+    (continuation-capture
+      (lambda (return)
+        (for-each (lambda (mesh)
+                    (for-each (lambda (part)
+                                (when (equal? (get-id~ part) part-id)
+                                  (continuation-return return (values mesh part))))
+                              (get-parts~ mesh)))
+                  meshes)
+        (values #f #f))))
+  
+  
   (method (find-material material-id)
     (find-if (lambda (material)
                (equal? (get-id~ material) material-id))
@@ -481,9 +498,23 @@
   
   
   (method (extract-animation name)
-    ;; HACK FOR TESTS
-    (let ((animation-fps 30.)
-          (total-frames 10))
+    (define (total-frames-heuristic)
+      (let ((total-frames 0))
+        (when animations
+          (for-each (lambda (animation)
+                      (for-each (lambda (bone)
+                                  (let ((keyframes (get-keyframes~ bone)))
+                                    (when (not-null? keyframes)
+                                      (let ((last-frame (last keyframes)))
+                                        (let ((time (fxceiling (get-keytime~ last-frame))))
+                                          (when (> time total-frames)
+                                            (set! total-frames time)))))))
+                                (get-bones~ animation)))
+                    animations))
+        total-frames))
+    
+    (let ((animation-fps 1000.)
+          (total-frames (total-frames-heuristic)))
       (let ((animation (new Animation name animation-fps total-frames (extract-bones))))
         (setup-bones~ animation)
         animation)))
@@ -497,20 +528,21 @@
           (queue (new-queue)))
       (define (process-node parent-bone node)
         (let ((id (get-id~ node))
-              (children (get-children~ node)))
-          ;; need to improve this heuristic
-          (let ((bone? (starts-with? id "Bone")))
-            (when bone?
-              (let ((translation (get-translation~ node))
-                    (rotation (get-rotation~ node))
-                    (translation-keys (extract-keys animation id get-translation~))
-                    (rotation-keys (extract-keys animation id get-rotation~)))
-                (enqueue queue (new Bone 0 id parent-bone rotation translation rotation-keys translation-keys))))
-            (when children
-              (let ((parent-bone (and bone? id)))
-                (for-each (lambda (node)
-                            (process-node parent-bone node))
-                          children))))))
+              (children (get-children~ node))
+              (bone? (bone?~ node)))
+          (when bone?
+            (let ((translation (or (get-translation~ node) (vertex 0. 0. 0.)))
+                  (rotation (or (get-rotation~ node) (quaternion 0. 0. 0. 1.)))
+                  (scale (or (get-scale~ node) (vertex 1. 1. 1.))))
+              (let ((scaled-translation (vertex/ translation scale)))
+                (let ((translation-keys (extract-keys animation id get-translation~ (lambda (pos) (vertex- pos scaled-translation))))
+                      (rotation-keys (extract-keys animation id get-rotation~ identity)))
+                  (enqueue queue (new Bone 0 id parent-bone rotation scaled-translation rotation-keys translation-keys))))))
+          (when children
+            (let ((parent-bone (and bone? id)))
+              (for-each (lambda (node)
+                          (process-node parent-bone node))
+                        children)))))
       
       (for-each (lambda (node)
                   (process-node #f node))
@@ -518,7 +550,7 @@
       (list->vector (queue-list queue))))
   
   
-  (method (extract-keys animation bone-id key)
+  (method (extract-keys animation bone-id key adjust)
     (let ((bone (find-bone~ animation bone-id)))
       (if (not bone)
           (vector)
@@ -526,7 +558,7 @@
                             (for time = (get-keytime~ keyframe))
                             (for value = (key keyframe))
                             (if value
-                                (collect (new KeyFrame time value) into keys)
+                                (collect (new KeyFrame time (adjust value)) into keys)
                               (return keys))
                             (finally keys)))))))
 
@@ -561,7 +593,7 @@
                             (all-animations~ model)))
         (error "Inconsistant bones in model: {a}" name)))
     
-    (let ((model (new Model name: name rotation: (vertex 0. 0. 0.))))
+    (let ((model (new Model name: name)))
       (set-metadata~ model metadata)
       (let ((w3d (load-model file)))
         (when (get-debug-w3d?)
