@@ -91,10 +91,10 @@
   
   
   (method (transformation-matrix)
-    (let ((translation (if translation (make-translation-matrix& translation) (make-identity-matrix&)))
-          (rotation (if rotation (make-quaternion-matrix& rotation) (make-identity-matrix&)))
-          (scaling (make-identity-matrix&)))
-      (matrix-multiply translation (matrix-multiply& rotation scaling)))))
+    (let ((scaled-translation (and translation (if scale (vertex/ translation scale) translation))))
+      (let ((translation (if scaled-translation (make-translation-matrix& scaled-translation) (make-identity-matrix&)))
+            (rotation (if rotation (make-quaternion-matrix& rotation) (make-identity-matrix&))))
+        (matrix-multiply translation rotation)))))
 
 
 ;;;
@@ -107,13 +107,42 @@
   
   (slot meshpartid <object> accessors generate)
   (slot materialid <object> accessors generate)
+  (slot bones      <object> accessors generate)
   (slot uvMapping  <object> accessors generate)
   
   
-  (method override (initialize meshpartid materialid uvMapping)
+  (method override (initialize meshpartid materialid bones uvMapping)
     (set! meshpartid~self meshpartid)
     (set! materialid~self materialid)
+    (set! bones~self bones)
     (set! uvMapping~self uvMapping)))
+
+
+;;;
+;;;; Node-Part-Bone
+;;;
+
+
+(class W3D-Node-Part-Bone extends Object
+  
+  
+  (slot node        <object> accessors generate)
+  (slot translation <object> accessors generate)
+  (slot rotation    <object> accessors generate)
+  (slot scale       <object> accessors generate)
+  
+  
+  (method override (initialize node translation rotation scale)
+    (set! node~self node)
+    (set! translation~self translation)
+    (set! rotation~self rotation)
+    (set! scale~self scale))
+  
+  
+  (method override (print output readably)
+    (print-unreadable self output
+      (lambda (output)
+        (format output "{a}" node)))))
 
 
 ;;;
@@ -310,6 +339,8 @@
   
   
   (slot nodes-table initialize (make-table test: equal?))
+  (slot bones-table initialize (make-table test: equal?))
+  (slot bones-index initialize 0)
   
   
   (method override (initialize meshes materials nodes animations)
@@ -401,17 +432,22 @@
                   0.
                 (f64vector-ref b 0))))
           
-          (define (add-triangle n1 n2 n3 matrix adjust-uv)
+          (define (add-triangle n1 n2 n3 matrix adjust-uv bone-ids)
             (define (transform vert)
               (matrix-transform matrix vert))
+            
+            (define (bone-index vert)
+              (if (not bone-ids)
+                  0.
+                (cast <fl> (list-ref bone-ids (fxround (vertex-bone vert))))))
             
             (let ((v1 (vertex-ref n1))
                   (v2 (vertex-ref n2))
                   (v3 (vertex-ref n3)))
               (add
-                (transform (get-position~ v1)) (get-normal~ v1) (adjust-uv (get-texcoord~ v1)) (vertex-bone v1)
-                (transform (get-position~ v2)) (get-normal~ v2) (adjust-uv (get-texcoord~ v2)) (vertex-bone v2)
-                (transform (get-position~ v3)) (get-normal~ v3) (adjust-uv (get-texcoord~ v3)) (vertex-bone v3))))
+                (transform (get-position~ v1)) (get-normal~ v1) (adjust-uv (get-texcoord~ v1)) (bone-index v1)
+                (transform (get-position~ v2)) (get-normal~ v2) (adjust-uv (get-texcoord~ v2)) (bone-index v2)
+                (transform (get-position~ v3)) (get-normal~ v3) (adjust-uv (get-texcoord~ v3)) (bone-index v3))))
           
           (define (add v1 n1 t1 b1 v2 n2 t2 b2 v3 n3 t3 b3)
             (add-vertex v1) (add-normal n1) (add-texture t1) (add-bone b1) (add-neighbors 0. v2 v3)
@@ -457,30 +493,34 @@
               (when parts
                 (let ((matrix (transformation-matrix~ node)))
                   (loop (for part in parts)
-                        (let ((mesh-part (find-part~ mesh (get-meshpartid~ part))))
-                          ;; for now it is possible to find no part since we
-                          ;; are traversing all nodes for a single target mesh
-                          (when mesh-part
-                            (let ((material (find-material (get-materialid~ part))))
-                              (let ((indices (get-indices~ mesh-part))
-                                    (image (extract-base (get-filename~ (car (get-textures~ material))))))
-                                (let ((uv (image-rect~ atlas image)))
-                                  (let ((left (uv-left uv))
-                                        (top (uv-top uv))
-                                        (texture-depth (uv-depth uv)))
-                                    (let ((width (- (uv-right uv) left))
-                                          (height (- (uv-bottom uv) top)))
-                                      (define (adjust-uv coord)
-                                        (vertex (+ left (* (vertex-x coord) width))
-                                                (+ top (* (vertex-y coord) height))
-                                                texture-depth))
-                                      
-                                      (loop (for n from 0 below (vector-length indices) by 3)
-                                            (add-triangle (vector-ref indices n)
-                                                          (vector-ref indices (+ n 1))
-                                                          (vector-ref indices (+ n 2))
-                                                          matrix
-                                                          adjust-uv)))))))))))))
+                        (let ((meshpartid (get-meshpartid~ part))
+                              (materialid (get-materialid~ part))
+                              (bones (get-bones~ part)))
+                          (let ((mesh-part (find-part~ mesh meshpartid)))
+                            ;; for now it is possible to find no part since we
+                            ;; are traversing all nodes for a single target mesh
+                            (when mesh-part
+                              (let ((material (find-material materialid)))
+                                (let ((indices (get-indices~ mesh-part))
+                                      (image (extract-base (get-filename~ (car (get-textures~ material))))))
+                                  (let ((uv (image-rect~ atlas image)))
+                                    (let ((left (uv-left uv))
+                                          (top (uv-top uv))
+                                          (texture-depth (uv-depth uv)))
+                                      (let ((width (- (uv-right uv) left))
+                                            (height (- (uv-bottom uv) top)))
+                                        (define (adjust-uv coord)
+                                          (vertex (+ left (* (vertex-x coord) width))
+                                                  (+ top (* (vertex-y coord) height))
+                                                  texture-depth))
+                                        
+                                        (loop (for n from 0 below (vector-length indices) by 3)
+                                              (add-triangle (vector-ref indices n)
+                                                            (vector-ref indices (+ n 1))
+                                                            (vector-ref indices (+ n 2))
+                                                            matrix
+                                                            adjust-uv
+                                                            (and bones (register-bones bones))))))))))))))))
             (let ((children (get-children~ node)))
               (when children
                 (for-each add-node children))))
@@ -551,29 +591,38 @@
   
   
   (method (extract-bones)
-    (define (first-animation)
-      (and animations (not-null? animations) (first animations)))
-    
-    (let ((animation (first-animation)))
-      (list->vector
-        (if (not animation)
-            '()
-          (let ((i 0))
-            (map (lambda (bone)
-                   (let ((id (get-boneid~ bone)))
-                     (let ((node (find-node id))
-                           (index i))
-                       (increase! i)
-                       (let ((parent (get-parent~ node))
-                             (translation (or (get-translation~ node) (vertex 0. 0. 0.)))
-                             (rotation (or (get-rotation~ node) (quaternion 0. 0. 0. 1.)))
-                             (scale (or (get-scale~ node) (vertex 1. 1. 1.))))
-                         (let ((parent-id (and parent (get-id~ parent)))
-                               (scaled-translation (vertex/ translation scale)))
-                           (let ((translation-keys (extract-keys animation id get-translation~ (lambda (pos) (vertex- pos scaled-translation))))
-                                 (rotation-keys (extract-keys animation id get-rotation~ identity)))
-                             (new Bone 0 id index parent-id rotation scaled-translation rotation-keys translation-keys)))))))
-                 (get-bones~ animation)))))))
+    (list->vector (sort < (table-values bones-table) key: get-index~)))
+  
+  
+  (method (register-bones bones)
+    (map register-bone bones))
+  
+  
+  (method (register-bone boneref)
+    (let ((id (get-node~ boneref)))
+      (let ((actual (table-ref bones-table id #f)))
+        (if actual
+            (get-index~ actual)
+          (let ((node (find-node id))
+                (animation (first-animation)))
+            (let ((boneanim (find-bone~ animation id)))
+              (let ((parent (get-parent~ node))
+                    (translation (or (get-translation~ node) (vertex 0. 0. 0.)))
+                    (rotation (or (get-rotation~ node) (quaternion 0. 0. 0. 1.)))
+                    (scale (or (get-scale~ node) (vertex 1. 1. 1.))))
+                (let ((index bones-index)
+                      (parent-id (and parent (get-id~ parent)))
+                      (scaled-translation (vertex/ translation scale)))
+                  (let ((translation-keys (extract-keys animation id get-translation~ (lambda (pos) (vertex- pos scaled-translation))))
+                        (rotation-keys (extract-keys animation id get-rotation~ identity)))
+                    (increase! bones-index)
+                    (let ((bone (new Bone 0 id index parent-id rotation scaled-translation rotation-keys translation-keys)))
+                      (table-set! bones-table id bone))
+                    index)))))))))
+  
+  
+  (method (first-animation)
+    (and animations (not-null? animations) (first animations)))
   
   
   (method (extract-keys animation bone-id key adjust)
@@ -619,7 +668,7 @@
                             (all-animations~ model)))
         (error "Inconsistant bones in model: {a}" name)))
     
-    (let ((model (new Model name: name)))
+    (let ((model (new Model name: name scale: (vertex .1 .1 .1))))
       (set-metadata~ model metadata)
       (let ((w3d (load-model file)))
         (when (get-debug-w3d?)
@@ -750,12 +799,22 @@
   (define (process-nodes parent nodes)
     (define (process-node node)
       (define (process-parts parts)
+        (define (process-bones bones)
+          (when bones
+            (loop (for bone in-vector bones)
+                  (collect (let ((node (getp bone "node"))
+                                 (translation (process-vertex (getp bone "translation")))
+                                 (rotation (process-quaternion (getp bone "rotation")))
+                                 (scale (process-vertex (getp bone "scale"))))
+                             (new W3D-Node-Part-Bone node translation rotation scale))))))
+        
         (when parts
           (loop (for part in-vector parts)
                 (collect (let ((meshpartid (getp part "meshpartid"))
                                (materialid (getp part "materialid"))
+                               (bones (process-bones (getp part "bones")))
                                (uvMapping (getp part "uvMapping")))
-                           (new W3D-Node-Part meshpartid materialid uvMapping))))))
+                           (new W3D-Node-Part meshpartid materialid bones uvMapping))))))
       
       (let ((id (getp node "id"))
             (translation (process-vertex (getp node "translation")))
