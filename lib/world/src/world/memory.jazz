@@ -14,35 +14,248 @@
 (module world.memory jazz
 
 
-(import (gambit.ext))
+(import (gambit.ext)
+        (world)
+        (world.autoload)
+        (world.syntax (phase syntax)))
 
 
-(definition public (setup-memory)
-  @w
-  (let ((domain (make-domain)))
+;; TODO
+;; - using the visit, when (register-ref (domain-copies domain) obj #f) return an object, log it
+;;   so we get a graph of mutated roots
+
+
+;;;
+;;;; Setup
+;;;
+
+
+@w
+(definition public (setup-memory (feedback?: feedback? #f))
+  (declare (optimize-dead-local-variables))
+  (let ((targets (make-table test: eq?)))
+    (define (add-target obj)
+      (table-set! targets obj #t))
     
-    ;; choose some parts of foobar to copy
-    (copy-to (list-ref foobar 2) STILL domain)
-    (copy-to (list-ref foobar 1) PERM domain)
-    
-    ;; foobar does not yet contain copies
-    (pp (map mem-allocated-kind foobar))
-    (pp (map mem-allocated-kind (list-ref foobar 2)))
-    
-    ;; update foobar to point to the permanent copies
+    (terminal 'DISCOVER)
     (update-reachable!
       '()
       (lambda (container i obj)
-        (or (table-ref (domain-copies domain) obj #f)
-            obj)))
+        (when (or (and (string? obj)
+                       (symbol? container))
+                  (source? obj))
+          (add-target obj))
+        obj)
+      feedback?)
     
-    ;; foobar now contains copies
-    (pp (map mem-allocated-kind foobar))
-    (pp (map mem-allocated-kind (list-ref foobar 2)))
+    (let ((kind PERM)
+          (domain (make-domain)))
+      (terminal 'COPY (table-length targets))
+      (iterate-table targets
+        (lambda (target ignore)
+          (copy-to target PERM domain)))
+      
+      (terminal 'UPDATE (register-count (domain-copies domain)))
+      (update-reachable!
+        '()
+        (lambda (container i obj)
+          (or (register-ref (domain-copies domain) obj #f)
+              obj))
+        feedback?)
+      
+    (terminal 'bytes-copied= (domain-bytes-copied domain)))))
+
+
+(definition public (setup-memory (feedback?: feedback? #f))
+  (declare (optimize-dead-local-variables))
+  (let ((kind PERM)
+        (domain (make-domain)))
+    (update-reachable!
+      '()
+      (lambda (container i obj)
+        (cond @w ((and (string? obj)
+                    (symbol? container))
+               (copy-to obj PERM domain))
+              ((source? obj)
+               (copy-to obj PERM domain))
+              (else
+               obj)))
+      feedback?)
+    (terminal 'bytes-copied= (domain-bytes-copied domain))))
+
+
+@w
+(definition public (setup-memory)
+  (declare (optimize-dead-local-variables))
+  (terminal 'COPYING)
+  (gc)
+  (let ((kind PERM)
+        (domain (make-domain))
+        (modules (get-modules))
+        (catalog (get-catalog)))
+    (copy-to modules kind domain)
+    ;(copy-to catalog kind domain)
+    ;; limit memory for tests
+    @w
+    (let ((n 0))
+      (iterate-table catalog
+        (lambda (unit-name entry)
+          (when (< n 100)
+            (copy-to entry kind domain)
+            (increase! n)))))
     
-    ;; test that the copies are correct
-    (pp ((list-ref foobar 1) 100))
-    (pp foobar)
+    (terminal 'UPDATING)
+    (gc)
+    @w
+    (update-reachable!
+      '()
+      (lambda (container i obj)
+        (let ((copy (register-ref (domain-copies domain) obj #f)))
+          (if copy
+              (begin
+                (table-set! graph container copy)
+                copy)
+            obj))))
     
-    (pp (list 'bytes-copied= (domain-bytes-copied domain)))
-    )))
+    (terminal 'bytes-copied= (domain-bytes-copied domain)))
+  (terminal 'DONE)
+  (gc))
+
+
+;;;
+;;;; Analyse
+;;;
+
+
+(definition public (analyse-memory)
+  (let ((world (current-world))
+        (zone (current-zone))
+        (kind MOVABLE0)
+        (domain (make-domain))
+        (sections (new-queue)))
+    (define (analyse section obj)
+      (domain-bytes-copied-set! domain 0)
+      (copy-to obj kind domain)
+      (enqueue sections (cons section (memory-copied domain))))
+    
+    (define (memory-copied domain)
+      (* 2 (domain-bytes-copied domain)))
+    
+    (define (report-memory)
+      (receive (last-gc-heap-size last-gc-alloc last-gc-live last-gc-movable last-gc-nonmovable) (process-memory)
+        (format :terminal "{%}live : {a}m ({a} + {a}){%}" (meg last-gc-live) (meg last-gc-movable) (meg last-gc-nonmovable))))
+    
+    (define (report-sections sections)
+      (for-each (lambda (info)
+                  (bind (section . bytes) info
+                    (format :terminal "{%}{a} : {a}m" section (meg bytes))))
+                sections))
+    
+    (define (meg bytes)
+      (fxround (/ (cast <fl> bytes) 1024. 1024.)))
+    
+    (report-memory)
+    (analyse 'modules (get-modules))
+    ;(analyse 'catalog (get-catalog))
+    (analyse 'sectors (get-sectors~ zone))
+    (analyse 'areas (get-areas~ zone))
+    (analyse 'world world)
+    (analyse 'zone zone)
+    (report-sections (queue-list sections))))
+
+
+(definition public (analyse-allocation (threshold: threshold #f) (feedback?: feedback? #t))
+  (let ((seen (new-register 4))
+        (movable (make-table test: eq?))
+        (still (make-table test: eq?))
+        (perm (make-table test: eq?))
+        (threshold (* (or threshold 100) 1024)))
+    (receive (last-gc-heap-size last-gc-alloc last-gc-live last-gc-movable last-gc-nonmovable) (process-memory)
+      (define (add-size table class size)
+        (table-set! table class (+ (table-ref table class 0) size)))
+      
+      (define (kb bytes)
+        (fxround (/ (cast <fl> bytes) 1024.)))
+      
+      (define (meg bytes)
+        (fxround (/ (cast <fl> bytes) 1024. 1024.)))
+      
+      (define (mem bytes)
+        (if (>= bytes 1048576)
+            (format "{a}m" (meg bytes))
+          (format "{a}k" (kb bytes))))
+      
+      (define (report-memory)
+        (format :terminal "Live : {a}m ({a} + {a}){%}{%}" (meg last-gc-live) (meg last-gc-movable) (meg last-gc-nonmovable)))
+      
+      (define (report-zone name zone (factor 1))
+        (let ((live (case name
+                      ((MOVA) last-gc-movable)
+                      ((STIL) last-gc-nonmovable)
+                      (else #f)))
+              (total (apply + (map (lambda (info) (* factor (cdr info))) zone))))
+          (let ((missing (and live (- live total))))
+            (format :terminal "{a}: {a}{? (- {a})~}{%}" name (mem total) (and missing (mem missing))))))
+      
+      (define (report-content name zone (factor 1))
+        (format :terminal "{%}{a}{%}" name)
+        (for-each (lambda (info)
+                    (let ((class (car info))
+                          (size (* factor (cdr info))))
+                      (when (>= size threshold)
+                        (format :terminal "{a} {a}{%}" class (mem size)))))
+                  (sort > zone key: cdr)))
+      
+      (report-memory)
+      (update-reachable!
+        '()
+        (lambda (container i obj)
+          (unless (register-ref seen obj #f)
+            (terminal obj)
+            (let ((table (and (mem-allocated? obj)
+                              (case (mem-allocated-kind obj)
+                                ((PERM) perm)
+                                ((STILL) still)
+                                (else movable)))))
+              (when table
+                (cond ((pair? obj)
+                       (add-size table 'Pair 12))
+                      ((symbol? obj)
+                       (add-size table 'Symbol 16))
+                      ((source? obj)
+                       (add-size table 'Source (mem-allocated-size obj)))
+                      ((or (table? obj)
+                           (gc-hash-table? obj))
+                       (add-size table 'Table (mem-allocated-size obj)))
+                      (else
+                       (add-size table (category-name (class-of obj)) (mem-allocated-size obj))))))
+            (register-set! seen obj #t))
+          obj)
+        feedback?)
+      (when feedback?
+        (format :terminal "{%}{%}"))
+      (let ((movable (table->list movable))
+            (still (table->list still))
+            (perm (table->list perm)))
+        (report-zone 'MOVA movable 2)
+        (report-zone 'STIL still)
+        (report-zone 'PERM perm)
+        (report-content 'MOVA movable 2)
+        (report-content 'STIL still)
+        (report-content 'PERM perm)
+        (format :terminal "{%}")
+        (set-%m movable)
+        (set-%s still)
+        (set-%p perm)))))
+
+
+;;;
+;;;; Graph
+;;;
+
+
+(definition protected graph
+  (make-table test: eq?))
+
+(definition public (get-graph)
+  graph))
