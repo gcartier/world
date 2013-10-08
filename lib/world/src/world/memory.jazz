@@ -34,108 +34,304 @@
   (declare (optimize-dead-local-variables))
   (let ((kind PERM)
         (domain (make-domain)))
+    (copy-to (get-modules) kind domain)
     (update-reachable!
-      '()
       (lambda (container i obj)
-        (cond @w ((and (string? obj)
-                    (symbol? container))
-               (copy-to obj PERM domain))
-              ((source? obj)
-               (copy-to obj PERM domain))
-              (else
-               obj)))
+        (or (register-ref (domain-copies domain) obj #f)
+            obj))
+      #f
+      #f
       feedback?)
-    (terminal 'bytes-copied= (domain-bytes-copied domain))))
-
-
-@w
-(definition public (setup-memory)
-  (declare (optimize-dead-local-variables))
-  (terminal 'COPYING)
-  (gc)
-  (let ((kind PERM)
-        (domain (make-domain))
-        (modules (get-modules))
-        (catalog (get-catalog)))
-    (copy-to modules kind domain)
-    ;(copy-to catalog kind domain)
-    ;; limit memory for tests
-    @w
-    (let ((n 0))
-      (iterate-table catalog
-        (lambda (unit-name entry)
-          (when (< n 100)
-            (copy-to entry kind domain)
-            (increase! n)))))
-    
-    (terminal 'UPDATING)
-    (gc)
-    @w
-    (update-reachable!
-      '()
-      (lambda (container i obj)
-        (let ((copy (register-ref (domain-copies domain) obj #f)))
-          (if copy
-              (begin
-                (table-set! graph container copy)
-                copy)
-            obj))))
-    
-    (terminal 'bytes-copied= (domain-bytes-copied domain)))
-  (terminal 'DONE)
-  (gc))
+    (when feedback?
+      (terminal 'bytes-copied= (domain-bytes-copied domain)))))
 
 
 ;;;
-;;;; Analyse
+;;;; Debug
 ;;;
 
 
-(definition public (analyse-memory)
+(class Memory-Snapshot extends Object
+  
+  
+  (slot name    getter generate)
+  (slot table   getter generate)
+  (slot roots   getter generate)
+  (slot content getter generate)
+  
+  
+  (method override (initialize name table roots content)
+    (set! name~self name)
+    (set! table~self table)
+    (set! roots~self roots)
+    (set! content~self content))
+  
+  
+  (method override (print output readably)
+    (print-unreadable self output
+      (lambda (output)
+        (format output "{a}" name)))))
+
+
+(definition snapshots
+  '())
+
+(definition public (get-snapshots)
+  snapshots)
+
+
+(definition public (setup-memory-debug)
+  (define (snapshot name table)
+    (let ((roots (table-keys table)))
+      (new Memory-Snapshot name table roots (snapshot-table table roots))))
+  
+  (dl)
+  (set! snapshots (list (snapshot 'modules (get-modules))
+                        @w (snapshot 'catalog (get-catalog)))))
+
+
+(definition public (setup-memory-compare (present: present #f))
+  (for-each (lambda (snapshot)
+              (let ((name (get-name~ snapshot))
+                    (table (get-table~ snapshot))
+                    (roots (get-roots~ snapshot))
+                    (before (get-content~ snapshot)))
+                (let ((after (snapshot-table table roots)))
+                  (newline)
+                  (debug name)
+                  (compare-snapshots before after present: present max: 4))))
+            snapshots))
+
+
+(definition public (dl)
+  (debug (table-length (get-modules)))
+  (debug (table-length (get-catalog))))
+
+
+(definition public (b obj)
+  (register-ref %b obj #f))
+
+
+(definition public (c obj)
+  (register-ref %c obj #f))
+
+
+;;;
+;;;; Snapshot
+;;;
+
+
+(definition public (snapshot-to! obj seen content data)
+  (update-reachable!
+    (lambda (container i obj)
+      (when (mem-allocated? obj)
+        (unless (register-ref content obj #f)
+          (let ((info (if (object? container)
+                          (if (= i 0)
+                              (list container 'class data)
+                            (let ((name (get-name~ (list-ref (get-instance-slots~ (class-of container)) (- i 1)))))
+                              (list container name data)))
+                        (list container i data))))
+            (register-set! content obj info))))
+      obj)
+    (list obj)
+    seen))
+
+
+(definition public (snapshot-object obj)
+  (let ((seen (new-register))
+        (content (new-register)))
+    (snapshot-to! obj seen content #f)
+    content))
+
+
+(definition public (snapshot-table table roots)
+  (let ((seen (new-register))
+        (content (new-register)))
+    (iterate-table table
+      (lambda (key value)
+        (when (memq? key roots)
+          (snapshot-to! value seen content key))))
+    content))
+
+
+;;;
+;;;; Compare
+;;;
+
+
+(definition public (compare-snapshots before after (present: present #f) (max: max #f))
+  (define (present-table table register)
+    (let ((count 0))
+      (iterate-table table
+        (lambda (obj info)
+          (when (or (not max) (< count max))
+            (pp obj)
+            (when (eq? present 'container)
+              (present-container info register))
+            (increase! count))))))
+  
+  (define (present-container info register)
+    (let (iter (scan info) (depth 0))
+      (when (< depth 1)
+        (bind (container i data) info
+          (display "  ")
+          (when data
+            (pp data)
+            (display "  "))
+          (pp container)
+          (display "    ")
+          (pp i)
+          (let ((parent (register-ref register container #f)))
+            (when parent
+              (iter parent (+ depth 1))))))))
+  
+  (let ((removed (make-table test: eq?))
+        (added (make-table test: eq?)))
+    (iterate-register before
+      (lambda (obj info)
+        ;; found diff
+        (when (not (register-ref after obj #f))
+          (let ((container (car info)))
+            ;; only keep root diffs
+            (when (register-ref after container #f)
+              (table-set! removed obj info))))))
+    (iterate-register after
+      (lambda (obj info)
+        ;; found diff
+        (when (not (register-ref before obj #f))
+          (let ((container (car info)))
+            ;; only keep root diffs
+            (when (register-ref before container #f)
+              (table-set! added obj info))))))
+    (debug 'before (register-length before))
+    (debug 'after (register-length after))
+    (newline)
+    (debug 'removed (table-length removed))
+    (debug 'added (table-length added))
+    (newline)
+    (when present
+      (when (> (table-length removed) 0)
+        (debug removed:)
+        (present-table removed before)
+        (newline))
+      (when (> (table-length added) 0)
+        (debug added:)
+        (present-table added after)
+        (newline)))
+    (set-%b before)
+    (set-%c after)
+    (set-%r removed)
+    (set-%a added)))
+
+
+;;;
+;;;; Zones
+;;;
+
+
+(definition public (analyse-zones (members?: members? #f) (orphans?: orphans? #f) (feedback?: feedback? #t))
   (let ((world (current-world))
         (zone (current-zone))
         (kind MOVABLE0)
         (domain (make-domain))
-        (sections (new-queue)))
-    (define (analyse section obj)
-      (domain-bytes-copied-set! domain 0)
-      (copy-to obj kind domain)
-      (enqueue sections (cons section (memory-copied domain))))
-    
-    (define (memory-copied domain)
-      (* 2 (domain-bytes-copied domain)))
-    
-    (define (report-memory)
-      (receive (last-gc-heap-size last-gc-alloc last-gc-live last-gc-movable last-gc-nonmovable) (process-memory)
-        (format :terminal "{%}live : {a}m ({a} + {a}){%}" (meg last-gc-live) (meg last-gc-movable) (meg last-gc-nonmovable))))
-    
-    (define (report-sections sections)
-      (for-each (lambda (info)
-                  (bind (section . bytes) info
-                    (format :terminal "{%}{a} : {a}m" section (meg bytes))))
-                sections))
-    
-    (define (meg bytes)
-      (fxround (/ (cast <fl> bytes) 1024. 1024.)))
-    
-    (report-memory)
-    (analyse 'modules (get-modules))
-    (analyse 'catalog (get-catalog))
-    (analyse 'sectors (get-sectors~ zone))
-    (analyse 'areas (get-areas~ zone))
-    (analyse 'world world)
-    (analyse 'zone zone)
-    (report-sections (queue-list sections))))
+        (zones (new-queue))
+        (orphans (and orphans? (make-table test: eq?))))
+    (receive (last-gc-heap-size last-gc-alloc last-gc-live last-gc-movable last-gc-nonmovable) (process-memory)
+      (define (analyse-strings)
+        (let ((size 0))
+          (walk-interned-symbols
+            (lambda (sym)
+              (let ((name (symbol-name sym)))
+                (when (string? name)
+                  (register-set! (domain-copies domain) name name)
+                  (increase! size (mem-allocated-size name))))
+              #f))
+          (enqueue zones (list 'strings size #f))))
+      
+      (define (analyse zone obj)
+        (let ((members (and members? (make-table test: eq?))))
+          (domain-bytes-copied-set! domain 0)
+          (copy-to obj kind domain
+            (lambda (obj)
+              (when members?
+                (let ((class (class-of obj)))
+                  (table-set! members class (+ (table-ref members class 0) 1))))))
+          (enqueue zones (list zone (memory-copied domain) members))))
+      
+      (define (memory-copied domain)
+        (* 2 (domain-bytes-copied domain)))
+      
+      (define (report-memory)
+        (format :terminal "{%}live : {a}m ({a} + {a}){%}" (meg last-gc-live) (meg last-gc-movable) (meg last-gc-nonmovable)))
+      
+      (define (report-zones zones)
+        (let ((total (apply + (map second zones))))
+          (format :terminal "{%}total : {a}m (- {a}m){%}" (meg total) (meg (- last-gc-live total))))
+        (for-each (lambda (info)
+                    (bind (zone bytes members) info
+                      (format :terminal "{%}{a} : {a}m" zone (meg bytes))
+                      (when members
+                        (for-each (lambda (info)
+                                    (bind (class . count) info
+                                      (format :terminal "{%}  {a} : {a}" (category-name class) count)))
+                                  (sort > (table->list members) key: cdr)))))
+                  zones))
+      
+      (define (meg bytes)
+        (fxround (/ (cast <fl> bytes) 1024. 1024.)))
+      
+      (define (analyse-orphans zones)
+        (format :terminal "{%}{%}")
+        (update-reachable!
+          (lambda (container i obj)
+            (when (mem-allocated? obj)
+              (unless (eq? (mem-allocated-kind obj) 'PERM)
+                (unless (register-ref (domain-copies domain) obj #f)
+                  (let ((class (class-of obj)))
+                    (table-set! orphans class (+ (table-ref orphans class 0) 1))))))
+            obj)
+          #f
+          #f
+          feedback?)
+        (format :terminal "{%}")
+        (for-each (lambda (info)
+                    (bind (class . count) info
+                      (format :terminal "{%}{a} : {a}" (category-name class) count)))
+                  (sort > (table->list orphans) key: cdr)))
+      
+      (report-memory)
+      (analyse-strings)
+      (analyse 'modules (get-modules))
+      (analyse 'catalog (get-catalog))
+      ;(analyse 'sectors (get-sectors~ zone))
+      ;(analyse 'areas (get-areas~ zone))
+      ;(analyse 'world world)
+      ;(analyse 'zone zone)
+      (let ((zones (queue-list zones)))
+        (report-zones zones)
+        (when orphans?
+          (format :terminal "{%}{%}")
+          (analyse-types ignore: (domain-copies domain))))
+      (format :terminal "{%}{%}{%}"))))
 
 
-(definition public (analyse-allocation (threshold: threshold #f) (feedback?: feedback? #t))
-  (let ((seen (new-register 4))
+;;;
+;;;; Types
+;;;
+
+
+(definition public (analyse-types (ignore: ignore #f) (sample: sample #f) (threshold: threshold #f) (feedback?: feedback? #t))
+  (let ((seen (new-register))
         (movable (make-table test: eq?))
         (still (make-table test: eq?))
         (perm (make-table test: eq?))
+        (samples '())
         (threshold (* (or threshold 100) 1024)))
     (receive (last-gc-heap-size last-gc-alloc last-gc-live last-gc-movable last-gc-nonmovable) (process-memory)
-      (define (add-size table class size)
+      (define (add-size table obj class size)
+        (when (eq? sample class)
+          (set! samples (cons obj samples)))
         (table-set! table class (+ (table-ref table class 0) size)))
       
       (define (kb bytes)
@@ -159,7 +355,7 @@
                       (else #f)))
               (total (apply + (map (lambda (info) (* factor (cdr info))) zone))))
           (let ((missing (and live (- live total))))
-            (format :terminal "{a}: {a}{? (- {a})~}{%}" name (mem total) (and missing (mem missing))))))
+            (format :terminal "{a}: {a}{? (- {a})~}{%}" name (mem total) (and (not ignore) missing (mem missing))))))
       
       (define (report-content name zone (factor 1))
         (format :terminal "{%}{a}{%}" name)
@@ -170,31 +366,33 @@
                         (format :terminal "{a} {a}{%}" class (mem size)))))
                   (sort > zone key: cdr)))
       
-      (report-memory)
+      (unless ignore
+        (report-memory))
       (update-reachable!
-        '()
         (lambda (container i obj)
           (unless (register-ref seen obj #f)
-            (terminal obj)
-            (let ((table (and (mem-allocated? obj)
-                              (case (mem-allocated-kind obj)
-                                ((PERM) perm)
-                                ((STILL) still)
-                                (else movable)))))
-              (when table
-                (cond ((pair? obj)
-                       (add-size table 'Pair 12))
-                      ((symbol? obj)
-                       (add-size table 'Symbol 16))
-                      ((source? obj)
-                       (add-size table 'Source (mem-allocated-size obj)))
-                      ((or (table? obj)
-                           (gc-hash-table? obj))
-                       (add-size table 'Table (mem-allocated-size obj)))
-                      (else
-                       (add-size table (category-name (class-of obj)) (mem-allocated-size obj))))))
+            (unless (and ignore (register-ref ignore obj #f))
+              (let ((table (and (mem-allocated? obj)
+                                (case (mem-allocated-kind obj)
+                                  ((PERM) perm)
+                                  ((STILL) still)
+                                  (else movable)))))
+                (when table
+                  (cond ((pair? obj)
+                         (add-size table obj 'Pair 12))
+                        ((symbol? obj)
+                         (add-size table obj 'Symbol 16))
+                        ((source? obj)
+                         (add-size table obj 'Source (mem-allocated-size obj)))
+                        ((or (table? obj)
+                             (gc-hash-table? obj))
+                         (add-size table obj 'Table (mem-allocated-size obj)))
+                        (else
+                         (add-size table obj (category-name (class-of obj)) (mem-allocated-size obj)))))))
             (register-set! seen obj #t))
           obj)
+        #f
+        #f
         feedback?)
       (when feedback?
         (format :terminal "{%}{%}"))
@@ -203,23 +401,18 @@
             (perm (table->list perm)))
         (report-zone 'MOVA movable 2)
         (report-zone 'STIL still)
-        (report-zone 'PERM perm)
+        (unless ignore
+          (report-zone 'PERM perm))
         (report-content 'MOVA movable 2)
         (report-content 'STIL still)
-        (report-content 'PERM perm)
-        (format :terminal "{%}")
+        (unless ignore
+          (report-content 'PERM perm))
+        (when sample
+          (format :terminal "{%}{%}")
+          (terminal (subseq samples 0 (min (length samples) 1000)))
+          (set-%a samples))
+        (unless ignore
+          (format :terminal "{%}{%}{%}"))
         (set-%m movable)
         (set-%s still)
-        (set-%p perm)))))
-
-
-;;;
-;;;; Graph
-;;;
-
-
-(definition protected graph
-  (make-table test: eq?))
-
-(definition public (get-graph)
-  graph))
+        (set-%p perm))))))
