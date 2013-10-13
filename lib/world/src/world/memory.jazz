@@ -15,14 +15,17 @@
 
 
 (import (gambit.ext)
+        (jazz.debuggee)
+        (jazz.io)
+        (jazz.platform)
         (world)
         (world.autoload)
         (world.syntax (phase syntax)))
 
 
 ;; TODO
-;; - using the visit, when (register-ref (domain-copies domain) obj #f) return an object, log it
-;;   so we get a graph of mutated roots
+;; - identify all incoming pointers
+;; - encapsulate monitor objects in monitors and prune them from walk
 
 
 ;;;
@@ -34,8 +37,19 @@
   (declare (optimize-dead-local-variables))
   (let ((kind PERM)
         (domain (make-domain)))
-    (copy-to (get-modules) kind domain)
+    (define (prune? obj)
+      (or (kind? obj)
+          (class? obj)
+          (table? obj)))
+    
+    (copy-to (outline-unit 'jazz.graphic.Color) kind domain
+      copy?: (lambda (obj)
+               (not (prune? obj))))
     (walk-object!
+      (lambda (container i obj)
+        (if (prune? obj)
+            walk-prune
+          walk-continue))
       (lambda (container i obj)
         (or (register-ref (domain-copies domain) obj #f)
             obj))
@@ -45,24 +59,48 @@
 
 
 ;;;
-;;;; Debug
+;;;; Region
 ;;;
 
 
-(class Memory-Snapshot extends Object
+(define base-evaluation
+  `(module yownu.world jazz
+   
+   (class Yownu-World extends World
+  
+     (method override (zone-based?)
+       #t))))
+
+
+(definition public (setup-memory-base)
+  (evaluate-code base-evaluation evaluation-mode: 'interpret)
+  ;(load-verbose? #t)
+  ;(outline-verbose? #t)
+  )
+
+
+(class Region-Snapshot extends Object
   
   
-  (slot name    getter generate)
-  (slot table   getter generate)
-  (slot roots   getter generate)
-  (slot content getter generate)
+  (slot name     getter generate)
+  (slot object   getter generate)
+  (slot roots    getter generate)
+  (slot prune?   getter generate)
+  (slot content  getter generate)
+  (slot outgoing getter generate)
+  (slot incoming initialize #f accessors generate)
+  (slot mutated  initialize #f accessors generate)
+  (slot removed  initialize #f accessors generate)
+  (slot added    initialize #f accessors generate)
   
   
-  (method override (initialize name table roots content)
+  (method override (initialize name object roots prune? content outgoing)
     (set! name~self name)
-    (set! table~self table)
+    (set! object~self object)
     (set! roots~self roots)
-    (set! content~self content))
+    (set! prune?~self prune?)
+    (set! content~self content)
+    (set! outgoing~self outgoing))
   
   
   (method override (print output readably)
@@ -78,40 +116,179 @@
   snapshots)
 
 
+(definition permanent
+  (new-register))
+
+(definition public (get-permanent)
+  permanent)
+
+
+(definition test-object
+  (list (vector 1 2 (list 'a 'b))))
+
+
+(definition snapshot-targets
+  '(unit @w modules @w catalog @w test))
+
+
 (definition public (setup-memory-debug)
-  (define (snapshot name table)
-    (let ((roots (table-keys table)))
-      (new Memory-Snapshot name table roots (snapshot-table table roots))))
+  (define (snap-when name prune? obj)
+    (when (memq? name snapshot-targets)
+      (format :terminal "snapshot {a} " name)
+      (receive (roots content outgoing) (snapshot-object obj prune?: prune?)
+        (format :terminal "{%}")
+        (new Region-Snapshot name obj roots prune? content outgoing))))
   
-  (dl)
-  (set! snapshots (list (snapshot 'modules (get-modules))
-                        @w (snapshot 'catalog (get-catalog)))))
+  (define (permanent? obj)
+    (and (mem-allocated? obj)
+         (eq? (mem-allocated-kind obj) 'PERM)))
+  
+  (define (modules-prune? obj)
+    (or (permanent? obj)
+        (kind? obj)
+        (category? obj)))
+  
+  (define (catalog-prune? obj)
+    (or (permanent? obj)
+        (kind? obj)
+        (category? obj)))
+  
+  (define (test-prune? obj)
+    (permanent? obj))
+  
+  (when (memq? 'unit snapshot-targets)
+    (load-unit 'world.test.x))
+  (let ((unit (snap-when 'unit modules-prune? (require-module 'world.test.x)))
+        (modules (snap-when 'modules modules-prune? (get-modules)))
+        (catalog (snap-when 'catalog catalog-prune? (get-catalog)))
+        (test (snap-when 'test test-prune? (car test-object))))
+    (set! snapshots (remove-false (list unit
+                                        modules
+                                        catalog
+                                        test))))
+  (set-%s snapshots)
+  (set-%p permanent)
+  (for-each (lambda (snapshot)
+              (let ((content (get-content~ snapshot))
+                    (outgoing (get-outgoing~ snapshot)))
+                (add-monitor-register content)
+                (add-monitor-register outgoing)
+                (set-%c content)
+                (set-%o outgoing)))
+            snapshots))
 
 
 (definition public (setup-memory-compare (present: present #f))
   (for-each (lambda (snapshot)
               (let ((name (get-name~ snapshot))
-                    (table (get-table~ snapshot))
+                    (object (get-object~ snapshot))
                     (roots (get-roots~ snapshot))
-                    (before (get-content~ snapshot)))
-                (let ((after (snapshot-table table roots)))
+                    (prune? (get-prune?~ snapshot))
+                    (content (get-content~ snapshot))
+                    (outgoing (get-outgoing~ snapshot)))
+                (receive (roots mutated outgoing) (snapshot-object object roots: roots prune?: prune?)
                   (newline)
                   (debug name)
-                  (compare-snapshots before after present: present max: 4))))
+                  (set-mutated~ snapshot mutated)
+                  (receive (removed added) (compare-snapshots content mutated present: present max: 16)
+                    (set-removed~ snapshot removed)
+                    (set-added~ snapshot added)
+                    (set-%m mutated)
+                    (set-%r removed)
+                    (set-%a added)))))
             snapshots))
 
 
-(definition public (dl)
-  (debug (table-length (get-modules)))
-  (debug (table-length (get-catalog))))
+(definition public (setup-memory-test)
+  (define (prune? obj)
+    (vector? obj))
+  
+  (let ((root (vector (vector 1) (list 'a) (list 'b))))
+    (walk-object!
+      (lambda (container i obj)
+        (cond ((or (not (mem-allocated? obj))
+                   (eq? (mem-allocated-kind obj) 'PERM))
+               walk-prune)
+              ((and prune? (prune? obj) (neq? obj root))
+               walk-prune)
+              (else
+               (debug obj)
+               walk-continue)))
+      #f
+      root: root)))
 
 
-(definition public (b obj)
-  (register-ref %b obj #f))
+@old
+(definition public (setup-memory-test)
+  (define (prune? obj)
+    (vector? obj))
+  
+  (let ((root (vector (vector 1) (list 'a) (list 'b))))
+    (walk-object!
+      (lambda (container i obj)
+        (if (and prune? (prune? obj) (neq? obj root))
+            walk-prune
+          walk-continue))
+      (lambda (container i obj)
+        (when (mem-allocated? obj)
+          (unless (eq? (mem-allocated-kind obj) 'PERM)
+            (unless (and prune? (prune? obj))
+              (debug obj))))
+        obj)
+      root: root)))
 
 
-(definition public (c obj)
-  (register-ref %c obj #f))
+;;;
+;;;; Monitor
+;;;
+
+
+(definition monitor-marker
+  '(monitor))
+
+
+(definition (monitor? obj)
+  (and (vector? obj)
+       (> (vector-length obj) 0)
+       (eq? (vector-ref obj 0) monitor-marker)))
+
+
+(definition (make-monitor-container container i data)
+  (vector monitor-marker container i data))
+
+
+(definition (monitor-container monitor)
+  (vector-ref monitor 1))
+
+(definition (monitor-i monitor)
+  (vector-ref monitor 2))
+
+(definition (monitor-data monitor)
+  (vector-ref monitor 3))
+
+
+(definition monitor-objects
+  (make-table test: eq?))
+
+
+(definition (add-monitor-object obj)
+  (table-set! monitor-objects obj #t))
+
+
+(definition (add-monitor-table table)
+  (let ((gcht (table-gcht table)))
+    (when (gc-hash-table? gcht)
+      (add-monitor-object gcht))))
+
+
+(definition (add-monitor-register register)
+  (loop (for table in-vector (register-content register))
+        (add-monitor-table table)))
+
+
+(definition (monitor-object? obj)
+  (or (monitor? obj)
+      (table-ref monitor-objects obj #f)))
 
 
 ;;;
@@ -119,38 +296,138 @@
 ;;;
 
 
-(definition public (snapshot-to! obj seen content data)
+(definition public (snapshot-object obj (roots: roots #f) (prune?: prune? #f) (feedback?: feedback? #t))
+  (cond ((table? obj)
+         (snapshot-table obj roots: roots prune?: prune? feedback?: feedback?))
+        ((is? obj Module)
+         (snapshot-module obj roots: roots prune?: prune? feedback?: feedback?))
+        (else
+         (snapshot-value obj roots: roots prune?: prune? feedback?: feedback?))))
+
+
+(definition (snapshot-table table (roots: roots #f) (prune?: prune? #f) (feedback?: feedback? #t))
+  (let ((seen (new-register))
+        (content (new-register))
+        (outgoing (new-register))
+        (roots (or roots (table-keys table))))
+    (for-each (lambda (root)
+                (let ((value (table-ref table root)))
+                  (snapshot-to! value seen content outgoing root prune?: prune? feedback?: feedback?)))
+              roots)
+    (values roots content outgoing)))
+
+
+(definition (snapshot-module module (roots: roots #f) (prune?: prune? #f) (feedback?: feedback? #t))
+  (let ((seen (new-register))
+        (content (new-register))
+        (outgoing (new-register)))
+    ;; we need to traverse entries first else they will already have
+    ;; been pruned and added to the seen register by the module traversal
+    (for-each (lambda (value)
+                (snapshot-to! value seen content outgoing #f prune?: prune? feedback?: feedback?))
+              (table-values (get-entries~ module)))
+    (snapshot-to! module seen content outgoing #f prune?: prune? feedback?: feedback?)
+    (values #f content outgoing)))
+
+
+(definition (snapshot-value value (roots: roots #f) (prune?: prune? #f) (feedback?: feedback? #t))
+  (let ((seen (new-register))
+        (content (new-register))
+        (outgoing (new-register)))
+    (snapshot-to! value seen content outgoing #f prune?: prune? feedback?: feedback?)
+    (values #f content outgoing)))
+
+
+(definition public (snapshot-to! root seen content outgoing data (prune?: prune? #f) (feedback?: feedback? #t))
   (walk-object!
     (lambda (container i obj)
-      (when (mem-allocated? obj)
-        (unless (register-ref content obj #f)
-          (let ((info (if (object? container)
-                          (if (= i 0)
-                              (list container 'class data)
-                            (let ((name (get-name~ (list-ref (get-instance-slots~ (class-of container)) (- i 1)))))
-                              (list container name data)))
-                        (list container i data))))
-            (register-set! content obj info))))
-      obj)
-    root: obj
-    seen: seen))
+      (cond ((not (mem-allocated? obj))
+             walk-prune)
+            ((and prune? (prune? obj) (neq? obj root))
+             (register-set! outgoing obj (make-monitor-container container i data))
+             walk-prune)
+            (else
+             (let ((info (if (object? container)
+                             (if (= i 0)
+                                 (make-monitor-container container 'class data)
+                               (let ((name (get-name~ (list-ref (get-instance-slots~ (class-of container)) (- i 1)))))
+                                 (make-monitor-container container name data)))
+                           (make-monitor-container container i data))))
+               (unless (register-ref content obj #f)
+                 (register-set! content obj info)))
+             walk-continue)))
+    #f
+    root: root
+    seen: seen
+    feedback?: feedback?))
 
 
-(definition public (snapshot-object obj)
-  (let ((seen (new-register))
-        (content (new-register)))
-    (snapshot-to! obj seen content #f)
-    content))
+;;;
+;;;; Incoming
+;;;
 
 
-(definition public (snapshot-table table roots)
-  (let ((seen (new-register))
-        (content (new-register)))
-    (iterate-table table
-      (lambda (key value)
-        (when (memq? key roots)
-          (snapshot-to! value seen content key))))
-    content))
+(definition public (analyse-incoming (feedback?: feedback? #t))
+  (define (analyse snapshot)
+    (let ((content (get-content~ snapshot))
+          (incoming (new-register)))
+      (walk-object!
+        (lambda (container i obj)
+          walk-continue)
+        (lambda (container i obj)
+          (unless (register-ref incoming container #f)
+            (unless (monitor-object? container)
+              (when (and (not (register-ref content container #f))
+                         (register-ref content obj #f))
+                (register-set! incoming container obj))))
+          obj)
+        feedback?: feedback?)
+      (set-incoming~ snapshot incoming)
+      (debug incoming)
+      (set-%i incoming)))
+  
+  (format :terminal "analyse incoming ")
+  (for-each analyse snapshots))
+
+
+;;;
+;;;; Memory
+;;;
+
+
+(definition memory-snapshot
+  #f)
+
+
+(definition public (analyse-memory (feedback?: feedback? #t))
+  (format :terminal "analyse memory ")
+  (let ((count 0))
+    (walk-object!
+      (lambda (container i obj)
+        walk-continue)
+      (lambda (container i obj)
+        (when (mem-allocated? obj)
+          (unless (eq? (mem-allocated-kind obj) 'PERM)
+            (increase! count)))
+        obj)
+      feedback?: feedback?)
+    (debug count: count)))
+
+
+(definition public (snapshot-memory (feedback?: feedback? #t))
+  (format :terminal "snapshot memory ")
+  (let ((register (new-register)))
+    (walk-object!
+      (lambda (container i obj)
+        walk-continue)
+      (lambda (container i obj)
+        (when (mem-allocated? obj)
+          (unless (eq? (mem-allocated-kind obj) 'PERM)
+            (register-set! register obj #t)))
+        obj)
+      feedback?: feedback?)
+    (set! memory-snapshot register)
+    (debug memory-snapshot: register)))
 
 
 ;;;
@@ -158,54 +435,37 @@
 ;;;
 
 
-(definition public (compare-snapshots before after (present: present #f) (max: max #f))
+(definition public (compare-snapshots content mutated (present: present #f) (max: max #f))
   (define (present-table table register)
     (let ((count 0))
       (iterate-table table
-        (lambda (obj info)
+        (lambda (obj monitor)
           (when (or (not max) (< count max))
-            (pp obj)
-            (when (eq? present 'container)
-              (present-container info register))
+            (present-object obj register present: present)
             (increase! count))))))
-  
-  (define (present-container info register)
-    (let (iter (scan info) (depth 0))
-      (when (< depth 1)
-        (bind (container i data) info
-          (display "  ")
-          (when data
-            (pp data)
-            (display "  "))
-          (pp container)
-          (display "    ")
-          (pp i)
-          (let ((parent (register-ref register container #f)))
-            (when parent
-              (iter parent (+ depth 1))))))))
   
   (let ((removed (make-table test: eq?))
         (added (make-table test: eq?)))
     ;; removed
-    (iterate-register before
-      (lambda (obj info)
+    (iterate-register content
+      (lambda (obj monitor)
         ;; found diff
-        (when (not (register-ref after obj #f))
-          (let ((container (car info)))
+        (when (not (register-ref mutated obj #f))
+          (let ((container (monitor-container monitor)))
             ;; only keep root diffs
-            (when (register-ref after container #f)
-              (table-set! removed obj info))))))
+            (when (register-ref mutated container #f)
+              (table-set! removed obj monitor))))))
     ;; added
-    (iterate-register after
-      (lambda (obj info)
+    (iterate-register mutated
+      (lambda (obj monitor)
         ;; found diff
-        (when (not (register-ref before obj #f))
-          (let ((container (car info)))
+        (when (not (register-ref content obj #f))
+          (let ((container (monitor-container monitor)))
             ;; only keep root diffs
-            (when (register-ref before container #f)
-              (table-set! added obj info))))))
-    (debug 'before (register-length before))
-    (debug 'after (register-length after))
+            (when (register-ref content container #f)
+              (table-set! added obj monitor))))))
+    (debug 'content (register-length content))
+    (debug 'mutated (register-length mutated))
     (newline)
     (debug 'removed (table-length removed))
     (debug 'added (table-length added))
@@ -213,29 +473,136 @@
     (when present
       (when (> (table-length removed) 0)
         (debug removed:)
-        (present-table removed before)
+        (present-table removed content)
         (newline))
       (when (> (table-length added) 0)
         (debug added:)
-        (present-table added after)
+        (present-table added mutated)
         (newline)))
-    (set-%b before)
-    (set-%c after)
-    (set-%r removed)
-    (set-%a added)))
+    (values removed added)))
+
+
+(definition (present-object obj register (present: present #f) (depth: depth #f))
+  (let ((present (or present 'container))
+        (max-depth (or depth 10)))
+    (define (present-obj obj)
+      (write obj)
+      (newline)
+      (when (eq? present 'container)
+        (let ((info (register-ref register obj #f)))
+          (when info
+            (present-container info))))
+      (newline))
+    
+    (define (present-container info)
+      (let (iter (scan info) (depth 0))
+        (if (>= depth max-depth)
+            (begin
+              (display "  ...")
+              (newline))
+          (bind (container i data) scan
+            (display "  ")
+            (write i)
+            (display " ")
+            (write container)
+            (newline)
+            (let ((parent (register-ref register container #f)))
+              (when parent
+                (iter parent (+ depth 1))))))))
+    
+    (present-obj obj)))
+
+
+(definition public (c obj)
+  (present-object obj %c))
+
+
+(definition public (m obj)
+  (present-object obj %m))
+
+
+(definition public (dl)
+  (debug (table-length (get-modules)))
+  (debug (table-length (get-catalog))))
+
+
+(definition public (ic)
+  (inspect (register->table %c)))
 
 
 ;;;
-;;;; Zones
+;;;; Evaluate
 ;;;
 
 
-(definition public (analyse-zones (members?: members? #f) (orphans?: orphans? #f) (feedback?: feedback? #t))
+(definition temporary-evaluation-file
+  #f)
+
+(definition (get-temporary-evaluation-file)
+  (or temporary-evaluation-file (let ((file (get-temporary-file)))
+                                  ;; changing the extension to jazz is a quick hack for debugger highlight
+                                  ;; the right solution is to do the same thing as (read-source-all port container line col)
+                                  ;; e.g. make it so compilation locations point to the original source file
+                                  (set! temporary-evaluation-file (new-brother~ file (make-filename (get-base~ file) "jazz")))
+                                  file)))
+
+
+(definition public (evaluate-code code (evaluation-mode: evaluation-mode 'compile))
+  (let ((unit-name (second code)))
+    (load-unit unit-name)
+    (outline-unit unit-name)
+    (case evaluation-mode
+      ((compile)
+       (let ((file (get-temporary-evaluation-file)))
+         (call-with-output-file (path-settings file char-encoding: 'UTF-8)
+           (lambda (output)
+             (pp code output)
+             (newline output)))
+         (let ((path (parse~ file)))
+           (let ((pathname (parameterize ((requested-unit-name unit-name)
+                                          (jazz:walk-for 'compile)
+                                          (generate-symbol-for "&")
+                                          (generate-symbol-context unit-name)
+                                          (generate-symbol-counter 0)
+                                          (path->container-override
+                                            (lambda (target)
+                                              (and (equal? target path)
+                                                   unit-name))))
+                             (with-jazz-readtable
+                               (lambda ()
+                                 (compile-file path options: compile-options))))))
+             (load-file (list path: pathname char-encoding: 'UTF) #f)))))
+      (else
+       (parameterize ((requested-unit-name unit-name)
+                      (walk-for 'eval)
+                      (generate-symbol-for (format "%{a}&" (eval-count)))
+                      (generate-symbol-context unit-name)
+                      (generate-symbol-counter 0))
+         (eval code))))))
+
+
+(definition public (analyse-evaluate code (present: present #f))
+  (let ((unit-name (second code)))
+    (load-unit unit-name)
+    (outline-unit unit-name)
+    (let ((target (list (get-catalog) (get-modules))))
+      (receive (content outgoing) (snapshot-object target)
+        (evaluate-code code)
+        (receive (mutated outgoing) (snapshot-object target)
+          (compare-snapshots content mutated present: present))))))
+
+
+;;;
+;;;; Regions
+;;;
+
+
+(definition public (analyse-regions (members?: members? #f) (orphans?: orphans? #f) (feedback?: feedback? #t))
   (let ((world (current-world))
         (zone (current-zone))
         (kind MOVABLE0)
         (domain (make-domain))
-        (zones (new-queue))
+        (regions (new-queue))
         (orphans (and orphans? (make-table test: eq?))))
     (receive (last-gc-heap-size last-gc-alloc last-gc-live last-gc-movable last-gc-nonmovable) (process-memory)
       (define (analyse-strings)
@@ -247,17 +614,17 @@
                   (register-set! (domain-copies domain) name name)
                   (increase! size (mem-allocated-size name))))
               #f))
-          (enqueue zones (list 'strings size #f))))
+          (enqueue regions (list 'strings size #f))))
       
-      (define (analyse zone obj)
+      (define (analyse region obj)
         (let ((members (and members? (make-table test: eq?))))
           (domain-bytes-copied-set! domain 0)
           (copy-to obj kind domain
-            (lambda (obj)
-              (when members?
-                (let ((class (class-of obj)))
-                  (table-set! members class (+ (table-ref members class 0) 1))))))
-          (enqueue zones (list zone (memory-copied domain) members))))
+            visit: (lambda (obj)
+                     (when members?
+                       (let ((class (class-of obj)))
+                         (table-set! members class (+ (table-ref members class 0) 1))))))
+          (enqueue regions (list region (memory-copied domain) members))))
       
       (define (memory-copied domain)
         (* 2 (domain-bytes-copied domain)))
@@ -265,25 +632,27 @@
       (define (report-memory)
         (format :terminal "{%}live : {a}m ({a} + {a}){%}" (meg last-gc-live) (meg last-gc-movable) (meg last-gc-nonmovable)))
       
-      (define (report-zones zones)
-        (let ((total (apply + (map second zones))))
+      (define (report-regions regions)
+        (let ((total (apply + (map second regions))))
           (format :terminal "{%}total : {a}m (- {a}m){%}" (meg total) (meg (- last-gc-live total))))
         (for-each (lambda (info)
-                    (bind (zone bytes members) info
-                      (format :terminal "{%}{a} : {a}m" zone (meg bytes))
+                    (bind (region bytes members) info
+                      (format :terminal "{%}{a} : {a}m" region (meg bytes))
                       (when members
                         (for-each (lambda (info)
                                     (bind (class . count) info
                                       (format :terminal "{%}  {a} : {a}" (category-name class) count)))
                                   (sort > (table->list members) key: cdr)))))
-                  zones))
+                  regions))
       
       (define (meg bytes)
         (fxround (/ (cast <fl> bytes) 1024. 1024.)))
       
-      (define (analyse-orphans zones)
+      (define (analyse-orphans regions)
         (format :terminal "{%}{%}")
         (walk-object!
+          (lambda (container i obj)
+            walk-continue)
           (lambda (container i obj)
             (when (mem-allocated? obj)
               (unless (eq? (mem-allocated-kind obj) 'PERM)
@@ -306,8 +675,8 @@
       ;(analyse 'areas (get-areas~ zone))
       ;(analyse 'world world)
       ;(analyse 'zone zone)
-      (let ((zones (queue-list zones)))
-        (report-zones zones)
+      (let ((regions (queue-list regions)))
+        (report-regions regions)
         (when orphans?
           (format :terminal "{%}{%}")
           (analyse-types ignore: (domain-copies domain))))
@@ -346,27 +715,29 @@
       (define (report-memory)
         (format :terminal "Live : {a}m ({a} + {a}){%}{%}" (meg last-gc-live) (meg last-gc-movable) (meg last-gc-nonmovable)))
       
-      (define (report-zone name zone (factor 1))
+      (define (report-region name region (factor 1))
         (let ((live (case name
                       ((MOVA) last-gc-movable)
                       ((STIL) last-gc-nonmovable)
                       (else #f)))
-              (total (apply + (map (lambda (info) (* factor (cdr info))) zone))))
+              (total (apply + (map (lambda (info) (* factor (cdr info))) region))))
           (let ((missing (and live (- live total))))
             (format :terminal "{a}: {a}{? (- {a})~}{%}" name (mem total) (and (not ignore) missing (mem missing))))))
       
-      (define (report-content name zone (factor 1))
+      (define (report-content name region (factor 1))
         (format :terminal "{%}{a}{%}" name)
         (for-each (lambda (info)
                     (let ((class (car info))
                           (size (* factor (cdr info))))
                       (when (>= size threshold)
                         (format :terminal "{a} {a}{%}" class (mem size)))))
-                  (sort > zone key: cdr)))
+                  (sort > region key: cdr)))
       
       (unless ignore
         (report-memory))
       (walk-object!
+        (lambda (container i obj)
+          walk-continue)
         (lambda (container i obj)
           (unless (register-ref seen obj #f)
             (unless (and ignore (register-ref ignore obj #f))
@@ -395,10 +766,10 @@
       (let ((movable (table->list movable))
             (still (table->list still))
             (perm (table->list perm)))
-        (report-zone 'MOVA movable 2)
-        (report-zone 'STIL still)
+        (report-region 'MOVA movable 2)
+        (report-region 'STIL still)
         (unless ignore
-          (report-zone 'PERM perm))
+          (report-region 'PERM perm))
         (report-content 'MOVA movable 2)
         (report-content 'STIL still)
         (unless ignore
