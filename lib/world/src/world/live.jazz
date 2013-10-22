@@ -141,6 +141,7 @@
         (world.support)
         (world.syntax (phase syntax))
         (world.target)
+        (world.task)
         (world.texture)
         (world.triangle)
         (world.user)
@@ -250,8 +251,7 @@
   (slot ongoing-action         <object>          initialize #f              accessors generate)
   (slot axes?                  <bool>            initialize #f              accessors generate)
   (slot tick-slice?            <bool>            initialize #t              getter generate)
-  (slot tick-pulse             <object>          initialize #f              getter generate)
-  (slot last-tick              <fl>              initialize #f              getter generate)
+  (slot tick-thread            <object>          initialize #f              getter generate)
   (slot down?                  <bool>            initialize #f              getter generate)
   (slot down-point             <object>          initialize #f              getter generate)
   (slot drag-tolerance         <object>          initialize 3               getter generate)
@@ -350,6 +350,7 @@
     (set-debug-animations? (find-setting 'world.debug-animations? #f))
     (set-debug-collisions? (find-setting 'world.debug-collisions? #f))
     (set-collide-max-slide (find-setting 'world.collide-max-slide 5))
+    (set! tick-slice? (and (not debug-user?) (not (find-setting 'world.inhibit-slicing? #f))))
     (set! draw-procedure-names (make-table test: eq?))
     (setup-info))
   
@@ -358,7 +359,10 @@
     (nextmethod rest)
     (update-world-up ambient-gravity)
     (when music?
-      (change-music)))
+      (change-music))
+    (register-task 'render self render-task)
+    (register-task 'player self player-task)
+    (register-task 'tick self tick-task))
   
   
   (method override (print output readably)
@@ -418,7 +422,7 @@
   
   
   (method (start-world)
-    (prepare-tick))
+    (start-tasks self))
   
   
   (method (initialize-render)
@@ -437,12 +441,7 @@
     (increase! tick-no))
   
   
-  (method (reset-last-tick)
-    (set! last-tick (current-seconds)))
-  
-  
   (method (setup-world)
-    (reset-last-tick)
     (set! paused? #f))
   
   
@@ -631,7 +630,7 @@
     (glDeleteTextures* (get-id~ message-texture))
     (glDeleteTextures* (get-id~ status-texture))
     (close-ambiance)
-    (close~ tick-pulse))
+    (stop-tasks self))
   
   
   (method public (toggle-gc-sound)
@@ -741,50 +740,41 @@
   ;;;
   
   
-  (method (prepare-tick)
-    (set! tick-slice? (and (not debug-user?) (not (find-setting 'world.inhibit-slicing? #f))))
-    (set! tick-pulse (new Pulse 'tick (find-setting 'world.tick-pulse .01) (lambda () (tick-world)))))
+  (method (tick-task)
+    (let (iter (previous (current-seconds)))
+      (wait .01)
+      (let ((time (current-seconds)))
+        (let ((elapse (- time previous))
+              (max-elapse 10.))
+          ;; ignore ridiculous elapses like
+          ;; coming back from computer sleep
+          (unless (> elapse max-elapse)
+            (with-task-mutex
+              (lambda ()
+                (tick-world elapse))))
+          (iter time)))))
   
   
-  (method (tick-world)
+  (method (tick-world elapse)
     (unless (or debugged? paused? (is-inactive?) (not render-ready?))
       (site (tick on?: #t)
         (let ((zone (current-zone))
               (me (current-me)))
-          (let ((seconds (current-seconds)))
-            (let ((max-elapse 10.)
-                  (elapse (- seconds last-tick))
-                  (process (get-process)))
-              (set! last-tick seconds)
-              ;; ignore ridiculous elapses like
-              ;; coming back from computer sleep
-              (unless (> elapse max-elapse)
-                (when history?
-                  (site (tick-history on?: #t parent: tick)
-                    (tick-history elapse)))
-                (site (tick-scene on?: #t parent: tick)
-                  (tick-scene~ zone elapse)
-                  (when showcase
-                    (tick-scene~ showcase elapse)))
-                (when (get-sun-cycle?~ zone)
-                  (site (tick-sun on?: #f parent: tick)
-                    (tick-sun~ zone elapse)))
-                (complete~ commands)
-                (if (client-side?~ process)
-                    (if (not (get-world-server~ process))
-                        (tick-actors commands elapse)
-                      (when (get-modified?~ commands)
-                        (tick-server~ (get-process) commands elapse)))
-                  (tick-sliced me commands elapse))
-                (reset-commands)
-                (site (tick-procedures on?: #f parent: tick)
-                  (when (not-null? tick-procedures)
-                    (for-each (lambda (proc)
-                                (proc elapse))
-                              tick-procedures)))
-                (restore-first-distance elapse)
-                (update-transformation-time elapse)
-                (process-tilt me))))))))
+          (when history?
+            (site (tick-history on?: #t parent: tick)
+              (tick-history elapse)))
+          (site (tick-scene on?: #t parent: tick)
+            (tick-scene~ zone elapse)
+            (when showcase
+              (tick-scene~ showcase elapse)))
+          (site (tick-procedures on?: #f parent: tick)
+            (when (not-null? tick-procedures)
+              (for-each (lambda (proc)
+                          (proc elapse))
+                        tick-procedures)))
+          (restore-first-distance elapse)
+          (update-transformation-time elapse)
+          (process-tilt me)))))
   
   
   (method (tick-actors commands elapse)
@@ -890,6 +880,25 @@
       (unless (null? player-commands)
         (when (find-setting 'world.client.debug? #f)
           (debug-players)))))
+  
+  
+  (method (player-task)
+    (let (iter (previous (current-seconds)))
+      (wait .01)
+      (let ((time (current-seconds)))
+        (let ((elapse (- time previous))
+              (max-elapse 10.))
+          ;; ignore ridiculous elapses like
+          ;; coming back from computer sleep
+          (unless (> elapse max-elapse)
+            (with-task-mutex
+              (lambda ()
+                (site (player on?: #t)
+                  (let ((me (current-me)))
+                    (complete~ commands)
+                    (tick-sliced me commands elapse)
+                    (reset-commands))))))
+          (iter time)))))
   
   
   (method (tick-sliced actor commands elapse)
@@ -2261,6 +2270,19 @@
   ;;;
   
   
+  (method (render-task)
+    (let ((window (current-window)))
+      (let (iter)
+        (let ((time (current-seconds)))
+          (with-task-mutex
+            (lambda ()
+              (render-world)))
+          (let ((duration (- (current-seconds) time)))
+            (wait (- .016666666666666666 duration)))
+          (render-sync~ window)
+          (iter)))))
+  
+  
   (method protected virtual (render-world)
     (define (update-interface)
       (when interface?
@@ -2277,6 +2299,9 @@
     
     (when (and render-ready? (not debugged?))
       (update-interface)
+      ;; poor man test to give time to other threads until all structures are thread safe
+      (mutex-unlock! task-mutex)
+      (mutex-lock! task-mutex)
       (site (render on?: #t)
         (let ((zone (current-zone)))
           (when post-processing?
@@ -4406,7 +4431,6 @@
     (set! paused? #f)
     (eye-behind-player)
     (follow-player)
-    (reset-last-tick)
     (reset-profiling)
     (update-parameter 'paused))
   
