@@ -362,6 +362,7 @@
     (update-world-up ambient-gravity)
     (when music?
       (change-music))
+    (setup-logging-heartbeat! current-log-context)
     (register-task 'render self render-task)
     (register-task 'player self player-task)
     (register-task 'tick self tick-task))
@@ -743,27 +744,22 @@
   
   
   (method (tick-task)
-    (let ((log-context (new-log-context tick-id)))
-      (log-start log-context support-state)
-      (continuation-capture
-        (lambda (exit)
-          (let (iter (previous (current-seconds)))
-            (log-transition log-context waiting-state)
-            (wait tick-wait exit)
-            (log-transition log-context support-state)
-            (let ((time (current-seconds)))
-              (let ((elapse (- time previous))
-                    (max-elapse 10.))
-                ;; ignore ridiculous elapses like
-                ;; coming back from computer sleep
-                (unless (> elapse max-elapse)
-                  (with-task-mutex
-                    (lambda ()
-                      (log-transition log-context locked-state)
-                      (tick-world elapse))))
-                (iter time))))))
-      (log-stop log-context)
-      (log-cleanup log-context)))
+    (with-log-context tick-id support-state
+      (lambda (log-context)
+        (continuation-capture
+          (lambda (exit)
+            (let (iter (previous (current-seconds)))
+              (task-sleep tick-wait exit support-state)
+              (let ((time (current-seconds)))
+                (let ((elapse (- time previous))
+                      (max-elapse 10.))
+                  ;; ignore ridiculous elapses like
+                  ;; coming back from computer sleep
+                  (unless (> elapse max-elapse)
+                    (with-task-mutex work-sequential-state
+                      (lambda ()
+                        (tick-world elapse))))
+                  (iter time)))))))))
   
   
   (method (tick-world elapse)
@@ -894,33 +890,28 @@
   
   
   (method (player-task)
-    (let ((log-context (new-log-context player-id)))
-      (log-start log-context support-state)
-      (continuation-capture
-        (lambda (exit)
-          (let (iter (previous (current-seconds)))
-            (log-transition log-context waiting-state)
-            (wait player-wait exit)
-            (log-transition log-context support-state)
-            (unless (get-focus)
-              (process-keys))
-            (let ((time (current-seconds)))
-              (let ((elapse (- time previous))
-                    (max-elapse 10.))
-                ;; ignore ridiculous elapses like
-                ;; coming back from computer sleep
-                (unless (> elapse max-elapse)
-                  (with-task-mutex
-                    (lambda ()
-                      (log-transition log-context locked-state)
-                      (site (player on?: #t)
-                        (let ((me (current-me)))
-                          (complete~ commands)
-                          (tick-sliced me commands elapse)
-                          (reset-commands))))))
-                (iter time))))))
-      (log-stop log-context)
-      (log-cleanup log-context)))
+    (with-log-context player-id support-state
+      (lambda (log-context)
+        (continuation-capture
+          (lambda (exit)
+            (let (iter (previous (current-seconds)))
+              (task-sleep player-wait exit support-state)
+              (unless (get-focus)
+                (process-keys))
+              (let ((time (current-seconds)))
+                (let ((elapse (- time previous))
+                      (max-elapse 10.))
+                  ;; ignore ridiculous elapses like
+                  ;; coming back from computer sleep
+                  (unless (> elapse max-elapse)
+                    (with-task-mutex work-sequential-state
+                      (lambda ()
+                        (site (player on?: #t)
+                          (let ((me (current-me)))
+                            (complete~ commands)
+                            (tick-sliced me commands elapse)
+                            (reset-commands))))))
+                  (iter time)))))))))
   
   
   (method (tick-sliced actor commands elapse)
@@ -2293,27 +2284,21 @@
   
   
   (method (render-task)
-    (let ((window (current-window))
-          (log-context (new-log-context render-id)))
-      (log-start log-context support-state)
-      (parameterize ((current-log-context log-context))
-        (continuation-capture
-          (lambda (exit)
-            (let (iter)
-              (let ((time (current-seconds)))
-                (with-task-mutex
-                  (lambda ()
-                    (log-transition log-context locked-state)
-                    (render-world)))
-                (log-start log-context support-state)
-                (render-sync~ window)
-                (let ((duration (- (current-seconds) time)))
-                  (log-transition log-context waiting-state)
-                  (wait (- max-fps duration) exit)
-                  (log-transition log-context support-state))
-                (iter))))))
-      (log-stop log-context)
-      (log-cleanup log-context)))
+    (let ((window (current-window)))
+      (with-log-context render-id support-state
+        (lambda (log-context)
+          (continuation-capture
+            (lambda (exit)
+              (let (iter)
+                (let ((time (current-seconds)))
+                  (with-task-mutex render-sequential-state
+                    (lambda ()
+                      (render-world)))
+                  (log-start log-context render-sync-state)
+                  (render-sync~ window)
+                  (let ((duration (- (current-seconds) time)))
+                    (task-sleep (- max-fps duration) exit #f))
+                  (iter)))))))))
   
   
   (method protected virtual (render-world)
@@ -2333,10 +2318,10 @@
     (when (and render-ready? (not debugged?))
       (update-interface)
       ;; poor man test to give time to other threads until all structures are thread safe
-      (mutex-unlock! task-mutex)
-      (log-transition (current-log-context) waiting-state)
-      (mutex-lock! task-mutex)
-      (log-transition (current-log-context) locked-state)
+      ;; (mutex-unlock! task-mutex)
+      ;; (log-transition (current-log-context) waiting-state)
+      ;; (mutex-lock! task-mutex)
+      ;; (log-transition (current-log-context) work-sequential-state)
       (site (render on?: #t)
         (let ((zone (current-zone)))
           (when post-processing?
