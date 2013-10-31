@@ -1357,9 +1357,11 @@
   texture: "farmland_wet")
 
 
-(loop (for id from 0 below 256)
-      (unless (vector-ref blockids id)
-        (register-minecraft-block 'Unknown id)))
+(let ((unknown-texture "gold_ore"))
+  (loop (for id from 0 below 256)
+        (unless (vector-ref blockids id)
+          (register-minecraft-block 'Unknown id
+            texture: unknown-texture))))
 
 
 ;;;
@@ -1616,10 +1618,19 @@
   
   
   (method override (prepare-lightmap faces)
-    (define (convert-light lighting <fx>) <fl>
-      (cast <fl> (expt .8 (/ (- 60. (cast <fl> lighting)) 5.))))
-    
     (let ((zone <Minecraft-Zone> (current-zone)))
+      (define (blocklight lighting <u8vector>) <fl>
+        (cast <fl> (+ (u8vector-ref lighting 0)
+                      (u8vector-ref lighting 2)
+                      (u8vector-ref lighting 4)
+                      (u8vector-ref lighting 6))))
+      
+      (define (skylight lighting <u8vector>) <fl>
+        (cast <fl> (+ (u8vector-ref lighting 1)
+                      (u8vector-ref lighting 3)
+                      (u8vector-ref lighting 5)
+                      (u8vector-ref lighting 7))))
+      
       (if heightmap?
           (nextmethod faces)
         (let ((triangles-count <fx> 0)
@@ -1632,19 +1643,16 @@
             (for-each (lambda (face <Minecraft-Face>)
                         (iterate-lighting~ face
                           (lambda (l1 l2 l3)
-                            (let ((l1 (convert-light l1))
-                                  (l2 (convert-light l2))
-                                  (l3 (convert-light l3)))
-                              (f32vector-set! f32 n l1)
-                              (f32vector-set! f32 (+ n 1) l1)
-                              (f32vector-set! f32 (+ n 2) l1)
-                              (f32vector-set! f32 (+ n 3) l2)
-                              (f32vector-set! f32 (+ n 4) l2)
-                              (f32vector-set! f32 (+ n 5) l2)
-                              (f32vector-set! f32 (+ n 6) l3)
-                              (f32vector-set! f32 (+ n 7) l3)
-                              (f32vector-set! f32 (+ n 8) l3)
-                              (increase! n 9)))))
+                            (f32vector-set! f32 n (blocklight l1))
+                            (f32vector-set! f32 (+ n 1) (skylight l1))
+                            (f32vector-set! f32 (+ n 2) 0.)
+                            (f32vector-set! f32 (+ n 3) (blocklight l2))
+                            (f32vector-set! f32 (+ n 4) (skylight l2))
+                            (f32vector-set! f32 (+ n 5) 0.)
+                            (f32vector-set! f32 (+ n 6) (blocklight l3))
+                            (f32vector-set! f32 (+ n 7) (skylight l3))
+                            (f32vector-set! f32 (+ n 8) 0.)
+                            (increase! n 9))))
                       faces)
             f32))))))
 
@@ -1693,14 +1701,20 @@
   (method override (prepare rest)
     (nextmethod rest)
     (set! ambient-color (dye 0. 0. 0. 0.))
-    (set! day-cycle (world-setting 'minecraft.day-cycle 'night 'default))
-    (if heightmap?
-        (set! sun-cycle? #t)
-      (set! sun-cycle? #f)))
+    (set! day-cycle (world-setting 'minecraft.day-cycle 'night 'default)))
   
   
   (method override (effective-lights)
     '())
+  
+  
+  (method override (sun-update-lighting effective coord)
+    )
+  
+  
+  (method override (sun-update)
+    (let ((angle (flmodulo sun-angle PI*2)))
+      (set! daytime (/ (* angle 24000.) PI*2))))
   
   
   (method override (create-atlas)
@@ -1858,7 +1872,7 @@
                         (section-y (* sector-y 16))
                         (section-z (+ (* region-z 32 16) (* (cast <fx> (cdr chunk-index)) 16)))
                         (sections <vector> (make-vector 27 #t))
-                        (cache <u16vector> (make-u16vector (* 18 18 18 2) cache-uninitialized))
+                        (cache <u16vector> (make-u16vector (* 18 18 18 3) cache-uninitialized))
                         (block-size 1.)
                         (block-radius .5)
                         (faces '())
@@ -1895,7 +1909,7 @@
                       (+ (* (+ b 1) 9) (* (+ c 1) 3) (+ a 1)))
                     
                     (define (cache-index i <fx> j <fx> k <fx>) <fx>
-                      (* (+ (* (+ j 1) 324) (* (+ k 1) 18) (+ i 1)) 2))
+                      (* (+ (* (+ j 1) 324) (* (+ k 1) 18) (+ i 1)) 3))
                     
                     (define (blocks-get section <Minecraft-Section>) <s8vector>
                       (get-blocks~ section))
@@ -1936,18 +1950,19 @@
                     (define (skylight-ref i <fx> j <fx> k <fx>) <fx>
                       (field-ref i j k skylight-get s4vector-ref 15 15))
                     
-                    (define (light-ref i <fx> j <fx> k <fx>) <fx>
-                      (let ((index (+ (cache-index i j k) 1)))
-                        (let ((value (u16vector-ref cache index)))
+                    (define (light-ref! i <fx> j <fx> k <fx> lighting <u8vector> offset <fx>) <void>
+                      (let ((index (cache-index i j k)))
+                        (let ((value (u16vector-ref cache (+ index 1))))
                           (if (/= value cache-uninitialized)
-                              value
-                            (let ((value (max (blocklight-ref i j k)
-                                              (cast <fx> (let ((skylight (skylight-ref i j k)))
-                                                           (if (eq? day-cycle 'day)
-                                                               skylight
-                                                             (- skylight 11)))))))
-                              (u16vector-set! cache index value)
-                              value)))))
+                              (begin
+                                (u8vector-set! lighting offset value)
+                                (u8vector-set! lighting (+ offset 1) (u16vector-ref cache (+ index 2))))
+                            (let ((blocklight (blocklight-ref i j k))
+                                  (skylight (skylight-ref i j k)))
+                              (u16vector-set! cache (+ index 1) blocklight)
+                              (u16vector-set! cache (+ index 2) skylight)
+                              (u8vector-set! lighting offset blocklight)
+                              (u8vector-set! lighting (+ offset 1) skylight))))))
                     
                     (define (s4vector-ref field <s8vector> index <fx>) <fx>
                       (let ((byte (s8vector-ref field (quotient index 2))))
@@ -2077,10 +2092,12 @@
                                                                (= block-id 9))))
                                                     
                                                     (define (compute-lighting ax <fx> ay <fx> az <fx> bx <fx> by <fx> bz <fx> cx <fx> cy <fx> cz <fx> dx <fx> dy <fx> dz <fx>)
-                                                      (+ (light-ref (+ i ax) (+ j ay) (+ k az))
-                                                         (light-ref (+ i bx) (+ j by) (+ k bz))
-                                                         (light-ref (+ i cx) (+ j cy) (+ k cz))
-                                                         (light-ref (+ i dx) (+ j dy) (+ k dz))))
+                                                      (let ((lighting (make-u8vector 8)))
+                                                        (light-ref! (+ i ax) (+ j ay) (+ k az) lighting 0)
+                                                        (light-ref! (+ i bx) (+ j by) (+ k bz) lighting 2)
+                                                        (light-ref! (+ i cx) (+ j cy) (+ k cz) lighting 4)
+                                                        (light-ref! (+ i dx) (+ j dy) (+ k dz) lighting 6)
+                                                        lighting))
                                                     
                                                     (let ((lighting compute-lighting))
                                                       (cond (generate
@@ -2243,7 +2260,8 @@
         (add-face (front-side  x y z block-radius front-uv lighting material)))
       
       (define (no-lighting ax <fx> ay <fx> az <fx> bx <fx> by <fx> bz <fx> cx <fx> cy <fx> cz <fx> dx <fx> dy <fx> dz <fx>)
-        0)
+        (let ((skylight 15))
+          (u8vector 0 skylight 0 skylight 0 skylight 0 skylight)))
       
       (let ((lighting no-lighting))
         (cond (generate
@@ -2561,7 +2579,8 @@
         (tr (uv-right uv))
         (tb (uv-bottom uv))
         (texture-depth (uv-depth uv))
-        (lighting (if (eq? (get-day-cycle~ (current-zone)) 'day) 60 30)))
+        (lighting (let ((skylight 15))
+                    (u8vector 0 skylight 0 skylight 0 skylight 0 skylight))))
     (add-transparent-face (make-minecraft-face material
                                                (f32vector tl tt tl tb tr tb tr tt)
                                                texture-depth
