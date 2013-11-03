@@ -35,17 +35,6 @@
 
 
 ;;;
-;;;; Site
-;;;
-
-
-(definition public (iterate-sites proc)
-  (iterate-table (registered-sites)
-    (lambda (name site)
-      (proc (symbol->enumerator name)))))
-
-
-;;;
 ;;;; Profile
 ;;;
 
@@ -138,9 +127,15 @@
       (- (current-seconds) (site-profile-started profile)))))
 
 
+(definition public (iterate-sites proc)
+  (iterate-table (registered-sites)
+    (lambda (name site)
+      (proc (symbol->enumerator name)))))
+
+
 (definition public (advise-sites)
   (iterate-sites advise-site)
-  (set! current-advise (lambda (site)
+  (set! current-advise (lambda (site <Call-Site>)
                          (let ((name (get-name~ site)))
                            (let ((what (symbol->enumerator name)))
                              (advise-site what))))))
@@ -150,7 +145,7 @@
   (set! current-advise #f))
 
 
-(definition (setup-site site)
+(definition (setup-site site <Call-Site>)
   (set-profile~ site (make-site-profile)))
 
 
@@ -209,6 +204,33 @@
 
 
 (definition public (sites-tree)
+  (let ((root (list #f))
+        (nodes (make-table test: eq?)))
+    (define (site-node site)
+      (or (table-ref nodes site #f)
+          (let ((node (list site)))
+            (table-set! nodes site node)
+            (let ((parent (get-parent~ site)))
+              (let ((parent-node (if (not parent)
+                                     root
+                                   (site-node (registered-site parent)))))
+                (set-cdr! parent-node (insert-ordered! node (cdr parent-node)
+                                        key: (lambda (node) (get-name~ (car node)))
+                                        test: (lambda (x y)
+                                                ;; quicky to put memory at the top
+                                                (cond ((eq? x 'memory) #t)
+                                                      ((eq? y 'memory) #f)
+                                                      (else (nu<? x y))))))))
+            node)))
+    
+    (iterate-table-safe (registered-sites)
+      (lambda (name site)
+        (site-node site)))
+    root))
+
+
+@wait
+(definition public (sites-tree)
   (when debug-bug?
   (terminal '********))
   (let ((root (list #f))
@@ -230,10 +252,10 @@
                                                       (else (nu<? x y))))))))
             node)))
     
-    (iterate-table (registered-sites)
+    (iterate-table-safe (registered-sites)
       (lambda (name site)
         (when debug-bug?
-        (when (eq? name 'animate)
+        (when (eq? name 'read-chunk)
           (terminal 'GAZ)))
         (site-node site)))
     (when debug-bug?
@@ -241,13 +263,13 @@
       (continuation-capture
         (lambda (return)
           (define (p node)
-            (if (and (car node) (eq? (get-name~ (car node)) 'animate))
+            (if (and (car node) (eq? (get-name~ (car node)) 'read-chunk))
                 (continuation-return return #f)
               (for-each p (cdr node))))
           
           (p root)
           (bell)(bell)(bell)
-          (terminal 'NOT-FOUND (registered-site 'animate))))))
+          (terminal 'NOT-FOUND (registered-site 'read-chunk))))))
     root))
 
 
@@ -288,4 +310,96 @@
                           (format :console "{_ :v}{a}{a}{%}" (* level 2) name (present-memory elapsed allocated called)))))))
                 nodes))
     
-    (report (cdr root) 0))))
+    (report (cdr root) 0)))
+
+
+;;;
+;;;; Checkpoint
+;;;
+
+
+(proclaim (warn optimizations))
+
+
+(class Checkpoint extends Object
+  
+  
+  (slot name    accessors generate)
+  (slot profile accessors generate)
+  
+  
+  (method override (initialize name)
+    (set! name~self name)
+    (set! profile~self (make-site-profile)))
+  
+  
+  (method override (print output detail)
+    (print-unreadable self output
+      (lambda (output)
+        (format output "{s}" name)))))
+
+
+(define checkpoints?
+  #f)
+
+
+(definition protected checkpoints <table>
+  (make-table test: equal?))
+
+(definition last-checkpoint <Checkpoint+>
+  (make-site-profile))
+
+
+(definition public (register-checkpoint name)
+  (let ((checkpoint (new Checkpoint name)))
+    (table-set! checkpoints name checkpoint)
+    checkpoint))
+
+
+(definition public call-checkpoint
+  (let ((alloc (make-f64vector 1)))
+    (lambda (checkpoint <Checkpoint>)
+      (when checkpoints?
+        (let ((profile (get-profile~ checkpoint)))
+          (bytes-allocated! alloc 0)
+          (let ((allocated (- (f64vector-ref alloc 0) (site-profile-allocated last-checkpoint))))
+            (site-profile-allocated-set! profile (+ (site-profile-allocated profile) allocated)))
+          (site-profile-called-set! profile (+ (site-profile-called profile) 1.))
+          (site-profile-allocated-set! last-checkpoint alloc))))))
+
+
+(definition public (clear-checkpoints)
+  (empty-table checkpoints))
+
+
+(definition public (reset-checkpoints)
+  (iterate-table checkpoints
+    (lambda (name checkpoint <Checkpoint>)
+      (site-profile-reset (get-profile~ checkpoint))))
+  (site-profile-reset last-checkpoint))
+
+
+(definition public (report-checkpoints)
+  (define (kb bytes)
+    (fxround (/ (cast <fl> bytes) 1024.)))
+  
+  (define (meg bytes)
+    (fxround (/ (cast <fl> bytes) 1024. 1024.)))
+  
+  (define (mem bytes)
+    (if #f;(>= bytes 1048576)
+        (format "{a}m" (meg bytes))
+      (format "{a}k" (kb bytes))))
+  
+  (for-each (lambda (name)
+              (let ((checkpoint <Checkpoint> (table-ref checkpoints name)))
+                (let ((profile (get-profile~ checkpoint)))
+                  (let ((allocated (site-profile-allocated profile))
+                        (called (site-profile-called profile)))
+                    (debug-string (format "{a} {a} {a}" name (fxround called) (/ allocated called)))
+                    @w
+                    (debug-string (format "{a} {a} {a} {a}" name (fxround called) (mem (/ allocated called)) (mem allocated)))))))
+            (sort nu<? (table-keys checkpoints) key: ->string)))
+
+
+(proclaim (not warn optimizations)))
