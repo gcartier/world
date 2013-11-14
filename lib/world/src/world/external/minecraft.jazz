@@ -34,6 +34,7 @@
         (world.atlas)
         (world.autoload)
         (world.binary)
+        (world.chunk)
         (world.dye)
         (world.external)
         (world.external.minecraft-syntax (phase syntax))
@@ -50,7 +51,9 @@
         (world.model)
         (world.profiling)
         (world.quad)
+        (world.region)
         (world.renderers)
+        (world.section)
         (world.sector)
         (world.settings)
         (world.support)
@@ -62,10 +65,6 @@
 
 
 (proclaim (warn optimizations))
-
-
-(constant region-size <fx>
-  32)
 
 
 ;;;
@@ -1350,7 +1349,7 @@
 ;;;
 
 
-(class Minecraft-Section extends Object
+(class Minecraft-Section extends World-Section
   
   
   (slot blocks     getter generate)
@@ -1371,7 +1370,7 @@
 ;;;
 
 
-(class Minecraft-Chunk extends Object
+(class Minecraft-Chunk extends World-Chunk
   
   
   (slot tag                             getter generate)
@@ -1380,17 +1379,16 @@
   (slot heightmap-uptodate?             accessors generate)
   (slot heightmap-generating?           accessors generate)
   (slot entities                        getter generate)
-  (slot sections              <table+>  getter generate)
   
   
-  (method override (initialize tag heightmap entities sections)
+  (method override (initialize sections tag heightmap entities)
+    (nextmethod sections)
     (set! tag~self tag)
     (set! heightmap~self heightmap)
     (set! heightmap-revision~self 0)
     (set! heightmap-uptodate?~self #f)
     (set! heightmap-generating?~self #f)
-    (set! entities~self entities)
-    (set! sections~self sections)))
+    (set! entities~self entities)))
 
 
 ;;;
@@ -1398,248 +1396,37 @@
 ;;;
 
 
-(definition region-header-size <fx>
-  (* 8 1024))
-
-(definition chunk-padding <fx>
-  (* 4 1024))
-
-(definition chunk-header-size <fx>
-  5)
-
-(definition zlib-header-size <fx>
-  2)
-
-(definition zlib-footer-size <fx>
-  4)
-
-
-(class Minecraft-Region extends Object
+(class Minecraft-Region extends World-Region
   
   
-  (slot x            <fx>                                            getter generate)
-  (slot z            <fx>                                            getter generate)
-  (slot file         <File>                                          getter generate)
-  (slot port         <port>                                          getter generate)
-  (slot header       <u8vector>                                      getter generate)
-  (slot chunks-mutex <object>   initialize (make-mutex 'chunks)      getter generate)
-  (slot chunks       <table>    initialize (make-table test: equal?) getter generate)
+  (method override (deserialize-chunk chunk-data)
+    (let ((zone <Minecraft-Zone> (current-zone)))
+      (with ((reader (new NBT-Reader (cons chunk-data 0))))
+        (let ((tag (read-tag~ reader)))
+          (let ((compound (tag-assoc "Level" (tag-value tag))))
+            (let ((heightmap (tag-assoc "HeightMap" compound))
+                  (entities (list-payload-content (tag-assoc "Entities" compound)))
+                  (sections (list-payload-content (tag-assoc "Sections" compound))))
+              (let ((sections-table (and sections (make-table test: eq?))))
+                (when sections-table
+                  (let ((truncate-y (get-truncate-y~ zone)))
+                    (for-each (lambda (section)
+                                (let ((yPos (- (cast <fx> (tag-assoc "Y" section)) 4)) ;; lower everything by 64
+                                      (blocks (tag-assoc "Blocks" section))
+                                      (data (tag-assoc "Data" section))
+                                      (blocklight (tag-assoc "BlockLight" section))
+                                      (skylight (tag-assoc "SkyLight" section)))
+                                  (when (or (not truncate-y)
+                                            (>= yPos (cast <fx> truncate-y)))
+                                    (table-set! sections-table yPos (new Minecraft-Section blocks data blocklight skylight)))))
+                              sections)))
+                (new Minecraft-Chunk sections-table tag heightmap entities))))))))
   
   
-  (method override (initialize x z file)
-    (set! x~self x)
-    (set! z~self z)
-    (set! file~self file)
-    (set! port~self (open-input-file (path-settings file)))
-    (set! header (read-header)))
-  
-  
-  (method override (print output readably)
-    (print-unreadable self output
-      (lambda (output)
-        (format output "{a} {a}" x z))))
-  
-  
-  (method override (destroy)
-    (close-port port)
-    (nextmethod))
-  
-  
-  (method (read-header)
-    (let ((size region-header-size))
-      (let ((content (make-u8vector size)))
-        (read-subu8vector content 0 size port)
-        content)))
-  
-  
-  (method (with-chunks-mutex thunk)
-    (mutex-lock! chunks-mutex)
-    (prog1 (thunk)
-      (mutex-unlock! chunks-mutex)))
-  
-  
-  (method (get-chunk sector-x <fx> sector-z <fx>) <Minecraft-Chunk+>
-    (get-chunk-at (chunk-index sector-x sector-z)))
-  
-  
-  (method (get-chunk-at chunk-index <pair>) <Minecraft-Chunk+>
-    (with-chunks-mutex
-      (lambda ()
-        (let ((value (table-ref chunks chunk-index #t)))
-          (if (neq? value #t)
-              value
-            (let ((chunk (read-chunk chunk-index)))
-              (table-set! chunks chunk-index chunk)
-              chunk))))))
-  
-  
-  (method (chunk-index sector-x <fx> sector-z <fx>) <pair>
-    ;; looks like we don't need to adjust for negative values like stated on the wiki
-    (cons (modulo sector-x 32)
-          (modulo sector-z 32)))
-  
-  
-  (method (chunk-header-offset chunk-x <fx> chunk-z <fx>) <fx>
-    (* 4 (+ chunk-x (* chunk-z 32))))
-  
-  
-  (method (get-chunk-offset header-offset <fx>) <fx+>
-    (let ((b1 (u8vector-ref header header-offset))
-          (b2 (u8vector-ref header (+ header-offset 1)))
-          (b3 (u8vector-ref header (+ header-offset 2)))
-          (b4 (u8vector-ref header (+ header-offset 3))))
-      (if (and (= b1 0)
-               (= b2 0)
-               (= b3 0)
-               (= b4 0))
-          #f
-        (* (+ (arithmetic-shift-left b1 16)
-              (arithmetic-shift-left b2 8)
-              b3)
-           chunk-padding))))
-  
-  
-  (method (get-chunk-size header-offset <fx>) <fx+>
-    (* (u8vector-ref header (+ header-offset 3)) chunk-padding))
-  
-  
-  (method (set-chunk-offset header-offset <fx> offset <fx>)
-    (let ((offset (/ offset chunk-padding)))
-      (assert (fixnum? offset))
-      (let ((b1 (modulo (arithmetic-shift offset -16) 256))
-            (b2 (modulo (arithmetic-shift offset -8) 256))
-            (b3 (modulo offset 256)))
-        (u8vector-set! header header-offset b1)
-        (u8vector-set! header (+ header-offset 1) b2)
-        (u8vector-set! header (+ header-offset 2) b3))))
-  
-  
-  (method (set-chunk-size header-offset <fx> size <fx>)
-    (let ((count (/ size chunk-padding)))
-      (assert (fixnum? count))
-      (u8vector-set! header (+ header-offset 3) count)))
-  
-  
-  (method (read-chunk chunk-index <pair>) <Minecraft-Chunk+>
-    (let ((zone <Minecraft-Zone> (current-zone))
-          (chunk-x <fx> (car chunk-index))
-          (chunk-z <fx> (cdr chunk-index)))
-      (let ((header-offset (chunk-header-offset chunk-x chunk-z)))
-        (assert (<= header-offset 4092))
-        (let ((offset (get-chunk-offset header-offset)))
-          (if (not offset)
-              #f
-            (site (read-chunk on?: #t parent: generate)
-              (input-port-byte-position port offset)
-              (let ((chunk-header (make-u8vector 5)))
-                (read-subu8vector chunk-header 0 5 port)
-                (let ((deflated-size <fx> (- (scan-u32-big-endian chunk-header 0) zlib-header-size zlib-footer-size))
-                      (compression-type (u8vector-ref chunk-header 4)))
-                  (assert (= compression-type 2))
-                  ;; skip zlib header to use inflate
-                  (read-u8 port)
-                  (read-u8 port)
-                  (let ((chunk-raw (make-u8vector deflated-size)))
-                    (read-subu8vector chunk-raw 0 deflated-size port)
-                    (let ((chunk-data (inflate-u8vector chunk-raw)))
-                      (with ((reader (new NBT-Reader (cons chunk-data 0))))
-                        (let ((tag (read-tag~ reader)))
-                          (let ((compound (tag-assoc "Level" (tag-value tag))))
-                            (let ((heightmap (tag-assoc "HeightMap" compound))
-                                  (entities (list-payload-content (tag-assoc "Entities" compound)))
-                                  (sections (list-payload-content (tag-assoc "Sections" compound))))
-                              (let ((sections-table (and sections (make-table test: eq?))))
-                                (when sections-table
-                                  (let ((truncate-y (get-truncate-y~ zone)))
-                                    (for-each (lambda (section)
-                                                (let ((yPos (- (cast <fx> (tag-assoc "Y" section)) 4)) ;; lower everything by 64
-                                                      (blocks (tag-assoc "Blocks" section))
-                                                      (data (tag-assoc "Data" section))
-                                                      (blocklight (tag-assoc "BlockLight" section))
-                                                      (skylight (tag-assoc "SkyLight" section)))
-                                                  (when (or (not truncate-y)
-                                                            (>= yPos (cast <fx> truncate-y)))
-                                                    (table-set! sections-table yPos (new Minecraft-Section blocks data blocklight skylight)))))
-                                              sections)))
-                                (new Minecraft-Chunk tag heightmap entities sections-table))))))))))))))))
-  
-  
-  (method (get-section sector-x <fx> sector-y <fx> sector-z <fx>) <Minecraft-Section+>
-    (let ((chunk (get-chunk sector-x sector-z)))
-      (when chunk
-        (let ((sections (get-sections~ chunk)))
-          (when sections
-            (table-ref sections sector-y #f))))))
-  
-  
-  (method (get-blocks sector-x <fx> sector-y <fx> sector-z <fx>) <u8vector+>
-    (let ((section (get-section sector-x sector-y sector-z)))
-      (when section
-        (get-blocks~ section))))
-  
-  
-  (method (save-region (compact?: compact? #f))
-    (define (save-header port)
-      (output-port-byte-position port 0)
-      (let ((size (u8vector-length header)))
-        (write-subu8vector header 0 size port)))
-    
-    ;; could we save only modified chunks in-place or maybe
-    ;; save them at the end and compact the region when size
-    ;; goes over a certain threshold!?
-    (define (save-chunks port)
-      (let ((end region-header-size))
-        (loop (for z from 0 below 32)
-              (loop (for x from 0 below 32)
-                    (let ((header-offset (chunk-header-offset x z))
-                          (chunk (get-chunk-at (cons x z))))
-                      (if (not chunk)
-                          (begin
-                            (set-chunk-offset header-offset 0)
-                            (set-chunk-size header-offset 0))
-                        (let ((writer (new NBT-Writer #f)))
-                          (write-tag~ writer (get-tag~ chunk))
-                          (let ((content (get-content~ writer)))
-                            (let ((deflated-size (u8vector-length content)))
-                              (let ((zlib-size (+ zlib-header-size deflated-size zlib-footer-size)))
-                                (let ((chunk-size (pad-chunk (+ chunk-header-size zlib-size)))
-                                      (actual-size (get-chunk-size header-offset)))
-                                  (let ((offset (if (or compact? (> chunk-size actual-size))
-                                                    end
-                                                  (get-chunk-offset header-offset))))
-                                    (output-port-byte-position port offset)
-                                    (let ((chunk-header (make-u8vector 5)))
-                                      (put-u32-big-endian chunk-header 0 zlib-size)
-                                      (u8vector-set! chunk-header 4 2)
-                                      (write-subu8vector chunk-header 0 5 port)
-                                      ;; zlib header
-                                      (write-u8 120 port)
-                                      (write-u8 156 port)
-                                      ;; deflated nbt
-                                      (write-subu8vector content 0 deflated-size port)
-                                      ;; zlib footer
-                                      (write-u8 0 port)
-                                      (write-u8 0 port)
-                                      (write-u8 #xFF port)
-                                      (write-u8 #xFF port)
-                                      (set-chunk-offset header-offset offset)
-                                      (set-chunk-size header-offset chunk-size)
-                                      (let ((chunk-end (+ offset chunk-size)))
-                                        (when (> chunk-end end)
-                                          (set! end chunk-end))))))))))))))))
-    
-    (define (pad-chunk size)
-      (let ((mod (modulo size chunk-padding)))
-        (if (= mod 0)
-            size
-          (+ size (- chunk-padding mod)))))
-    
-    (let ((dest (new-brother~ file "out.mca"))) ;; for tests
-      (create-directories~ dest)
-      (call-with-output-file (path-settings dest truncate: compact?)
-        (lambda (port)
-          (save-chunks port)
-          (save-header port))))))
+  (method override (serialize-chunk chunk)
+    (let ((writer (new NBT-Writer #f)))
+      (write-tag~ writer (get-tag~ chunk))
+      (get-content~ writer))))
 
 
 ;;;
@@ -1650,14 +1437,6 @@
 (definition public (import-minecraft-level file)
   (with ((reader (new NBT-Reader file)))
     (read-tag~ reader)))
-
-
-;;;
-;;;; Sector
-;;;
-
-
-(class Minecraft-Sector extends Sector)
 
 
 ;;;
@@ -1776,10 +1555,6 @@
       ((opaque) "stone")
       ((transparent) "flower_rose")
       (else "wool_colored_light_blue")))
-  
-  
-  (method override (sector-class)
-    Minecraft-Sector)
   
   
   (method override (zone-editable?)
