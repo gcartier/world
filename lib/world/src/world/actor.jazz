@@ -327,6 +327,11 @@
   ;;;
   
   
+  ;; If I augment the jump-impulsion, lets say by a factor a 2.5, then collide&stop starts
+  ;; returning incorrect collisions as in the following example taken from minecraft/Sample
+  ;; (collide&stop (vertex -262.292 .400 72.041) (vertex -262.292 1.227 72.041) (lookat (vertex .662 .000 -.749) (vertex -.000 1.000 .000) (vertex .749 .000 .662)) (vertex .4 .4 .4))
+  
+  
   ;; (slot position      <f64vector>)    ;; position
   ;; (slot lookat        <LookAt>)       ;; lookat is always perpendicular to gravity
   ;; (slot scale         <f64vector>)    ;; scale
@@ -354,8 +359,6 @@
             (model (cache-model))
             (center (transformed-center)))
         (let ((gravity (if gravity? (compute-gravity~ world center) (make-zero-vertex)))
-              ;; quicky
-              (initial-gravity (if gravity? (compute-gravity~ world center) (make-zero-vertex)))
               (factor (* elapse 65.))
               (first-person? (get-first-person?~ world))
               (fly? (get-fly?~ world))
@@ -424,6 +427,22 @@
                 (set! acceleration-duration 0.)
                 (update-parameter~ world 'sprint))))
           
+          (define (collide-actor)
+            (let* ((pumps (and (needs-pumps?~ zone) (get-pumps~ model)))
+                   (pumped-center (if pumps (vertex+ center pumps) center))
+                   (target-center (vertex+ pumped-center velocity))
+                   (collide (case response ((stop) collide&stop) ((slide) collide&slide)))
+                   (radiuses (transformed-radiuses)))
+              (receive (new-center slide-direction collisions) (site (collide&slide on?: #f parent: tick-actor) (collide pumped-center target-center lookat radiuses ignore-entities?: ignore-entities? ignore-players?: ignore-players?))
+                (when pumps
+                  (set! new-center (vertex- new-center pumps)))
+                (let ((target-fall (copy-vertex new-center)))
+                  (when (not fly?)
+                    (let ((adjusted (* elapse 50.)))
+                      (vertex+! fall-velocity fall-velocity (vertex-scalar*& gravity adjusted))
+                      (vertex+! target-fall target-fall (vertex+& (vertex-scalar*& fall-velocity adjusted) (vertex-scalar*& gravity (* .5 adjusted adjusted))))))
+                  (site (collide&stop on?: #f parent: tick-actor) (collide&stop new-center target-fall lookat radiuses ignore-entities?: ignore-entities? ignore-players?: ignore-players?))))))
+          
           (define (verify-death)
             @wait
             (when (< (get-y) die-bottom)
@@ -456,71 +475,55 @@
               (set! jump-ready? #t))
             (when (> (dot-product fall-velocity normalized-gravity) max-fall-speed)
               (vertex-copy! fall-velocity (vertex-scalar*& normalized-gravity max-fall-speed))))
-          (let* ((pumps (and (needs-pumps?~ zone) (get-pumps~ model)))
-                 (pumped-center (if pumps (vertex+ center pumps) center))
-                 (target-center (vertex+ pumped-center velocity))
-                 (collide (case response ((stop) collide&stop) ((slide) collide&slide)))
-                 (radiuses (transformed-radiuses)))
-            (receive (new-center slide-direction collisions) (site (collide&slide on?: #f parent: tick-actor) (collide pumped-center target-center lookat radiuses ignore-entities?: ignore-entities? ignore-players?: ignore-players?))
-              (when pumps
-                (set! new-center (vertex- new-center pumps)))
-              (let ((target-fall (copy-vertex new-center)))
+          (receive (new-fall fall-direction collisions) (collide-actor)
+            (hit collisions exit)
+            (when (and floor-level (< (- (vertex-y new-fall) (get-radius-y)) floor-level))
+              (hit-floor
+                (lambda (y)
+                  (vertex-y-set! new-fall y))
+                exit))
+            (when (and controller (not fly?))
+              (update-world-up~ world gravity)
+              (realign-lookat (gravity-up gravity)))
+            (let ((floor-level (and floor-level (+ floor-level (get-radius-y)))))
+              (if (and floor-level (< (vertex-y new-fall) floor-level) (not fly?))
+                  (begin
+                    (vertex-y-set! new-fall floor-level)
+                    ;; quick hack
+                    (if (and (= (vertex-x gravity) 0.)
+                             (= (vertex-z gravity) 0.))
+                        (vertex-init! fall-velocity 0. 0. 0.)
+                      (vertex-y-set! fall-velocity 0.))
+                    (set! jumping? #f)
+                    (set! floor? #t))
+                (let ((fall-collided? (not-null? collisions)))
+                  (if (not fall-collided?)
+                      (set! floor? #f)
+                    (vertex-init! fall-velocity 0. 0. 0.)
+                    (set! jumping? #f)
+                    (set! floor? #t)
+                    (when (eq? orientation 'horizontal)
+                      (let ((c0 (car collisions)))
+                        (let ((normal (get-normal~ (get-plane~ c0))))
+                          (let ((up (remove-tilt normal (get-right~ lookat))))
+                            (set-up~ lookat up)
+                            (set-sight~ lookat (cross-normal& up (get-right~ lookat)))))))))))
+            (let ((new-position (vertex+ position (vertex- new-fall center)))
+                  (old-position (copy-vertex position)))
+              (if (or (not controller) (eq? self controller))
+                  (set-position new-position)
+                (set-property 'position new-position))
+              (update-element~ zone self old-position)
+              (vertex-! movement position old-position)
+              (verify-death)
+              (rotate-model)
+              (when (and controller
+                         @to-redo-was-commented-after-conversion-for-mind-control (eq? self me)
+                         (not (vertex=? old-position new-position)))
                 (when (not fly?)
-                  (let ((adjusted (* elapse 50.)))
-                    (vertex+! fall-velocity fall-velocity (vertex-scalar*& gravity adjusted))
-                    (vertex+! target-fall target-fall (vertex+& (vertex-scalar*& fall-velocity adjusted) (vertex-scalar*& gravity (* .5 adjusted adjusted))))))
-                ;; if I augment the jump-impulsion, lets say by a factor a 2.5, then collide&stop starts
-                ;; returning incorrect collisions as in the following example taken from minecraft/Sample
-                ;; (collide&stop (vertex -262.292 .400 72.041) (vertex -262.292 1.227 72.041) (lookat (vertex .662 .000 -.749) (vertex -.000 1.000 .000) (vertex .749 .000 .662)) (vertex .4 .4 .4))
-                (receive (new-fall fall-direction collisions) (site (collide&stop on?: #f parent: tick-actor) (collide&stop new-center target-fall lookat radiuses ignore-entities?: ignore-entities? ignore-players?: ignore-players?))
-                  (hit collisions exit)
-                  (when (and floor-level (< (- (vertex-y target-center) (get-radius-y)) floor-level))
-                    (hit-floor
-                      (lambda (y)
-                        (vertex-y-set! target-center y))
-                      exit))
-                  (when (and controller (not fly?))
-                    (update-world-up~ world gravity)
-                    (realign-lookat (gravity-up gravity)))
-                  (let ((floor-level (and floor-level (+ floor-level (get-radius-y)))))
-                    (if (and floor-level (< (vertex-y new-fall) floor-level) (not fly?))
-                        (begin
-                          (vertex-y-set! new-fall floor-level)
-                          ;; quick hack
-                          (if (and (= (vertex-x gravity) 0.)
-                                   (= (vertex-z gravity) 0.))
-                              (vertex-init! fall-velocity 0. 0. 0.)
-                            (vertex-y-set! fall-velocity 0.))
-                          (set! jumping? #f)
-                          (set! floor? #t))
-                      (let ((fall-collided? (not-null? collisions)))
-                        (if (not fall-collided?)
-                            (set! floor? #f)
-                          (vertex-init! fall-velocity 0. 0. 0.)
-                          (set! jumping? #f)
-                          (set! floor? #t)
-                          (when (eq? orientation 'horizontal)
-                            (let ((c0 (car collisions)))
-                              (let ((normal (get-normal~ (get-plane~ c0))))
-                                (let ((up (remove-tilt normal (get-right~ lookat))))
-                                  (set-up~ lookat up)
-                                  (set-sight~ lookat (cross-normal& up (get-right~ lookat)))))))))))
-                  (let ((new-position (vertex+ position (vertex- new-fall center)))
-                        (old-position (copy-vertex position)))
-                    (if (or (not controller) (eq? self controller))
-                        (set-position new-position)
-                      (set-property 'position new-position))
-                    (update-element~ zone self old-position)
-                    (vertex-! movement position old-position)
-                    (verify-death)
-                    (rotate-model)
-                    (when (and controller
-                               @to-redo-was-commented-after-conversion-for-mind-control (eq? self me)
-                               (not (vertex=? old-position new-position)))
-                      (when (not fly?)
-                        (let ((final-gravity (compute-gravity~ world position)))
-                          (realign-lookat-horizon! (get-eye-lookat~ world) (get-up~ lookat) initial-gravity final-gravity)))
-                      (eye-center-player~ world)))))))))))
+                  (let ((final-gravity (compute-gravity~ world position)))
+                    (realign-lookat-horizon! (get-eye-lookat~ world) (get-up~ lookat) gravity final-gravity)))
+                (eye-center-player~ world))))))))
   
   
   (method protected virtual (tick-slice)
