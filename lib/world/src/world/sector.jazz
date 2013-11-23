@@ -36,8 +36,75 @@
 
 
 ;;;
+;;;; Queue
+;;;
+
+
+(class Generate-Queue extends Object
+  
+  
+  (slot queue)
+  (slot mutex           initialize (make-mutex))
+  (slot mutex-condition initialize (make-condition))
+  
+  
+  (method override (initialize)
+    (nextmethod)
+    (set! queue (new-queue)))
+  
+  
+  (method public (empty?)
+    (mutex-lock! mutex)
+    (prog1 (queue-empty? queue)
+      (mutex-unlock! mutex)))
+  
+  
+  (method public (reset)
+    (mutex-lock! mutex)
+    (reset-queue queue)
+    (mutex-unlock! mutex))
+  
+  
+  (method public (push obj)
+    (mutex-lock! mutex)
+    (enqueue queue obj)
+    (mutex-unlock! mutex)
+    (condition-signal! mutex-condition))
+  
+  
+  (method public (pop timeout)
+    (declare (proper-tail-calls))
+    (let (iter)
+      (mutex-lock! mutex)
+      (cond ((not (queue-empty? queue))
+             (prog1 (dequeue queue)
+               (mutex-unlock! mutex)))
+            ((mutex-unlock! mutex mutex-condition timeout)
+             (iter))
+            (else
+             (eof-object))))))
+
+
+;;;
 ;;;; Thread
 ;;;
+
+
+(definition protected generate-queue
+  (new Generate-Queue))
+
+
+(definition public (push-content thunk)
+  (push~ generate-queue thunk))
+
+(definition public (pop-content)
+  (pop~ generate-queue +infinity))
+
+
+(definition protected (stop-generate)
+  (push-content
+    (lambda (exit)
+      (continuation-return exit #f))))
 
 
 (definition protected (generate-task task <Task>)
@@ -55,18 +122,12 @@
                 (with-restart-catcher 'resume-loop (present-current-loop-restart)
                   (lambda ()
                     (let (iter)
-                      (let ((thunk (thread-receive)))
+                      (let ((thunk (pop-content)))
                         (log-transition log-context generate-parallel-state)
                         (thunk exit)
                         (log-transition log-context waiting-state)
                         (iter)))))))
             (restart-loop)))))))
-
-
-(definition public (post-content zone <Zone> thunk)
-  (thread-send (get-generate-thread~ zone)
-    (lambda (exit)
-      (thunk))))
 
 
 ;;;
@@ -199,8 +260,8 @@
                    (begin
                      (increase-sectors-generating~ zone self)
                      (if generate-threaded?
-                         (post-content zone
-                           (lambda ()
+                         (push-content
+                           (lambda (exit)
                              (site (generate on?: #t)
                                (generate-content~ zone self))))
                        (site (generate-sequential on?: #t parent: draw-neighbors)
