@@ -18,56 +18,141 @@
 
 
 ;;;
-;;;; Queue
+;;;; Circular
 ;;;
 
 
 (class Circular-Queue extends Object
   
   
-  (slot queue)
-  (slot mutex           initialize (make-mutex))
-  (slot mutex-condition initialize (make-condition))
+  (slot count   <fx>)
+  (slot content <vector>)
+  (slot head    <fx>)
+  (slot tail    <fx>)
+  (slot size    <fx>     getter generate)
   
   
-  (method override (initialize)
+  (method override (initialize cnt)
+    (set! count cnt)
+    (set! content (make-vector cnt))
+    (set! head 0)
+    (set! tail 0)
+    (set! size 0))
+  
+  
+  (method public (empty?)
+    (= head tail))
+  
+  
+  (method public (reset)
+    (loop (for n from 0 below size)
+          (let ((offset (modulo (+ head n) count)))
+            (let ((sector (vector-ref content offset)))
+              (set-generating?~ sector #f)
+              (vector-set! content offset #f))))
+    (set! head 0)
+    (set! tail 0)
+    (set! size 0))
+  
+  
+  (method public (enqueue obj)
+    (if (>= size count)
+        (error "Queue overflow")
+      (vector-set! content tail obj)
+      (set! tail (modulo (+ tail 1) count))
+      (increase! size)))
+  
+  
+  (method public (dequeue)
+    (if (<= size 0)
+        (error "Queue is empty")
+      (prog1 (vector-ref content head)
+        (vector-set! content head #f)
+        (set! head (modulo (+ head 1) count))
+        (decrease! size)))))
+
+
+;;;
+;;;; Priorities
+;;;
+
+
+(class Priorities-Queue extends Object
+  
+  
+  (slot count     <fx>)
+  (slot queues    <vector>)
+  (slot mutex              initialize (make-mutex))
+  (slot condition          initialize (make-condition))
+  
+  
+  (method override (initialize cnt reserved)
     (nextmethod)
-    (set! queue (new-queue)))
+    (assert (> cnt 0))
+    (set! count cnt)
+    (set! queues (list->vector (map (lambda (n) (new Circular-Queue reserved))
+                                    (naturals 0 count)))))
+  
+  
+  (method (top-queue)
+    (let (iter (priority 0))
+      (if (< priority count)
+          (let ((queue (element queues priority)))
+            (if (not (empty?~ queue))
+                queue
+              (iter (+ priority 1))))
+        #f)))
+  
+  
+  (method public (size)
+    (mutex-lock! mutex)
+    (prog1 (let ((size 0))
+             (loop (for queue in-vector queues)
+                   (increase! size (get-size~ queue)))
+             size)
+      (mutex-unlock! mutex)))
   
   
   (method public (empty?)
     (mutex-lock! mutex)
-    (prog1 (queue-empty? queue)
+    (prog1 (not (top-queue))
       (mutex-unlock! mutex)))
   
   
   (method public (reset)
     (mutex-lock! mutex)
-    (reset-queue queue)
+    (loop (for queue in-vector queues)
+          (reset~ queue))
     (mutex-unlock! mutex))
   
   
-  (method public (trim keep)
+  (method public (trim priority)
     (mutex-lock! mutex)
-    (prog1 (trim-queue queue keep)
-      (mutex-unlock! mutex)))
+    (let ((trimmed 0))
+      (loop (for p from priority below count)
+            (let ((queue (element queues p)))
+              (increase! trimmed (get-size~ queue))
+              (reset~ queue)))
+      (prog1 trimmed
+        (mutex-unlock! mutex))))
   
   
-  (method public (push obj)
+  (method public (push obj priority <fx>)
     (mutex-lock! mutex)
-    (enqueue queue obj)
+    (enqueue~ (element queues priority) obj)
     (mutex-unlock! mutex)
-    (condition-signal! mutex-condition))
+    (condition-signal! condition))
   
   
   (method public (pop timeout)
     (declare (proper-tail-calls))
     (let (iter)
       (mutex-lock! mutex)
-      (cond ((not (queue-empty? queue))
-             (prog1 (dequeue queue)
-               (mutex-unlock! mutex)))
-            ((mutex-unlock! mutex mutex-condition timeout)
-             (iter))
-            (else
-             (eof-object)))))))
+      (let ((queue (top-queue)))
+        (cond (queue
+               (prog1 (dequeue~ queue)
+                 (mutex-unlock! mutex)))
+              ((mutex-unlock! mutex condition timeout)
+               (iter))
+              (else
+               (eof-object))))))))
