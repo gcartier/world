@@ -102,6 +102,7 @@
         (world.material)
         (world.mesh)
         (world.model)
+        (world.motion)
         (world.opengl)
         (world.parameters)
         (world.planet)
@@ -154,7 +155,7 @@
   (slot height                 <fl>              initialize #f              accessors generate)
   (slot boundaries             <f64vector+>      initialize #f              getter generate)
   (slot eye                    <Camera>          initialize (make-camera)   getter generate)
-  (slot eye-mode               <symbol>          initialize 'free           getter generate)
+  (slot eye-motion             <Motion>          initialize #f              getter generate)
   (slot eye-hook               <object>          initialize #f              accessors generate)
   (slot world-up               <f64vector>       initialize (make-vertex)   getter generate)
   (slot lighting?              <bool>            initialize #t              getter generate)
@@ -183,9 +184,6 @@
   
   
   (slot version                <object>          initialize #f              getter generate)
-  (slot desired-roll           <fl>              initialize 0.              getter generate)
-  (slot roll-speed             <fl+>             initialize #f              getter generate)
-  (slot last-roll-time         <fl+>             initialize #f              getter generate)
   (slot orientation?           <bool>            initialize #f              getter generate)
   (slot aim?                   <bool>            initialize #f              getter generate)
   (slot free-aim?              <bool>            initialize #f              getter generate)
@@ -193,11 +191,6 @@
   (slot moving?                <bool>            initialize #f              getter generate)
   (slot moved?                 <bool>            initialize #f              getter generate)
   (slot preserved-mouse        <object>          initialize #f              getter generate)
-  (slot max-distance           <fl>              initialize 30.0            getter generate)
-  (slot first-distance         <fl>              initialize 3.5             getter generate)
-  (slot first-override         <fl+>             initialize #f              getter generate)
-  (slot first-goal             <fl+>             initialize #f              getter generate)
-  (slot first-restore          <fl+>             initialize #f              getter generate)
   (slot first-camera           <object>          initialize #f              getter generate)
   (slot vehicle                <object>          initialize #f              getter generate)
   (slot mount?                 <bool>            initialize #f              getter generate)
@@ -221,7 +214,6 @@
   (slot render-what            <fx+>             initialize 0               accessors generate)
   (slot dynamic-lights         <fx>              initialize 8               getter generate)
   (slot post-processing?       <bool>            initialize #t              getter generate)
-  (slot track-sensitivity      <fl>              initialize 200.            getter generate)
   (slot ongoing-key            <object>          initialize #f              accessors generate)
   (slot axes?                  <bool>            initialize #f              accessors generate)
   (slot tick-slice?            <bool>            initialize #t              getter generate)
@@ -245,6 +237,8 @@
   (slot gc-sound?              <bool>            initialize #f              getter generate)
   (slot history?               <bool>            initialize #t              getter generate)
   (slot history                <object>          initialize #f              getter generate)
+  (slot history-camera         <Camera>          initialize (make-camera)   getter generate)
+  (slot history-motion         <Motion>          initialize #f              getter generate)
   (slot message                <object>          initialize #f              getter generate)
   (slot message-time           <object>          initialize #f              getter generate)
   (slot message-color          <object>          initialize #f              getter generate)
@@ -294,13 +288,14 @@
     (set-current-world self)
     (set! view-distance (find-setting 'world.view-distance 7))
     (set! view-radius 200.)
-    (set-perspective-fov~ eye (find-setting 'world.perspective-fov 45.))
-    (set-perspective-near~ eye (find-setting 'world.perspective-near 0.1))
-    (set-perspective-far~ eye (find-setting 'world.perspective-far 10000.0))
+    (set! history-motion (make-free-motion self history-camera))
+    (set! eye-motion (make-free-motion self eye))
     (set-stable-callback~ eye eye-stable-callback)
+    (set-current-camera eye)
+    (set-current-motion eye-motion)
     (set! dynamic-lights (min max-dynamic-lights (find-setting 'world.dynamic-lights 8)))
     (set! earth? (find-setting 'world.earth? #t))
-    (set! track-sensitivity (find-setting 'world.track-sensitivity 200.))
+    (set-track-sensitivity (find-setting 'world.track-sensitivity 200.))
     (set! post-processing? (find-setting 'world.post-processing? #t))
     (set! interface? (world-setting 'world.start-interface? #t 'default))
     (set! interface-target? (world-setting 'world.interface-target? #t 'default))
@@ -372,6 +367,7 @@
     (set! width (cast <fl> (get-width~ size)))
     (set! height (cast <fl> (get-height~ size)))
     (size-change~ eye size)
+    (size-change~ history-camera size)
     (when showcases
       (iterate-table showcases
         (lambda (name showcase)
@@ -634,7 +630,6 @@
     (set! grid? start-grid?)
     (set! axes? (or start-axes? (find-setting 'world.axes? #f)))
     (set! lighting? #t)
-    (activate-perspective~ eye)
     (setup-interface)
     (unless (zone-based?)
       (setup-history))
@@ -694,16 +689,12 @@
             (add-element~ zone player)
             (set-current-me player)
             ;; eye
-            (set! eye-mode 'free)
             (let ((start-mode (or (get-start-mode~ zone) 'first-person)))
-              (when (eq? start-mode 'first-person)
-                (person-camera)
+              (if (neq? start-mode 'first-person)
+                  (free-motion feedback?: #f)
+                (person-motion feedback?: #f)
                 (let ((distance (or (get-start-distance~ zone) default-start-distance)))
-                  (set! first-distance distance)
-                  (set! first-override #f)
-                  (set! first-goal #f)
-                  (align-eye-behind (player-lens player))
-                  (adjust-player-alpha)))))))))
+                  (setup-motion~ (get-motion~ player) distance)))))))))
   
   
   ;;;
@@ -760,9 +751,10 @@
               (for-each (lambda (proc)
                           (proc elapse))
                         tick-procedures)))
-          (restore-first-distance elapse)
           (update-transformation-time elapse)
-          (process-roll me)))))
+          (let ((motion (current-motion)))
+            (restore-desired-distance~ motion elapse)
+            (process-roll~ motion me))))))
   
   
   (method (tick-actors commands time elapse)
@@ -1152,15 +1144,15 @@
     (character-pane))
   
   
-  ;; Camera
-  (method (on-person-camera evt)
-    (person-camera))
+  ;; Motion
+  (method (on-person-motion evt)
+    (person-motion))
   
-  (method (on-orbit-camera evt)
-    (orbit-camera))
+  (method (on-orbit-motion evt)
+    (orbit-motion))
   
-  (method (on-free-camera evt)
-    (free-camera))
+  (method (on-free-motion evt)
+    (free-motion))
   
   (method (on-toggle-camera-lock evt)
     (toggle-camera-lock))
@@ -1475,14 +1467,6 @@
   ;;;
   
   
-  (method (effective-first-person?)
-    (and (eq? eye-mode 'person) (not paused?)))
-  
-  
-  (method (effective-orbit-mode?)
-    (and (eq? eye-mode 'orbit) (first-target)))
-  
-  
   (method (process-idleness flag)
     (set! idle? flag)
     (when idle?
@@ -1491,129 +1475,58 @@
   
   (method (idle)
     (let ((me (current-me)))
-      (when (effective-first-person?)
+      (when (person-motion?)
         (idle~ me))))
   
   
   (method (move-forward)
-    (let ((me (current-me))
-          (target (first-target)))
-      (cond ((effective-orbit-mode?)
-             (first-distance-closer speed: .95)
-             (orbit-behind target))
-            ((effective-first-person?)
-             (move-forward~ me commands))
-            (else
-             (when (hook-eye)
-               (move-forward~ eye))))))
+    (move-forward~ (current-motion)))
   
   
   (method (move-backward)
-    (let ((me (current-me))
-          (target (first-target)))
-      (cond ((effective-orbit-mode?)
-             (first-distance-further speed: .95)
-             (orbit-behind target))
-            ((effective-first-person?)
-             (move-backward~ me commands))
-            (else
-             (when (hook-eye)
-               (move-backward~ eye))))))
+    (move-backward~ (current-motion)))
   
   
   (method (blink-forward)
-    (let ((me (current-me)))
-      (cond ((effective-orbit-mode?))
-            ((effective-first-person?)
-             (blink-forward~ me commands))
-            (else
-             (when (hook-eye)
-               (blink-forward~ eye))))))
+    (blink-forward~ (current-motion)))
   
   
   (method (blink-backward)
-    (let ((me (current-me)))
-      (cond ((effective-orbit-mode?))
-            ((effective-first-person?)
-             (blink-backward~ me commands))
-            (else
-             (when (hook-eye)
-               (blink-backward~ eye))))))
+    (blink-backward~ (current-motion)))
+  
+  
+  (method (warp-forward)
+    (warp-forward~ (current-motion)))
+  
+  
+  (method (warp-backward)
+    (warp-backward~ (current-motion)))
   
   
   (method (move-left)
-    (let ((me (current-me))
-          (target (first-target)))
-      (cond ((effective-orbit-mode?)
-             (rotate-right~ eye)
-             (orbit-behind target))
-            ((effective-first-person?)
-             (move-left~ me commands))
-            (else
-             (when (hook-eye)
-               (move-left~ eye))))))
+    (move-left~ (current-motion)))
   
   
   (method (move-right)
-    (let ((me (current-me))
-          (target (first-target)))
-      (cond ((effective-orbit-mode?)
-             (rotate-left~ eye)
-             (orbit-behind target))
-            ((effective-first-person?)
-             (move-right~ me commands))
-            (else
-             (when (hook-eye)
-               (move-right~ eye))))))
-  
-  
-  (method (move-up)
-    (let ((me (current-me))
-          (target (first-target)))
-      (cond ((effective-orbit-mode?)
-             (rotate-down)
-             (orbit-behind target))
-            ((effective-first-person?)
-             (move-up~ me commands))
-            (else
-             (when (hook-eye)
-               (move-up~ eye))))))
+    (move-right~ (current-motion)))
   
   
   (method (process-move-up)
-    (if (or paused? (and (eq? eye-mode 'person) fly?))
+    (if (or paused? (and (person-motion?) fly?))
         (move-up)
       (space)))
   
   
-  (method (move-down)
-    (let ((me (current-me))
-          (target (first-target)))
-      (cond ((effective-orbit-mode?)
-             (rotate-up)
-             (orbit-behind target))
-            ((effective-first-person?)
-             (move-down~ me commands))
-            (else
-             (when (hook-eye)
-               (move-down~ eye))))))
+  (method (move-up)
+    (move-up~ (current-motion)))
   
   
   (method (process-move-down)
     (move-down))
   
   
-  (method (rotate-left)
-    (let ((me (current-me))
-          (target (first-target)))
-      (cond ((effective-orbit-mode?)
-             (rotate-right~ eye)
-             (orbit-behind target))
-            ((effective-first-person?)
-             (rotate-left~ me commands))
-            (else
-             (when (hook-eye)
-               (rotate-left~ eye))))))
+  (method (move-down)
+    (move-down~ (current-motion)))
   
   
   (method (process-rotate-left)
@@ -1622,17 +1535,8 @@
       (rotate-left)))
   
   
-  (method (rotate-right)
-    (let ((me (current-me))
-          (target (first-target)))
-      (cond ((effective-orbit-mode?)
-             (rotate-left~ eye)
-             (orbit-behind target))
-            ((effective-first-person?)
-             (rotate-right~ me commands))
-            (else
-             (when (hook-eye)
-               (rotate-right~ eye))))))
+  (method (rotate-left)
+    (rotate-left~ (current-motion)))
   
   
   (method (process-rotate-right)
@@ -1641,33 +1545,19 @@
       (rotate-right)))
   
   
-  (method (rotate-up)
-    (rotate-up~ eye))
-  
-  
-  (method (rotate-down)
-    (rotate-down~ eye))
-  
-  
-  (method (force-player-up player distance)
-    (let ((position (get-position~ eye)))
-      (set-position~ eye (vertex+& position (vertex-scalar*& (get-up~ (get-lookat~ player)) distance)))
-      (derive-target~ eye)
-      (camera-update~ eye)
-      (set-y~ player (+ (get-y~ player) distance))
-      (follow-player)))
+  (method (rotate-right)
+    (rotate-right~ (current-motion)))
   
   
   (method (space)
     (let ((me (current-me))
-          (target (first-target)))
-      (cond ((effective-orbit-mode?)
-             (rotate-down)
-             (orbit-behind target))
-            ((eq? eye-mode 'person)
+          (motion (current-motion)))
+      (cond ((person-motion?)
              (if (key-down? (char->integer #\4))
-                 (force-player-up me 1.)
+                 (force-up~ motion 1.)
                (space~ me commands)))
+            ((orbit-motion?)
+             (move-up~ motion))
             (else
              (move-up)))))
   
@@ -1679,20 +1569,20 @@
   
   (method (fire kind)
     (let ((me (current-controlled)))
-      (cond ((effective-orbit-mode?))
-            ((effective-first-person?)
+      (cond ((orbit-motion?))
+            ((person-motion?)
              (fire~ me commands kind)))))
   
   
   (method (maybe-fire kind)
     (let ((me (current-controlled)))
-      (cond ((effective-orbit-mode?))
-            ((effective-first-person?)
+      (cond ((orbit-motion?))
+            ((person-motion?)
              (maybe-fire~ me commands kind)))))
   
   
   (method (maybe-rapid-fire)
-    (unless (effective-orbit-mode?)
+    (unless (orbit-motion?)
       (rapid-fire)))
   
   
@@ -1707,19 +1597,18 @@
   
   
   (method (warp (reversed? #f))
-    (let ((me (current-controlled)))
-      (cond ((effective-orbit-mode?))
-            ((eq? eye-mode 'person)
-             (warp~ me reversed?))
-            (else
-             (if (not reversed?)
-                 (warp-forward~ eye)
-               (warp-backward~ eye))))))
+    (if reversed?
+        (warp-backward)
+      (warp-forward)))
   
   
   ;;;
   ;;;; Eye
   ;;;
+  
+  
+  (method (set-eye camera)
+    (camera-copy! eye camera))
   
   
   (method (initialize-eye)
@@ -1749,7 +1638,7 @@
   
   (method (reset-camera)
     (vertex-copy! world-up (vertex 0. 1. 0.))
-    (reset-camera~ eye))
+    (reset-camera~ (current-camera)))
   
   
   (method (hook-eye)
@@ -1772,25 +1661,11 @@
 
   
   (method (zoom-in)
-    (let ((target (first-target)))
-      (cond ((effective-orbit-mode?)
-             (first-distance-closer)
-             (orbit-behind target))
-            ((eq? eye-mode 'person)
-             (first-person-closer))
-            (else
-             (zoom-in~ eye)))))
+    (zoom-in~ (current-motion)))
   
   
   (method (zoom-out)
-    (let ((target (first-target)))
-      (cond ((effective-orbit-mode?)
-             (first-distance-further)
-             (orbit-behind target))
-            ((eq? eye-mode 'person)
-             (first-person-further))
-            (else
-             (zoom-out~ eye)))))
+    (zoom-out~ (current-motion)))
   
   
   (method (toggle-camera-lock)
@@ -1808,123 +1683,31 @@
   
   
   (method (follow-player)
-    (follow-actor (current-controlled)))
+    (follow-player~ (current-motion)))
   
   
   (method (follow-actor actor)
-    (when (and (effective-first-person?) (not (effective-orbit-mode?)))
-      (unless (or viewing? (eq? first-camera 'free))
-        (eye-behind-actor actor))
-      (when actor
-        (let ((lens (player-lens actor)))
-          (align-eye-behind lens)
-          (remove-eye-occlusion lens)))))
+    (follow-actor~ (current-motion) actor))
   
   
   (method (eye-behind-player)
-    (eye-behind-actor (current-controlled)))
+    (eye-behind-player~ (current-motion)))
   
   
   (method (eye-behind-actor actor)
-    (when (and actor (effective-first-person?))
-      (set-lookat~ eye (realign-lookat& (get-lookat~ actor) world-up))
-      (camera-update~ eye)))
+    (eye-behind-actor~ (current-motion) actor))
   
   
   (method (player-lens player)
-    (let ((model (cache-model~ player)))
-      (let ((center (get-center~ model))
-            (bounds (get-bounds~ model))
-            (matrix (get-matrix~ player)))
-        (let ((model-lens (vertex+ center (vertex 0. (* (cuboid-height bounds) .15) 0.))))
-          (matrix-transform-3x4 matrix model-lens)))))
-  
-  
-  (definition eye-restore-duration
-    1.6)
-  
-  
-  ;; lens   override   goal   distance
-  ;; |      |          |      |
-  ;; |      |          |      | - user requested distance
-  ;; |      |          | - new override target
-  ;; |      | - override to clear any occlusion
-  ;; | - eye target
-  (method (restore-first-distance elapse)
-    (let ((me (current-me)))
-      (when first-goal
-        (let ((augmented-override (+ first-override (* elapse first-restore))))
-          (cond ((>= augmented-override first-distance)
-                 (set! first-override #f)
-                 (set! first-goal #f))
-                ((>= augmented-override first-goal)
-                 (set! first-override first-goal)
-                 (set! first-goal #f))
-                (else
-                 (set! first-override augmented-override))))
-        (align-eye-behind (player-lens me))
-        (adjust-player-alpha))))
-  
-  
-  (method (remove-eye-occlusion lens)
-    (let ((sight (get-sight~ eye)))
-      (define (determine-eye-occlusion lens)
-        ;; the + 5. is a quick hack until a full solution
-        ;; problem comes from the align-eye-behind call in follow-actor
-        ;; that can bring the eye too close to a polygon but not touching
-        ;; so remove-eye-occlusion doesn't kick in
-        (let ((closest (ray-closest-polygon lens (vertex-negate& sight) (+ first-distance 5.) ignore-players?: #t)))
-          (if (not closest)
-              (values #f #f)
-            (bind (poly distance) closest
-              (values distance (get-normal~ poly))))))
-      
-      (define (closer-eye-occlusion occlusion normal)
-        (let ((epsilon .1)
-              (trend (dot-product sight normal)))
-          (if (= trend 0.)
-              occlusion
-            (let ((safe (- occlusion (/ epsilon trend))))
-              (if (< safe first-distance)
-                  safe
-                first-distance)))))
-      
-      (receive (occlusion normal) (determine-eye-occlusion lens)
-        (let ((effective (effective-first-distance))
-              (goal (if occlusion
-                        (closer-eye-occlusion occlusion normal)
-                      first-distance)))
-          (when (and (/= goal effective)
-                     (or (not first-goal)
-                         (/= goal first-goal)))
-            (if (< goal effective)
-                (begin
-                  (set! first-override goal)
-                  (set! first-goal #f)
-                  (set! first-restore (/ (- first-distance goal) eye-restore-duration))
-                  (align-eye-behind lens)
-                  (adjust-player-alpha))
-              (set! first-goal goal)))))))
-  
-  
-  (method (align-eye-behind pos)
-    (let ((sight (get-sight~ eye)))
-      (set-position~ eye (vertex-& pos (vertex-scalar*& sight (effective-first-distance))))
-      (set-target~ eye (vertex+& (get-position~ eye) sight))
-      (camera-update~ eye)))
-  
-  
-  (method (orbit-behind elem)
-    (set! first-override #f)
-    (align-eye-behind (transformed-center~ elem)))
+    (player-lens~ (current-motion) player))
   
   
   (method (mark-eye)
     (let ((zone (current-zone))
           (me (current-me)))
       (add-mark~ zone (new Vertex-Mark (player-lens me) color: red-dye))
-      (add-mark~ zone (new Vertex-Mark (get-position~ eye) color: green-dye))
-      (add-mark~ zone (new Vertex-Mark (get-target~ eye) color: blue-dye))))
+      (add-mark~ zone (new Vertex-Mark (get-position~ (current-camera)) color: green-dye))
+      (add-mark~ zone (new Vertex-Mark (get-target~ (current-camera)) color: blue-dye))))
   
   
   (definition current-area-visit <fx>
@@ -2009,11 +1792,6 @@
       ignore-players?: ignore-players?))
   
   
-  (method (eye-center-player)
-    (unless paused?
-      (follow-player)))
-  
-  
   ;;;
   ;;;; Player
   ;;;
@@ -2023,239 +1801,8 @@
     Player)
   
   
-  (method (effective-first-distance)
-    (or first-override first-distance))
-  
-  
-  (method (first-distance-closer (speed: speed #f))
-    (let ((speed (or speed .75)))
-      (set! first-distance (* first-distance speed))
-      (update-first-restore)))
-  
-  
-  (method (first-distance-further (speed: speed #f))
-    (let ((speed (or speed .75)))
-      (set! first-distance (min (/ first-distance speed) max-distance))
-      (update-first-restore)))
-  
-  
-  (method (update-first-restore)
-    (when (and first-restore first-override)
-      (set! first-restore (/ (- first-distance first-override) eye-restore-duration))))
-  
-  
-  (method (first-person-closer)
-    (first-distance-closer)
-    (eye-center-player)
-    (adjust-player-alpha))
-  
-  
-  (method (first-person-further)
-    (first-distance-further)
-    (eye-center-player)
-    (adjust-player-alpha))
-  
-  
-  (method (adjust-player-alpha)
-    (let ((me (current-me)))
-      (dye-alpha-set! (get-color~ me)
-                      (if (contains-vertex?~ me (get-position~ eye))
-                          0.
-                        (max 0.2 (min 1. (/ (effective-first-distance) 2.)))))))
-  
-  
   (method (is-moving?)
     moving?)
-  
-  
-  (method (move-player-forward player factor target-velocity)
-    (vertex-increase! target-velocity (vertex-scalar*& (get-sight~ (get-lookat~ player)) (* factor (vehicle-speed player)))))
-  
-  
-  (method (move-player-backward player factor target-velocity)
-    (vertex-decrease! target-velocity (vertex-scalar*& (get-sight~ (get-lookat~ player)) (* factor (vehicle-speed player)))))
-  
-  
-  (method (move-player-left player factor target-velocity)
-    (vertex-decrease! target-velocity (vertex-scalar*& (get-right~ (get-lookat~ player)) (* factor (vehicle-speed player)))))
-  
-  
-  (method (move-player-right player factor target-velocity)
-    (vertex-increase! target-velocity (vertex-scalar*& (get-right~ (get-lookat~ player)) (* factor (vehicle-speed player)))))
-  
-  
-  (method (move-player-up player factor target-velocity)
-    (vertex-increase! target-velocity (vertex-scalar*& (get-up~ (get-lookat~ player)) (* factor (vehicle-speed player)))))
-  
-  
-  (method (move-player-down player factor target-velocity)
-    (vertex-decrease! target-velocity (vertex-scalar*& (get-up~ (get-lookat~ player)) (* factor (vehicle-speed player)))))
-    
-  
-  (method (blink-player-forward player factor target-velocity)
-    (vertex-increase! target-velocity (vertex-scalar*& (get-sight~ eye) (* factor (vehicle-speed player) (find-setting 'world.blink-speed 5.)))))
-  
-  
-  (method (blink-player-backward player factor target-velocity)
-    (vertex-decrease! target-velocity (vertex-scalar*& (get-sight~ eye) (* factor (vehicle-speed player) (find-setting 'world.blink-speed 5.)))))
-
-  
-  (definition player-rotation-speed <fl>
-    0.02)
-  
-  
-  (method (rotate-player-left player factor)
-    (rotate-player-horizontal player (* player-rotation-speed factor))
-    @buggy
-    (when fly?
-      (roll-player player 1.)))
-  
-  
-  (method (rotate-player-right player factor)
-    (rotate-player-horizontal player (- (* player-rotation-speed factor)))
-    @buggy
-    (when fly?
-      (roll-player player -1.)))
-  
-  
-  @new
-  (method (rotate-player-horizontal player angle (follow-player?: follow-player? #t))
-    (let ((me (current-controlled)))
-      (let ((lookat (get-lookat~ player)))
-        (let ((sight (get-sight~ lookat))
-              (eye-sight (get-sight~ eye))
-              (up (get-up~ lookat)))
-          (let ((flat-sight (vertex-normalize (vertex (vertex-x sight) 0. (vertex-z sight))))
-                (flat-eye-sight (vertex-normalize (vertex (vertex-x eye-sight) 0. (vertex-z eye-sight)))))
-            (set-lookat~ player (rotate-lookat& lookat angle up))
-            (update-matrix~ me)
-            (when (and (eq? player me) (not paused?))
-              (unless (and down? (not moving?))
-                ;; the sign multiplication is a quick solution
-                ;; quaternions could be used to simplify all this
-                (let ((adjusted-angle (* (cast <fl> (sign angle)) (vector-angle flat-eye-sight flat-sight))))
-                  (set-lookat~ eye (rotate-lookat& (get-lookat~ eye) adjusted-angle world-up))))
-              (when follow-player?
-                (follow-player))))))))
-  
-  
-  (method (rotate-player-horizontal player angle (follow-player?: follow-player? #t))
-    (let ((me (current-controlled)))
-      (let ((lookat (get-lookat~ player)))
-        (let ((up (get-up~ lookat)))
-          (set-lookat~ player (rotate-lookat& lookat angle up))
-          (update-matrix~ me)
-          (when (and (eq? player me) (not paused?))
-            (unless (and down? (not moving?))
-              ;; EYEPLAYERLOOKATPROBLEM
-              (set-lookat~ eye (rotate-lookat& (get-lookat~ eye) angle up)))
-            (when follow-player?
-              (follow-player)))))))
-  
-  
-  (method (rotate-player-vertical player angle (follow-player?: follow-player? #t))
-    (let ((me (current-controlled)))
-      (let ((lookat (get-lookat~ player)))
-        (set-lookat~ player (rotate-lookat& lookat angle (get-right~ lookat)))
-        (update-matrix~ me))
-      (when (and (eq? player me) (not paused?))
-        (set-lookat~ eye (rotate-lookat& (get-lookat~ eye) angle (get-right~ eye)))
-        (when follow-player?
-          (follow-player)))))
-  
-  
-  (method (reset-roll player)
-    (set! desired-roll 0.)
-    (set! roll-speed .25)
-    (process-roll player))
-  
-  
-  (method (roll-player player angle)
-    (let ((max-roll PI/4))
-      (let ((desired (max (- max-roll) (min max-roll (* (- angle) 25.)))))
-        (set! desired-roll desired)
-        (set! roll-speed .25)
-        (process-roll player))))
-  
-  
-  (method (process-roll player)
-    (when (and roll-speed (or (not last-roll-time) (> (- (current-seconds) last-roll-time) .01)))
-      (let ((lookat (get-lookat~ player)))
-        (let ((current (vertical-angle (get-right~ lookat) world-up)))
-          (if (near? current desired-roll .001)
-              (set! roll-speed #f)
-            (let ((damper 10.))
-              (let ((target-roll (/ (+ desired-roll (* damper current)) (+ 1. damper))))
-                (increase-roll player (max (- roll-speed) (min roll-speed (- target-roll current)))))))))))
-  
-  
-  (method (increase-roll player inc)
-    (let ((lookat (get-lookat~ player)))
-      (when (or (not last-roll-time)
-                (> (abs inc) .01)
-                (> (- (current-seconds) last-roll-time) .05))
-        (set! last-roll-time (current-seconds))
-        (set-lookat~ player (rotate-lookat& lookat inc (get-sight~ lookat))))))
-  
-  
-  (method (track-actor actor dh dv local-sight local-up local-right first?)
-    (if fly?
-        (track-actor-fly actor dh dv local-sight local-up local-right first?)
-      (track-actor-floor actor dh dv local-sight local-up local-right first?)))
-  
-  
-  (method (track-actor-floor actor dh dv camera-sight camera-up camera-right first?)
-    (let ((me (current-controlled)))
-      (let ((me? (eq? actor me))
-            (angleh (/ (- (cast <fl> dh)) track-sensitivity))
-            (anglev (/ (- (cast <fl> dv)) track-sensitivity))
-            (actor-lookat (get-lookat~ actor))
-            (camera-lookat (lookat camera-sight camera-up camera-right)))
-        (let ((pitch (vertical-angle camera-sight world-up)))
-          ;; remove pitch
-          (when (and me? (not paused?))
-            (rotate-lookat-vertical! camera-lookat pitch))
-          ;; start from the camera lookat
-          (when first?
-            (lookat-copy! actor-lookat camera-lookat))
-          (rotate-player-horizontal actor angleh follow-player?: #f)
-          ;; add pitch
-          (when (and me? (not paused?))
-            (rotate-vertical-up~ eye anglev (get-up~ (get-lookat~ actor))))
-          (when (and me? (not paused?))
-            (follow-actor actor))))))
-  
-  
-  (method (track-actor-fly actor dh dv camera-sight camera-up camera-right first?)
-    (let ((me (current-controlled)))
-      (let ((me? (eq? actor me))
-            (angleh (/ (- (cast <fl> dh)) track-sensitivity))
-            (anglev (/ (- (cast <fl> dv)) track-sensitivity))
-            (eye-lookat (get-lookat~ eye))
-            (actor-lookat (get-lookat~ actor))
-            (camera-lookat (lookat camera-sight camera-up camera-right)))
-        ;; start from the camera lookat
-        (when first?
-          (lookat-copy! actor-lookat camera-lookat))
-        
-        ;; adjust pitch
-        (let ((actor-horizon (cross-normal& (get-sight~ actor-lookat) world-up)))
-          (set-lookat~ actor (rotate-lookat& actor-lookat anglev actor-horizon))
-          (set-lookat~ eye (rotate-lookat& eye-lookat anglev actor-horizon)))
-        
-        ;; adjust roll
-        (roll-player actor angleh)
-        
-        ;; adjust rotation
-        (set-lookat~ actor (rotate-lookat& actor-lookat angleh world-up))
-        (set-lookat~ eye (rotate-lookat& eye-lookat angleh world-up))
-        
-        ;; update matrix
-        (update-matrix~ me)
-        
-        ;; eye follows player
-        (when (and me? (not paused?))
-          (follow-actor actor)))))
   
   
   (method (mind-control)
@@ -2341,7 +1888,8 @@
                       (lambda ()
                         (let ((zone (current-zone)))
                           (let (iter)
-                            (let ((time (current-seconds)))
+                            (let ((time (current-seconds))
+                                  (camera (current-camera)))
                               (with-task-mutex render-sequential-state
                                 (lambda ()
                                   (unless (task-stopping?)
@@ -2352,7 +1900,7 @@
                                             (when (not (eof-object? thunk))
                                               (thunk)
                                               (loop)))))
-                                      (update-stable~ eye camera-stable-delay)
+                                      (update-stable~ camera camera-stable-delay)
                                       (render-world)
                                       (when render-what
                                         (set! render-what (if (= render-what 1)
@@ -2361,7 +1909,7 @@
                                     (log-transition log-context render-sync-state)
                                     (site (render-sync on?: #t)
                                       (render-sync~ window)))))
-                              (let ((rate (let ((stable? (get-stable?~ eye))
+                              (let ((rate (let ((stable? (get-stable?~ camera))
                                                 (generating? (> (get-sectors-generating~ zone) 0)))
                                             (if generating?
                                                 (if stable? render-rate-idle-generate render-rate-busy-generate)
@@ -2392,7 +1940,7 @@
         (when post-processing?
           (prepare-render))
         (prepare-world)
-        (setup-camera~ eye)
+        (setup-camera~ (current-camera))
         (setup-lighting~ zone)
         (glEnable GL_DEPTH_TEST)
         (glShadeModel GL_SMOOTH)
@@ -2407,7 +1955,7 @@
   
   (method (prepare-world)
     (glClear (bitwise-ior GL_COLOR_BUFFER_BIT GL_DEPTH_BUFFER_BIT))
-    (prepare-projection~ eye)
+    (prepare-projection~ (current-camera))
     (glMatrixMode GL_MODELVIEW)
     (glLoadIdentity)
     (glDisable GL_LIGHTING)
@@ -2474,7 +2022,7 @@
         (when (and aim? free-aim?)
           (draw-aim))
         (when orientation?
-          (draw-orientation~ eye))
+          (draw-orientation~ (current-camera)))
         (when paused?
           (site (draw-history on?: #t parent: draw-world)
             (draw-history)))
@@ -2525,7 +2073,7 @@
             (when (> trimmed 0)
               (decrease-sectors-generating~ zone trimmed)))
           (set! render-trim? #f))
-        (draw-eye-neighbors~ zone (get-position~ eye) view-distance @w radius proc))))
+        (draw-eye-neighbors~ zone (current-camera) view-distance @w radius proc))))
   
   
   (method (draw-sectors) <void>
@@ -2632,7 +2180,7 @@
   (method (draw-grid)
     (when grid?
       (site (draw-grid on?: #t parent: draw-world)
-        (let ((index (position-area-index~ (current-zone) (get-position~ eye)))
+        (let ((index (position-area-index~ (current-zone) (get-position~ (current-camera))))
               (size (get-area-size~ (current-zone))))
           (let ((bx (fl& (cast <fl> (* (cast <fx> (vector-ref index 0)) size))))
                 (by (fl& (cast <fl> (* (cast <fx> (vector-ref index 1)) size))))
@@ -3163,7 +2711,7 @@
     (unimplemented-connected)
     (let ((zone (current-zone)))
       (let ((designer (get-designer~ zone)))
-        (set-property~ designer zone 'start-mode (if (eq? eye-mode 'person) 'first-person 'free-camera)))))
+        (set-property~ designer zone 'start-mode (if (person-motion?) 'first-person 'free-camera)))))
   
   
   (method (save-camera)
@@ -3184,7 +2732,7 @@
         (let ((lookat (get-lookat~ me)))
           (set-property~ designer zone 'start-sight (get-sight~ lookat))
           (set-property~ designer zone 'start-up (get-up~ lookat)))
-        (set-property~ designer zone 'start-distance first-distance))))
+        (set-property~ designer zone 'start-distance (get-desired-distance~ (current-motion))))))
   
   
   (method (save-player&camera (user-feedback?: user-feedback? #t))
@@ -3378,7 +2926,7 @@
   (method (toggle-mount)
     (when (not paused?)
       (unimplemented-connected)
-      (person-camera)
+      (person-motion)
       (deactivate-fly)
       (if mount?
           (deactivate-mount)
@@ -3408,7 +2956,7 @@
   
   (method (toggle-fly)
     (unimplemented-connected)
-    (person-camera)
+    (person-motion)
     (deactivate-mount)
     (if fly?
         (deactivate-fly)
@@ -3433,9 +2981,7 @@
         (activate-vehicle #f)
         (update-parameter 'mount)
         (update-parameter 'fly)
-        (let ((lookat (get-lookat~ me)))
-          (rotate-player-vertical me (vertical-angle (get-sight~ lookat) (get-up~ lookat)))
-          (follow-player)))))
+        (exit-fly~ (current-motion)))))
   
   
   ;;;
@@ -3743,10 +3289,11 @@
   
   
   (method (add-model path)
-    (let ((me (current-me)))
+    (let ((me (current-me))
+          (camera (current-camera)))
       (define (determine-position)
-        (let ((pos (if (eq? eye-mode 'person) (vertex-& (get-position~ me) (vertex 0. (get-radius-y~ me) 0.)) (vertex-& (get-position~ eye) (vertex 0. 1. 0.)))))
-          (vertex+ pos (vertex-scalar*& (get-sight~ eye) 2.))))
+        (let ((pos (if (person-motion?) (vertex-& (get-position~ me) (vertex 0. (get-radius-y~ me) 0.)) (vertex-& (get-position~ camera) (vertex 0. 1. 0.)))))
+          (vertex+ pos (vertex-scalar*& (get-sight~ camera) 2.))))
       
       (place-model path (determine-position) class: Actor user-origin?: #t)))
   
@@ -4065,7 +3612,7 @@
                                  #f))))
                           (else
                            (let ((target (vertex+ position (vertex-scalar* direction view-radius)))
-                                 (lookat (get-lookat~ eye))
+                                 (lookat (get-lookat~ (current-camera)))
                                  (radiuses (vertex .001 .001 .001)))
                              (receive (new-position new-direction collisions) (collide&stop position target lookat radiuses max-distance: view-radius polygon-filter: filter ignore-entities?: #t ignore-players?: #t)
                                (when (not-null? collisions)
@@ -4095,12 +3642,12 @@
           (set-property~ designer element 'position position))
         (add-element~ zone element)
         (when (and (is? element Player) (not (get-world-server~ (get-process))))
-          (let ((preserved-lookat (and (eq? eye-mode 'person) (get-lookat~ me))))
+          (let ((preserved-lookat (and (person-motion?) (get-lookat~ me))))
             (remove-element me)
             (when (server-side?~ (get-process))
               (set-color~ element white-dye))
             (set-current-me element)
-            (set-lookat~ element (or preserved-lookat (get-lookat~ eye)))))
+            (set-lookat~ element (or preserved-lookat (get-lookat~ (current-camera))))))
         (when (eq? element (current-me))
           (follow-player))
         (update-future)
@@ -4119,7 +3666,7 @@
     
     (define (instantiate-block block)
       (define (determine-rotation)
-        (let ((sight (get-sight~ eye)))
+        (let ((sight (get-sight~ (current-camera))))
           (let ((angle (plane-angle 1. 0. (vertex-x sight) (vertex-z sight))))
             (cond ((or (between? angle 0. PI/4) (between? angle (- PI*2 PI/4) PI*2)) 'north)
                   ((between? angle PI/4 (* 3. PI/4)) 'west)
@@ -4289,7 +3836,7 @@
     (let ((zone (current-zone)))
       (if (zone-editable?~ zone)
           (when (and (is? showcase Blocks-Showcase) (get-selection~ showcase))
-            (receive (position direction) (screen->ray~ eye h v)
+            (receive (position direction) (screen->ray~ (current-camera) h v)
               (editor-change position direction 'down)
               (set! editing? #t)
               (set! changing? #t)))
@@ -4301,7 +3848,7 @@
           (player? (shift-down?)))
       (if (or (zone-editable?~ zone)
               player?)
-          (receive (position direction) (screen->ray~ eye h v)
+          (receive (position direction) (screen->ray~ (current-camera) h v)
             (let ((class (editor-element-class)))
               (if (or (not editor-actions?) paused?)
                   (editor-add editor-mode class grid? grid-plane grid-position floor-grid? position direction 'down)
@@ -4313,7 +3860,7 @@
   (method (mouse-remove h v)
     (let ((zone (current-zone)))
       (if (zone-editable?~ zone)
-          (receive (position direction) (screen->ray~ eye h v)
+          (receive (position direction) (screen->ray~ (current-camera) h v)
             (editor-remove editor-mode position direction 'down)
             (set! editing? #t)
             (set! removing? #t))
@@ -4332,7 +3879,7 @@
              (mouse-remove h v))
             (else
              (when target-widget
-               (receive (position direction) (screen->ray~ eye h v)
+               (receive (position direction) (screen->ray~ (current-camera) h v)
                  (let ((closest (ray-closest-widget position direction target-widget)))
                    (when closest
                      (bind (poly distance) closest
@@ -4345,15 +3892,15 @@
   (method (editor-mouse-move h v)
     (when editing?
       (cond (removing?
-             (receive (position direction) (screen->ray~ eye h v)
+             (receive (position direction) (screen->ray~ (current-camera) h v)
                (editor-remove editor-mode position direction 'move)))
             (changing?
-             (receive (position direction) (screen->ray~ eye h v)
+             (receive (position direction) (screen->ray~ (current-camera) h v)
                (editor-change position direction 'move)))
             (else
              (let ((player? (shift-down?)))
                (unless player?
-                 (receive (position direction) (screen->ray~ eye h v)
+                 (receive (position direction) (screen->ray~ (current-camera) h v)
                    (let ((class (editor-element-class)))
                      (if (or (not editor-actions?) paused?)
                          (editor-add editor-mode class grid? grid-plane grid-position floor-grid? position direction 'move)
@@ -4362,7 +3909,7 @@
   
   (method (editor-mouse-up h v)
     (let ((zone (current-zone)))
-      (receive (position direction) (screen->ray~ eye (get-h~ down-point) (get-v~ down-point))
+      (receive (position direction) (screen->ray~ (current-camera) (get-h~ down-point) (get-v~ down-point))
         (if editing?
             (cond (removing?
                    (editor-remove editor-mode position direction 'up))
@@ -4373,7 +3920,7 @@
                      (if (or (not editor-actions?) paused?)
                          (editor-add editor-mode class grid? grid-plane grid-position floor-grid? position direction 'up)
                        (add-action~ commands 'add (list editor-mode class grid? grid-plane grid-position floor-grid? position direction 'up))))))
-          (let ((closest (ray-closest-polygon (get-position~ eye) direction view-radius ignore-entities?: #f ignore-players?: #t)))
+          (let ((closest (ray-closest-polygon (get-position~ (current-camera)) direction view-radius ignore-entities?: #f ignore-players?: #t)))
             (if (not closest)
                 (reset-target user-origin?: #t)
               (bind (poly distance) closest
@@ -4504,6 +4051,10 @@
       (set-current~ history (snapshot-world)))
     (activate~ history)
     (set! paused? #t)
+    (camera-copy! history-camera eye)
+    (set-current-camera history-camera)
+    (set-current-motion history-motion)
+    (update-camera-parameters)
     (reset-profiling)
     (update-parameter 'paused))
   
@@ -4512,6 +4063,9 @@
     (truncate-future)
     (set-current~ history #f)
     (deactivate~ history)
+    (camera-copy! eye history-camera)
+    (set-current-camera eye)
+    (set-current-motion eye-motion)
     (set! paused? #f)
     (eye-behind-player)
     (follow-player)
@@ -4525,12 +4079,12 @@
   
   
   (method (snapshot-metadata/world)
-    ;; need to generalize to all actors
-    (define (determine-metadata)
-      (let ((me (current-me)))
-        (list me (cache-model~ me) (copy-matrix (get-matrix~ me)))))
+    (define (snapshot-metadata entity)
+      (list entity (cache-model~ entity) (copy-matrix (get-matrix~ entity))))
     
-    (values (determine-metadata) (snapshot-world)))
+    (values (list (snapshot-metadata (current-me))
+                  (snapshot-metadata eye))
+            (snapshot-world)))
   
   
   (method (load-world snapshot)
@@ -4612,6 +4166,11 @@
         (update-script-pane)
         (when (not-null? target)
           (activate-target~ (first target)))
+        (when (orbit-motion?)
+          (set-target~ (current-motion)
+            (if (null? target)
+                (current-me)
+              (first target))))
         (refresh-interface condition: '(info target)))))
   
   
@@ -4948,31 +4507,22 @@
   
   
   (method protected virtual (mouse-track elapse dh dv)
-    (define (track-camera)
-      (rotate-horizontal~ eye (/ (- (cast <fl> dh)) track-sensitivity))
-      (rotate-vertical~ eye (/ (- (cast <fl> dv)) track-sensitivity)))
-    
-    (define (track-orbit target)
-      (rotate-horizontal~ eye (/ (- (cast <fl> dh)) track-sensitivity))
-      (rotate-vertical~ eye (/ (- (cast <fl> dv)) track-sensitivity))
-      (orbit-behind target))
-    
     (let ((me (current-controlled))
-          (target (first-target)))
-      (cond ((effective-orbit-mode?)
-             (track-orbit target))
-            ((and moving? (effective-first-person?))
-             (let ((sight (copy-vertex (get-sight~ eye)))
-                   (up (copy-vertex (get-up~ eye)))
-                   (right (copy-vertex (get-right~ eye)))
+          (motion (current-motion))
+          (camera (current-camera)))
+      (cond ((orbit-motion?)
+             (track-motion~ motion dh dv))
+            ((and moving? (person-motion?))
+             (let ((sight (copy-vertex (get-sight~ camera)))
+                   (up (copy-vertex (get-up~ camera)))
+                   (right (copy-vertex (get-right~ camera)))
                    (first? (not moved?)))
                (if paused?
-                   (track-actor me dh dv sight up right first?)
+                   (track-actor~ motion me dh dv sight up right first?)
                  (add-action~ commands 'track (list dh dv sight up right first?)))
                (set! moved? #t)))
             (else
-             (when (hook-eye)
-               (track-camera))))))
+             (track-motion~ motion dh dv)))))
   
   
   (method protected virtual (mouse-up h v)
@@ -5009,9 +4559,10 @@
   
   
   (method protected virtual (right-mouse-up h v)
-    (let ((me (current-me)))
+    (let ((me (current-me))
+          (motion (current-motion)))
       (restore/show-cursor)
-      (reset-roll me)
+      (reset-roll~ motion me)
       (set! down? #f)
       (set! down-point #f)
       (set! moving? #f)
@@ -5231,35 +4782,41 @@
     (display-on/off "Post processing" post-processing?))
   
   
-  (method (person-camera)
-    (unless (eq? eye-mode 'person)
-      (set! eye-mode 'person)
-      (eye-center-player)
-      (update-camera-parameters)
-      (display-message "First person")))
-  
-  
-  (method (orbit-camera)
-    (let ((target (first-target)))
-      (unless (or (eq? eye-mode 'orbit)
-                  (not target))
-        (set! eye-mode 'orbit)
-        (orbit-behind target)
+  (method (person-motion (feedback?: feedback? #t))
+    (let ((me (current-me)))
+      (unless (person-motion?)
+        (set! eye-motion (get-motion~ me))
+        (set-current-motion eye-motion)
+        (eye-center-player~ eye-motion)
         (update-camera-parameters)
-        (display-message "Orbit around"))))
+        (when feedback?
+          (display-message "First person")))))
   
   
-  (method (free-camera)
-    (unless (eq? eye-mode 'free)
-      (set! eye-mode 'free)
+  (method (orbit-motion (feedback?: feedback? #t))
+    (unless (orbit-motion?)
+      (let ((target (or (first-target) (current-me))))
+        (set! eye-motion (make-orbit-motion self eye target))
+        (set-current-motion eye-motion)
+        (orbit-behind~ eye-motion target)
+        (update-camera-parameters)
+        (when feedback?
+          (display-message "Orbit around")))))
+  
+  
+  (method (free-motion (feedback?: feedback? #t))
+    (unless (free-motion?)
+      (set! eye-motion (make-free-motion self eye))
+      (set-current-motion eye-motion)
       (update-camera-parameters)
-      (display-message "Free camera")))
+      (when feedback?
+        (display-message "Free camera"))))
   
   
   (method (update-camera-parameters)
-    (update-parameter 'person-camera)
-    (update-parameter 'orbit-camera)
-    (update-parameter 'free-camera))
+    (update-parameter 'person-motion)
+    (update-parameter 'orbit-motion)
+    (update-parameter 'free-motion))
   
   
   (method (effective-draw-gadgets?)

@@ -16,6 +16,7 @@
 
 
 (import (jazz.graphic.opengl.glew)
+        (jazz.system)
         (world)
         (world.autoload)
         (world.collision)
@@ -25,6 +26,7 @@
         (world.foreign)
         (world.geometry)
         (world.history)
+        (world.motion)
         (world.opengl)
         (world.serialization)
         (world.spell)
@@ -58,6 +60,7 @@
                model animate? animation)
     (slot velocity                <f64vector>  initialize (make-zero-vertex) getter generate)
     (slot fall-velocity           <f64vector>  initialize (make-zero-vertex) getter generate)
+    (slot motion                  <Motion>     initialize #f                 accessors generate)
     (slot life                    <fx>         initialize 100                accessors generate)
     (slot global-cooldown         <fl>         initialize 0.                 accessors generate)
     (slot spell                   <Spell+>     initialize #f                 accessors generate)
@@ -88,7 +91,13 @@
     (nextmethod rest)
     (let ((color (copy-dye color)))
       (dye-alpha-set! color .2)
-      (set! history-color color)))
+      (set! history-color color))
+    (setup-motion))
+  
+  
+  (method (setup-motion)
+    (let ((world (current-world)))
+      (set! motion (make-person-motion world (get-eye~ world) self))))
   
   
   (method public inline (set-velocity vel <f64vector>) <void>
@@ -153,9 +162,15 @@
     (set! rapid-fire-cooldown 45.))
   
   
-  (method (warp (reversed? #f))
+  (method (warp-forward)
     (let ((world (current-world)))
-      (set-position (vertex+& position (vertex-scalar*& (get-sight~ (get-eye~ world)) (if reversed? -2. 2.))))
+      (set-position (vertex+& position (vertex-scalar*& (get-sight~ (get-camera~ motion)) 2.)))
+      (follow-player~ world)))
+  
+  
+  (method (warp-backward)
+    (let ((world (current-world)))
+      (set-position (vertex+& position (vertex-scalar*& (get-sight~ (get-camera~ motion)) -2.)))
       (follow-player~ world)))
   
   
@@ -257,6 +272,7 @@
             (me (current-me))
             (model (cache-model))
             (center (transformed-center))
+            (camera (get-camera~ motion))
             (blink-forward? (get-blink-forward?~ commands))
             (blink-backward? (get-blink-backward?~ commands)))
         (let ((gravity (compute-gravity~ world center))
@@ -275,46 +291,46 @@
                 (log-commands~ history commands elapse))
               ;; move forward
               (when (get-move-forward?~ commands)
-                (move move-player-forward~)
+                (move move-forward)
                 (context-animation time (move-animation)))
               ;; move backward
               (when (get-move-backward?~ commands)
-                (move move-player-backward~)
+                (move move-backward)
                 (context-animation time "WalkBackwards"))
               ;; move left
               (when (get-move-left?~ commands)
-                (move move-player-left~)
+                (move move-left)
                 (context-animation time "Run"))
               ;; move right
               (when (get-move-right?~ commands)
-                (move move-player-right~)
+                (move move-right)
                 (context-animation time "Run"))
               ;; move up
               (when (and (get-move-up?~ commands))
-                (move move-player-up~))
+                (move move-up))
               ;; move down
               (when (and (get-move-down?~ commands))
-                (move move-player-down~))
+                (move move-down))
               ;; blink forward
               (when blink-forward?
-                (move blink-player-forward~)
+                (move blink-forward)
                 (context-animation time "Run"))
               ;; blink backward
               (when blink-backward?
-                (move blink-player-backward~)
+                (move blink-backward)
                 (context-animation time "WalkBackwards"))
               ;; rotate left
               (when (get-rotate-left?~ commands)
-                (rotate-player-left~ world self factor))
+                (rotate-left factor))
               ;; rotate right
               (when (get-rotate-right?~ commands)
-                (rotate-player-right~ world self factor))))
+                (rotate-right factor))))
           
           (define (move proc)
             (cond ((or ground? fly? blink?)
-                   (proc world self (* factor sprint) target-velocity))
+                   (proc (* factor sprint) target-velocity))
                   ((and jumping? jump-grace?)
-                   (proc world self (* factor sprint grace-slowdown) target-velocity)
+                   (proc (* factor sprint grace-slowdown) target-velocity)
                    (set! grace-move? #t)
                    (set! jump-grace? #f)))
             (when (> sprint-duration 0.)
@@ -323,6 +339,45 @@
                 (set! sprint 1.)
                 (set! sprint-duration 0.)
                 (update-parameter~ world 'sprint))))
+          
+          (define (move-forward factor target-velocity)
+            (vertex-increase! target-velocity (vertex-scalar*& (get-sight~ lookat) (* factor (vehicle-speed~ world self)))))
+          
+          (define (move-backward factor target-velocity)
+            (vertex-decrease! target-velocity (vertex-scalar*& (get-sight~ lookat) (* factor (vehicle-speed~ world self)))))
+          
+          (define (move-left factor target-velocity)
+            (vertex-decrease! target-velocity (vertex-scalar*& (get-right~ lookat) (* factor (vehicle-speed~ world self)))))
+          
+          (define (move-right factor target-velocity)
+            (vertex-increase! target-velocity (vertex-scalar*& (get-right~ lookat) (* factor (vehicle-speed~ world self)))))
+          
+          (define (move-up factor target-velocity)
+            (vertex-increase! target-velocity (vertex-scalar*& (get-up~ lookat) (* factor (vehicle-speed~ world self)))))
+          
+          (define (move-down factor target-velocity)
+            (vertex-decrease! target-velocity (vertex-scalar*& (get-up~ lookat) (* factor (vehicle-speed~ world self)))))
+          
+          (define (blink-forward factor target-velocity)
+            (vertex-increase! target-velocity (vertex-scalar*& (get-sight~ camera) (* factor (vehicle-speed~ world self) (find-setting 'world.blink-speed 5.)))))
+          
+          (define (blink-backward factor target-velocity)
+            (vertex-decrease! target-velocity (vertex-scalar*& (get-sight~ camera) (* factor (vehicle-speed~ world self) (find-setting 'world.blink-speed 5.)))))
+          
+          (define player-rotation-speed <fl>
+            0.02)
+          
+          (define (rotate-left factor)
+            (rotate-actor-horizontal~ motion self (* player-rotation-speed factor))
+            @buggy
+            (when fly?
+              (roll-player~ world self 1.)))
+          
+          (define (rotate-right factor)
+            (rotate-actor-horizontal~ motion self (- (* player-rotation-speed factor)))
+            @buggy
+            (when fly?
+              (roll-player~ world self -1.)))
           
           (define (process-velocity)
             (cond ((or ground? fly? blink? grace-move?)
@@ -466,14 +521,13 @@
           
           (define (realign-horizon)
             (when (and gravity? (not fly?) (eq? self me))
-              (let ((eye (get-eye~ world))
-                    (final-gravity (compute-gravity~ world center)))
-                (set-lookat~ eye (realign-lookat-horizon& (get-lookat~ eye) (get-up~ lookat) gravity final-gravity))
-                (camera-update~ eye))))
+              (let ((final-gravity (compute-gravity~ world center)))
+                (set-lookat~ camera (realign-lookat-horizon& (get-lookat~ camera) (get-up~ lookat) gravity final-gravity))
+                (camera-update~ camera))))
           
           (define (center-eye)
             (when (eq? self me)
-              (eye-center-player~ world)))
+              (eye-center-player~ motion)))
           
           (define (verify-death)
             (when (and die-bottom (< (get-y) die-bottom))
@@ -520,7 +574,7 @@
         (case name
           ((track)
            (bind (dh dv eye-sight eye-up eye-right first?) arguments
-             (track-actor~ world self dh dv eye-sight eye-up eye-right first?)))
+             (track-actor~ (current-motion) self dh dv eye-sight eye-up eye-right first?)))
           ((add)
            (bind (mode class grid? grid-plane grid-position floor-grid? eye direction stage) arguments
              (editor-add~ world mode class grid? grid-plane grid-position floor-grid? eye direction stage)))
@@ -528,10 +582,9 @@
            (bind (position) arguments
              (editor-delete~ world position)))
           ((fire)
-           (let ((first-person? (effective-first-person?~ world)))
-             (when first-person?
-               (bind (direction kind) arguments
-                 (fire-missile direction kind)))))
+           (when (person-motion?)
+             (bind (direction kind) arguments
+               (fire-missile direction kind))))
           ((rapid-fire)
            (start-rapid-fire))))))
   

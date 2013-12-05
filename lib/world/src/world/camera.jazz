@@ -16,18 +16,49 @@
 
 (import (jazz.geometry)
         (jazz.graphic.opengl.glew)
+        (jazz.system)
         (world)
         (world.autoload)
         (world.dyes)
+        (world.gadget)
         (world.geometry)
         (world.homogeneous)
         (world.lookat)
         (world.opengl)
-        (world.syntax (phase syntax)))
+        (world.serialization)
+        (world.syntax (phase syntax))
+        (world.window))
 
 
 (definition public (make-camera)
-  (new Free-Camera))
+  (new Camera))
+
+
+(definition public (camera-copy! dst src)
+  (size-change~ dst (get-size~ (current-world-window)))
+  (set-position~ dst (get-position~ src))
+  (set-lookat~ dst (get-lookat~ src))
+  (derive-target~ dst)
+  (camera-update~ dst))
+
+
+(class Camera-Class extends (:class Gadget)
+  
+  
+  (method override (marshall-object object)
+    (serialize-object (class-of object)
+                      (vector (serialize (get-position~ object))
+                              (serialize (get-lookat~ object)))))
+  
+  
+  (method override (unmarshall-object content)
+    (bind-vector (position lookat) content
+      (let ((camera (make-camera)))
+        (size-change~ camera (get-size~ (current-world-window)))
+        (set-position~ camera position)
+        (set-lookat~ camera lookat)
+        (derive-target~ camera)
+        camera))))
 
 
 ;;;
@@ -35,24 +66,22 @@
 ;;;
 
 
-(class Camera extends Object
+(class Camera metaclass Camera-Class extends Gadget
   
   
-  ;; camera
-  (slot position           <f64vector>       initialize (make-vertex) getter generate)
+  ;; target
   (slot target             <f64vector>       initialize (make-vertex) getter generate)
-  (slot lookat             <LookAt>          initialize (make-lookat) getter generate)
   
   ;; stable
   (slot dirty?             <bool>            initialize #f            getter generate)
   (slot stable?            <bool>            initialize #f            getter generate)
   (slot stable-since       <fl+>             initialize #f            getter generate)
   (slot stable-callback    <object>          initialize #f            accessors generate)
-
+  
   ;; screen
-  (slot width              <fl>              initialize #f            accessors generate)
-  (slot height             <fl>              initialize #f            accessors generate)
-    
+  (slot screen-width       <fl>              initialize #f            accessors generate)
+  (slot screen-height      <fl>              initialize #f            accessors generate)
+  
   ;; projection
   (slot projection         <symbol>          initialize 'perspective  getter generate)
   
@@ -64,7 +93,7 @@
   
   ;; orthographic
   (slot zoom-factor        <fl>              initialize 0.            accessors generate)
-
+  
   ;; frustum
   (slot frustum-radius     <fl+>             initialize #f            accessors generate)
   (slot frustum-left       <f64vector>       initialize (make-vertex) getter generate)
@@ -84,6 +113,18 @@
   (slot rotate-speed       <fl>              initialize .035          accessors generate)
   
   
+  (method override (prepare rest)
+    (nextmethod rest)
+    (set-perspective-fov (find-setting 'world.perspective-fov 45.))
+    (set-perspective-near (find-setting 'world.perspective-near 0.1))
+    (set-perspective-far (find-setting 'world.perspective-far 10000.0))
+    (set-model (camera-model)))
+  
+  
+  (method protected virtual (camera-model)
+    'Camera)
+  
+  
   (method override (print output readably)
     (print-unreadable self output
       (lambda (output)
@@ -91,8 +132,8 @@
   
   
   (method (size-change size)
-    (set! width (cast <fl> (get-width~ size)))
-    (set! height (cast <fl> (get-height~ size))))
+    (set! screen-width (cast <fl> (get-width~ size)))
+    (set! screen-height (cast <fl> (get-height~ size))))
   
   
   ;;;
@@ -100,47 +141,9 @@
   ;;;
   
   
-  (method inline (get-sight) <f64vector>
-    (get-sight~ lookat))
-  
-  (method inline (get-up) <f64vector>
-    (get-up~ lookat))
-  
-  (method inline (get-right) <f64vector>
-    (get-right~ lookat))
-  
-  
-  (method (set-position vert <f64vector>) <void>
-    (unless (vertex-near? vert position)
-      (vertex-copy! position vert)
-      (dirty-update)))
-  
-  
   (method (set-target vert <f64vector>) <void>
     (unless (vertex-near? vert target)
       (vertex-copy! target vert)
-      (dirty-update)))
-  
-  
-  (method (set-lookat at <LookAt>) <void>
-    (unless (lookat-near? at lookat)
-      (lookat-copy! lookat at)
-      (dirty-update)))
-  
-  
-  (method (set-sight sight <f64vector>) <void>
-    (unless (vertex-near? sight (get-sight~ lookat))
-      (set-sight~ lookat sight)
-      (dirty-update)))
-  
-  (method (set-up up <f64vector>) <void>
-    (unless (vertex-near? up (get-up~ lookat))
-      (set-up~ lookat up)
-      (dirty-update)))
-  
-  (method (set-right right <f64vector>) <void>
-    (unless (vertex-near? right (get-right~ lookat))
-      (set-right~ lookat right)
       (dirty-update)))
   
   
@@ -184,6 +187,11 @@
   ;;;
   
   
+  (method override (update-matrix)
+    (nextmethod)
+    (dirty-update))
+  
+  
   (method (camera-update)
     (when dirty?
       (update-frustum)
@@ -202,7 +210,7 @@
   
   
   (method (prepare-projection)
-    (let ((ratio (/ width height)))
+    (let ((ratio (/ screen-width screen-height)))
       (glMatrixMode GL_PROJECTION)
       (glLoadIdentity)
       (case projection
@@ -212,15 +220,6 @@
          (let ((width zoom-factor))
            (let ((height (/ width ratio)))
              (glOrtho (- width) width (- height) height perspective-near perspective-far)))))))
-  
-  
-  (method (activate-perspective)
-    (set! projection 'perspective))
-  
-  
-  (method (activate-orthographic)
-    (reset-camera)
-    (set! projection 'orthographic))
   
   
   (method (setup-camera)
@@ -249,19 +248,19 @@
   
   
   (method (world->screen vertex)
-    (let ((projection (make-projection-matrix& perspective-fov (/ width height) perspective-near perspective-far))
+    (let ((projection (make-projection-matrix& perspective-fov (/ screen-width screen-height) perspective-near perspective-far))
           (view (make-view-matrix& position lookat)))
       (let ((projection/view (matrix-multiply& projection view)))
         (let ((vert (matrix-transform& projection/view vertex)))
           (new Point
-            (fxround (* (+ (vertex-x vert) 1.) (/ width 2.)))
-            (fxround (* (- 1. (vertex-y vert)) (/ height 2.))))))))
+            (fxround (* (+ (vertex-x vert) 1.) (/ screen-width 2.)))
+            (fxround (* (- 1. (vertex-y vert)) (/ screen-height 2.))))))))
   
   
   (method (screen->ray h v)
-    (let ((ratio (/ width height))
-          (ch (- h (/ width 2)))
-          (cv (- (- height v) (/ height 2))))
+    (let ((ratio (/ screen-width screen-height))
+          (ch (- h (/ screen-width 2)))
+          (cv (- (- screen-height v) (/ screen-height 2))))
       (case projection
         ((perspective)
          (let ((half-fov (/ (degree->radian perspective-fov) 2.))
@@ -269,13 +268,13 @@
            (let ((cone (tan half-fov))
                  (d (vertex-distance position target))
                  (right (cross-product& (vertex-& target position) up)))
-             (let ((target-in-eye-space (vertex+& (vertex-scalar*& up (/ (* cv d cone 2.) height))
-                                                  (vertex+& (vertex-scalar*& right (/ (* ch d cone 2. ratio) width))
+             (let ((target-in-eye-space (vertex+& (vertex-scalar*& up (/ (* cv d cone 2.) screen-height))
+                                                  (vertex+& (vertex-scalar*& right (/ (* ch d cone 2. ratio) screen-width))
                                                             target))))
                (values (copy-vertex position) (vertex-normalize (vertex-& target-in-eye-space position)))))))
         ((orthographic)
-         (let ((x (+ (/ (* 2. ch zoom-factor) width) (vertex-x position)))
-               (y (+ (/ (* 2. cv zoom-factor) height ratio) (vertex-y position))))
+         (let ((x (+ (/ (* 2. ch zoom-factor) screen-width) (vertex-x position)))
+               (y (+ (/ (* 2. cv zoom-factor) screen-height ratio) (vertex-y position))))
            (values (vertex x y (vertex-z position)) (vertex 0. 0. -1.)))))))
   
   
@@ -301,17 +300,17 @@
   
   (method (frustum-normals! left-normal <f64vector> bottom-normal <f64vector> right-normal <f64vector> top-normal <f64vector>) <void>
     ;; copied from screen->ray for performance
-    (let ((ratio (/ width height))
+    (let ((ratio (/ screen-width screen-height))
           (half-fov (/ (degree->radian perspective-fov) 2.))
           (up (get-up~ lookat)))
       (let ((cone (tan half-fov))
             (d (f64-ref (vertex-distance& position target)))
             (right (cross-product& (vertex-& target position) up)))
         (define (compute-normal! res <f64vector> h <fl> v <fl>) <void>
-          (let ((ch (- h (/ width 2.)))
-                (cv (- (- height v) (/ height 2.))))
-            (let ((target-in-eye-space (vertex+& (vertex-scalar*& up (/ (* cv d cone 2.) height))
-                                                 (vertex+& (vertex-scalar*& right (/ (* ch d cone 2. ratio) width))
+          (let ((ch (- h (/ screen-width 2.)))
+                (cv (- (- screen-height v) (/ screen-height 2.))))
+            (let ((target-in-eye-space (vertex+& (vertex-scalar*& up (/ (* cv d cone 2.) screen-height))
+                                                 (vertex+& (vertex-scalar*& right (/ (* ch d cone 2. ratio) screen-width))
                                                            target))))
               (vertex-normalize! res (vertex-& target-in-eye-space position)))))
         
@@ -320,9 +319,9 @@
               (r10 (make-vertex&))
               (r11 (make-vertex&)))
           (compute-normal! r00 0. 0.)
-          (compute-normal! r01 0. height)
-          (compute-normal! r10 width 0.)
-          (compute-normal! r11 width height)
+          (compute-normal! r01 0. screen-height)
+          (compute-normal! r10 screen-width 0.)
+          (compute-normal! r11 screen-width screen-height)
           (cross-product! left-normal r01 r00)
           (cross-product! bottom-normal r00 r10)
           (cross-product! right-normal r10 r11)
@@ -530,28 +529,4 @@
           (glVertex3f (vertex-x axis-z) (vertex-y axis-z) (vertex-z axis-z))
           (glEnd)
           (glEnable GL_LIGHTING)
-          (glLineWidth 1.))))))
-
-
-;;;
-;;;; Free
-;;;
-
-
-(class Free-Camera extends Camera)
-
-
-;;;
-;;;; Person
-;;;
-
-
-(class Person-Camera extends Camera)
-
-
-;;;
-;;;; Orbit
-;;;
-
-
-(class Orbit-Camera extends Camera))
+          (glLineWidth 1.)))))))
