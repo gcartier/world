@@ -82,6 +82,7 @@
         (world.settings)
         (world.skybox)
         (world.sun)
+        (world.support)
         (world.syntax (phase syntax))
         (world.task)
         (world.texture)
@@ -144,7 +145,7 @@
   (slot gravities                   <list>       initialize '()                       getter generate)
   (slot gadgets                     <list>       initialize '()                       getter generate)
   (slot marks                       <list>       initialize '()                       getter generate)
-  (slot close-ambiance?             <bool>       initialize #t                        accessors generate)
+  (slot close-ambience?             <bool>       initialize #t                        accessors generate)
   (slot editable-warned?            <bool>       initialize #f                        accessors generate)
   (slot generate-thread             <object>     initialize #f                        accessors generate)
   (slot lighting                    <Lighting>   initialize (new Lighting)            accessors generate)
@@ -206,12 +207,10 @@
     (set! start-time (world-setting 'world.start-time 'dawn 'default))
     (register-task 'generate generate-task)
     (register-task 'render (lambda (task) (render-task~ (current-world) task)))
-    (when player-task?
-      (register-task 'player (lambda (task) (player-task~ (current-world) task))))
-    (when tick-task?
-      (register-task 'tick (lambda (task) (tick-task~ (current-world) task))))
-    (when sun-task?
-      (register-task 'sun sun-task))
+    (register-task 'keys (lambda (task) (keys-task~ (current-world) task)))
+    (register-task 'player (lambda (task) (player-task~ (current-world) task)))
+    (register-task 'tick (lambda (task) (tick-task~ (current-world) task)))
+    (register-task 'sun sun-task)
     (register-entity-classes)
     (prepare-skybox))
   
@@ -223,16 +222,10 @@
       (setup-boundaries)
       (setup-content)
       (setup-overrides)
+      (setup-programs)
+      (setup-music)
       (when (zone-based?~ world)
         (setup-history~ world))))
-  
-  
-  (method (start-zone)
-    (start-task 'generate)
-    (start-task 'render)
-    (start-task 'player)
-    (start-task 'tick)
-    (start-task 'sun))
   
   
   (method (setup-overrides)
@@ -247,6 +240,22 @@
         (set-axes?~ world start-axes?))))
   
   
+  (method (setup-programs)
+    (let ((world (current-world)))
+      (let ((block-program (find-mesh-program~ (current-world) (default-block-program))))
+        (set-block-program~ world block-program)
+        (set-program~ (get-opaque-renderer) block-program)
+        (set-program~ (get-transparent-renderer) block-program)
+        (set-program~ (get-culled-transparent-renderer) block-program)
+        (set-program~ (get-coverage-renderer) block-program))))
+  
+  
+  (method (setup-music)
+    (let ((world (current-world)))
+      (when (find-setting 'world.music? #t)
+        (change-music~ world))))
+  
+  
   (method override (print output readably)
     (print-unreadable self output
       (lambda (output)
@@ -255,6 +264,10 @@
   
   (method protected virtual (sector-class)
     Sector)
+  
+  
+  (method protected virtual (default-block-program)
+    'phong)
   
   
   (method protected virtual (populate-zone)
@@ -331,11 +344,34 @@
                 destroy-hooks)
       (free-sectors)
       (free-regions)
-      (when (and close-ambiance? (zone-based?~ world))
-        (close-ambiance~ world))))
+      (when (and close-ambience? (zone-based?~ world))
+        (close-ambience~ world))))
+  
+  
+  ;;;
+  ;;;; Tasks
+  ;;;
+  
+  
+  (method (start-tasks)
+    (start-task 'generate)
+    (start-task 'render)
+    (start-task 'player)
+    (start-task 'tick)
+    (start-task 'sun)
+    (start-task 'keys)
+    (thread-base-priority-set! (task-thread 'keys) keys-priority)
+    (thread-base-priority-set! (task-thread 'player) player-priority)
+    (thread-base-priority-set! (task-thread 'render) render-priority)
+    (thread-base-priority-set! (task-thread 'tick) tick-priority)
+    (thread-base-priority-set! (task-thread 'sun) sun-priority)
+    (thread-base-priority-set! (task-thread 'generate) generate-priority))
   
   
   (method (stop-tasks)
+    ;; so no one waits on render
+    (set-render-boost? #f)
+    (stop-task 'keys)
     (stop-task 'sun)
     (stop-task 'tick)
     (stop-task 'player)
@@ -414,7 +450,7 @@
   (method (draw-zone)
     (site (draw-zone on?: #t parent: draw-world)
       (let ((world (current-world)))
-        (when skybox
+        @GLFC(when skybox
           (draw-skybox~ skybox))
         (if (get-draw-elements?~ world)
             (draw-sectors~ world)
@@ -1110,7 +1146,6 @@
     (mutex-lock! sectors-mutex)
     (when (= sectors-generating 0)
       (active-site 'generate)
-      (active-site 'generate-sequential)
       (active-site 'content)
       (active-site 'read-chunk))
     (set! sectors-generating (+ sectors-generating count))
@@ -1122,7 +1157,6 @@
     (set! sectors-generating (- sectors-generating count))
     (when (= sectors-generating 0)
       (inactive-site 'generate)
-      (inactive-site 'generate-sequential)
       (inactive-site 'content)
       (inactive-site 'read-chunk))
     (mutex-unlock! sectors-mutex))
@@ -1579,6 +1613,8 @@
                                   (with-task-mutex sun-sequential-state
                                     (lambda ()
                                       (unless (task-stopping?)
+                                        (when (and (testing?) (memq? 'sun (get-task-trace)))
+                                          (debug-string "S"))
                                         (tick-sun elapse)))))
                                 (let ((duration (- (current-seconds) time)))
                                   (task-sleep (- sun-rate duration) exit #f))
@@ -1709,7 +1745,6 @@
           (set-ambient-color~ lighting ambient-color)
           (set-lights~ lighting lights)
           (set-lights-count~ lighting (min (get-dynamic-lights~ world) (length lights)))
-          (setup~ lighting)
           (set-current-lighting lighting)))))
   
   
