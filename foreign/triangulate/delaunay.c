@@ -12,6 +12,10 @@ typedef struct {
    double x,y,z;
 } XYZ;
 
+int CircumCircle(double xp,double yp,
+   double x1,double y1,double x2,double y2,double x3,double y3,
+   double *xc,double *yc,double *rsqr);
+
 /*
    Code by Paul Bourke
    http://paulbourke.net/papers/triangulate
