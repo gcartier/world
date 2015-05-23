@@ -1,0 +1,219 @@
+;;;===============
+;;;  WorldScheme
+;;;===============
+;;;
+;;;; Music
+;;;
+;;;  The contents of this file are subject to the Mozilla Public License Version
+;;;  1.1 (the "License"); you may not use this file except in compliance with
+;;;  the License. You may obtain a copy of the License at
+;;;  http://www.mozilla.org/MPL/
+;;;
+;;;  Software distributed under the License is distributed on an "AS IS" basis,
+;;;  WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License
+;;;  for the specific language governing rights and limitations under the
+;;;  License.
+;;;
+;;;  The Original Code is WorldScheme.
+;;;
+;;;  The Initial Developer of the Original Code is Guillaume Cartier.
+;;;  Portions created by the Initial Developer are Copyright (C) 2012-2014
+;;;  the Initial Developer. All Rights Reserved.
+;;;
+;;;  Contributor(s):
+;;;
+;;;  Alternatively, the contents of this file may be used under the terms of
+;;;  the GNU General Public License Version 2 or later (the "GPL"), in which
+;;;  case the provisions of the GPL are applicable instead of those above. If
+;;;  you wish to allow use of your version of this file only under the terms of
+;;;  the GPL, and not to allow others to use your version of this file under the
+;;;  terms of the MPL, indicate your decision by deleting the provisions above
+;;;  and replace them with the notice and other provisions required by the GPL.
+;;;  If you do not delete the provisions above, a recipient may use your version
+;;;  of this file under the terms of any one of the MPL or the GPL.
+;;;
+;;;  See http://github.com/gcartier/world for details.
+
+
+(module world.music jazz
+
+
+(import (jazz.io)
+        (jazz.media)
+        (jazz.ui.window)
+        (world)
+        (world.autoload)
+        (world.geometry)
+        (world.settings)
+        (world.syntax (phase syntax)))
+
+
+(class World-Music extends Object
+  
+  
+  (slot music?         <bool>   initialize #f getter generate)
+  (slot music-playing  <object> initialize #f getter generate)
+  (slot silence-thread <object> initialize #f getter generate)
+  (slot silence-mutex  <object> initialize #f getter generate)
+  
+  
+  (method override (initialize)
+    (set! music? (world-setting 'world.music? #t))
+    (set! silence-mutex (make-mutex 'silence))
+    (music-played-callback music-played))
+  
+  
+  ;;;
+  ;;;; Events
+  ;;;
+  
+  
+  (method (on-toggle-music evt)
+    (toggle-music))
+  
+  
+  (method (on-change-music evt)
+    (change-music))
+  
+  
+  (method (on-display-music evt)
+    (display-music))
+  
+  
+  ;;;
+  ;;;; Music
+  ;;;
+  
+  
+  (method (toggle-music)
+    (let ((world (current-world)))
+      (if music-playing
+          (close-ambience)
+        (change-music))
+      (display-on/off~ world "Music" (get-music-playing?))))
+  
+  
+  (method (change-music)
+    (let ((world (current-world)))
+      (let ((queue (new-queue)))
+        (for-each (lambda (assets)
+                    (let ((music-dir (new-directory~ assets "music")))
+                      (when (exists?~ music-dir)
+                        (iterate-directory~ music-dir
+                          (lambda (path kind)
+                            (let ((path (join path "/")))
+                              (when (extension=? (extract-extension path) "mp3")
+                                (enqueue queue (extract-base path)))))
+                          full?: #f
+                          files?: #t
+                          directories?: #f))))
+                  (get-all-assets~ world))
+        (let ((music-list (queue-list queue)))
+          (if (null? music-list)
+              (display-error~ world "No music found")
+            (let ((music (random-element music-list)))
+              (play-ambience (concatenate "music/" music))))))))
+  
+  
+  (method (initial-music)
+    (when music?
+      (enter-silence minimum: 0. maximum: 15.)))
+  
+  
+  (definition minimum-silence
+    60.)
+  
+  (definition maximum-silence
+    (* 3. 60.))
+  
+  
+  (method (enter-silence (minimum: minimum #f) (maximum: maximum #f))
+    (let ((minimum (or minimum minimum-silence))
+          (maximum (or maximum maximum-silence)))
+      (mutex-lock! silence-mutex)
+      (set! silence-thread
+            (thread-start!
+              (new-thread
+                (lambda ()
+                  (sleep (random-between minimum maximum))
+                  (mutex-lock! silence-mutex)
+                  (set! silence-thread #f)
+                  (mutex-unlock! silence-mutex)
+                  (post-event
+                    (lambda ()
+                      (change-music))))
+                'silence)))
+      (mutex-unlock! silence-mutex)))
+  
+  
+  (method (exit-silence)
+    (mutex-lock! silence-mutex)
+    (if (not silence-thread)
+        (mutex-unlock! silence-mutex)
+      (exit-thread silence-thread)
+      (mutex-unlock! silence-mutex)
+      (thread-join! silence-thread)))
+  
+  
+  (method (play-intro-music)
+    (maybe-play-ambience "music/Intro"))
+  
+  
+  (method (maybe-play-ambience path)
+    (when music?
+      (play-ambience path)))
+  
+  
+  (method (play-ambience path)
+    (let ((world (current-world)))
+      (exit-silence)
+      (play-music-file path "ambience")
+      (set! music-playing path)
+      (update-parameter~ world 'music)))
+  
+  
+  (method (close-ambience)
+    (let ((world (current-world)))
+      (close-music "ambience")
+      (set! music-playing #f)
+      (update-parameter~ world 'music)))
+  
+  
+  (method (get-music-playing?)
+    (boolean music-playing))
+  
+  
+  (method (play-music-file path name)
+    (let ((file (effective-music-file path)))
+      (when file
+        (close-music name)
+        (open-music file name)
+        (play-music name))))
+  
+  
+  (method (effective-music-file path)
+    (let ((world (current-world)))
+      (when path
+        (continuation-capture
+          (lambda (return)
+            (for-each (lambda (assets)
+                        (let ((mp3 (new-file~ assets (make-filename path "mp3"))))
+                          (if (exists?~ mp3)
+                              (continuation-return return mp3)
+                            (let ((ogg (new-file~ assets (make-filename path "ogg"))))
+                              (when (exists?~ ogg)
+                                (continuation-return return ogg))))))
+                      (get-all-assets~ world))
+            #f)))))
+  
+  
+  (method (music-played alias)
+    (when (and music? (equal? alias "ambience"))
+      (enter-silence)))
+  
+  
+  (method (display-music)
+    (let ((world (current-world)))
+      (if music-playing
+          (display-status~ world (format "Playing {a}" music-playing))
+        (display-status~ world "No music playing"))))))
