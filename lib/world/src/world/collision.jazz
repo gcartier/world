@@ -326,34 +326,40 @@
 (definition collide-mutex
   (make-mutex 'collide))
 
+(definition (with-collide-mutex thunk)
+  (dynamic-wind
+    (lambda () (mutex-lock! collide-mutex))
+    thunk
+    (lambda () (mutex-unlock! collide-mutex))))
+
 
 (definition public (collide&stop origin <f64vector> target <f64vector> lookat <LookAt> radiuses <f64vector> (max-distance: max-distance #f) (polygon-filter: polygon-filter #f) (ignore-entities?: ignore-entities? #t) (ignore-players?: ignore-players? #f))
   ;; quicky for tests
   (if (vertex=? origin target)
       (values origin (get-sight~ lookat) '())
-    (mutex-lock! collide-mutex)
-    (let ((sphere-matrix (make-matrix&))
-          (inverse-matrix (make-matrix&))
-          (travel-breadth (determine-travel-breadth radiuses)))
-      (sphere-matrices! sphere-matrix inverse-matrix origin lookat radiuses)
-      (let ((mvt (collide-movement& sphere-matrix origin target)))
-        (let ((cl (site (calculate-stop-colliders on?: #f parent: collide&stop) (calculate-colliders sphere-matrix inverse-matrix mvt travel-breadth max-distance polygon-filter '() ignore-entities? ignore-players?))))
-          (let ((dest (if (null? cl)
-                          (movement-end mvt)
-                        (let ((cl0 <Collision> (car cl)))
-                          ;; quick hack for a case that should only happen if actor is moved without
-                          ;; going through collide&slide logic which is the case when we rotate the player
-                          (if (eq? (get-type~ cl0) 'embedded)
-                              (vertex- (get-origin~ mvt) (vertex-scalar*& (get-normal~ (get-plane~ cl0)) (get-distance~ cl0)))
-                            (let ((dist (get-distance~ cl0)))
-                              (if (< dist (get-length~ mvt))
-                                  (movement-end-to mvt dist)
-                                (movement-end mvt))))))))
-            (prog1 (receive (dest dir) (transform-ray/normalize dest (get-vector~ mvt) inverse-matrix)
-                     (values dest
-                             dir
-                             (transform-collisions cl inverse-matrix sphere-matrix)))
-              (mutex-unlock! collide-mutex))))))))
+    (with-collide-mutex
+      (lambda ()
+        (let ((sphere-matrix (make-matrix&))
+              (inverse-matrix (make-matrix&))
+              (travel-breadth (determine-travel-breadth radiuses)))
+          (sphere-matrices! sphere-matrix inverse-matrix origin lookat radiuses)
+          (let ((mvt (collide-movement& sphere-matrix origin target)))
+            (let ((cl (site (calculate-stop-colliders on?: #f parent: collide&stop) (calculate-colliders sphere-matrix inverse-matrix mvt travel-breadth max-distance polygon-filter '() ignore-entities? ignore-players?))))
+              (let ((dest (if (null? cl)
+                              (movement-end mvt)
+                            (let ((cl0 <Collision> (car cl)))
+                              ;; quick hack for a case that should only happen if actor is moved without
+                              ;; going through collide&slide logic which is the case when we rotate the player
+                              (if (eq? (get-type~ cl0) 'embedded)
+                                  (vertex- (get-origin~ mvt) (vertex-scalar*& (get-normal~ (get-plane~ cl0)) (get-distance~ cl0)))
+                                (let ((dist (get-distance~ cl0)))
+                                  (if (< dist (get-length~ mvt))
+                                      (movement-end-to mvt dist)
+                                    (movement-end mvt))))))))
+                (receive (dest dir) (transform-ray/normalize dest (get-vector~ mvt) inverse-matrix)
+                  (values dest
+                          dir
+                          (transform-collisions cl inverse-matrix sphere-matrix)))))))))))
 
 
 (definition collide-max-slide <fx>
@@ -380,150 +386,150 @@
   ;; quick for tests
   (if (vertex=? origin target)
       (values origin (get-sight~ lookat) '())
-    (mutex-lock! collide-mutex)
-    (let ((world (current-world))
-          (zone (current-zone))
-          (sphere-matrix (make-matrix&))
-          (inverse-matrix (make-matrix&))
-          (travel-breadth (determine-travel-breadth radiuses))
-          (dir (vertex-normalize-safe& (vertex-& target origin))))
-      (sphere-matrices! sphere-matrix inverse-matrix origin lookat radiuses)
-      (let ((mvt (collide-movement& sphere-matrix origin target)))
-        (let ((max-loops collide-max-slide)
-              (last-direction (vertex 0. 0. 0.))
-              (last-cl <list> '())
-              (second-to-last-cl <list> '())
-              (input-ray <Movement> (copy-movement& mvt))
-              (output-ray <Movement> (copy-movement& mvt))
-              (skip-list <list> '()))
-          (define (skip-polygons coll <Collision>)
-            (for-each (lambda (poly)
-                        (set! skip-list (cons poly skip-list)))
-                      (get-colliders~ coll)))
-          
-          (when debug-collisions?
-            (reset-marks~ zone))
-          ;; Sliding is an iterative process
-          (let (iter (loop-no 0))
-            (when (and (< loop-no max-loops)
-                       (not (vertex-zero? (get-vector~ output-ray)))
-                       (> (get-length~ output-ray) EPSILON))
-              ;; This is handy
-              (vertex-copy! last-direction (get-vector~ output-ray))
-              ;; Quicky to not redo the sphere-matrices! we did above
-              (when (> loop-no 0)
-                (movement-transform-3x4! output-ray inverse-matrix)
-                (sphere-matrices! sphere-matrix inverse-matrix (get-origin~ output-ray) lookat radiuses)
-                (movement-transform-3x4! output-ray sphere-matrix))
-              (let (;; Get the colliders
-                    (cl (site (calculate-slide-colliders on?: #f parent: collide&slide) (calculate-colliders sphere-matrix inverse-matrix output-ray travel-breadth max-distance polygon-filter skip-list ignore-entities? ignore-players?))))
-                (when (and debug-collisions? (not-null? cl))
-                  (add-mark~ zone
-                    (new Collisions-Mark (transform-collisions cl inverse-matrix sphere-matrix) loop-no)))
-                (when (not-null? cl)
-                  (set! second-to-last-cl last-cl)
-                  (set! last-cl cl))
-                ;; We can consider these polygons again
-                (set! skip-list '())
-                ;; If we didn't hit anything just return the destination
-                (if (null? cl)
-                    (set-origin~ output-ray (movement-end& output-ray))
-                  (let ((hit-count <fx> (length cl))
-                        (hit-list cl)
-                        (cl0 <Collision> (car cl)))
-                    ;; If it was embedded push away
-                    (if (eq? (get-type~ cl0) 'embedded)
-                        ;; If it's embedded back up along the collision plane normal
-                        (begin
-                          (set-origin~ output-ray (vertex-& (get-origin~ output-ray) (vertex-scalar*& (get-normal~ (get-plane~ cl0)) (get-distance~ cl0))))
-                          (iter (+ loop-no 1)))
-                      (let ((world-plane (transform-plane (get-plane~ cl0) inverse-matrix sphere-matrix))
-                            (world-ray (movement-transform-3x4 output-ray inverse-matrix)))
-                        (let (@new (plane-slide-dst (plane-closest& world-plane (movement-end& world-ray)))
-                              @new (up (get-up~ lookat))
-                              (plane-slide-dst (plane-closest& (get-plane~ cl0) (movement-end& output-ray)))
-                              (up (get-up~ lookat)))
-                          @debug
-                          (terminal (< (abs (dot-product (get-normal~ world-plane) up)) EPSILON))
-                          (let (@new
-                                (slide-dst (if (< (abs (dot-product (get-normal~ world-plane) up)) EPSILON)
-                                               (matrix-transform-3x4 sphere-matrix plane-slide-dst)
-                                             (let ((mvt (make-movement& (vertex+& (vertex-& (movement-end& world-ray) (get-origin~ world-ray)) (get-origin~ world-plane)) up)))
-                                               (receive (collision-distance intersect?) (intersect-plane world-plane mvt)
-                                                 (let ((xz-dst (movement-end-to& mvt collision-distance)))
-                                                   ;; could have a percentage here...
-                                                   (matrix-transform-3x4 sphere-matrix (vertex+& (get-origin~ world-plane) (vertex-scalar*& (vertex-normalize-safe& (vertex-& xz-dst (get-origin~ world-plane))) (get-length~ world-ray)))))))))
-                                (slide-dst (if (< (abs (dot-product (get-normal~ (get-plane~ cl0)) up)) EPSILON)
-                                               plane-slide-dst
-                                             (let ((mvt (make-movement& (vertex+& (vertex-& (movement-end& output-ray) (get-origin~ output-ray)) (get-origin~ (get-plane~ cl0))) up)))
-                                               (receive (collision-distance intersect?) (intersect-plane (get-plane~ cl0) mvt)
-                                                 (let ((xz-dst (movement-end-to& mvt collision-distance)))
-                                                   ;; could have a percentage here...
-                                                   (vertex+& (get-origin~ (get-plane~ cl0)) (vertex-scalar*& (vertex-normalize-safe& (vertex-& xz-dst (get-origin~ (get-plane~ cl0)))) (get-length~ output-ray)))))))))
-                            @debug (
-                                    (terminal '********)
-                                    (terminal world-plane)
-                                    (terminal (get-plane~ cl0))
-                                    (format :terminal "{a}{%}" (present-vertex plane-slide-dst))
-                                    (format :terminal "{a}{%}" (present-vertex (movement-end& world-ray)))
-                                    (format :terminal "{a}{%}" (vertex-distance plane-slide-dst (movement-end& world-ray)))
-                                    (format :terminal "{a}{%}" (present-vertex slide-dst))
-                                    (format :terminal "{a}{%}" (present-vertex (movement-end& output-ray)))
-                                    (format :terminal "{a}{%}" (vertex-distance slide-dst (movement-end& output-ray))))
-                            (when debug-collisions?
-                              (add-mark~ zone (new Vertex-Mark (matrix-transform-3x4 inverse-matrix slide-dst) color: blue-dye)))
-                            ;; We hit something -- move as far as we can
-                            (set-origin~ output-ray (vertex+& (get-origin~ output-ray) (vertex-scalar*& (get-normal~ output-ray) (get-distance~ cl0))))
-                            ;; If we hit two or more find the two with the most "pressure"
-                            (if (>= hit-count 2)
-                                (let ((c0 0)
-                                      (d0 2.))
-                                  (loop (for i from 0 below hit-count)
-                                        (let ((dot (f64-ref (dot-product& (get-normal~ (get-plane~ (cast <Collision> (element hit-list i)))) (get-normal~ output-ray)))))
-                                          (when (< dot d0)
-                                            (set! d0 dot)
-                                            (set! c0 i))))
-                                  (let ((c1 0)
-                                        (d1 2.))
-                                    (loop (for j from 0 below hit-count)
-                                          (when (/= j c0)
-                                            (let ((dot (f64-ref (dot-product& (get-normal~ (get-plane~ (cast <Collision> (element hit-list j)))) (get-normal~ output-ray)))))
-                                              (when (< dot d1)
-                                                (set! d1 dot)
-                                                (set! c1 j)))))
-                                    ;; Temp vector
-                                    (let ((temp-v (get-vector~ output-ray))
-                                          ;; Point along the crease
-                                          (perp (vertex-abs& (cross-product& (get-normal~ (get-plane~ (cast <Collision> (element hit-list c1))))
-                                                                             (get-normal~ (get-plane~ (cast <Collision> (element hit-list c0))))))))
-                                      (set! temp-v (vertex* temp-v perp))
-                                      (if (< (f64-ref (vertex-norm& temp-v)) EPSILON)
-                                          (iter (+ loop-no 1))
-                                        (vertex-normalize! temp-v temp-v)
-                                        (vertex-scalar*! temp-v temp-v (f64-ref (vertex-norm& (get-vector~ output-ray))))
-                                        ;; Find out how much to scale our vector that points along the crease
-                                        (let ((n1 (vertex-normalize& temp-v))
-                                              (n2 (vertex-normalize& (get-vector~ output-ray))))
-                                          (let ((scalar (f64-ref (dot-product& n1 n2))))
-                                            ;; New vector is new direction vector scaled
-                                            (set-vector~ output-ray (vertex-scalar*& temp-v scalar))))
-                                        (vertex-copy! last-direction (get-vector~ output-ray))
-                                        ;; Don't collide with these next time
-                                        (skip-polygons (cast <Collision> (element hit-list c0)))
-                                        (skip-polygons (cast <Collision> (element hit-list c1)))
-                                        (iter (+ loop-no 1))))))
-                              ;; Otherwise we slide
-                              (let ((slide-src (plane-closest& (get-plane~ cl0) (get-origin~ output-ray))))
-                                (set-vector~ output-ray (vertex-& slide-dst slide-src)))
-                              (vertex-copy! last-direction (get-vector~ output-ray))
-                              ;; Don't collide with this one next time
-                              (skip-polygons cl0)
-                              (iter (+ loop-no 1))))))))))))
-          (prog1 (receive (dest dir) (transform-ray/normalize (get-origin~ output-ray) last-direction inverse-matrix)
-                   (values dest
-                           dir
-                           (transform-collisions (union last-cl second-to-last-cl) inverse-matrix sphere-matrix)))
-            (mutex-unlock! collide-mutex)))))))
+    (with-collide-mutex
+      (lambda ()
+        (let ((world (current-world))
+              (zone (current-zone))
+              (sphere-matrix (make-matrix&))
+              (inverse-matrix (make-matrix&))
+              (travel-breadth (determine-travel-breadth radiuses))
+              (dir (vertex-normalize-safe& (vertex-& target origin))))
+          (sphere-matrices! sphere-matrix inverse-matrix origin lookat radiuses)
+          (let ((mvt (collide-movement& sphere-matrix origin target)))
+            (let ((max-loops collide-max-slide)
+                  (last-direction (vertex 0. 0. 0.))
+                  (last-cl <list> '())
+                  (second-to-last-cl <list> '())
+                  (input-ray <Movement> (copy-movement& mvt))
+                  (output-ray <Movement> (copy-movement& mvt))
+                  (skip-list <list> '()))
+              (define (skip-polygons coll <Collision>)
+                (for-each (lambda (poly)
+                            (set! skip-list (cons poly skip-list)))
+                          (get-colliders~ coll)))
+              
+              (when debug-collisions?
+                (reset-marks~ zone))
+              ;; Sliding is an iterative process
+              (let (iter (loop-no 0))
+                (when (and (< loop-no max-loops)
+                           (not (vertex-zero? (get-vector~ output-ray)))
+                           (> (get-length~ output-ray) EPSILON))
+                  ;; This is handy
+                  (vertex-copy! last-direction (get-vector~ output-ray))
+                  ;; Quicky to not redo the sphere-matrices! we did above
+                  (when (> loop-no 0)
+                    (movement-transform-3x4! output-ray inverse-matrix)
+                    (sphere-matrices! sphere-matrix inverse-matrix (get-origin~ output-ray) lookat radiuses)
+                    (movement-transform-3x4! output-ray sphere-matrix))
+                  (let (;; Get the colliders
+                        (cl (site (calculate-slide-colliders on?: #f parent: collide&slide) (calculate-colliders sphere-matrix inverse-matrix output-ray travel-breadth max-distance polygon-filter skip-list ignore-entities? ignore-players?))))
+                    (when (and debug-collisions? (not-null? cl))
+                      (add-mark~ zone
+                        (new Collisions-Mark (transform-collisions cl inverse-matrix sphere-matrix) loop-no)))
+                    (when (not-null? cl)
+                      (set! second-to-last-cl last-cl)
+                      (set! last-cl cl))
+                    ;; We can consider these polygons again
+                    (set! skip-list '())
+                    ;; If we didn't hit anything just return the destination
+                    (if (null? cl)
+                        (set-origin~ output-ray (movement-end& output-ray))
+                      (let ((hit-count <fx> (length cl))
+                            (hit-list cl)
+                            (cl0 <Collision> (car cl)))
+                        ;; If it was embedded push away
+                        (if (eq? (get-type~ cl0) 'embedded)
+                            ;; If it's embedded back up along the collision plane normal
+                            (begin
+                              (set-origin~ output-ray (vertex-& (get-origin~ output-ray) (vertex-scalar*& (get-normal~ (get-plane~ cl0)) (get-distance~ cl0))))
+                              (iter (+ loop-no 1)))
+                          (let ((world-plane (transform-plane (get-plane~ cl0) inverse-matrix sphere-matrix))
+                                (world-ray (movement-transform-3x4 output-ray inverse-matrix)))
+                            (let (@new (plane-slide-dst (plane-closest& world-plane (movement-end& world-ray)))
+                                  @new (up (get-up~ lookat))
+                                  (plane-slide-dst (plane-closest& (get-plane~ cl0) (movement-end& output-ray)))
+                                  (up (get-up~ lookat)))
+                              @debug
+                              (terminal (< (abs (dot-product (get-normal~ world-plane) up)) EPSILON))
+                              (let (@new
+                                    (slide-dst (if (< (abs (dot-product (get-normal~ world-plane) up)) EPSILON)
+                                                   (matrix-transform-3x4 sphere-matrix plane-slide-dst)
+                                                 (let ((mvt (make-movement& (vertex+& (vertex-& (movement-end& world-ray) (get-origin~ world-ray)) (get-origin~ world-plane)) up)))
+                                                   (receive (collision-distance intersect?) (intersect-plane world-plane mvt)
+                                                     (let ((xz-dst (movement-end-to& mvt collision-distance)))
+                                                       ;; could have a percentage here...
+                                                       (matrix-transform-3x4 sphere-matrix (vertex+& (get-origin~ world-plane) (vertex-scalar*& (vertex-normalize-safe& (vertex-& xz-dst (get-origin~ world-plane))) (get-length~ world-ray)))))))))
+                                    (slide-dst (if (< (abs (dot-product (get-normal~ (get-plane~ cl0)) up)) EPSILON)
+                                                   plane-slide-dst
+                                                 (let ((mvt (make-movement& (vertex+& (vertex-& (movement-end& output-ray) (get-origin~ output-ray)) (get-origin~ (get-plane~ cl0))) up)))
+                                                   (receive (collision-distance intersect?) (intersect-plane (get-plane~ cl0) mvt)
+                                                     (let ((xz-dst (movement-end-to& mvt collision-distance)))
+                                                       ;; could have a percentage here...
+                                                       (vertex+& (get-origin~ (get-plane~ cl0)) (vertex-scalar*& (vertex-normalize-safe& (vertex-& xz-dst (get-origin~ (get-plane~ cl0)))) (get-length~ output-ray)))))))))
+                                @debug (
+                                        (terminal '********)
+                                        (terminal world-plane)
+                                        (terminal (get-plane~ cl0))
+                                        (format :terminal "{a}{%}" (present-vertex plane-slide-dst))
+                                        (format :terminal "{a}{%}" (present-vertex (movement-end& world-ray)))
+                                        (format :terminal "{a}{%}" (vertex-distance plane-slide-dst (movement-end& world-ray)))
+                                        (format :terminal "{a}{%}" (present-vertex slide-dst))
+                                        (format :terminal "{a}{%}" (present-vertex (movement-end& output-ray)))
+                                        (format :terminal "{a}{%}" (vertex-distance slide-dst (movement-end& output-ray))))
+                                (when debug-collisions?
+                                  (add-mark~ zone (new Vertex-Mark (matrix-transform-3x4 inverse-matrix slide-dst) color: blue-dye)))
+                                ;; We hit something -- move as far as we can
+                                (set-origin~ output-ray (vertex+& (get-origin~ output-ray) (vertex-scalar*& (get-normal~ output-ray) (get-distance~ cl0))))
+                                ;; If we hit two or more find the two with the most "pressure"
+                                (if (>= hit-count 2)
+                                    (let ((c0 0)
+                                          (d0 2.))
+                                      (loop (for i from 0 below hit-count)
+                                            (let ((dot (f64-ref (dot-product& (get-normal~ (get-plane~ (cast <Collision> (element hit-list i)))) (get-normal~ output-ray)))))
+                                              (when (< dot d0)
+                                                (set! d0 dot)
+                                                (set! c0 i))))
+                                      (let ((c1 0)
+                                            (d1 2.))
+                                        (loop (for j from 0 below hit-count)
+                                              (when (/= j c0)
+                                                (let ((dot (f64-ref (dot-product& (get-normal~ (get-plane~ (cast <Collision> (element hit-list j)))) (get-normal~ output-ray)))))
+                                                  (when (< dot d1)
+                                                    (set! d1 dot)
+                                                    (set! c1 j)))))
+                                        ;; Temp vector
+                                        (let ((temp-v (get-vector~ output-ray))
+                                              ;; Point along the crease
+                                              (perp (vertex-abs& (cross-product& (get-normal~ (get-plane~ (cast <Collision> (element hit-list c1))))
+                                                                                 (get-normal~ (get-plane~ (cast <Collision> (element hit-list c0))))))))
+                                          (set! temp-v (vertex* temp-v perp))
+                                          (if (< (f64-ref (vertex-norm& temp-v)) EPSILON)
+                                              (iter (+ loop-no 1))
+                                            (vertex-normalize! temp-v temp-v)
+                                            (vertex-scalar*! temp-v temp-v (f64-ref (vertex-norm& (get-vector~ output-ray))))
+                                            ;; Find out how much to scale our vector that points along the crease
+                                            (let ((n1 (vertex-normalize& temp-v))
+                                                  (n2 (vertex-normalize& (get-vector~ output-ray))))
+                                              (let ((scalar (f64-ref (dot-product& n1 n2))))
+                                                ;; New vector is new direction vector scaled
+                                                (set-vector~ output-ray (vertex-scalar*& temp-v scalar))))
+                                            (vertex-copy! last-direction (get-vector~ output-ray))
+                                            ;; Don't collide with these next time
+                                            (skip-polygons (cast <Collision> (element hit-list c0)))
+                                            (skip-polygons (cast <Collision> (element hit-list c1)))
+                                            (iter (+ loop-no 1))))))
+                                  ;; Otherwise we slide
+                                  (let ((slide-src (plane-closest& (get-plane~ cl0) (get-origin~ output-ray))))
+                                    (set-vector~ output-ray (vertex-& slide-dst slide-src)))
+                                  (vertex-copy! last-direction (get-vector~ output-ray))
+                                  ;; Don't collide with this one next time
+                                  (skip-polygons cl0)
+                                  (iter (+ loop-no 1))))))))))))
+              (receive (dest dir) (transform-ray/normalize (get-origin~ output-ray) last-direction inverse-matrix)
+                (values dest
+                        dir
+                        (transform-collisions (union last-cl second-to-last-cl) inverse-matrix sphere-matrix))))))))))
 
 
 ;;;
