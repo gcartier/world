@@ -311,9 +311,10 @@
   (slot water-cube?              getter generate)
   (slot physical?                getter generate)
   (slot generate                 getter generate)
+  (slot right-mouse              getter generate)
   
   
-  (method override (initialize name id subid texture rendering opaque-cube? water-cube? physical? generate)
+  (method override (initialize name id subid texture rendering opaque-cube? water-cube? physical? generate right-mouse)
     (set! name~self name)
     (set! id~self id)
     (set! subid~self subid)
@@ -324,7 +325,8 @@
     (set! opaque-cube?~self opaque-cube?)
     (set! water-cube?~self water-cube?)
     (set! physical?~self physical?)
-    (set! generate~self generate))
+    (set! generate~self generate)
+    (set! right-mouse~self right-mouse))
   
   
   (method override (print output readably)
@@ -347,11 +349,11 @@
   (make-vector 256 #f))
 
 
-(definition (register-minecraft-block name id (texture: texture #f) (rendering: rendering #f) (opaque-cube?: opaque-cube? #t) (water-cube?: water-cube? #f) (physical?: physical? #t) (generate: generate #f))
+(definition (register-minecraft-block name id (texture: texture #f) (rendering: rendering #f) (opaque-cube?: opaque-cube? #t) (water-cube?: water-cube? #f) (physical?: physical? #t) (generate: generate #f) (right-mouse: right-mouse #f))
   (let ((id <fx> (if (pair? id) (car id) id))
         (subid (if (pair? id) (cadr id) #f)))
     (when (not subid)
-      (let ((block (new Minecraft-Block-Model name id subid texture rendering opaque-cube? water-cube? physical? generate)))
+      (let ((block (new Minecraft-Block-Model name id subid texture rendering opaque-cube? water-cube? physical? generate right-mouse)))
         (table-set! blocks name block)
         (vector-set! blockids id block)
         (unspecified)))))
@@ -899,7 +901,9 @@
                       (add-face (bottom-face i j k left right bottom top back front bottom-uv generic-coordinates lighting rendering block-id border-kind) rendering)
                       (add-face (top-face i j k left right bottom top back front top-uv generic-coordinates lighting rendering block-id border-kind) rendering)
                       (add-face (back-face i j k left right bottom top back front back-uv generic-coordinates lighting rendering block-id border-kind) rendering)
-                      (add-face (front-face i j k left right bottom top back front front-uv generic-coordinates lighting rendering block-id border-kind) rendering)))))))
+                      (add-face (front-face i j k left right bottom top back front front-uv generic-coordinates lighting rendering block-id border-kind) rendering))))))
+  right-mouse: (lambda (sector block-id data-id i j k x y z uv rendering block-ref block-set!)
+                 (debug "click")))
 
 (define-minecraft-block RedstoneWire
   55
@@ -1304,7 +1308,8 @@
 (define-minecraft-block Portal
   90
   rendering: multitexture-rendering
-  texture: "portal")
+  texture: "portal"
+  opaque-cube?: #f)
 
 (define-minecraft-block Jack-O-Lantern
   91
@@ -2693,7 +2698,7 @@
   ;;;
   
   
-  (method (update-sector pos <f64vector> proc)
+  (method (with-sector pos <f64vector> proc)
     (let ((sector (position-sector pos))
           (x (fxfloor (vertex-x pos)))
           (y (fxfloor (vertex-y pos)))
@@ -2816,21 +2821,31 @@
                               (uv (block-texture-coordinates block))
                               (rendering (cache-rendering~ block))
                               (generate (get-generate~ block)))
-                          (mutex-lock! generate-mutex)
-                          (proc block-id (local-data-ref i j k) i j k x y z uv rendering effective-block-ref effective-block-set!)
-                          (iterate-sector-areas sector
-                            (lambda (area)
-                              (clear-polygons~ area)))
-                          (set-physical-uptodate?~ sector #f)
-                          ;; no need to generate the physical explicitly
-                          ;; (generate-sector sector 'physical)
-                          (loop (for i from -1 to 1)
-                                (loop (for j from -1 to 1)
-                                      (loop (for k from -1 to 1)
-                                            (let ((sector (index-sector (vector (+ sector-x i) (+ sector-y j) (+ sector-z k)))))
-                                              (set-content-uptodate?~ sector #f)
-                                              (generate-sector sector 'render)))))
-                          (mutex-unlock! generate-mutex)))))))))))))
+                          (proc sector block-id (local-data-ref i j k) i j k x y z uv rendering effective-block-ref effective-block-set!)))))))))))))
+  
+  
+  (method (update-sector pos <f64vector> proc)
+    (with-sector pos
+      (lambda (sector block-id data-id i j k x y z uv rendering effective-block-ref effective-block-set!)
+        (mutex-lock! generate-mutex)
+        (proc sector block-id data-id i j k x y z uv rendering effective-block-ref effective-block-set!)
+        (iterate-sector-areas sector
+                              (lambda (area)
+                                (clear-polygons~ area)))
+        (set-physical-uptodate?~ sector #f)
+        ;; no need to generate the physical explicitly
+        ;; (generate-sector sector 'physical)
+        (let ((sector-index (get-index~ sector)))
+          (let ((sector-x <fx> (vector-ref sector-index 0))
+                (sector-y <fx> (vector-ref sector-index 1))
+                (sector-z <fx> (vector-ref sector-index 2)))
+            (loop (for i from -1 to 1)
+                  (loop (for j from -1 to 1)
+                        (loop (for k from -1 to 1)
+                              (let ((sector (index-sector (vector (+ sector-x i) (+ sector-y j) (+ sector-z k)))))
+                                (set-content-uptodate?~ sector #f)
+                                (generate-sector sector 'render)))))))
+        (mutex-unlock! generate-mutex))))
   
   
   ;;;
@@ -3088,12 +3103,12 @@
           (let ((closest (ray-closest-polygon~ world (get-position~ camera) direction (get-view-radius~ world) ignore-non-physical?: #f ignore-entities?: #f ignore-players?: #t)))
             (when closest
               (let ((poly (car closest)))
-                (let ((block (vertex+ (get-center~ poly) (vertex-scalar*& (get-normal~ poly) (let ((kind (get-data2~ poly)))
-                                                                                               (cond ((= kind border-kind) -.5)
-                                                                                                     ((= kind inverted-kind) .5)
-                                                                                                     (else 0.)))))))
-                  (update-sector~ zone block
-                    (lambda (block-id <fx> data-id <fx> i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> uv rendering block-ref block-set!)
+                (let ((pos (vertex+ (get-center~ poly) (vertex-scalar*& (get-normal~ poly) (let ((kind (get-data2~ poly)))
+                                                                                             (cond ((= kind border-kind) -.5)
+                                                                                                   ((= kind inverted-kind) .5)
+                                                                                                   (else 0.)))))))
+                  (update-sector~ zone pos
+                    (lambda (sector block-id <fx> data-id <fx> i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> uv rendering block-ref block-set!)
                       (block-set! i j k 0)))
                   (reset-target~ world)))))))))
   
@@ -3103,19 +3118,25 @@
           (zone (current-zone))
           (camera (current-camera)))
       (let ((down-point (get-down-point~ world)))
-        (receive (position direction) (screen->ray~ camera (get-h~ down-point) (get-v~ down-point))
-          (let ((closest (ray-closest-polygon~ world (get-position~ camera) direction (get-view-radius~ world) ignore-non-physical?: #f ignore-entities?: #f ignore-players?: #t)))
-            (when closest
-              (let ((poly (car closest)))
-                (let ((pos (vertex+ (get-center~ poly) (vertex-scalar*& (get-normal~ poly) .5)))
-                      (id (let ((showcase (get-showcase~ world)))
-                            (if (is? showcase Blocks-Showcase)
-                                (let ((name (get-model~ (get-selection~ showcase))))
-                                  (get-id~ (name->block name)))
-                              1))))
-                  (update-sector~ zone pos
-                    (lambda (block-id <fx> data-id <fx> i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> uv rendering block-ref block-set!)
-                      (block-set! i j k id))))))))))))
+        (when down-point
+          (receive (position direction) (screen->ray~ camera (get-h~ down-point) (get-v~ down-point))
+            (let ((closest (ray-closest-polygon~ world (get-position~ camera) direction (get-view-radius~ world) ignore-non-physical?: #f ignore-entities?: #f ignore-players?: #t)))
+              (when closest
+                (let ((poly (car closest)))
+                  (let ((pos (vertex+ (get-center~ poly) (vertex-scalar*& (get-normal~ poly) .5)))
+                        (id (let ((showcase (get-showcase~ world)))
+                              (if (is? showcase Blocks-Showcase)
+                                  (let ((name (get-model~ (get-selection~ showcase))))
+                                    (get-id~ (name->block name)))
+                                1))))
+                    (with-sector~ zone pos
+                      (lambda (sector block-id <fx> data-id <fx> i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> uv rendering block-ref block-set!)
+                        (let ((block (blockid->block block-id)))
+                          (let ((right-mouse (get-right-mouse~ block)))
+                            (debug block-id block right-mouse)
+                            (if (not right-mouse)
+                                (block-set! i j k id)
+                              (right-mouse sector block-id data-id i j k x y z uv rendering block-ref block-set!))))))))))))))))
 
 
 ;;;
