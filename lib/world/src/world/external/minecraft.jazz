@@ -33,6 +33,7 @@
         (world.external.minecraft-syntax (phase syntax))
         (world.external.nbt)
         (world.face)
+        (world.foreign)
         (world.game)
         (world.generate)
         (world.geometry)
@@ -1642,22 +1643,22 @@
                   (add-face (right-face i j k left right bottom top back front uv generic-coordinates lighting rendering block-id border-kind) rendering)
                   (add-face (back-face i j k left right bottom top back front uv generic-coordinates lighting rendering block-id border-kind) rendering)
                   (add-face (front-face i j k left right bottom top back front uv generic-coordinates lighting rendering block-id border-kind) rendering)))
-              (if (= data-id 4)
-                  (let ((margin (/ 4. 16.))
-                        (eye-uv (get-name-coordinates "endframe_eye")))
-                    (let ((top (+ y block-radius))
-                          (bottom (+ y (/ 5. 16.)))
-                          (left (- x margin))
-                          (right (+ x margin))
-                          (back (- z margin))
-                          (front (+ z margin))
-                          (side-uv (uv-rect eye-uv margin 0. (- 1 margin) margin ))
-                          (top-uv (uv-rect eye-uv margin margin (- 1 margin) (- 1 margin))))
-                      (add-face (left-face i j k left right bottom top back front side-uv generic-coordinates lighting rendering block-id border-kind) rendering)
-                      (add-face (right-face i j k left right bottom top back front side-uv generic-coordinates lighting rendering block-id border-kind) rendering)
-                      (add-face (front-face i j k left right bottom top back front side-uv generic-coordinates lighting rendering block-id border-kind) rendering)
-                      (add-face (back-face i j k left right bottom top back front side-uv generic-coordinates lighting rendering block-id border-kind) rendering)
-                      (add-face (top-face i j k left right bottom top back front top-uv generic-coordinates lighting rendering block-id border-kind) rendering))))))
+              (when (= data-id 4)
+                (let ((margin (/ 4. 16.))
+                      (eye-uv (get-name-coordinates "endframe_eye")))
+                  (let ((top (+ y block-radius))
+                        (bottom (+ y (/ 5. 16.)))
+                        (left (- x margin))
+                        (right (+ x margin))
+                        (back (- z margin))
+                        (front (+ z margin))
+                        (side-uv (uv-rect eye-uv margin 0. (- 1 margin) margin ))
+                        (top-uv (uv-rect eye-uv margin margin (- 1 margin) (- 1 margin))))
+                    (add-face (left-face i j k left right bottom top back front side-uv generic-coordinates lighting rendering block-id border-kind) rendering)
+                    (add-face (right-face i j k left right bottom top back front side-uv generic-coordinates lighting rendering block-id border-kind) rendering)
+                    (add-face (front-face i j k left right bottom top back front side-uv generic-coordinates lighting rendering block-id border-kind) rendering)
+                    (add-face (back-face i j k left right bottom top back front side-uv generic-coordinates lighting rendering block-id border-kind) rendering)
+                    (add-face (top-face i j k left right bottom top back front top-uv generic-coordinates lighting rendering block-id border-kind) rendering))))))
 
 
 (define-minecraft-block EndStone
@@ -2802,26 +2803,91 @@
                           (proc sector block-id (local-data-ref i j k) i j k x y z uv rendering effective-block-ref effective-block-set!)))))))))))))
   
   
-  (method (with-sector-update sector <Sector> thunk)
+  (method (with-sector-update sector <Sector> thunk (neighbors?: neighbors? #f))
     (mutex-lock! generate-mutex)
     (thunk)
     (iterate-sector-areas sector
-                          (lambda (area)
-                            (clear-polygons~ area)))
+      (lambda (area)
+        (clear-polygons~ area)))
     (set-physical-uptodate?~ sector #f)
     ;; no need to generate the physical explicitly
     ;; (generate-sector sector 'physical)
-    (let ((sector-index (get-index~ sector)))
-      (let ((sector-x <fx> (vector-ref sector-index 0))
-            (sector-y <fx> (vector-ref sector-index 1))
-            (sector-z <fx> (vector-ref sector-index 2)))
-        (loop (for i from -1 to 1)
-              (loop (for j from -1 to 1)
-                    (loop (for k from -1 to 1)
-                          (let ((sector (index-sector (vector (+ sector-x i) (+ sector-y j) (+ sector-z k)))))
-                            (set-content-uptodate?~ sector #f)
-                            (generate-sector sector 'render)))))))
+    (if (not neighbors?)
+        (begin
+          (set-content-uptodate?~ sector #f)
+          (generate-sector sector 'render))
+      (let ((sector-index (get-index~ sector)))
+        (let ((sector-x <fx> (vector-ref sector-index 0))
+              (sector-y <fx> (vector-ref sector-index 1))
+              (sector-z <fx> (vector-ref sector-index 2)))
+          (loop (for i from -1 to 1)
+                (loop (for j from -1 to 1)
+                      (loop (for k from -1 to 1)
+                            (let ((sector (index-sector (vector (+ sector-x i) (+ sector-y j) (+ sector-z k)))))
+                              (set-content-uptodate?~ sector #f)
+                              (generate-sector sector 'render))))))))
     (mutex-unlock! generate-mutex))
+  
+  
+  ;;;
+  ;;;; Evaluate
+  ;;;
+  
+  
+  (method override (evaluate-hook forms syntax str container line col)
+    (let ((world (current-world))
+          (zone (current-zone)))
+      (let ((ids (collect (lambda (form)
+                            (when (and (pair? form) (eq? (car form) 'define-minecraft-block))
+                              (third form)))
+                          forms)))
+        (when (not-null? ids)
+          (let ((sectors '()))
+            (define (add-sector sector)
+              (unless (memq? sector sectors)
+                (set! sectors (cons sector sectors))))
+            
+            (finding-visual-blocks ids
+              add-sector)
+            (finding-physical-blocks ids
+              (lambda (area)
+                (add-sector (area-sector~ zone area))))
+            
+            (for-each (lambda (sector)
+                        (with-sector-update~ zone sector
+                          (lambda ()
+                            )))
+                      sectors))))))
+  
+  
+  (method (finding-visual-blocks ids proc)
+    (let ((zone (current-zone))
+          (count 0))
+      (iterate-sectors~ zone
+        (lambda (index sector)
+          (let ((sector-index (get-index~ sector)))
+            (let ((sector-x <fx> (vector-ref sector-index 0))
+                  (sector-y <fx> (vector-ref sector-index 1))
+                  (sector-z <fx> (vector-ref sector-index 2)))
+              (let ((region (sector-region sector-x sector-y sector-z)))
+                (let ((section (get-section~ region sector-x sector-y sector-z)))
+                  (when section
+                    (let ((blocks (get-blocks~ section)))
+                      (for-each (lambda (id)
+                                  (when (u8vector-find blocks (u8vector-length blocks) id)
+                                    (proc sector)))
+                                ids)))))))))))
+  
+  
+  (method (finding-physical-blocks ids proc)
+    (let ((zone (current-zone)))
+      (iterate-areas~ zone
+        (lambda (index area)
+          (iterate-polygons~ area
+            (lambda (elem polygons offset)
+              (let ((data1 (f64vector-ref polygons (+ offset 16))))
+                (when (and (/= data1 0.) (memq? (fxround data1) ids))
+                  (proc area)))))))))
   
   
   ;;;
@@ -3097,7 +3163,8 @@
             (lambda (sector block-id <fx> data-id <fx> i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> uv rendering block-ref block-set!)
               (with-sector-update~ zone sector
                 (lambda ()
-                  (block-set! i j k 0)))))
+                  (block-set! i j k 0))
+                neighbors?: #t)))
           (reset-target~ world)))))
   
   
