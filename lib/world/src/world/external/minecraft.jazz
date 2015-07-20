@@ -3081,7 +3081,7 @@
                           (bitwise-and byte #x0F)
                         (bitwise-and (arithmetic-shift-right byte 4) #x0F))))
                   
-                  (define (with-field i <fx> j <fx> k <fx> proc) <fx>
+                  (define (with-field i <fx> j <fx> k <fx> proc)
                     (define (bind-i a <fx> i <fx>)
                       (define (bind-j b <fx> j <fx>)
                         (define (bind-k c <fx> k <fx>)
@@ -3121,7 +3121,7 @@
                             (proc sector block-id data-id i j k x y z uv rendering with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!))))))))))))))
   
   
-  (method (with-sector-update sector <Sector> thunk (neighbors?: neighbors? #f))
+  (method (with-sector-update sector <Sector> thunk (sectors: sectors #f))
     (mutex-lock! generate-mutex)
     (thunk)
     (iterate-sector-areas sector
@@ -3130,20 +3130,10 @@
     (set-physical-uptodate?~ sector #f)
     ;; no need to generate the physical explicitly
     ;; (generate-sector sector 'physical)
-    (if (not neighbors?)
-        (begin
-          (set-content-uptodate?~ sector #f)
-          (generate-sector sector 'render))
-      (let ((sector-index (get-index~ sector)))
-        (let ((sector-x <fx> (vector-ref sector-index 0))
-              (sector-y <fx> (vector-ref sector-index 1))
-              (sector-z <fx> (vector-ref sector-index 2)))
-          (loop (for i from -1 to 1)
-                (loop (for j from -1 to 1)
-                      (loop (for k from -1 to 1)
-                            (let ((sector (index-sector (vector (+ sector-x i) (+ sector-y j) (+ sector-z k)))))
-                              (set-content-uptodate?~ sector #f)
-                              (generate-sector sector 'render))))))))
+    (for-each (lambda (sector)
+                (set-content-uptodate?~ sector #f)
+                (generate-sector sector 'render))
+              (or sectors (list sector)))
     (mutex-unlock! generate-mutex)))
 
 
@@ -3174,34 +3164,71 @@
     (let ((world (current-world))
           (camera (current-camera)))
       (let ((pos (get-down-point~ world)))
-        (receive (position direction) (screen->ray~ camera (get-h~ pos) (get-v~ pos))
-          (let ((closest (ray-closest-polygon~ world (get-position~ camera) direction (get-view-radius~ world) ignore-non-physical?: #f ignore-entities?: #f ignore-players?: #t)))
-            (when closest
-              (let ((poly (car closest)))
-                (let ((center (get-center~ poly))
-                      (normal (get-normal~ poly)))
-                  (let ((block (vertex+ center (vertex-scalar*& normal (let ((kind (get-data2~ poly)))
-                                                                         (cond ((= kind border-kind) -.5)
-                                                                               ((= kind inverted-kind) .5)
-                                                                               (else 0.))))))
-                        (fore (vertex+ center (vertex-scalar*& normal .5))))
-                    (proc block fore))))))))))
+        (when pos
+          (receive (position direction) (screen->ray~ camera (get-h~ pos) (get-v~ pos))
+            (let ((closest (ray-closest-polygon~ world (get-position~ camera) direction (get-view-radius~ world) ignore-non-physical?: #f ignore-entities?: #f ignore-players?: #t)))
+              (when closest
+                (let ((poly (car closest)))
+                  (let ((center (get-center~ poly))
+                        (normal (get-normal~ poly)))
+                    (let ((block (vertex+ center (vertex-scalar*& normal (let ((kind (get-data2~ poly)))
+                                                                           (cond ((= kind border-kind) -.5)
+                                                                                 ((= kind inverted-kind) .5)
+                                                                                 (else 0.))))))
+                          (fore (vertex+ center (vertex-scalar*& normal .5))))
+                      (proc block fore)))))))))))
   
   
-  (method override (mouse-up h v)
+  (method (delete-block block)
     (let ((world (current-world))
           (zone (current-zone)))
+      (call-with-sector~ zone block
+        (lambda (sector block-id <fx> data-id <fx> i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> uv rendering with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!)
+          (define (find-sectors-update)
+            (let ((sectors (list sector)))
+              (define (test-sector i j k)
+                (with-field i j k
+                  (lambda (section index)
+                    (let ((sector (get-sector~ section)))
+                      (unless (memq? sector sectors)
+                        (set! sectors (cons sector sectors)))))))
+              
+              (test-sector (- i 1) j k)
+              (test-sector (+ i 1) j k)
+              (test-sector i (- j 1) k)
+              (test-sector i (+ j 1) k)
+              (test-sector i j (- k 1))
+              (test-sector i j (+ k 1))
+              sectors))
+          
+          (let ((sectors (find-sectors-update)))
+            (with-sector-update~ zone sector
+              (lambda ()
+                (with-field i j k
+                  (lambda (section index)
+                    (block-set! section index 0))))
+              sectors: sectors)
+            (display-message~ world (format "Updated {a} sector{a}" (length sectors) (format-plural (length sectors)))))))
+      (reset-target~ world)))
+  
+  
+  (method (add-block block id)
+    (let ((zone (current-zone)))
       (with-interaction
         (lambda (block fore)
-          (call-with-sector~ zone block
+          (call-with-sector~ zone fore
             (lambda (sector block-id <fx> data-id <fx> i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> uv rendering with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!)
               (with-sector-update~ zone sector
                 (lambda ()
                   (with-field i j k
                     (lambda (section index)
-                      (block-set! section index 0))))
-                neighbors?: #t)))
-          (reset-target~ world)))))
+                      (block-set! section index id)))))))))))
+  
+  
+  (method override (mouse-up h v)
+    (with-interaction
+      (lambda (block fore)
+        (delete-block block))))
   
   
   (method override (right-mouse-up h v)
@@ -3219,13 +3246,7 @@
                                       (let ((name (get-model~ (get-selection~ showcase))))
                                         (get-id~ (name->block name)))
                                     1))))
-                        (call-with-sector~ zone fore
-                          (lambda (sector block-id <fx> data-id <fx> i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> uv rendering with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!)
-                            (with-sector-update~ zone sector
-                              (lambda ()
-                                (with-field i j k
-                                  (lambda (section index)
-                                    (block-set! section index id))))))))
+                        (add-block fore id))
                     (right-mouse sector block-id data-id i j k x y z uv rendering with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!)))))))))))
 
 
