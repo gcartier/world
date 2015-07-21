@@ -52,6 +52,7 @@
         (world.quad-texture)
         (world.region)
         (world.renderers)
+        (world.role)
         (world.section)
         (world.sector)
         (world.settings)
@@ -2720,27 +2721,18 @@
   
   
   (method override (evaluate-hook forms syntax str container line col)
-    (let ((world (current-world))
-          (zone (current-zone)))
-      (let ((ids (collect (lambda (form)
-                            (when (and (pair? form) (eq? (car form) 'define-minecraft-block))
-                              (third form)))
-                          forms)))
-        (when (not-null? ids)
-          (let ((sectors '()))
-            (define (add-sector sector)
-              (unless (memq? sector sectors)
-                (set! sectors (cons sector sectors))))
-            
+    (let ((ids (collect (lambda (form)
+                          (when (and (pair? form) (eq? (car form) 'define-minecraft-block))
+                            (third form)))
+                        forms)))
+      (when (not-null? ids)
+        (updating-sectors
+          (lambda (add-sector)
             (finding-visual-blocks ids
               add-sector)
             (finding-physical-blocks ids
               (lambda (area)
-                (add-sector (area-sector~ zone area))))
-            
-            (updating-sectors~ zone sectors
-              (lambda ()
-                )))))))
+                (add-sector (area-sector area)))))))))
   
   
   (method (finding-visual-blocks ids proc)
@@ -3095,16 +3087,16 @@
                                 (proc #f (and bottom-section? (= b -1)))
                               (proc section (local-index i j k)))))
                         
-                        (cond ((< k 0) (bind-k -1 15))
-                              ((> k 15) (bind-k 1 0))
+                        (cond ((< k 0) (bind-k -1 (+ 16 k)))
+                              ((> k 15) (bind-k 1 (- 16 k)))
                               (else (bind-k 0 k))))
                       
-                      (cond ((< j 0) (bind-j -1 15))
-                            ((> j 15) (bind-j 1 0))
+                      (cond ((< j 0) (bind-j -1 (+ 16 j)))
+                            ((> j 15) (bind-j 1 (- 16 j)))
                             (else (bind-j 0 j))))
                     
-                    (cond ((< i 0) (bind-i -1 15))
-                          ((> i 15) (bind-i 1 0))
+                    (cond ((< i 0) (bind-i -1 (+ 16 i)))
+                          ((> i 15) (bind-i 1 (- 16 i)))
                           (else (bind-i 0 i))))
                   
                   (let ((i (- x (* sector-x 16)))
@@ -3126,23 +3118,32 @@
                             (proc sector block-id data-id i j k x y z uv rendering with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!))))))))))))))
   
   
-  (method (updating-sectors sectors thunk)
-    (let ((world (current-world)))
-      (mutex-lock! generate-mutex)
-      (thunk)
-      (for-each (lambda (sector)
-                  (iterate-sector-areas sector
-                                        (lambda (area)
-                                          (clear-polygons~ area)))
-                  (set-physical-uptodate?~ sector #f)
-                  ;; no need to generate the physical explicitly
-                  ;; (generate-sector sector 'physical)
-                  (set-content-uptodate?~ sector #f)
-                  (generate-sector sector 'render))
-                sectors)
-      (mutex-unlock! generate-mutex)
-      (let ((count (length sectors)))
-        (display-message~ world (format "Updated {a} sector{a}" count (format-plural count)))))))
+  (method (updating-sectors proc)
+    (define (update-sectors sectors)
+      (let ((world (current-world)))
+        (for-each (lambda (sector)
+                    (iterate-sector-areas sector
+                                          (lambda (area)
+                                            (clear-polygons~ area)))
+                    (set-physical-uptodate?~ sector #f)
+                    ;; no need to generate the physical explicitly
+                    ;; (generate-sector sector 'physical)
+                    (set-content-uptodate?~ sector #f)
+                    (generate-sector sector 'render))
+                  sectors)
+        (when (programmer-role?)
+          (let ((count (length sectors)))
+            (display-message~ world (format "Updated {a} sector{a}" count (format-plural count)))))))
+    
+    (mutex-lock! generate-mutex)
+    (let ((sectors '()))
+      (define (add-sector sector)
+        (unless (memq? sector sectors)
+          (set! sectors (cons sector sectors))))
+      
+      (proc add-sector)
+      (update-sectors sectors)
+      (mutex-unlock! generate-mutex))))
 
 
 ;;;
@@ -3187,37 +3188,38 @@
                       (proc block fore)))))))))))
   
   
+  
+  
+  
+  ;; can be improved by testing for opaque blocks in all directions
+  ;; and then testing that every block in all directions is opaque
   (method (delete-block block)
     (let ((world (current-world))
           (zone (current-zone)))
       (call-with-sector~ zone block
         (lambda (sector block-id <fx> data-id <fx> i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> uv rendering with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!)
-          (define (find-sectors-update)
-            (let ((sectors (list sector)))
-              (define (test-sector i j k)
-                (with-field i j k
-                  (lambda (section index)
-                    (when section
-                      (let ((sector (get-sector~ section)))
-                        (unless (memq? sector sectors)
-                          (set! sectors (cons sector sectors))))))))
-              
-              (test-sector (- i 1) j k)
-              (test-sector (+ i 1) j k)
-              (test-sector i (- j 1) k)
-              (test-sector i (+ j 1) k)
-              (test-sector i j (- k 1))
-              (test-sector i j (+ k 1))
-              sectors))
+          (define (add-sectors add-sector)
+            (define (test-sector i j k)
+              (with-field i j k
+                (lambda (section index)
+                  (when section
+                    (add-sector (get-sector~ section))))))
+            
+            (test-sector (- i 1) j k)
+            (test-sector (+ i 1) j k)
+            (test-sector i (- j 1) k)
+            (test-sector i (+ j 1) k)
+            (test-sector i j (- k 1))
+            (test-sector i j (+ k 1)))
           
-          (let ((sectors (find-sectors-update)))
-            (updating-sectors~ zone sectors
-              (lambda ()
-                (with-field i j k
-                  (lambda (section index)
-                    (block-set! section index 0)
-                    ;; quick hack until light propagation
-                    (blocklight-set! section index 15))))))))
+          (updating-sectors~ zone
+            (lambda (add-sector)
+              (add-sectors add-sector)
+              (with-field i j k
+                (lambda (section index)
+                  (block-set! section index 0)
+                  ;; quick hack until light propagation
+                  (blocklight-set! section index 15)))))))
       (reset-target~ world)))
   
   
