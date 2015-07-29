@@ -16,17 +16,12 @@
 
 (import (jazz.debuggee)
         (jazz.evaluate)
+        (jazz.io)
         (jazz.system)
         (world)
         (world.autoload)
         (world.settings)
         (world.syntax (phase syntax)))
-
-
-;; Not settings to be active as soon as possible in the boot
-
-(definition worker-debug?
-  #f)
 
 
 ;;;
@@ -106,42 +101,46 @@
     (set! worker-port #f)))
 
 
-(definition protected (worker-work command . arguments)
-  (let ((port (get-worker-port)))
-    (write (cons command (cons (world-setting 'world.worker-debug? #f) arguments)) port)
-    (force-output port)))
-
-
 ;;;
 ;;;; Hooks
 ;;;
 
 
-(definition (interpreted-hook unit-name)
+(definition (worker-mode)
+  (effective-evaluation-mode (world-setting 'world.worker-mode 'interpret)))
+
+
+(definition (worker-cache)
+  (parse~ {Directory Settings "work" "cache"}))
+
+
+(definition (unit-hook unit-name)
   (when (world-setting 'world.worker? #t)
     (when (world-setting 'world.worker-verbose? #f)
-      (debug 'expand-unit unit-name))
-    (worker-work 'expand-unit unit-name)
-    (eval-worker-result 'unit)
+      (debug 'unit unit-name))
+    (let ((mode (worker-mode)))
+      (worker-work 'unit mode unit-name)
+      (worker-result 'unit mode))
     #t))
 
 
 (definition (script-hook path)
   (when (world-setting 'world.worker? #t)
     (when (world-setting 'world.worker-verbose? #f)
-      (debug 'expand-script path))
-    (worker-work 'expand-script path)
-    (eval-worker-result 'script)
+      (debug 'script (extract-base (extract-name path))))
+    (let ((mode (worker-mode)))
+      (worker-work 'script mode path)
+      (worker-result 'script mode))
     #t))
 
 
 (definition (evaluate-hook forms syntax str container line col evaluation-mode)
   (when (world-setting 'world.worker? #t)
-    (let ((evaluation-mode (effective-evaluation-mode (or evaluation-mode (find-setting 'world.evaluation-mode 'interpret)))))
-      (when (world-setting 'world.worker-verbose? #f)
-        (debug 'expand-evaluate))
-      (worker-work 'expand-evaluate syntax str container line col evaluation-mode)
-      (when (eval-worker-result 'evaluate evaluation-mode: evaluation-mode)
+    (when (world-setting 'world.worker-verbose? #f)
+      (debug 'evaluate))
+    (let ((mode (worker-mode)))
+      (worker-work 'evaluate mode syntax str container line col evaluation-mode)
+      (when (worker-result 'evaluate mode)
         (hook-evaluate forms syntax str container line col)))
     #t))
 
@@ -150,29 +149,37 @@
   (if (not (world-setting 'world.worker? #t))
       (values #f #f)
     (when (world-setting 'world.worker-verbose? #f)
-      (debug 'expand-console expr))
-    (worker-work 'expand-console unit-name expr)
-    (values (eval-worker-result 'console evaluator: evaluator) #t)))
+      (debug 'console))
+    (let ((mode 'interpret))
+      (worker-work 'console mode unit-name expr)
+      (values (worker-result 'console mode evaluator: evaluator) #t))))
 
 
-(definition (eval-worker-result kind (evaluation-mode: evaluation-mode #f) (evaluator: evaluator #f))
+(definition (worker-work command mode . arguments)
+  (let ((port (get-worker-port))
+        (cache (parse~ {Directory Settings "work" "cache"}))
+        (debug? (world-setting 'world.worker-debug? #f)))
+    (write `(,command ,mode ,cache ,debug? ,@arguments) port)
+    (force-output port)))
+
+
+(definition (worker-result kind mode (evaluator: evaluator #f))
   (let ((info (read-binary-content (get-worker-port) unmarshall)))
     (unless (eof-object? info)
       (bind (what expr exception) info
         (when (world-setting 'world.worker-verbose-result? #f)
           (debug 'result what))
         (case what
-          ((result)
+          ((eval)
            (parameterize ((generate-symbol-for "%")
                           (generate-symbol-context (gensym))
                           (generate-symbol-counter 0))
-             (cond ((eq? evaluation-mode 'compile)
-                    (load-file expr))
-                   (evaluator
-                     (evaluator expr))
-                   (else
-                    (eval expr)
-                    #t))))
+             (if evaluator
+                 (evaluator expr)
+               (eval expr)
+               #t)))
+          ((load)
+           (load-file expr))
           ((walk)
            ;quicky
            (error expr)
@@ -188,7 +195,7 @@
 
 
 (set-load-interpreted-hook
-  interpreted-hook)
+  unit-hook)
 
 (set-load-script-hook
   script-hook)

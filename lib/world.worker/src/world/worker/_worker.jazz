@@ -14,6 +14,8 @@
 (module world.worker jazz
 
 
+(require (dialect.development))
+
 (import (jazz.evaluate)
         (jazz.io))
 
@@ -23,62 +25,86 @@
   (let ((port (open-tcp-client (string->number (command-argument "port")))))
     (let iter ()
          (let ((form (read port)))
-           (define (write-expand-unit unit-name)
-             (write-result (expand-unit unit-name)))
-           
-           (define (write-expand-script path)
-             (write-result (expand-script path)))
-           
-           (define (write-expand-evaluate syntax str container line col evaluation-mode)
-             (write-result (evaluate-forms syntax str container line col evaluation-mode expand?: #t)))
-           
-           (define (write-expand-console unit-name expr)
-             (let ((module-declaration (outline-unit unit-name)))
-               (let ((form `(module ,unit-name ,(get-dialect-name~ module-declaration) ,expr)))
-                 (load-unit 'dialect.development)
-                 (write-result (expand-form form unit-name: unit-name walk-for: 'eval)))))
-           
-           (define (write-result result)
-             (write-binary-content port (list 'result result #f) marshall))
-           
-           (define (with-walk-problems debug? thunk)
-             (define (catch-walk)
-               (catch (Walk-Problems exc
-                        (write-binary-content port (list 'walk (exception-reason exc) (exception-detail exc)) marshall))
-                 (thunk)))
-             
-             (if debug?
-                 (catch-walk)
-               (with-exception-catcher
-                 (lambda (exc)
-                   (write-binary-content port (list 'error (exception-reason exc) #f) marshall))
-                 catch-walk)))
-           
            (if (or (eof-object? form)
                    (null? form))
                (begin
                  (close-port port)
                  (exit))
-             (let ((command (car form))
-                   (debug? (cadr form))
-                   (arguments (cddr form)))
+             (bind (command mode cache debug? . arguments) form
+               (define (process-unit unit-name)
+                 (case mode
+                   ((interpret)
+                    (write-result 'eval (expand-unit unit-name)))
+                   ((compile)
+                    (expanding-unit unit-name
+                      (lambda ()
+                        (let ((resource (requested-unit-resource)))
+                          (with-resource-reader resource
+                            (lambda ()
+                              (let ((path (resource-pathname resource)))
+                                (let ((object-path (compile-file path options: compile-options output: cache)))
+                                  (write-result 'load object-path)))))))))))
+               
+               (define (process-script path)
+                 (case mode
+                   ((interpret)
+                    (write-result 'eval (expand-script path)))
+                   ((compile)
+                    (expanding-script path
+                      (lambda ()
+                        (with-extension-reader (extract-extension (extract-name path))
+                          (lambda ()
+                            (let ((object-path (compile-file path options: compile-options output: cache)))
+                              (write-result 'load object-path)))))))))
+               
+               (define (process-evaluate syntax str container line col evaluation-mode)
+                 (case mode
+                   ((interpret)
+                    (write-result 'eval (evaluate-forms syntax str container line col 'interpret evaluate?: #f)))
+                   ((compile)
+                    (let ((cache-dir (new Directory (tokenise-filename cache))))
+                      (let ((file (new-file~ cache-dir "evaluate.jazz")))
+                        (write-result 'load (evaluate-forms syntax str container line col 'compile file: file evaluate?: #f)))))))
+               
+               (define (process-console unit-name expr)
+                 (let ((module-declaration (outline-unit unit-name)))
+                   (let ((form `(module ,unit-name ,(get-dialect-name~ module-declaration) ,expr)))
+                     (load-unit 'dialect.development)
+                     (write-result 'eval (expand-form form unit-name: unit-name walk-for: 'eval)))))
+               
+               (define (write-result what result)
+                 (write-binary-content port (list what result #f) marshall))
+               
+               (define (with-walk-problems thunk)
+                 (define (catch-walk)
+                   (catch (Walk-Problems exc
+                            (write-binary-content port (list 'walk (exception-reason exc) (exception-detail exc)) marshall))
+                     (thunk)))
+                 
+                 (if debug?
+                     (catch-walk)
+                   (with-exception-catcher
+                     (lambda (exc)
+                       (write-binary-content port (list 'error (exception-reason exc) #f) marshall))
+                     catch-walk)))
+               
                (case command
-                 ((expand-unit)
-                  (with-walk-problems debug?
+                 ((unit)
+                  (with-walk-problems
                     (lambda ()
-                      (apply write-expand-unit arguments))))
-                 ((expand-script)
-                  (with-walk-problems debug?
+                      (apply process-unit arguments))))
+                 ((script)
+                  (with-walk-problems
                     (lambda ()
-                      (apply write-expand-script arguments))))
-                 ((expand-evaluate)
-                  (with-walk-problems debug?
+                      (apply process-script arguments))))
+                 ((evaluate)
+                  (with-walk-problems
                     (lambda ()
-                      (apply write-expand-evaluate arguments))))
-                 ((expand-console)
-                  (with-walk-problems debug?
+                      (apply process-evaluate arguments))))
+                 ((console)
+                  (with-walk-problems
                     (lambda ()
-                      (apply write-expand-console arguments))))
+                      (apply process-console arguments))))
                  (else
                   (error "Unknown worker command" command)))
                (iter))))))))
