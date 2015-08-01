@@ -238,7 +238,6 @@
   (slot base-assets            <object>          initialize #f              getter generate)
   (slot world-assets           <object>          initialize #f              getter generate)
   (slot user-assets            <object>          initialize #f              getter generate)
-  (slot all-assets             <object>          initialize #f              getter generate)
   (slot textures               <object>          initialize #f              getter generate)
   (slot models                 <object>          initialize #f              getter generate)
   (slot newable?               <bool>            initialize #f              accessors generate)
@@ -457,8 +456,13 @@
     (let ((world-directory (get-world-directory)))
       (set! base-assets (gather-assets (new Directory (cons (world-alias) '("lib" "world.client" "assets")))))
       (set! world-assets (gather-assets (and world-directory (new-directory~ world-directory "assets"))))
-      (set! user-assets (gather-assets (and (user-assets?) {Directory Settings "assets"})))
-      (set! all-assets (remove-false (append user-assets world-assets base-assets)))))
+      (set! user-assets (gather-assets (and (user-assets?) {Directory Settings "assets"})))))
+  
+  
+  (method (iterate-assets proc)
+    (for-each proc user-assets)
+    (for-each proc world-assets)
+    (for-each proc base-assets))
   
   
   (method (prepare-modules)
@@ -472,15 +476,15 @@
                   (continuation-return return repository)))))
           #f)))
     
-    (for-each (lambda (assets)
-                (let ((module-dir (new-directory~ assets "module")))
-                  (when (exists?~ module-dir)
-                    (let ((module-dirname (parse~ module-dir)))
-                      (unless (find-module module-dirname)
-                        (let ((repo (install-repository module-dirname)))
-                          (let ((name (repository-name repo)))
-                            (table-set! installed-modules name (cons module-dirname repo)))))))))
-              all-assets)
+    (iterate-assets
+      (lambda (assets)
+        (let ((module-dir (new-directory~ assets "module")))
+          (when (exists?~ module-dir)
+            (let ((module-dirname (parse~ module-dir)))
+              (unless (find-module module-dirname)
+                (let ((repo (install-repository module-dirname)))
+                  (let ((name (repository-name repo)))
+                    (table-set! installed-modules name (cons module-dirname repo))))))))))
     (set-world-repositories
       (map repository-directory (map cdr (table-values installed-modules)))))
   
@@ -497,9 +501,9 @@
   
   (method (make-block-atlas (min-filter: min-filter #f) (mag-filter: mag-filter #f) (adder: adder #f))
     (let ((atlas (new Atlas min-filter: min-filter mag-filter: mag-filter)))
-      (for-each (lambda (assets)
-                  (add-directory-if-exists~ atlas (new-directory~ assets "tile")))
-                all-assets)
+      (iterate-assets
+        (lambda (assets)
+          (add-directory-if-exists~ atlas (new-directory~ assets "tile"))))
       (when adder
         (adder atlas))
       (complete~ atlas)
@@ -3257,12 +3261,12 @@
     
     (when (not textures)
       (let ((table (make-table test: equal?)))
-        (for-each (lambda (assets)
-                    (add-files (new-directory~ assets "texture") table))
-                  all-assets)
-        (for-each (lambda (assets)
-                    (add-files (new-directory~ assets "tile") table))
-                  all-assets)
+        (iterate-assets
+          (lambda (assets)
+            (add-files (new-directory~ assets "texture") table)))
+        (iterate-assets
+          (lambda (assets)
+            (add-files (new-directory~ assets "tile") table)))
         (set! textures table)))
     textures)
   
@@ -3419,31 +3423,24 @@
   
   (method (collect-models)
     (let ((models '()))
-      (define (scan-assets)
-        (let (iter (scan all-assets))
-          (when (not-null? scan)
-            (let ((assets (car scan)))
-              (scan-directory (new-directory~ assets "model"))
-              (iter (cdr scan))))))
-      
-      (define (scan-directory models-dir)
-        (when (exists?~ models-dir)
-          (iterate-directory~ models-dir
-            (lambda (path kind)
-              (let ((dir (new-directory~ models-dir path)))
-                (let ((dirname (get-name~ dir)))
-                  (when (or (exists?~ (new-file~ dir (make-filename dirname "fbx")))
-                            (exists?~ (new-file~ dir (make-filename dirname "w3ds")))
-                            (exists?~ (new-file~ dir (make-filename dirname "ms3d")))
-                            (exists?~ (new-file~ dir (make-filename dirname "obj"))))
-                    (let ((path (join path "/")))
-                      (set! models (cons path models)))))))
-            full?: #f
-            files?: #f
-            directories?: #t
-            recursive?: #t)))
-      
-      (scan-assets)
+      (iterate-assets
+        (lambda (assets)
+          (let ((models-dir (new-directory~ assets "model")))
+            (when (exists?~ models-dir)
+              (iterate-directory~ models-dir
+                (lambda (path kind)
+                  (let ((dir (new-directory~ models-dir path)))
+                    (let ((dirname (get-name~ dir)))
+                      (when (or (exists?~ (new-file~ dir (make-filename dirname "fbx")))
+                                (exists?~ (new-file~ dir (make-filename dirname "w3ds")))
+                                (exists?~ (new-file~ dir (make-filename dirname "ms3d")))
+                                (exists?~ (new-file~ dir (make-filename dirname "obj"))))
+                        (let ((path (join path "/")))
+                          (set! models (cons path models)))))))
+                full?: #f
+                files?: #f
+                directories?: #t
+                recursive?: #t)))))
       (sort di<? models)))
   
   
@@ -3474,12 +3471,14 @@
   
   (method public (find-model path (error?: error? #t))
     (define (search-assets existing-time)
-      (let (iter (scan all-assets))
-        (if (null? scan)
-            (values #f #f)
-          (let ((assets (car scan)))
-            (or (search-in (new-directory~ assets "model") existing-time)
-                (iter (cdr scan)))))))
+      (continuation-capture
+        (lambda (return)
+          (iterate-assets
+            (lambda (assets)
+              (let ((info (search-in (new-directory~ assets "model") existing-time)))
+                (when info
+                  (continuation-return return info)))))
+          (values #f #f))))
     
     (define (search-in models-dir existing-time)
       (when (exists?~ models-dir)
@@ -3563,25 +3562,18 @@
   
   (method (collect-scripts)
     (let ((scripts '()))
-      (define (scan-assets)
-        (let (iter (scan all-assets))
-          (when (not-null? scan)
-            (let ((assets (car scan)))
-              (scan-directory (new-directory~ assets "script"))
-              (iter (cdr scan))))))
-      
-      (define (scan-directory scripts-dir)
-        (when (exists?~ scripts-dir)
-          (iterate-directory~ scripts-dir
-            (lambda (path kind)
-              (unless (member? (last path) '(".DS_Store" "README") test: filename=?)
-                (set! scripts (cons (cons scripts-dir path) scripts))))
-            full?: #f
-            files?: #t
-            directories?: #f
-            recursive?: #t)))
-      
-      (scan-assets)
+      (iterate-assets
+        (lambda (assets)
+          (let ((scripts-dir (new-directory~ assets "script")))
+            (when (exists?~ scripts-dir)
+              (iterate-directory~ scripts-dir
+                (lambda (path kind)
+                  (unless (member? (last path) '(".DS_Store" "README") test: filename=?)
+                    (set! scripts (cons (cons scripts-dir path) scripts))))
+                full?: #f
+                files?: #t
+                directories?: #f
+                recursive?: #t)))))
       (sort di<? scripts key: cdr)))
   
   
@@ -4402,11 +4394,11 @@
     (when path
       (continuation-capture
         (lambda (return)
-          (for-each (lambda (assets)
-                      (let ((wav (new-file~ assets (make-filename path "wav"))))
-                        (when (exists?~ wav)
-                          (continuation-return return wav))))
-                    all-assets)
+          (iterate-assets
+            (lambda (assets)
+              (let ((wav (new-file~ assets (make-filename path "wav"))))
+                (when (exists?~ wav)
+                  (continuation-return return wav)))))
           #f))))
   
   
