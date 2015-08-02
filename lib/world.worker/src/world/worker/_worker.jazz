@@ -18,6 +18,7 @@
 
 (import (jazz.evaluate)
         (jazz.io)
+        (jazz.library)
         (jazz.system))
 
 
@@ -58,11 +59,43 @@
     (empty-directory~ worker-evaluation-dir)))
 
 
-(definition (lookup-compilation-cache kind path)
-  #f
-  ;(write-result 'load object-path)
-  ;#t
-  )
+(definition (load-digests output-dir base)
+  (let ((dgs (new-file~ output-dir (add-extension base "dgs")))
+        (digests (make-table test: eq?)))
+    (when (exists?~ dgs)
+      (call-with-input-file (path-settings dgs)
+        (lambda (port)
+          (let ((form (read port)))
+            (assert (and (pair? form) (eq? (car form) 'digests))
+              (for-each (lambda (info)
+                          (bind (kind hash time) info
+                            (table-set! digests kind (new File-Digest hash time))))
+                        (cdr form)))))))
+    digests))
+
+
+(definition (lookup/update-digests digests kind src)
+  (let ((old-digest (table-ref digests kind #f)))
+    (let ((new-digest (file-digest (new File src) old-digest)))
+      (table-set! digests kind new-digest)
+      (eq? new-digest old-digest))))
+
+
+(definition (save-digests digests output-dir base)
+  (let ((dgs (new-file~ output-dir (add-extension base "dgs"))))
+    (call-with-output-file (path-settings dgs)
+      (lambda (port)
+        (display "(digests" port)
+        (newline port)
+        (iterate-table digests
+          (lambda (kind digest)
+            (let ((hash (get-hash~ digest))
+                  (time (get-time~ digest)))
+              (newline port)
+              (display "  " port)
+              (write (list kind hash time) port))))
+        (display ")" port)
+        (newline port)))))
 
 
 (definition (process-work port feedback hide)
@@ -85,39 +118,34 @@
                     ((interpret)
                      (write-result 'eval (expand-unit unit-name)))
                     ((compile)
-                     (let ((output-dir (new-directory~ worker-cache-dir (cons "unit" (map symbol->string (butlast (split-identifier unit-name)))))))
-                       (create-directories~ output-dir)
-                       (let ((resource (find-unit-src unit-name #f)))
-                         (let ((path (resource-pathname resource)))
-                           (unless (lookup-compilation-cache 'unit path)
-                             (when feedback?
-                               (feedback (format "Compiling {a}..." unit-name)))
-                             (expanding-unit unit-name
-                               (lambda ()
-                                 (with-resource-reader resource
-                                   (lambda ()
-                                     (let ((object-path (compile-file path options: compile-options output: (parse~ output-dir))))
-                                       (write-result 'load object-path)))))))))))))
-                
-                (define (process-script path name)
-                  ;; a name is needed to cache the compilation
-                  (let ((effective-mode (if (not name) 'interpret mode)))
-                    (case effective-mode
-                      ((interpret)
-                       (write-result 'eval (expand-script path)))
-                      ((compile)
-                       (let ((output-dir (new-directory~ worker-cache-dir (cons "script" (butlast name)))))
+                     (let ((splitted (split-identifier unit-name)))
+                       (let ((output-dir (new-directory~ worker-cache-dir (cons "unit" (map symbol->string (butlast splitted)))))
+                             (base (symbol->string (last splitted))))
                          (create-directories~ output-dir)
-                         (unless (lookup-compilation-cache 'script name)
-                           (let ((name (join name "/")))
-                             (when feedback?
-                               (feedback (format "Compiling {a}..." (extract-base (join name "/")))))
-                             (expanding-script path
-                               (lambda ()
-                                 (with-extension-reader (extract-extension name)
-                                   (lambda ()
-                                     (let ((object-path (compile-file path options: compile-options output: (parse~ output-dir))))
-                                       (write-result 'load object-path)))))))))))))
+                         (let ((resource (find-unit-src unit-name #f)))
+                           (let ((path (resource-pathname resource)))
+                             (define (compile-unit)
+                               (when feedback?
+                                 (feedback (format "Compiling {a}..." unit-name)))
+                               (expanding-unit unit-name
+                                 (lambda ()
+                                   (with-resource-reader resource
+                                     (lambda ()
+                                       (compile-file path options: compile-options output: (parse~ output-dir)))))))
+                             
+                             (let ((digests (load-digests output-dir base)))
+                               (if (lookup/update-digests digests 'compile path)
+                                   (write-result 'load (parse~ (new-file~ output-dir base)))
+                                 (let ((object-path (compile-unit)))
+                                   (save-digests digests output-dir base)
+                                   (write-result 'load object-path)))))))))))
+                
+                ;; because gambit doesn't support loading the same object file twice, it would be
+                ;; very tricky to cache script compilation as scripts are meant to be ran over and over.
+                ;; in fact this is probably a good thing giving the user the freedom to choose between
+                ;; scripts that stay interpreted and load fast, and modules that get cache compiled
+                (define (process-script path)
+                  (write-result 'eval (expand-script path)))
                 
                 (define (process-evaluate syntax str container line col evaluation-mode)
                   (case mode
