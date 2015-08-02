@@ -29,98 +29,114 @@
       'worker)))
 
 
+(definition worker-cache
+  #f)
+
+(definition worker-debug?
+  #f)
+
+
+(definition (setup-worker cache debug?)
+  (set! worker-cache cache)
+  (set! worker-debug? debug?))
+
+
 (definition (process-work port feedback hide)
   (declare (proper-tail-calls))
   (let ((port (open-tcp-client (string->number port))))
-    (let iter ()
-         (let ((form (read-binary port)))
-           (if (or (eof-object? form)
-                   (null? form))
-               (begin
-                 (close-port port)
-                 (exit))
-             (bind (command mode cache debug? feedback? . arguments) form
-               (define (process-unit unit-name)
-                 (case mode
-                   ((interpret)
-                    (write-result 'eval (expand-unit unit-name)))
-                   ((compile)
-                    (when feedback?
-                      (feedback (format "Compiling {a}..." unit-name)))
-                    (expanding-unit unit-name
+    (let (iter)
+      (let ((form (read-binary port)))
+        (if (or (eof-object? form)
+                (null? form))
+            (begin
+              (close-port port)
+              (exit))
+          (bind (command . rest) form
+            (if (eq? command 'setup)
+                (bind (cache debug?) rest
+                  (setup-worker cache debug?))
+              (bind (command mode feedback? . arguments) form
+                (define (process-unit unit-name)
+                  (case mode
+                    ((interpret)
+                     (write-result 'eval (expand-unit unit-name)))
+                    ((compile)
+                     (when feedback?
+                       (feedback (format "Compiling {a}..." unit-name)))
+                     (expanding-unit unit-name
+                       (lambda ()
+                         (let ((resource (requested-unit-resource)))
+                           (with-resource-reader resource
+                             (lambda ()
+                               (let ((path (resource-pathname resource)))
+                                 (let ((object-path (compile-file path options: compile-options output: worker-cache)))
+                                   (write-result 'load object-path)))))))))))
+                
+                (define (process-script path)
+                  (case mode
+                    ((interpret)
+                     (write-result 'eval (expand-script path)))
+                    ((compile)
+                     (let ((name (extract-name path)))
+                       (when feedback?
+                         (feedback (format "Compiling {a}..." (extract-base name))))
+                       (expanding-script path
+                         (lambda ()
+                           (with-extension-reader (extract-extension name)
+                             (lambda ()
+                               (let ((object-path (compile-file path options: compile-options output: worker-cache)))
+                                 (write-result 'load object-path))))))))))
+                
+                (define (process-evaluate syntax str container line col evaluation-mode)
+                  (case mode
+                    ((interpret)
+                     (write-result 'eval (evaluate-forms syntax str container line col 'interpret evaluate?: #f)))
+                    ((compile)
+                     (when feedback?
+                       (feedback "Compiling evaluation..."))
+                     (let ((cache-dir (new Directory (tokenise-filename worker-cache))))
+                       (let ((file (new-file~ cache-dir "evaluate.jazz")))
+                         (write-result 'load (evaluate-forms syntax str container line col 'compile file: file evaluate?: #f)))))))
+                
+                (define (process-console unit-name expr)
+                  (let ((module-declaration (outline-unit unit-name)))
+                    (let ((form `(module ,unit-name ,(get-dialect-name~ module-declaration) ,expr)))
+                      (load-unit 'dialect.development)
+                      (write-result 'eval (expand-form form unit-name: unit-name walk-for: 'eval)))))
+                
+                (define (write-result what result)
+                  (write-binary-content port (list what result #f) marshall))
+                
+                (define (with-walk-problems thunk)
+                  (if worker-debug?
+                      (thunk)
+                    (with-exception-catcher
+                      (lambda (exc)
+                        (write-binary-content port (list 'error (exception-reason exc) #f) marshall))
                       (lambda ()
-                        (let ((resource (requested-unit-resource)))
-                          (with-resource-reader resource
-                            (lambda ()
-                              (let ((path (resource-pathname resource)))
-                                (let ((object-path (compile-file path options: compile-options output: cache)))
-                                  (write-result 'load object-path)))))))))))
-               
-               (define (process-script path)
-                 (case mode
-                   ((interpret)
-                    (write-result 'eval (expand-script path)))
-                   ((compile)
-                    (let ((name (extract-name path)))
-                      (when feedback?
-                        (feedback (format "Compiling {a}..." (extract-base name))))
-                      (expanding-script path
-                        (lambda ()
-                          (with-extension-reader (extract-extension name)
-                            (lambda ()
-                              (let ((object-path (compile-file path options: compile-options output: cache)))
-                                (write-result 'load object-path))))))))))
-               
-               (define (process-evaluate syntax str container line col evaluation-mode)
-                 (case mode
-                   ((interpret)
-                    (write-result 'eval (evaluate-forms syntax str container line col 'interpret evaluate?: #f)))
-                   ((compile)
-                    (when feedback?
-                      (feedback "Compiling evaluation..."))
-                    (let ((cache-dir (new Directory (tokenise-filename cache))))
-                      (let ((file (new-file~ cache-dir "evaluate.jazz")))
-                        (write-result 'load (evaluate-forms syntax str container line col 'compile file: file evaluate?: #f)))))))
-               
-               (define (process-console unit-name expr)
-                 (let ((module-declaration (outline-unit unit-name)))
-                   (let ((form `(module ,unit-name ,(get-dialect-name~ module-declaration) ,expr)))
-                     (load-unit 'dialect.development)
-                     (write-result 'eval (expand-form form unit-name: unit-name walk-for: 'eval)))))
-               
-               (define (write-result what result)
-                 (write-binary-content port (list what result #f) marshall))
-               
-               (define (with-walk-problems thunk)
-                 (if debug?
-                     (thunk)
-                   (with-exception-catcher
-                     (lambda (exc)
-                       (write-binary-content port (list 'error (exception-reason exc) #f) marshall))
+                        (catch (Walk-Problems exc
+                                 (write-binary-content port (list 'walk (exception-reason exc) (exception-detail exc)) marshall))
+                          (thunk))))))
+                
+                (case command
+                  ((unit)
+                   (with-walk-problems
                      (lambda ()
-                       (catch (Walk-Problems exc
-                                (write-binary-content port (list 'walk (exception-reason exc) (exception-detail exc)) marshall))
-                         (thunk))))))
-               
-               (case command
-                 ((unit)
-                  (with-walk-problems
-                    (lambda ()
-                      (apply process-unit arguments))))
-                 ((script)
-                  (with-walk-problems
-                    (lambda ()
-                      (apply process-script arguments))))
-                 ((evaluate)
-                  (with-walk-problems
-                    (lambda ()
-                      (apply process-evaluate arguments))))
-                 ((console)
-                  (with-walk-problems
-                    (lambda ()
-                      (apply process-console arguments))))
-                 ((hide)
-                  (hide))
-                 (else
-                  (error "Unknown worker command" command)))
-               (iter))))))))
+                       (apply process-unit arguments))))
+                  ((script)
+                   (with-walk-problems
+                     (lambda ()
+                       (apply process-script arguments))))
+                  ((evaluate)
+                   (with-walk-problems
+                     (lambda ()
+                       (apply process-evaluate arguments))))
+                  ((console)
+                   (with-walk-problems
+                     (lambda ()
+                       (apply process-console arguments))))
+                  ((hide)
+                   (hide))
+                  (else
+                   (error "Unknown worker command" command))))))
+          (iter)))))))
