@@ -2829,81 +2829,72 @@
   
   (method override (spawn-task task <Task>)
     (declare (proper-tail-calls))
-    (let ((world (current-world)))
-      (with-log-context "spawn" spawn-id support-state task
-        (lambda (log-context)
-          (set-context~ task log-context)
-          (continuation-capture
-            (lambda (exit)
-              (ready-task~ task)
-              (let (restart-loop)
-                (with-current-loop
-                  (lambda ()
-                    (with-restart-catcher 'resume-loop (present-current-loop-restart)
-                      (lambda ()
-                        (if (not spawn?)
-                            (task-sleep +infinity exit support-state)
-                          (let ((sector #f)
-                                (spawners #f))
-                            (let (iter (previous (current-seconds)))
-                              (let ((time (current-seconds)))
-                                (let ((elapse (- time previous)))
-                                  (unless (get-paused?~ world)
-                                    (with-task-mutex spawn-sequential-state
-                                      (lambda ()
-                                        (unless (task-stopping?)
-                                          (when (and (testing?) (memq? 'spawn (get-task-trace)))
-                                            (debug-string "W"))
-                                          (let ((current-sector (element-sector (current-me))))
-                                            (let ((current-spawners (if (eq? sector current-sector)
-                                                                        spawners
-                                                                      (find-spawners current-sector))))
-                                              (tick-spawn elapse current-spawners)
-                                              (set! sector current-sector)
-                                              (set! spawners current-spawners)))
-                                          @w
-                                          (bind (sector new-spawners) (tick-spawn elapse current-sector spawners)
-                                            (set! current-sector sector)
-                                            (set! spawners new-spawners))))))
-                                  (let ((duration (- (current-seconds) time)))
-                                    (task-sleep (- spawn-rate duration) exit #f))
-                                  (iter time))))))))))
-                (restart-loop))))))))
+    (let ((world (current-world))
+          (me (current-me)))
+      (with-task task "spawn" spawn-id support-state
+        (lambda (log-context exit)
+          (if (not spawn?)
+              (task-sleep +infinity exit support-state)
+            (let ((sector #f)
+                  (spawners #f))
+              (let (iter (previous (current-seconds)))
+                (let ((time (current-seconds)))
+                  (let ((elapse (- time previous)))
+                    (unless (get-paused?~ world)
+                      (with-task-mutex spawn-sequential-state
+                        (lambda ()
+                          (unless (task-stopping?)
+                            (trace-task spawn "W")
+                            (let ((current-sector (element-sector me)))
+                              (let ((current-spawners (if (eq? sector current-sector)
+                                                          spawners
+                                                        (find-spawners current-sector))))
+                                (set! sector current-sector)
+                                (set! spawners current-spawners)
+                                (tick-spawn elapse current-spawners)))))))
+                    (let ((duration (- (current-seconds) time)))
+                      (task-sleep (- spawn-rate duration) exit #f))
+                    (iter time))))))))))
   
   
   (method (tick-spawn elapse spawners)
     (site (spawn on?: #t)
       (spawn-enemies elapse spawners)))
-          
+  
+  
+  (method (spawn-interval)
+    (random-between 10. 30.))
+  
   
   (method (find-spawners sector)
-    (let ((me (current-me))
-          (queue (new-queue)))
+    (let ((queue (new-queue)))
       (iterate-sector-neighbors sector 1
         (lambda (sector)
           (sector-iterate-blocks sector '(52)
             (lambda (index)
-              (enqueue queue (cons sector (cons 0. (cons (random-between 10. 30.) (index->coordinates index)))))))))
+              (enqueue queue (cons sector (cons 0. (cons (spawn-interval) (index->coordinates index)))))))))
       (queue-list queue)))
   
   
   (method (spawn-enemies elapse spawners)
     (let ((world (current-world)))
-      (for-each (lambda (info)
-                  (bind (sector time-since-last time-for-spawn i j k) info
+      (for-each (lambda (spawner)
+                  (bind (sector time-since-last time-for-spawn i j k) spawner
                     (call-with-sector sector i j k
                       (lambda (region sector block-id <fx> data-id <fx> i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> uv rendering with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!)
                         (if (> (+ time-since-last elapse) time-for-spawn)
                             (let ((possible-spawn-places (find-spawning-spots i j k with-field block-ref blocklight-ref)))
                               (loop (for number from 0 below (random-element (list 2 3 4)))
-                                    (let ((location (random-element possible-spawn-places)))
-                                      (remove! location possible-spawn-places)
-                                      (bind (x y z) location
-                                        (let ((enemy (new (random-element (list Spider Wolf Jumper)) parent: world position: (vertex x (+ y 1.) z))))
-                                          (add-element enemy)))))
-                              (list-set! info 1 0.)
-                              (list-set! info 2 (random-between 10. 30.)))
-                          (list-set! info 1 (+ time-since-last elapse)))))))
+                                    (unless (null? possible-spawn-places)
+                                      (let ((location (random-element possible-spawn-places)))
+                                        (set! possible-spawn-places (remove! location possible-spawn-places))
+                                        (bind (x y z) location
+                                          (let ((enemy (new (random-element (list Spider Wolf Jumper)) parent: world position: (vertex x y z))))
+                                            (debug 'add enemy x y z)
+                                            (add-element enemy))))))
+                              (list-set! spawner 1 0.)
+                              (list-set! spawner 2 (spawn-interval)))
+                          (list-set! spawner 1 (+ time-since-last elapse)))))))
                 spawners)))
   
   
@@ -2914,8 +2905,10 @@
                   (loop (for y from (- j 1) below (+ j 1))
                         (with-field i j k
                           (lambda (section index)
-                            (when (and (= block-ref section index 0) (< blocklight-ref section index 8))
-                              (enqueue queue (list x y z))))))))
+                            (when (and section (= (block-ref section index) 0) (< (blocklight-ref section index) 8))
+                              (call-with-sector (get-sector~ section) i j k
+                                (lambda (region sector block-id <fx> data-id <fx> i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> uv rendering with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!)
+                                  (enqueue queue (list x y z))))))))))
       (queue-list queue)))
   
   
