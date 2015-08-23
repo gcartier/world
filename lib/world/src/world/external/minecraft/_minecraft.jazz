@@ -471,6 +471,17 @@
         (lambda (section index)
           (proc section index (block-ref section index) (data-ref section index)))))
     
+    (define (with-section section index proc)
+      (let ((section-index (get-index~ (get-sector~ section)))
+            (sector-index (get-index~ sector)))
+        (let ((a (- (vector-ref section-index 0) (vector-ref sector-index 0)))
+              (b (- (vector-ref section-index 1) (vector-ref sector-index 1)))
+              (c (- (vector-ref section-index 2) (vector-ref sector-index 2))))
+          (let* ((i (modulo index 16))
+                 (k (modulo (/ (- index i) 16) 16))
+                 (j (/ (- index i (* k 16)) 256)))
+            (proc (+ (* a 16) i) (+ (* b 16) j) (+ (* c 16) k))))))
+    
     (define (effective-block-ref i j k)
       (with-block i j k
         (lambda (section index block data)
@@ -482,7 +493,7 @@
           data)))
     
     (define (powerlevel-update section index power)
-      (when (and (/= (block-ref section index) 0) (> power (powerlevel-ref section index)))
+      (when (and (/= (block-ref section index) 0) (> power (cache-powerlevel section index)))
         (powerlevel-set! section index power)
         (when (= (block-ref section index) 55)
           (data-set! section index power))))
@@ -493,19 +504,39 @@
         (when (= (block-ref section index) 55)
           (data-set! section index power))))
     
-    @w
     (define (cache-powerlevel section index)
       (let ((power (powerlevel-ref section index)))
         (if (/= power 255)
             power
-          (let ((p (foo section index)))
-            (powerlevel-set! section index p)
-            p))))
+          (begin
+            (powerlevel-set! section index 0)
+            (let ((p (calculate-power-level section index)))
+              (powerlevel-update! section index p)
+              p)))))
+    
+    (define (calculate-power-level section index)
+      (with-section section index
+        (lambda (i j k)
+          (let ((block (block-ref section index))
+                (data-id (data-ref section index)))
+            (cond ((= block 76)
+                   15)
+                  ((= block 94)
+                   15)
+                  ((= block 55)
+                   (data-ref section index))
+                  ((memv? block powerable-redstone-components)
+                   (or (powered-redstone-component? i j k) 0))
+                  ((and (memv? block '(69 77 143)) (bit-set? 3 data-id))
+                   15)
+                  ((and (get-cube?~ (blockid->block block)) (get-opaque-cube?~ (blockid->block block)) (> (cache-powerlevel section index) 0))
+                   (or (powered-block? i j k i j k) 0))
+                  (else 0))))))
     
     (define (strong-power-side side-i side-j side-k from-i from-j from-k)
       (with-block side-i side-j side-k
         (lambda (section index block data)
-          (unless (= (powerlevel-ref section index) 15)
+          (unless (= (cache-powerlevel section index) 15)
             (cond ((memv? block powerable-redstone-components)
                    (power-redstone-component side-i side-j side-k 15))
                   ((and (get-cube?~ (blockid->block block)) (get-opaque-cube?~ (blockid->block block)))
@@ -546,22 +577,22 @@
           (cond ((memv? block powerable-redstone-components)
                  (unless (powered-redstone-component? side-i side-j side-k)
                    (unpower-redstone-component side-i side-j side-k)))
-                ((and (= block 55) (> (powerlevel-ref section index) 0))
+                ((and (= block 55) (> (cache-powerlevel section index) 0))
                  (unpower-wire side-i side-j side-k))
-                ((and (= block 94) (= data (repeater-data-out side-i side-k from-i from-k)))
+                ((and (= block 94) (= (bitwise-and data #b11) (repeater-data-out side-i side-k from-i from-k)))
                  (unless (powered-repeater? side-i side-j side-k)
                    (powerlevel-update! section index 0)
                    (unpower-repeater side-i side-j side-k)))
-                ((and (get-cube?~ (blockid->block block)) (get-opaque-cube?~ (blockid->block block)) (> (powerlevel-ref section index) 0))
-                 (unless (powered-block? side-i side-j side-k)
+                ((and (get-cube?~ (blockid->block block)) (get-opaque-cube?~ (blockid->block block)) (or  (= (powerlevel-ref section index) 255) (> (cache-powerlevel section index) 0)))
+                 (unless (powered-block? side-i side-j side-k from-i from-j from-k)
                    (powerlevel-update! section index 0)
                    (unpower-block side-i side-j side-k)))))))
     
     (define (power-torch i j k)
-      (with-block i j k
+	(with-block i j k
         (lambda (section index block data)
           (powerlevel-update section index 15)
-          (block-set! section index 76)
+          (block-set! section index 76) 
           (strong-power-side i (+ j 1) k i j k)
           (unless (= data 1)
             (component-power-side (- i 1) j k i j k))
@@ -586,7 +617,7 @@
                           ((5) '( 0 -1  0)))
             (with-field (+ i a) (+ j b) (+ k c)
               (lambda (section index)
-                (> (powerlevel-ref section index) 0)))))))
+                (> (cache-powerlevel section index) 0)))))))
     
     (define (unpower-torch i j k)
       (with-block i j k
@@ -610,7 +641,7 @@
     (define (power-lever i j k)
       (with-block i j k
         (lambda (section index block data)
-          (set! data (bitwise-and data #b111))
+          (powerlevel-update section index 15)
           (bind (attach-i attach-j attach-k) (case data
                                                ((0 7) (list i (+ j 1) k))
                                                ((1)   (list (- i 1) j k))
@@ -619,6 +650,7 @@
                                                ((4)   (list i j (+ k 1)))
                                                ((5 6) (list i (- j 1) k)))
             (strong-power-side attach-i attach-j attach-k i j k)
+            (data-set! section index (bit-set data 3 #t))
             (unless (memv? data '(0 7))
               (component-power-side i (+ j 1) k i j k))
             (unless (memv? data '(5 6))
@@ -636,6 +668,7 @@
     (define (unpower-lever i j k)
       (with-field i j k
         (lambda (section index)
+          (data-set! section index (bit-set (data-ref section index) 3 #f))
           (powerlevel-update! section index 0)
           (add-sector (get-sector~ section))))
       (unpower-side (- i 1) j k i j k)
@@ -659,7 +692,7 @@
         
         (with-field i j k
           (lambda (section index)
-            (when (> power (powerlevel-ref section index))
+            (when (> power (cache-powerlevel section index))
               (powerlevel-update section index power)
               (block-power-side (- i 1) j k)
               (block-power-side (+ i 1) j k)
@@ -671,10 +704,12 @@
                 (lambda (section index)
                   (add-sector (get-sector~ section)))))))))
     
-    (define (powered-block? i j k)
+    (define (powered-block? i j k from-i from-j from-k)
       (define (side-powered? side-i side-j side-k)
-        (with-block side-i side-j side-k
-          (lambda (section index block data)
+        (if (equal? (list side-i side-j side-k) (list from-i from-j from-k))
+            -1
+          (with-block side-i side-j side-k
+            (lambda (section index block data)
               (cond ((and (< side-j j) (= block 76))
                      15)
                     ((and (> side-j j) (memv? block '(70 72)) (bit-set? 0 data))
@@ -683,9 +718,9 @@
                      15)
                     ((and (memv? block '(69 77 143)) (bit-set? 3 data) (memv? (bitwise-and data #b111) (attached-to-data i j k side-i side-j side-k)))
                      15)
-                    ((and (not (< side-j j)) (= block 55) (> (powerlevel-ref section index) 0) (or (> side-j j) (connected-redstone-to? i j k side-i side-j side-k)) (> (get-wire-power side-i side-j side-k i j k) 0))
+                    ((and (not (< side-j j)) (= block 55) (or (> side-j j) (connected-redstone-to? i j k side-i side-j side-k)) (> (cache-powerlevel section index) 0) (> (get-wire-power side-i side-j side-k i j k) 0))
                      1)
-                    (else 0)))))
+                    (else 0))))))
       
       (let ((power (max (side-powered? (- i 1) j k)
                         (side-powered? (+ i 1) j k)
@@ -701,7 +736,7 @@
           (lambda (section index block data)
             (if (and (= block 75) (memv? data (attached-to-data i j k side-i side-j side-k)))
                 (power-torch side-i side-j side-k)
-                (unpower-side side-i side-j side-k i j k)))))
+              (unpower-side side-i side-j side-k i j k)))))
       
       (with-field i j k
         (lambda (section index)
@@ -750,7 +785,7 @@
                           ((3) (list  1 0  0)))
             (with-field (+ i a) (+ j b) (+ k c)
               (lambda (section index)
-                (> (powerlevel-ref section index) 0)))))))
+                (> (cache-powerlevel section index) 0)))))))
     
     (define (unpower-repeater i j k)
       (with-block i j k
@@ -784,7 +819,7 @@
       (unless (= power 0)
         (with-field i j k
           (lambda (section index)
-            (when (> power (powerlevel-ref section index))
+            (when (> power (cache-powerlevel section index))
               (powerlevel-update section index power)
               (add-sector (get-sector~ section))
               (power-side (- i 1) j k)
@@ -800,23 +835,23 @@
           (with-block side-i side-j side-k
             (lambda (section index block data)
               (cond ((= block 55)
-                     (- (powerlevel-ref section index) 1))
+                     (- (cache-powerlevel section index) 1))
                     ((= block 76)
                      15)
                     ((and (memv? block '(69 77 143)) (bit-set? 3 data))
                      15)
                     ((and (= block 94) (= (bitwise-and data #b11) (repeater-data-in side-i side-k i k)))
                      15)
-                    ((and (> (powerlevel-ref section index) 1) (get-cube?~ (blockid->block block)) (get-opaque-cube?~ (blockid->block block)))
+                    ((and (get-cube?~ (blockid->block block)) (get-opaque-cube?~ (blockid->block block)) (> (cache-powerlevel section index) 1))
                      15)
                     (else
                      (or
                        (with-block side-i (+ side-j 1) side-k
                          (lambda (section index upper data)
-                           (and (= upper 55) (> (powerlevel-ref section index) 0) (not (get-cube?~ (blockid->block (effective-block-ref i (+ j 1) k)))) (- (powerlevel-ref section index) 1))))
+                           (and (= upper 55) (not (get-cube?~ (blockid->block (effective-block-ref i (+ j 1) k)))) (> (cache-powerlevel section index) 0) (- (cache-powerlevel section index) 1))))
                        (with-block side-i (- side-j 1) side-k
                          (lambda (section index under data)
-                           (and (= under 55) (> (powerlevel-ref section index) 0) (not (get-cube?~ (blockid->block block))) (- (powerlevel-ref section index) 1))))
+                           (and (= under 55) (not (get-cube?~ (blockid->block block))) (> (cache-powerlevel section index) 0) (- (cache-powerlevel section index) 1))))
                        0)))))))
       
       (define (top-power)
@@ -824,7 +859,7 @@
           (lambda (section index block data)
             (if (or (= block 76)
                     (and (memv? block '(69 77 143)) (bit-set? 3 data))
-                    (and (> (powerlevel-ref section index) 1) (get-cube?~ (blockid->block block)) (get-opaque-cube?~ (blockid->block block))))
+                    (and (get-cube?~ (blockid->block block)) (get-opaque-cube?~ (blockid->block block)) (> (cache-powerlevel section index) 1)))
                 15
               0))))
       
@@ -840,7 +875,7 @@
             0
           (with-block i (- j 1) k
             (lambda (section index block data)
-              (if (and (> (powerlevel-ref section index) 1) (get-opaque-cube?~ (blockid->block block)) (get-cube?~ (blockid->block block)))
+              (if (and (get-opaque-cube?~ (blockid->block block)) (get-cube?~ (blockid->block block)) (> (cache-powerlevel section index) 1))
                   15
                 0))))))
     
@@ -862,13 +897,13 @@
           (with-field i j k
             (lambda (section index)
               (add-sector (get-sector~ section))
-              (let ((power (powerlevel-ref section index)))
+              (let ((power (cache-powerlevel section index)))
                 (define (check-side side-i side-j side-k)
                   (with-block side-i side-j side-k
                     (lambda (section index block data)
                       (when section
                         (if (= block 55)
-                            (let ((new-power (powerlevel-ref section index)))
+                            (let ((new-power (cache-powerlevel section index)))
                               (unless (= new-power 0)
                                 (if (< new-power power)
                                     (unpower side-i side-j side-k)
@@ -877,7 +912,7 @@
                             (with-block side-i (+ side-j 1) side-k
                               (lambda (section index upper data)
                                 (when (and (= upper 55) (not (get-cube?~ (blockid->block (effective-block-ref i (+ j 1) k)))))
-                                  (let ((new-power (powerlevel-ref section index)))
+                                  (let ((new-power (cache-powerlevel section index)))
                                     (unless (= new-power 0)
                                       (if (< new-power power)
                                           (unpower side-i (+ side-j 1) side-k)
@@ -885,12 +920,12 @@
                             (with-block side-i (- side-j 1) side-k
                               (lambda (section index lower data)
                                 (when (and (= lower 55) (not (get-cube?~ (blockid->block block))))
-                                  (let ((new-power (powerlevel-ref section index)))
+                                  (let ((new-power (cache-powerlevel section index)))
                                     (unless (= new-power 0)
                                       (if (< new-power power)
                                           (unpower side-i (- side-j 1) side-k)
                                         (enqueue propagate-spots (list side-i (- side-j 1) side-k))))))))
-                            (cond ((and (= block 94) (= data (repeater-data-in side-i side-k i k)))
+                            (cond ((and (= block 94) (= (bitwise-and data #b11) (repeater-data-in side-i side-k i k)))
                                    (enqueue propagate-spots (list side-i side-j side-k)))
                                   ((= block 76)
                                    (enqueue propagate-spots (list side-i side-j side-k)))
@@ -898,7 +933,7 @@
                                    (enqueue propagate-spots (list side-i side-j side-k)))
                                   ((and (memv? block '(70 72)) (bit-set? 0 data))
                                    (enqueue propagate-spots (list side-i side-j side-k)))
-                                  ((and (get-cube?~ (blockid->block block)) (get-opaque-cube?~ (blockid->block block)) (= (powerlevel-ref section index) 15))
+                                  ((and (get-cube?~ (blockid->block block)) (get-opaque-cube?~ (blockid->block block)) (= (cache-powerlevel section index) 15))
                                    (enqueue propagate-spots (list side-i side-j side-k))))))))))
                 
                 (define (top-powered?)
@@ -906,7 +941,7 @@
                     (lambda (section index block data)
                       (when (or
                               (= block 76)
-                              (and (get-cube?~ (blockid->block block)) (get-opaque-cube?~ (blockid->block block)) (= (powerlevel-ref section index) 15))
+                              (and (get-cube?~ (blockid->block block)) (get-opaque-cube?~ (blockid->block block)) (= (cache-powerlevel section index) 15))
                               (and (memv? block '(69 77 143)) (bit-set? 3 data)))
                         (enqueue propagate-spots (list i (+ j 1) k))))))
                 
@@ -920,7 +955,7 @@
                   (top-powered?)
                   (with-block i (- j 1) k
                     (lambda (section index block data)
-                      (when (and (get-cube?~ (blockid->block block)) (get-opaque-cube?~ (blockid->block block)) (= (powerlevel-ref section index) 15))
+                      (when (and (get-cube?~ (blockid->block block)) (get-opaque-cube?~ (blockid->block block)) (= (cache-powerlevel section index) 15))
                         (enqueue propagate-spots (list i (- j 1) k))))))))))
         
         (unpower i j k)
@@ -929,7 +964,7 @@
             (bind (i j k) (dequeue propagate-spots)
               (with-block i j k
                 (lambda (section index block data)
-                  (let ((power (powerlevel-ref section index)))
+                  (let ((power (cache-powerlevel section index)))
                     (cond ((= block 55)
                            (powerlevel-update! section index 0)
                            (power-wire i j k power))
@@ -948,7 +983,7 @@
             (bind (i j k) (dequeue changed)
               (with-field i j k
                 (lambda (section index)
-                  (when (= (powerlevel-ref section index) 0)
+                  (when (= (cache-powerlevel section index) 0)
                     (unpower-wire-part i j k)))))
             (update)))))
     
@@ -985,9 +1020,9 @@
       (define (side-powered? side-i side-j side-k)
         (with-block side-i side-j side-k
           (lambda (section index block data)
-            (cond ((and (memv? block '(124)) (> (powerlevel-ref section index) 0))
+            (cond ((and (memv? block '(124)) (> (cache-powerlevel section index) 0))
                    0)
-                  ((and (get-cube?~ (blockid->block block)) (get-opaque-cube?~ (blockid->block block)) (> (powerlevel-ref section index) 0))
+                  ((and (get-cube?~ (blockid->block block)) (get-opaque-cube?~ (blockid->block block)) (> (cache-powerlevel section index) 0))
                    0)
                   ((and (= block 76) (not (memv? data (attached-to-data i j k side-i side-j side-k))))
                    (if (< side-j j)
@@ -1003,7 +1038,7 @@
                    (if (memv? (bitwise-and data #b111) (attached-to-data i j k side-i side-j side-k))
                        15
                      0))
-                  ((and (not (< side-j j)) (= block 55) (> (powerlevel-ref section index) 0) (or (> side-j j) (connected-redstone-to? i j k side-i side-j side-k)))
+                  ((and (not (< side-j j)) (= block 55) (or (> side-j j) (connected-redstone-to? i j k side-i side-j side-k)) (> (cache-powerlevel section index) 0))
                    1)
                   (else
                    -1)))))
@@ -1128,7 +1163,7 @@
               (side-data-id (effective-data-ref side-i side-j side-k)))
           (cond ((memv? side-id (cons 55 redstone-power-components))
                  #t)
-                ((and (memv? side-id '(93 94)) (memv? side-data-id (cond ((/= side-i wire-i) '(1 3))
+                ((and (memv? side-id '(93 94)) (memv? (bitwise-and side-data-id #b11) (cond ((/= side-i wire-i) '(1 3))
                                                                          (else '(0 2)))))
                  #t)
                 ((or (get-opaque-cube?~ (blockid->block side-id)) ;;solid block...
@@ -1160,21 +1195,6 @@
               ((right) (or right? (and left? (not back?) (not front?))))
               ((back) (or back? (and front? (not left?) (not right?))))
               ((front) (or front? (and back? (not left?) (not right?))))))))
-    
-    @w
-    (define (calculate-power-level section index)
-      (let ((block (block-ref section index)))
-        (cond ((= block 55)
-               (get-wire-power i j k i j k))
-              ((= block 94)
-               15)
-              ((= block 76)
-               15)
-              ((and (get-cube? (blockid->block block)) (get-opaque-cube?~ (blockid->block block)))
-               (or (power (powered-block? i j k)) 0))
-              ((memv? block powerable-redstone-components)
-               (or (powered-redstone-component? i j k) 0))
-              (else 0))))
     
     (with-field i j k
       (lambda (section index)
