@@ -3757,7 +3757,7 @@
                     (if (< delay 0)
                         (if power?
                             (redstone-update~ (current-game) sector i j k 93 'activate add-sector with-field block-ref block-set! data-ref data-set! powerlevel-ref powerlevel-set! blocklight-ref blocklight-set!)
-                            (redstone-update~ (current-game) sector i j k 94 'deactivate add-sector with-field block-ref block-set! data-ref data-set! powerlevel-ref powerlevel-set! blocklight-ref blocklight-set!))
+                          (redstone-update~ (current-game) sector i j k 94 'deactivate add-sector with-field block-ref block-set! data-ref data-set! powerlevel-ref powerlevel-set! blocklight-ref blocklight-set!))
                       (enqueue new-repeaters (list sector i j k (- delay 1) power?))))))
               (iter)))
           (set-repeaters~ (current-game) new-repeaters)))))
@@ -3767,31 +3767,47 @@
   ;;;
   
   
+  (definition (can-flow-in)
+    '(0 6 27 28 30 31 32 37 38 39 40 50 51 55 59 66 69 75 76 77 78 83 93 94 104 105 106 111 127 131 132 140 141 142 143))
+  
   (method override (lava-task task <Task>)
     (declare (proper-tail-calls))
-    (let ((world (current-world)))
+    (let ((world (current-world))
+          (first-call? #t))
       (with-task task "lava" lava-id support-state
         (lambda (log-context exit)
           (if (not lava?)
               (task-sleep +infinity exit support-state)
-            (let (iter (previous (current-seconds)))
-              (let ((time (current-seconds)))
-                (let ((elapse (- time previous)))
-                  (unless (get-paused?~ world)
-                    (with-task-mutex lava-sequential-state
-                      (lambda ()
-                        (unless (task-stopping?)
-                          (trace-task lava "L")
-                          @w(let ((current-repeaters (get-repeaters~ (current-game))))
-                              (unless (queue-empty? current-repeaters)
-                                (tick-lava elapse current-repeaters)))))))
-                  (let ((duration (- (current-seconds) time)))
-                    (task-sleep (- lava-rate duration) exit #f))
-                  (iter time)))))))))
+            (let ((lava-blocks (new-queue)))
+              (let (iter (previous (current-seconds)))
+                (let ((time (current-seconds)))
+                  (let ((elapse (- time previous)))
+                    (unless (get-paused?~ world)
+                      (with-task-mutex lava-sequential-state
+                        (lambda ()
+                          (unless (task-stopping?)
+                            (trace-task lava "L")
+                            @w(when first-call?
+                                (set! first-call? #f)
+                                (set! lava-blocks (find-flowing-lava (element-sector (current-me)))))
+                            (unless (queue-empty? lava-blocks)
+                              @w(set! lava-blocks (tick-lava elapse lava-blocks)))))))
+                    (let ((duration (- (current-seconds) time)))
+                      (task-sleep (- lava-rate duration) exit #f))
+                    (iter time))))))))))
   
   (method (tick-lava elapse lava-blocks)
     (site (lava on?: #t)
       (lava-flow elapse lava-blocks)))
+  
+  (method (find-flowing-lava sector)
+    (let ((queue (new-queue)))
+      (iterate-sector-neighbors sector 1
+        (lambda (sector)
+          (sector-iterate-blocks sector '(8)
+            (lambda (index)
+              (enqueue queue (cons sector (index->coordinates index)))))))
+      (queue-list queue)))
   
   (method (lava-flow elapse lava-blocks)
     (let ((world (current-world)))
@@ -3799,11 +3815,63 @@
         (lambda (add-sector)
           (let (iter)
             (unless (queue-empty? lava-blocks)
-              (bind (sector i j k delay power?) (dequeue lava-blocks)
+              (bind (sector i j k) (dequeue lava-blocks)
                 (call-with-sector sector i j k
                   (lambda (region sector block-id <fx> data-id <fx> i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> uv rendering with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set! powerlevel-ref powerlevel-set!)
-                    #f)))
-              (iter)))))))
+                    (with-field i j k
+                      (lambda (section index)
+                        (let ((data (data-ref section index)))
+                          (define (get-inward-flow i j k)
+                            (define (side-flow side-i side-j side-k)
+                              (with-field side-i side-j side-k
+                                (lambda (section index)
+                                  (let ((data (data-ref section index)))
+                                    (cond ((< data 6)
+                                           (+ data 2))
+                                          ((= data 6)
+                                           7)
+                                          ((> data 6)
+                                           (with-field side-i (- side-j 1) side-k
+                                             (lambda (section index)
+                                               (if (memq? (block-ref section index) '(10 11))
+                                                   7
+                                                 2)))))))))
+                            
+                            (define (top-flow)
+                              (with-field i (+ j 1) k
+                                (lambda (section index)
+                                  (if (memq? (block-ref section index) '(10 11))
+                                      (let ((data (data-ref section index)))
+                                        (if (< data 8)
+                                            (+ data 8)
+                                          data))
+                                    0))))
+                            
+                            (max
+                              (top-flow)
+                              (min
+                                (side-flow (+ i 1) j k)
+                                (side-flow (- i 1) j k)
+                                (side-flow i j (+ k 1))
+                                (side-flow i j (- k 1)))))
+                          
+                          (define (flow i j k data)
+                            (if (> data 7)
+                                (with-field i (- j 1) k
+                                  (lambda (section index)
+                                    (when (memq? (block-ref section index) can-flow-in)
+                                      (block-set! section index 10)
+                                      (data-set! section index data)
+                                      (enqueue lava-blocks (list (get-sector~ section) i (- j 1) k)))))
+                              ))
+                          
+                          (unless (= data 0)
+                            (let ((level-set (get-inward-flow i j k)))
+                              (when (/= level-set data)
+                                )
+                              (data-set! section index level-set)))))))))
+              (iter)))
+          lava-blocks))))
   
   
   ;;;
@@ -4708,7 +4776,6 @@
                        (lighting top-light i j k -1  1  0 -1  1  1  0  1  0  0  1  1)
                        (lighting top-light i j k  0  1  0  0  1  1  1  1  0  1  1  1)
                        (lighting top-light i j k  0  1 -1  0  1  0  1  1 -1  1  1  0)))
-
 
 (definition public (top-generic i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> left <fl> right <fl> bottom <fl> top <fl> back <fl> front <fl> uv <f32vector> uv-coordinates lighting rendering block-id matrix)
   (let ((v1 (vertex left top back))
