@@ -15,7 +15,8 @@
 (module protected world.external.minecraft.generate jazz
 
 
-(import (jazz.application)
+(import (jazz.action)
+        (jazz.application)
         (jazz.cairo)
         (jazz.debuggee)
         (jazz.geometry)
@@ -23,10 +24,9 @@
         (jazz.io)
         (jazz.jml)
         (jazz.json)
-        (jazz.library)
         (jazz.opengl.glew)
-        (jazz.system)
-        (jazz.ui)
+        (jazz.syntax (phase syntax))
+        (jazz.time)
         (world)
         (world.area)
         (world.atlas)
@@ -1484,6 +1484,28 @@
     (let ((quad (make-quad #f v1 v2 v3 v4)))
       (new Sign-Element position: position quad: quad data: data))))
 
+(definition public (find-sign text)
+  (continuation-capture
+    (lambda (return)
+      (iterate-signs
+        (lambda (sign)
+          (let ((data (get-data~ sign)))
+            (when (or (search (tag-assoc "Text1" data) text)
+                      (search (tag-assoc "Text2" data) text)
+                      (search (tag-assoc "Text3" data) text)
+                      (search (tag-assoc "Text4" data) text))
+              (continuation-return return sign)))))
+      #f)))
+
+(definition public (iterate-signs proc)
+  (let ((zone (current-zone)))
+    (iterate-table (get-sectors~ zone)
+      (lambda (index sector)
+        (for-each (lambda (element)
+                    (when (is? element Sign-Element)
+                      (proc element)))
+                  (get-texture-elements~ sector))))))
+
 (define-minecraft-block SignPost
   63
   texture: "planks_birch"
@@ -2720,7 +2742,7 @@
 
 
 (definition public (find-minecraft-model name)
-  (let ((model (table-ref minecraft-models name #f)))
+  (let ((model (table-ref minecraft-models name)))
     (if (is? model Model)
         model
       (let ((model <Model> (model)))
@@ -2729,7 +2751,7 @@
         model))))
 
 
-(definition (minecraft-model block <Minecraft-Block-Model>)
+(definition public (minecraft-model block <Minecraft-Block-Model>)
   (let ((faces '())
         (block-id (get-id~ block))
         (uv (block-texture-coordinates block))
@@ -2933,7 +2955,7 @@
   
   (method override (install-interface)
     (let ((world (current-world)))
-      (update-actions~ (get-application)
+      (updating-actions~ (get-application)
         (lambda ()
           (set-visible?~ (child~ (get-bindings) '(world-minecraft toggle-player-glow)) #t)))
       (let ((interface (get-interface~ world)))
@@ -2946,7 +2968,7 @@
   
   (method override (uninstall-interface)
     (let ((world (current-world)))
-      (update-actions~ (get-application)
+      (updating-actions~ (get-application)
         (lambda ()
           (set-visible?~ (child~ (get-bindings) '(world-minecraft toggle-player-glow)) #f)))
       (let ((interface (get-interface~ world)))
@@ -3853,13 +3875,13 @@
                   (lambda (region sector block-id <fx> data-id <fx> i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> uv rendering with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set! powerlevel-ref powerlevel-set!)
                     (with-field i j k
                       (lambda (section index)
-                        (when (memq? (block-ref section index) '(10 11))
+                        (when (and section (memq? (block-ref section index) '(10 11)))
                           (let ((data (data-ref section index)))
                             (define (get-inward-flow i j k)
                               (define (side-flow side-i side-j side-k)
                                 (with-field side-i side-j side-k
                                   (lambda (section index)
-                                    (if (memq? (block-ref section index) '(10 11))
+                                    (if (and section (memq? (block-ref section index) '(10 11)))
                                         (let ((data (data-ref section index)))
                                           (cond ((< data 6)
                                                  (+ data 2))
@@ -3868,7 +3890,7 @@
                                                 ((> data 6)
                                                  (with-field side-i (- side-j 1) side-k
                                                    (lambda (section index)
-                                                     (if (memq? (block-ref section index) '(10 11))
+                                                     (if (and section (memq? (block-ref section index) '(10 11)))
                                                          7
                                                        2))))))
                                       7))))
@@ -3876,7 +3898,7 @@
                               (define (top-flow)
                                 (with-field i (+ j 1) k
                                   (lambda (section index)
-                                    (if (memq? (block-ref section index) '(10 11))
+                                    (if (and section (memq? (block-ref section index) '(10 11)))
                                         (let ((data (data-ref section index)))
                                           (if (< data 8)
                                               (+ data 8)
@@ -4210,9 +4232,19 @@
                  (add-sector (element-sector (current-me)))))))))
   
   
-  (method (finding-visual-blocks ids proc)
+  (method (find-visual-blocks ids)
     (let ((zone (current-zone))
-          (count 0))
+          (queue (new-queue)))
+      (iterate-sectors~ zone
+        (lambda (index sector)
+          (sector-iterate-blocks sector ids
+            (lambda (found)
+              (enqueue queue (cons sector (index->coordinates found)))))))
+      (queue-list queue)))
+  
+  
+  (method (finding-visual-blocks ids proc)
+    (let ((zone (current-zone)))
       (iterate-sectors~ zone
         (lambda (index sector)
           (when (sector-contains-blocks? sector ids)
@@ -4297,149 +4329,150 @@
                 (sector-y (vector-ref sector-index 1))
                 (sector-z (vector-ref sector-index 2)))
             (let ((region (sector-region sector-x sector-y sector-z)))
-              (let ((section (get-section~ region sector-x sector-y sector-z))
-                    (cache-uninitialized 65535))
-                (when section
-                  (let ((bottom-section? (= sector-y (cast <fx> (or truncate-y -4))))
-                        (sections <vector> (make-vector 27 #t))
-                        (cache <u16vector> (initialize-block-cache cache-uninitialized))
-                        (blocks (get-blocks~ section))
-                        (data (get-data~ section))
-                        (blocklight (get-blocklight~ section))
-                        (skylight (get-skylight~ section))
-                        (powerlevel (get-powerlevels~ section)))
-                    (define (section-ref a <fx> b <fx> c <fx>) <Minecraft-Section+>
-                      (if (and (= a 0)
-                               (= b 0)
-                               (= c 0))
-                          section
-                        (let ((index (section-index a b c)))
-                          (let ((section (vector-ref sections index)))
-                            (if (neq? section #t)
-                                section
-                              (let ((x (+ sector-x a))
-                                    (y (+ sector-y b))
-                                    (z (+ sector-z c)))
-                                (let ((region (sector-region x y z)))
-                                  (let ((section (and region (get-section~ (cast <Minecraft-Region> region) x y z))))
-                                    (vector-set! sections index section)
-                                    section))))))))
-                    
-                    (define (section-index a <fx> b <fx> c <fx>) <fx>
-                      (+ (* b 9) (* c 3) a 13))
-                    
-                    (define (local-index i <fx> j <fx> k <fx>) <fx>
-                      (+ (* j 256) (* k 16) i))
-                    
-                    (define (effective-index i <fx> j <fx> k <fx>) <fx>
-                      (* (+ (* j 324) (* k 18) i 343) 4))
-                    
-                    (define (blocks-get section <Minecraft-Section>) <u8vector>
-                      (get-blocks~ section))
-                    
-                    (define (blocklight-get section <Minecraft-Section>) <u8vector>
-                      (get-blocklight~ section))
-                    
-                    (define (blocklight-ref i <fx> j <fx> k <fx>)
-                      (u4vector-ref blocklight (local-index i j k)))
-                    
-                    (define (skylight-ref i <fx> j <fx> k <fx>)
-                      (u4vector-ref skylight (local-index i j k)))
-                    
-                    (define (powerlevel-ref i <fx> j <fx> k <fx>) <fx>
-                      (u8vector-ref powerlevel (local-index i j k)))
-                    
-                    (define (local-block-ref i <fx> j <fx> k <fx>)
-                      (u8vector-ref blocks (local-index i j k)))
-                    
-                    (define (local-data-ref i <fx> j <fx> k <fx>)
-                      (u4vector-ref data (local-index i j k)))
-                    
-                    (define (effective-block-ref i <fx> j <fx> k <fx>) <fx>
-                      (let ((index (effective-index i j k)))
-                        (let ((value (u16vector-ref cache index)))
-                          (if (/= value cache-uninitialized)
-                              value
-                            (let ((value (field-ref i j k blocks-get u8vector-ref 0 1)))
-                              (u16vector-set! cache index value)
-                              value)))))
-                    
-                    (define (effective-light-ref shade <fl> i <fx> j <fx> k <fx>) <fx>
-                      (field-ref i j k blocklight-get u4vector-ref 0 0))
-                    
-                    (define (u4vector-ref field <u8vector> index <fx>) <fx>
-                      (let ((byte (u8vector-ref field (quotient index 2))))
-                        (if (even? index)
-                            (bitwise-and byte #x0F)
-                          (bitwise-and (arithmetic-shift-right byte 4) #x0F))))
-                    
-                    (define (field-ref i <fx> j <fx> k <fx> get-field ref empty bottom) <fx>
-                      (define (bind-i a <fx> i <fx>)
-                        (define (bind-j b <fx> j <fx>)
-                          (define (bind-k c <fx> k <fx>)
-                            (let ((section (section-ref a b c)))
-                              (if (not section)
-                                  (if (and bottom-section? (= b -1)) bottom empty)
-                                (let ((field (get-field section)))
-                                  (if (not field)
-                                      (if (and bottom-section? (= b -1)) bottom empty)
-                                    (ref field (local-index i j k)))))))
-                          
-                          (cond ((< k 0) (bind-k -1 (+ 16 k)))
-                                ((> k 15) (bind-k 1 (- k 16)))
-                                (else (bind-k 0 k))))
-                        
-                        (cond ((< j 0) (bind-j -1 (+ 16 j)))
-                              ((> j 15) (bind-j 1 (- j 16)))
-                              (else (bind-j 0 j))))
+              (when region
+                (let ((section (get-section~ region sector-x sector-y sector-z))
+                      (cache-uninitialized 65535))
+                  (when section
+                    (let ((bottom-section? (= sector-y (cast <fx> (or truncate-y -4))))
+                          (sections <vector> (make-vector 27 #t))
+                          (cache <u16vector> (initialize-block-cache cache-uninitialized))
+                          (blocks (get-blocks~ section))
+                          (data (get-data~ section))
+                          (blocklight (get-blocklight~ section))
+                          (skylight (get-skylight~ section))
+                          (powerlevel (get-powerlevels~ section)))
+                      (define (section-ref a <fx> b <fx> c <fx>) <Minecraft-Section+>
+                        (if (and (= a 0)
+                                 (= b 0)
+                                 (= c 0))
+                            section
+                          (let ((index (section-index a b c)))
+                            (let ((section (vector-ref sections index)))
+                              (if (neq? section #t)
+                                  section
+                                (let ((x (+ sector-x a))
+                                      (y (+ sector-y b))
+                                      (z (+ sector-z c)))
+                                  (let ((region (sector-region x y z)))
+                                    (let ((section (and region (get-section~ (cast <Minecraft-Region> region) x y z))))
+                                      (vector-set! sections index section)
+                                      section))))))))
                       
-                      (cond ((< i 0) (bind-i -1 (+ 16 i)))
-                            ((> i 15) (bind-i 1 (- i 16)))
-                            (else (bind-i 0 i))))
-                    
-                    (define (compute-lighting shade <fl> i <fx> j <fx> k <fx> ax <fx> ay <fx> az <fx> bx <fx> by <fx> bz <fx> cx <fx> cy <fx> cz <fx> dx <fx> dy <fx> dz <fx>)
-                      (format "{a} {a} {a} {a}"
-                              (effective-light-ref shade (+ i ax) (+ j ay) (+ k az))
-                              (effective-light-ref shade (+ i bx) (+ j by) (+ k bz))
-                              (effective-light-ref shade (+ i cx) (+ j cy) (+ k cz))
-                              (effective-light-ref shade (+ i dx) (+ j dy) (+ k dz))))
-                    
-                    (define (ambient-light i <fx> j <fx> k <fx> vert)
-                      (let ((origin (vertex- (vertex-& vert (vertex& (cast <fl> x) (cast <fl> y) (cast <fl> z))) (vertex& .5 .5 .5)))
-                            (normal (get-normal~ poly)))
-                        (generic-lighting i j k origin normal compute-lighting)))
-                    
-                    (define (block-info i <fx> j <fx> k <fx>)
-                      (let ((id (local-block-ref i j k))
-                            (data (local-data-ref i j k))
-                            (blocklight (blocklight-ref i j k))
-                            (skylight (skylight-ref i j k))
-                            (powerlevel (powerlevel-ref i j k)))
-                        (let ((block (blockid->block id)))
-                          (append (list (cons title (get-name~ block))
-                                        (cons "id" id)
-                                        (cons "data" data)
-                                        (cons "block light" blocklight)
-                                        (cons "sky light" skylight)
-                                        (cons "power level" powerlevel)
-                                        (cons "sector" (format "{a} {a} {a}" sector-x sector-y sector-z))
-                                        (cons "coord" (format "{a} {a} {a}" i j k)))
-                                  (if poly
-                                      (list (cons "block-id" (fxround (get-data1~ poly)))
-                                            (cons "vertex" (present-vertex vert))
-                                            (cons "ambient" (ambient-light i j k vert)))
-                                    '())))))
-                    
-                    (define (present-vertex vert)
-                      (format "{r precision: 3}, {r precision: 3}, {r precision: 3}"
-                              (vertex-x vert)
-                              (vertex-y vert)
-                              (vertex-z vert)))
-                    
-                    (let ((i (- x (* sector-x 16)))
-                          (j (- y (* sector-y 16)))
-                          (k (- z (* sector-z 16))))
-                      (block-info i j k))))))))))
+                      (define (section-index a <fx> b <fx> c <fx>) <fx>
+                        (+ (* b 9) (* c 3) a 13))
+                      
+                      (define (local-index i <fx> j <fx> k <fx>) <fx>
+                        (+ (* j 256) (* k 16) i))
+                      
+                      (define (effective-index i <fx> j <fx> k <fx>) <fx>
+                        (* (+ (* j 324) (* k 18) i 343) 4))
+                      
+                      (define (blocks-get section <Minecraft-Section>) <u8vector>
+                        (get-blocks~ section))
+                      
+                      (define (blocklight-get section <Minecraft-Section>) <u8vector>
+                        (get-blocklight~ section))
+                      
+                      (define (blocklight-ref i <fx> j <fx> k <fx>)
+                        (u4vector-ref blocklight (local-index i j k)))
+                      
+                      (define (skylight-ref i <fx> j <fx> k <fx>)
+                        (u4vector-ref skylight (local-index i j k)))
+                      
+                      (define (powerlevel-ref i <fx> j <fx> k <fx>) <fx>
+                        (u8vector-ref powerlevel (local-index i j k)))
+                      
+                      (define (local-block-ref i <fx> j <fx> k <fx>)
+                        (u8vector-ref blocks (local-index i j k)))
+                      
+                      (define (local-data-ref i <fx> j <fx> k <fx>)
+                        (u4vector-ref data (local-index i j k)))
+                      
+                      (define (effective-block-ref i <fx> j <fx> k <fx>) <fx>
+                        (let ((index (effective-index i j k)))
+                          (let ((value (u16vector-ref cache index)))
+                            (if (/= value cache-uninitialized)
+                                value
+                              (let ((value (field-ref i j k blocks-get u8vector-ref 0 1)))
+                                (u16vector-set! cache index value)
+                                value)))))
+                      
+                      (define (effective-light-ref shade <fl> i <fx> j <fx> k <fx>) <fx>
+                        (field-ref i j k blocklight-get u4vector-ref 0 0))
+                      
+                      (define (u4vector-ref field <u8vector> index <fx>) <fx>
+                        (let ((byte (u8vector-ref field (quotient index 2))))
+                          (if (even? index)
+                              (bitwise-and byte #x0F)
+                            (bitwise-and (arithmetic-shift-right byte 4) #x0F))))
+                      
+                      (define (field-ref i <fx> j <fx> k <fx> get-field ref empty bottom) <fx>
+                        (define (bind-i a <fx> i <fx>)
+                          (define (bind-j b <fx> j <fx>)
+                            (define (bind-k c <fx> k <fx>)
+                              (let ((section (section-ref a b c)))
+                                (if (not section)
+                                    (if (and bottom-section? (= b -1)) bottom empty)
+                                  (let ((field (get-field section)))
+                                    (if (not field)
+                                        (if (and bottom-section? (= b -1)) bottom empty)
+                                      (ref field (local-index i j k)))))))
+                            
+                            (cond ((< k 0) (bind-k -1 (+ 16 k)))
+                                  ((> k 15) (bind-k 1 (- k 16)))
+                                  (else (bind-k 0 k))))
+                          
+                          (cond ((< j 0) (bind-j -1 (+ 16 j)))
+                                ((> j 15) (bind-j 1 (- j 16)))
+                                (else (bind-j 0 j))))
+                        
+                        (cond ((< i 0) (bind-i -1 (+ 16 i)))
+                              ((> i 15) (bind-i 1 (- i 16)))
+                              (else (bind-i 0 i))))
+                      
+                      (define (compute-lighting shade <fl> i <fx> j <fx> k <fx> ax <fx> ay <fx> az <fx> bx <fx> by <fx> bz <fx> cx <fx> cy <fx> cz <fx> dx <fx> dy <fx> dz <fx>)
+                        (format "{a} {a} {a} {a}"
+                                (effective-light-ref shade (+ i ax) (+ j ay) (+ k az))
+                                (effective-light-ref shade (+ i bx) (+ j by) (+ k bz))
+                                (effective-light-ref shade (+ i cx) (+ j cy) (+ k cz))
+                                (effective-light-ref shade (+ i dx) (+ j dy) (+ k dz))))
+                      
+                      (define (ambient-light i <fx> j <fx> k <fx> vert)
+                        (let ((origin (vertex- (vertex-& vert (vertex& (cast <fl> x) (cast <fl> y) (cast <fl> z))) (vertex& .5 .5 .5)))
+                              (normal (get-normal~ poly)))
+                          (generic-lighting i j k origin normal compute-lighting)))
+                      
+                      (define (block-info i <fx> j <fx> k <fx>)
+                        (let ((id (local-block-ref i j k))
+                              (data (local-data-ref i j k))
+                              (blocklight (blocklight-ref i j k))
+                              (skylight (skylight-ref i j k))
+                              (powerlevel (powerlevel-ref i j k)))
+                          (let ((block (blockid->block id)))
+                            (append (list (cons title (get-name~ block))
+                                          (cons "id" id)
+                                          (cons "data" data)
+                                          (cons "block light" blocklight)
+                                          (cons "sky light" skylight)
+                                          (cons "power level" powerlevel)
+                                          (cons "sector" (format "{a} {a} {a}" sector-x sector-y sector-z))
+                                          (cons "coord" (format "{a} {a} {a}" i j k)))
+                                    (if poly
+                                        (list (cons "block-id" (fxround (get-data1~ poly)))
+                                              (cons "vertex" (present-vertex vert))
+                                              (cons "ambient" (ambient-light i j k vert)))
+                                      '())))))
+                      
+                      (define (present-vertex vert)
+                        (format "{r precision: 3}, {r precision: 3}, {r precision: 3}"
+                                (vertex-x vert)
+                                (vertex-y vert)
+                                (vertex-z vert)))
+                      
+                      (let ((i (- x (* sector-x 16)))
+                            (j (- y (* sector-y 16)))
+                            (k (- z (* sector-z 16))))
+                        (block-info i j k)))))))))))
     
     (define (update-info)
       (register-info 'minecraft
@@ -4691,8 +4724,12 @@
   
   
   (method (section/index->position section index)
+    (sector/index->position (get-sector~ section) index))
+  
+  
+  (method (sector/index->position sector index)
     (bind (i j k) (index->coordinates index)
-      (call-with-sector (get-sector~ section) i j k
+      (call-with-sector sector i j k
         (lambda (region sector block-id <fx> data-id <fx> i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> uv rendering with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set! powerlevel-ref powerlevel-set!)
           (vertex x y z))))))
 
