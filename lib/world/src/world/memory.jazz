@@ -14,9 +14,6 @@
 (module world.memory jazz
 
 
-@permanent-memory (
-
-
 (import (gambit.walk)
         (jazz.debuggee)
         (jazz.io)
@@ -24,54 +21,6 @@
         (world)
         (world.autoload)
         (world.syntax (phase syntax)))
-
-
-;;;
-;;;; Setup
-;;;
-
-
-(definition public (setup-memory (feedback?: feedback? #f))
-  (define (catalog-prune? obj)
-    (or (permanent? obj)
-        (kind? obj)
-        (category? obj)
-        (is? obj Dialect)))
-  
-  (set-outline-hook
-    (lambda (unit-name declaration)
-      (terminal unit-name)
-      (let ((kind PERM)
-            (domain (make-domain)))
-        (copy-to declaration kind domain
-          copy?: (lambda (obj)
-                   (not (catalog-prune? obj))))))))
-
-
-@old
-(definition public (setup-memory (feedback?: feedback? #f))
-  (declare (optimize-dead-local-variables))
-  (let ((kind PERM)
-        (domain (make-domain)))
-    (define (prune? obj)
-      (or (kind? obj)
-          (class? obj)
-          (table? obj)))
-    
-    (copy-to (outline-unit 'jazz.graphic.Color) kind domain
-      copy?: (lambda (obj)
-               (not (prune? obj))))
-    (walk-object!
-      (lambda (container i obj)
-        (if (prune? obj)
-            walk-prune
-          walk-continue))
-      (lambda (container i obj)
-        (or (register-ref (domain-copies domain) obj #f)
-            obj))
-      feedback?: feedback?)
-    (when feedback?
-      (terminal 'bytes-copied= (domain-bytes-copied domain)))))
 
 
 ;;;
@@ -166,7 +115,7 @@
   
 
 (definition snapshot-targets
-  '(@w unit outline @w modules @w catalog @w test))
+  '(@w unit @w modules @w test))
 
 
 (definition public (setup-memory-debug)
@@ -183,26 +132,15 @@
         (kind? obj)
         (category? obj)))
   
-  (define (catalog-prune? obj)
-    (or (permanent? obj)
-        (copied-permanent? obj)
-        (kind? obj)
-        (category? obj)
-        (is? obj Dialect)))
-  
   (define (test-prune? obj)
     (or (permanent? obj)
         (copied-permanent? obj)))
   
   (let ((unit (snap-when 'unit modules-prune? (require-module 'world.test.x)))
-        (outline (snap-when 'outline catalog-prune? (outline-unit 'world.test.x)))
         (modules (snap-when 'modules modules-prune? (get-modules)))
-        (catalog (snap-when 'catalog catalog-prune? (get-catalog)))
         (test (snap-when 'test test-prune? (car test-object))))
     (set! snapshots (remove-false (list unit
-                                        outline
                                         modules
-                                        catalog
                                         test))))
   (set-%s snapshots)
   (set-%p permanent)
@@ -388,30 +326,6 @@
 ;;;
 
 
-(definition protected outline-snapshots
-  (make-monitored (make-table test: eq?)))
-
-
-(definition public (setup-outline-hook unit-name)
-  (define (catalog-prune? obj)
-    (or (permanent? obj)
-        (copied-permanent? obj)
-        (kind? obj)
-        (category? obj)
-        (is? obj Dialect)))
-  
-  (set-outline-hook
-    (lambda (unit-name declaration)
-      (format :terminal "{a} " unit-name)
-      (receive (roots content outgoing) (snapshot-object declaration prune?: catalog-prune?)
-        (let ((snapshot (new Region-Snapshot unit-name declaration roots catalog-prune? content outgoing)))
-          (table-set! (monitored-content outline-snapshots) unit-name snapshot)))
-      declaration))
-  (outline-unit unit-name)
-  (set-outline-hook
-    #f))
-
-
 (definition public (analyse-incoming (unit-name: unit-name #f) (feedback?: feedback? #t))
   (define (analyse content)
     (let ((incoming (new-register)))
@@ -428,6 +342,7 @@
       incoming))
   
   (format :terminal "analyse incoming ")
+  @outline
   (let ((snapshot (and unit-name (table-ref (monitored-content outline-snapshots) unit-name))))
     (let ((incoming (analyse (if unit-name
                                  (get-content~ snapshot)
@@ -558,68 +473,6 @@
     (if monitored
         (car (first (monitored-content monitored)))
       #f)))
-
-
-;;;
-;;;; Evaluate
-;;;
-
-
-(definition temporary-evaluation-file
-  #f)
-
-(definition (get-temporary-evaluation-file)
-  (or temporary-evaluation-file (let ((file (get-temporary-file)))
-                                  ;; changing the extension to jazz is a quick hack for debugger highlight
-                                  ;; the right solution is to do the same thing as (read-source-all port container line col)
-                                  ;; e.g. make it so compilation locations point to the original source file
-                                  (set! temporary-evaluation-file (new-brother~ file (make-filename (get-base~ file) "jazz")))
-                                  file)))
-
-
-(definition public (evaluate-code code (evaluation-mode: evaluation-mode 'compile))
-  (let ((unit-name (second code)))
-    (load-unit unit-name)
-    (outline-unit unit-name)
-    (case evaluation-mode
-      ((compile)
-       (let ((file (get-temporary-evaluation-file)))
-         (call-with-output-file (path-settings file char-encoding: 'UTF-8)
-           (lambda (output)
-             (pp code output)
-             (newline output)))
-         (let ((path (parse~ file)))
-           (let ((pathname (parameterize ((requested-unit-name unit-name)
-                                          (jazz:walk-for 'compile)
-                                          (generate-symbol-for "&")
-                                          (generate-symbol-context unit-name)
-                                          (generate-symbol-counter 0)
-                                          (path->container-override
-                                            (lambda (target)
-                                              (and (equal? target path)
-                                                   unit-name))))
-                             (with-jazz-readtable
-                               (lambda ()
-                                 (compile-file path options: compile-options))))))
-             (load-file (list path: pathname char-encoding: 'UTF) #f)))))
-      (else
-       (parameterize ((requested-unit-name unit-name)
-                      (walk-for 'eval)
-                      (generate-symbol-for (format "%{a}&" (eval-count)))
-                      (generate-symbol-context unit-name)
-                      (generate-symbol-counter 0))
-         (eval code))))))
-
-
-(definition public (analyse-evaluate code (present: present #f))
-  (let ((unit-name (second code)))
-    (load-unit unit-name)
-    (outline-unit unit-name)
-    (let ((target (list (get-catalog) (get-modules))))
-      (receive (content outgoing) (snapshot-object target)
-        (evaluate-code code)
-        (receive (mutated outgoing) (snapshot-object target)
-          (compare-snapshots content mutated present: present))))))
 
 
 ;;;
@@ -812,4 +665,4 @@
           (format :terminal "{%}{%}{%}"))
         (set-%m movable)
         (set-%s still)
-        (set-%p perm)))))))
+        (set-%p perm))))))
