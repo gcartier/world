@@ -95,50 +95,78 @@ void main()
 ;;;
 
 
-(definition public stepping-history?
-  (make-parameter #f))
-
-
-(definition public requested-break-logic
-  (make-parameter #f))
-
-
-(definition protected (break-logic? name)
-  (let ((requested (requested-break-logic)))
-    (or (eq? requested #t)
-        (eq? requested name))))
-
-
 (definition protected previous-logic
   #f)
 
 (definition protected at-logic
   #f)
 
+(definition protected logic-request
+  #f)
+
+(definition protected logic-continuation
+  #f)
+
+
+(definition any-logic
+  '(any))
+
+(definition skip-logic
+  '(skip))
+
+(definition (request-logic request)
+  (set! logic-request request))
+
+
+(definition protected logic-exit
+  #f)
+
+(definition (with-logic-exit thunk)
+  (continuation-capture
+    (lambda (exit)
+      (set! logic-exit exit)
+      (thunk))))
+
+(definition (exit-logic)
+  (let ((exit logic-exit))
+    (if exit
+        (begin
+          (set! logic-exit #f)
+          (continuation-return exit #f))
+      (error "No available logic exit"))))
+
+
+(definition (end-logic)
+  (set! previous-logic #f)
+  (set! at-logic #f)
+  (set! logic-continuation #f)
+  (update-at-logic))
+
 
 (definition protected (break-logic-at name)
-  (define (before)
-    (set! at-logic name)
-    (update-title (->string name)))
-  
-  (define (after)
-    (set! previous-logic at-logic)
-    (update-title ""))
-  
-  (define (update-title title)
-    (set-title~ (child~ (find-bar 'history) 'at-logic) title))
-  
-  (when (break-logic? name)
-    (mutex-unlock! task-mutex)
-    (dynamic-wind
-      (lambda () (before))
-      (lambda () (break))
-      (lambda () (after)))))
+  (let ((request logic-request))
+    (when request
+      (set! previous-logic at-logic)
+      (set! at-logic name)
+      (when (or (eq? request any-logic)
+                (eq? request name))
+        (mutex-unlock! task-mutex)
+        (update-at-logic)
+        (continuation-capture
+          (lambda (cont)
+            (set! logic-request #f)
+            (set! logic-continuation cont)
+            (exit-logic)))))))
 
 
 (definition protected (break-logic-action action)
-  (when (requested-break-logic)
+  (when logic-request
     (action)))
+
+
+(definition (update-at-logic)
+  (let ((title (if at-logic (->string at-logic) "")))
+    (set-title~ (child~ (find-bar 'history) 'at-logic) title)))
 
 
 ;;;
@@ -216,7 +244,7 @@ void main()
   
   
   (method (deactivate)
-    (continue-if))
+    (end-logic))
 
   
   (method (history-start)
@@ -273,19 +301,35 @@ void main()
     (goto-history (+ now 1)))
   
   
-  (method (goto-history n)
+  (method (goto-now)
+    (goto-history now force?: #t))
+  
+  
+  (method (goto-history n (force?: force? #f))
     (let ((world (current-world)))
-      (continue-if)
+      (end-logic)
       (let ((n (in-history n)))
-        (unless (= n now)
+        (when (or (/= n now) force?)
           (set! now n)
           (let ((snapshot
                   (if (= n (history-end))
                       current
                     (get-snapshot~ (historical-moment now)))))
             (load-world~ world snapshot)
-            (invalidate-view~ (child~ (get-interface~ world) 'slider))
+            (invalidate-slider)
             (set-?n now))))))
+  
+  
+  (method (stepped-history)
+    (when (< now (history-end))
+      (increase! now)
+      (invalidate-slider)
+      (set-?n now)))
+  
+  
+  (method (invalidate-slider)
+    (let ((world (current-world)))
+      (invalidate-view~ (child~ (get-interface~ world) 'slider))))
   
   
   (method (slide-history where)
@@ -306,66 +350,56 @@ void main()
   (method (step-history)
     (let ((world (current-world))
           (me (current-me)))
-      (receive (thread stop) (step-info)
-        (if stop
-            (continue-stop thread stop)
-          (when (< now (history-end))
-            (let ((moment (historical-moment now)))
-              (increase! now)
-              (when moment
-                (parameterize ((stepping-history? #t))
-                  (let ((commands (get-commands~ moment))
-                        (time (get-time~ moment))
-                        (elapse (get-elapse~ moment)))
-                    (complete~ commands)
-                    (tick-sliced~ world me commands time elapse)
-                    (tick-actors~ world commands time elapse))))))))))
-  
-  
-  (method (step-logic)
-    (receive (thread stop) (step-info)
-      (if stop
-          (continue-stop thread stop)
-        (request-break-logic thread #t))))
-  
-  
-  (method (request-break-logic thread requested)
-    (thread-send thread
-      (lambda (exit)
-        (parameterize ((requested-break-logic requested))
-          (step-history)))))
+      (end-logic)
+      (when (< now (history-end))
+        (let ((moment (historical-moment now)))
+          (when moment
+            (let ((commands (get-commands~ moment))
+                  (time (get-time~ moment))
+                  (elapse (get-elapse~ moment)))
+              (complete~ commands)
+              (tick-sliced~ world me commands time elapse)
+              (tick-actors~ world commands time elapse))))
+        (stepped-history))))
   
   
   (method (rewind-logic)
-    (let ((world (current-world)))
-      (continue-if)
-      (if previous-logic
-          (let ((name previous-logic))
+    (if (not previous-logic)
+        (begin
+          ;; find last logic
+          (backward-history)
+          (request-logic skip-logic)
+          (step-history)
+          ;; backward again to it
+          (let ((request at-logic))
             (backward-history)
-            (receive (thread stop) (step-info)
-              (request-break-logic thread name)))
-        (backward-history))))
+            (step-into request)))
+      (let ((request previous-logic))
+        (goto-now)
+        (step-into request))))
   
   
-  (method (step-info)
-    (let ((thread (task-thread 'player)))
-      (let ((stops (get-thread-stops thread)))
-        (if (null? stops)
-            (values thread #f)
-          (values thread (get-object~ (car stops)))))))
+  (method (step-logic)
+    (if logic-continuation
+        (with-logic-exit
+          (lambda ()
+            (let ((cont logic-continuation))
+              (request-logic any-logic)
+              (set! logic-continuation #f)
+              (continuation-return cont #f))))
+      (step-into any-logic)))
   
   
-  (method (continue-if)
-    (receive (thread stop) (step-info)
-      (when stop
-        (continue-stop thread stop))))
-  
-  
-  (method (continue-stop thread stop)
-    (let ((continuation (get-continuation~ stop)))
-      (thread-post thread 'continue-stop
-        (lambda ()
-          (continuation-return continuation #f)))))
+  (method (step-into request)
+    (with-logic-exit
+      (lambda ()
+        (request-logic request)
+        (step-history)))
+    (when (not logic-continuation)
+      ;; exit was not consumed so step again
+      (if (and logic-exit (< now (history-end)))
+          (step-logic)
+        (end-logic))))
   
   
   ;;;
