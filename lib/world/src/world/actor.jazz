@@ -16,6 +16,7 @@
 
 
 (import (jazz.syntax (phase syntax))
+        (jazz.geometry)
         (world)
         (world.animation)
         (world.autoload)
@@ -75,6 +76,9 @@
     (slot jump-grace?             <bool>       initialize #f                 accessors generate)
     (slot jump-time               <fl>         initialize 0.                 accessors generate)
     (slot ground?                 <bool>       initialize #f                 accessors generate)
+    (slot water?                  <bool>       initialize #f                 accessors generate)
+    (slot swim-timer              <fl>         initialize 0.                 accessors generate)
+    (slot water-jump?             <bool>       initialize #f                 accessors generate)
     (slot ladder?                 <bool>       initialize #f                 accessors generate)
     (slot ladder-shaft            <f64vector+> initialize #f                 accessors generate)
     (slot last-step               <fl>         initialize 0.                 accessors generate)
@@ -243,6 +247,9 @@
   ;; (slot jump-grace?   <bool>)         ;; a standing jump allows us one last move
   ;; (slot jump-time     <fl>)           ;; time of current jump
   ;; (slot ground?       <bool>)         ;; are we currently in contact with the ground
+  ;; (slot water?        <bool>)         ;; are we colliding with a water polygon
+  ;; (slot swim-timer    <bool>)         ;; time before able to swim up
+  ;; (slot water-jump?   <bool>)         ;; jump when we get out of water
   ;; (slot ladder?       <bool>)         ;; are we climbing up a ladder
   ;; (slot ladder-shaft  <f64vector+>)   ;; the xz of the shaft we are climbing in
   ;; (slot last-step     <fl>)           ;; last time we played a step sound
@@ -341,7 +348,9 @@
                 (rotate-right))))
           
           (define (move proc)
-            (cond ((or ground? ladder? fly? blink?)
+            (cond ((and water? (>= swim-timer 0.))
+                    (proc (* sprint 0.75) displacement))
+                  ((or ground? ladder? fly? blink?)
                    (proc sprint displacement))
                   ((and jumping? jump-grace?)
                    (proc (* sprint grace-slowdown) displacement)
@@ -401,13 +410,13 @@
             "Run")
           
           (define (process-velocity)
-            (cond ((or ground? ladder? fly? blink? grace-move?)
+            (cond ((or ground? ladder? fly? blink? grace-move? (and water? (moving?~ commands)))
                    (vertex-copy! velocity displacement))
                   ((or (not jumping?)
                        (> (- time jump-time) 1.))
                    (let ((friction (get-friction)))
                      (when friction
-                       (let ((reduce (* friction elapse)))
+                       (let ((reduce (* friction elapse (if water? 4. 1.))))
                          (if (< (vertex-norm velocity) reduce)
                              (vertex-zero! velocity)
                            (vertex-decrease! velocity (vertex-scalar*& (vertex-normalize-safe& velocity) reduce)))))))))
@@ -415,18 +424,31 @@
           (define (process-gravity)
             (let ((normalized-gravity (vertex-normalize gravity)))
               (if (get-jump?~ commands)
-                  (when (and jump-ready? (or run? blink? (and (or ground? ladder?) (not jumping?))))
-                    (set! jumping? #t)
-                    (set! jump-ready? #f)
-                    (set! jump-grace? (and (allow-grace?) (vertex-zero? velocity)))
-                    (set! jump-time time)
-                    (vertex-copy! fall-velocity (vertex-scalar*& normalized-gravity (* (- (get-jump-impulsion~ world)) (cond (run? (world-setting 'world.run-jump 2.))
-                                                                                                                             (blink? (world-setting 'world.blink-jump 1.5))
-                                                                                                                             (else 1.)))))
+                  (when (or water-jump? (and jump-ready? (or run? blink? water? (and (or ground? ladder?) (not jumping?)))))
+                    (unless (and water? (not water-jump?))
+                      (set! jumping? #t)
+                      (set! jump-ready? #f)
+                      (set! jump-grace? (and (allow-grace?) (vertex-zero? velocity)))
+                      (set! jump-time time))
+                    (vertex-copy! fall-velocity (vertex-scalar*& normalized-gravity (* (- (/ (get-jump-impulsion~ world) (if water-jump? 2. 1.))) (cond (run? (world-setting 'world.run-jump 2.))
+                                                                                                                                                        (blink? (world-setting 'world.blink-jump 1.5))
+                                                                                                                                                        (water? (/ 1. 3.))
+                                                                                                                                                        (else 1.)))))
+                    (when water-jump? (set! water-jump? #f))
                     (animate-model time :context))
+                (unless water?
+                  (set! jump-ready? #t)))
+              (when (> swim-timer 0.)
+                (decrease! swim-timer elapse)
+                (when (<= swim-timer 0.)
+                  (set! swim-timer 0.)
+                  (set! jump-ready? #t)))
+              (when (and (not jump-ready?) (vertex-zero? fall-velocity))
                 (set! jump-ready? #t))
-              (when (> (dot-product fall-velocity normalized-gravity) max-fall-speed)
-                (vertex-copy! fall-velocity (vertex-scalar*& normalized-gravity max-fall-speed)))))
+              (when (> (dot-product fall-velocity normalized-gravity) (if water? 0.01 max-fall-speed))
+                (if water?
+                    (vertex-y-set! fall-velocity (* (vertex-y fall-velocity) (if (< (vertex-y fall-velocity) -0.1) 0.3 0.7)))
+                  (vertex-copy! fall-velocity (vertex-scalar*& normalized-gravity max-fall-speed))))))
           
           (define (collide-actor)
             (break-logic slide)
@@ -442,8 +464,13 @@
                    (collide (case collision-response ((stop) collide&stop) ((slide) collide&slide))))
               ;; collide&slide
               (receive (new-center slide-direction slide-collisions) (site (collide&slide on?: #f parent: tick-actor) (collide pumped-center target-center lookat radiuses ignore-entities?: ignore-entities? ignore-players?: ignore-players? debuggable-collisions?: #t))
+                (receive (new-slide-collisions water-collisions?) (liquid? slide-collisions)
+                  (when water-collisions? 
+                    (receive (new-center-2 slide-direction-2 slide-collisions-2) (site (collide&stop on?: #f parent: tick-actor) (collide pumped-center target-center lookat radiuses polygon-filter: liquid-filter ignore-entities?: ignore-entities? ignore-players?: ignore-players? debuggable-collisions?: #t))
+                      (set! new-center new-center-2)
+                      (set! slide-collisions slide-collisions-2))))
                 (let ((new-center (if pumps
-                                      (receive (unpumped unpumped-direction unpumped-collisions) (collide&stop new-center (vertex- new-center pumps) lookat radiuses ignore-entities?: ignore-entities? ignore-players?: ignore-players?)
+                                      (receive (unpumped unpumped-direction unpumped-collisions) (collide&stop new-center (vertex- new-center pumps) lookat radiuses polygon-filter: liquid-filter ignore-entities?: ignore-entities? ignore-players?: ignore-players?)
                                         unpumped)
                                     new-center)))
                   (break-action
@@ -468,6 +495,7 @@
                                      ;; slow fall
                                      (set! adjusted (/ adjusted 3.)))
                                  (set! ladder-shaft #f)))))
+                      
                       (break-logic fall)
                       (break-action
                         (when (get-debug-collisions?)
@@ -479,7 +507,56 @@
                                                                 (vertex+& (vertex-scalar*& fall-velocity adjusted) (vertex-scalar*& gravity (* .5 adjusted adjusted)))))))
                         ;; collide&stop
                         (receive (new-fall fall-direction fall-collisions) (site (collide&stop on?: #f parent: tick-actor) (collide&stop new-center target-fall lookat radiuses ignore-entities?: ignore-entities? ignore-players?: ignore-players? debuggable-collisions?: #t))
-                          (values new-fall slide-collisions fall-collisions)))))))))
+                          (receive (new-fall-collisions water-collisions?) (liquid? fall-collisions)
+                            (when water-collisions?
+                              (receive (new-fall-2 fall-direction fall-collisions) (site (collide&stop on?: #f parent: tick-actor) (collide&stop new-center target-fall lookat radiuses polygon-filter: liquid-filter ignore-entities?: ignore-entities? ignore-players?: ignore-players? debuggable-collisions?: #t))
+                                (set! new-fall new-fall-2)))
+                            (values new-fall slide-collisions fall-collisions))))))))))
+          
+          (define (liquid? fall-collisions)
+            (let ((new-collisions (new-queue))
+                  (water-polygons (new-queue)))
+              (for-each (lambda (collision)
+                          (let ((poly (get-polygon~ collision)))
+                            (if (get-water-cube?~ (world.external.minecraft:blockid->block (fxround (get-data1~ poly))))
+                                (enqueue water-polygons poly)
+                              (enqueue new-collisions collision))))
+                        fall-collisions)
+              (unless (queue-empty? water-polygons)
+                (set! water? (entering-water? (queue-list water-polygons))))
+              (values (queue-list new-collisions) (not (queue-empty? water-polygons)))))
+          
+          (define (entering-water? water-polygons)
+            (let ((poly (car water-polygons))) ;; For now we consider only one
+              (let ((angle (radian->degree (vector-angle (get-normal~ poly) (vertex+ velocity fall-velocity)))))
+                (cond ((< angle 90.)
+                       @w(let ((block (get-block (current-me))))
+                         (unless (get-water-cube?~ (world.external.minecraft:blockid->block block))
+                           (set! water-jump? #t)
+                           #f))
+                       (set! water-jump? #t)
+                       #f)
+                      (else
+                       (set! jumping? #f)
+                       (set! grace-move? #f)
+                       (set! jump-time time)
+                       (set! water-jump? #f)
+                       (if (/= (vertex-y (get-normal~ poly)) 0)
+                           (begin
+                             (set! jump-ready? #f)
+                             (set! swim-timer (* (abs (vertex-y fall-velocity)) 2)))
+                         (set! jump-ready? #t))
+                       #t)))))
+          
+          (define (liquid-filter poly)
+            (not (get-water-cube?~ (world.external.minecraft:blockid->block (fxround (get-data1~ poly))))))
+          
+          (define (get-block actor)
+            (let ((pos (get-position~ actor)))
+              (u8vector-ref (get-blocks~ (get-section~ (position-sector~ ?z pos))) (local-index pos))))
+          
+          (define (local-index pos)
+            (+ (* (vertex-y pos) 256) (* (vertex-z pos) 16) (vertex-x pos)))
           
           (define (hit-collisions new-center slide-collisions fall-collisions)
             (define (ground-update flag velocity)
@@ -712,7 +789,8 @@
                     (> (- time animation-fall) elapse-before-fall))
             (let ((model (cache-model)))
               (define (determine-animation proc)
-                (cond (jumping? (proc '("JumpStart" "Jump") (list "Jump")))
+                (cond (water? (proc (if (eq? name :context) '("SwimIdle") '("Swim")) #f))
+                      (jumping? (proc '("JumpStart" "Jump") (list "Jump")))
                       (fall? (proc '("Fall") #f))
                       (else (proc (if (eq? name :context)
                                       (list "Idle")
