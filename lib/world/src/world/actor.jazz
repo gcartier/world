@@ -78,6 +78,7 @@
     (slot jump-time               <fl>         initialize 0.                 accessors generate)
     (slot ground?                 <bool>       initialize #f                 accessors generate)
     (slot water?                  <bool>       initialize #f                 accessors generate)
+    (slot exiting-water?          <bool>       initialize #f                 accessors generate)
     (slot shallow-water?          <bool>       initialize #f                 accessors generate)
     (slot lava?                   <bool>       initialize #f                 accessors generate)
     (slot swim-timer              <fl>         initialize 0.                 accessors generate)
@@ -258,6 +259,7 @@
   ;; (slot jump-time      <fl>)           ;; time of current jump
   ;; (slot ground?        <bool>)         ;; are we currently in contact with the ground
   ;; (slot water?         <bool>)         ;; are we in a liquid environment
+  ;; (slot exiting-water? <bool>)         ;; are we going against a water polygon's normal
   ;; (slot shallow-water? <bool>)         ;; are we in shallow water
   ;; (slot lava?          <bool>)         ;; are we in lava
   ;; (slot swim-timer     <bool>)         ;; time before able to swim up
@@ -436,9 +438,9 @@
                       (set! jump-ready? #f)
                       (set! jump-grace? (and (allow-grace?) (vertex-zero? velocity)))
                       (set! jump-time time))
-                    (vertex-copy! fall-velocity (vertex-scalar*& normalized-gravity (* (- (/ (get-jump-impulsion~ world) (if water-jump? 2. 1.))) (cond (run? (world-setting 'world.run-jump 2.))
+                    (vertex-copy! fall-velocity (vertex-scalar*& normalized-gravity (* (- (/ (get-jump-impulsion~ world) (if water-jump? 1.5 1.))) (cond (run? (world-setting 'world.run-jump 2.))
                                                                                                                                                         (blink? (world-setting 'world.blink-jump 1.5))
-                                                                                                                                                        (water? (/ 1. 3.))
+                                                                                                                                                        (water? (if water-jump? 1. (/ 1. 3.)))
                                                                                                                                                         (else 1.)))))
                     (when water-jump? (set! water-jump? #f))
                     (animate-model time :context))
@@ -469,7 +471,7 @@
                    (target-center (vertex+ pumped-center (vertex-scalar*& velocity elapse)))
                    (collide (case collision-response ((stop) collide&stop) ((slide) collide&slide))))
               ;; collide&slide
-              (receive (new-center slide-direction slide-collisions) (site (collide&slide on?: #f parent: tick-actor) (collide pumped-center target-center lookat radiuses ignore-entities?: ignore-entities? ignore-players?: ignore-players? debuggable-collisions?: #t))
+              (receive (new-center slide-direction slide-collisions) (site (collide&slide on?: #f parent: tick-actor) (collide pumped-center target-center lookat radiuses include-back-facing?: #t ignore-entities?: ignore-entities? ignore-players?: ignore-players? debuggable-collisions?: #t))
                 (receive (new-slide-collisions water-collisions?) (liquid? slide-collisions)
                   (when water-collisions? 
                     (receive (new-center-2 slide-direction-2 slide-collisions-2) (site (collide&stop on?: #f parent: tick-actor) (collide pumped-center target-center lookat radiuses polygon-filter: liquid-filter ignore-entities?: ignore-entities? ignore-players?: ignore-players? debuggable-collisions?: #t))
@@ -512,84 +514,92 @@
                                                                   (vertex 0. (* elapse 3.5) 0.)
                                                                 (vertex+& (vertex-scalar*& fall-velocity adjusted) (vertex-scalar*& gravity (* .5 adjusted adjusted)))))))
                         ;; collide&stop
-                        (receive (new-fall fall-direction fall-collisions) (site (collide&stop on?: #f parent: tick-actor) (collide&stop new-center target-fall lookat radiuses ignore-entities?: ignore-entities? ignore-players?: ignore-players? debuggable-collisions?: #t))
+                        (receive (new-fall fall-direction fall-collisions) (site (collide&stop on?: #f parent: tick-actor) (collide&stop new-center target-fall lookat radiuses include-back-facing?: #t ignore-entities?: ignore-entities? ignore-players?: ignore-players? debuggable-collisions?: #t))
                           (receive (new-fall-collisions water-collisions?) (liquid? fall-collisions)
                             (if water-collisions?
                                 (begin
                                   (set! shallow-water? #t)
-                                  (receive (new-fall-2 fall-direction fall-collisions) (site (collide&stop on?: #f parent: tick-actor) (collide&stop new-center target-fall lookat radiuses polygon-filter: liquid-filter ignore-entities?: ignore-entities? ignore-players?: ignore-players? debuggable-collisions?: #t))
-                                    (set! new-fall new-fall-2)))
+                                  (receive (new-fall-2 fall-direction other-fall-collisions) (site (collide&stop on?: #f parent: tick-actor) (collide&stop new-center target-fall lookat radiuses polygon-filter: liquid-filter ignore-entities?: ignore-entities? ignore-players?: ignore-players? debuggable-collisions?: #t))
+                                    (set! new-fall new-fall-2)
+                                    (set! fall-collisions other-fall-collisions)))
                               (when water?
                                 (set! shallow-water? #f)))
-                            (values new-fall slide-collisions new-fall-collisions))))))))))
+                            (values new-fall slide-collisions fall-collisions))))))))))
           
           (define (liquid? fall-collisions)
             (let ((new-collisions (new-queue))
-                  (water-polygons (new-queue)))
+                  (water-polygons (new-queue))
+                  (water-collision? #f))
               (for-each (lambda (collision)
                           (let ((poly (get-polygon~ collision)))
                             (if (get-water-cube?~ (world.external.minecraft:blockid->block (fxround (get-data1~ poly))))
-                                (enqueue water-polygons poly)
+                                (begin
+                                  (set! water-collision? #t)
+                                  (unless (get-back-facing?~ collision)
+                                    (enqueue water-polygons poly)))
                               (enqueue new-collisions collision))))
                         fall-collisions)
-              (unless (queue-empty? water-polygons)
+              (if (queue-empty? water-polygons)
+                  (when (and water? exiting-water?)
+                    (set! water? #f)
+                    (set! lava? #f)
+                    (set! water-jump? #t)
+                    (set! exiting-water? #f))
                 (let ((entering? (entering-water? (queue-list water-polygons))))
                   (when (neq? entering? water?)
                     (set! water? entering?)
                     (when (eq? self me)
                       (if (and water? (not shallow-water?))
                           (let ((fall-speed (abs (vertex-y fall-velocity))))
-                            (debug fall-speed)
                             (when (> fall-speed 1.)
                               (play-3d-sound "sound/water/EnterWaterSmallA" position))
                             (play-ambience~ (current-ambience) "ambience/water/Underwater"))
                         (change-ambience~ (current-ambience)))))))
-              (values (queue-list new-collisions) (not (queue-empty? water-polygons)))))
+              (values (queue-list new-collisions) water-collision?)))
           
           (define (entering-water? water-polygons)
             (let ((poly (car water-polygons))) ;; For now we consider only one
-              (let ((angle (radian->degree (vector-angle (get-normal~ poly) (vertex+ velocity fall-velocity)))))
-                (let ((block (get-block (current-me))))
+              (let ((angle (radian->degree (vector-angle (get-normal~ poly) (vertex+ velocity (if ground? (make-zero-vertex) fall-velocity))))))
+                (let ((block (fxround (get-data1~ poly))))
                   (cond ((< angle 90.)
-                         (if (get-water-cube?~ (world.external.minecraft:blockid->block block))
-                             (begin
-                               (set! lava? (memq? block '(10 11)))
-                               #t)
-                           (begin
-                             (set! water-jump? #t)
-                             (set! lava? #f)
-                             #f)))
+                         (set! exiting-water? #t))
+                        ((= angle 90.)
+                         (set! jump-ready? #t))
                         (else
-                         (set! jumping? #f)
-                         (set! grace-move? #f)
-                         (set! jump-time time)
-                         (set! water-jump? #f)
-                         (if (/= (vertex-y (get-normal~ poly)) 0)
-                             (begin
-                               (set! jump-ready? #f)
-                               (set! swim-timer (* (abs (vertex-y fall-velocity)) 2)))
-                           (set! jump-ready? #t))
-                         (set! lava? (memq? (get-data1~ poly) '(10 11)))
-                         #t))))))
+                         (set! exiting-water? #f)
+                         (unless water?
+                           (set! jumping? #f)
+                           (set! grace-move? #f)
+                           (set! jump-time time)
+                           (set! water-jump? #f)
+                           (if (/= (vertex-y (get-normal~ poly)) 0)
+                               (begin
+                                 (set! jump-ready? #f)
+                                 (set! swim-timer (* (abs (vertex-y fall-velocity)) 2)))
+                             (set! jump-ready? #t)))))
+                  (set! lava? (memq? block '(10 11)))
+                  #t))))
           
           (define (liquid-filter poly)
             (not (get-water-cube?~ (world.external.minecraft:blockid->block (fxround (get-data1~ poly))))))
           
-          (define (get-block actor)
-            (let ((pos (get-position~ actor)))
-              (call-with-position~ (current-zone) (vertex (cast <fl> (fxfloor (vertex-x pos))) (cast <fl> (fxfloor (vertex-y pos))) (cast <fl> (fxfloor (vertex-z pos))))
+          @not-used-anymore(define (get-block poly)
+            (let ((origin (get-origin~ poly))
+                  (normal (get-normal~ poly)))
+              (let ((pos origin))
+              (call-with-position~ ?z (vertex (cast <fl> (fxfloor (vertex-x pos))) (cast <fl> (fxfloor (vertex-y pos))) (cast <fl> (fxfloor (vertex-z pos))))
                 (lambda (region sector block-id data-id i j k x y z uv rendering with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set! powerlevel-ref powerlevel-set!)
                   (with-field i (+ j 1) k
                     (lambda (section index)
                       (if section
                           (block-ref section index)
-                        0)))))))
+                        0))))))))
           
           (define (hit-collisions new-center slide-collisions fall-collisions)
             (define (ground-update flag velocity)
               (when (neq? ground? flag)
                 (set! ground? flag)
-                (if ground?
+                (if velocity
                     (hit-ground velocity exit)
                   (leave-ground exit))))
             
@@ -603,12 +613,21 @@
                     (vertex! fall-velocity 0. 0. 0.)
                     (set! jumping? #f)
                     (ground-update #t velocity))
-                (let ((fall-collided? (not-null? fall-collisions)))
+                (let ((fall-collided? (not-null? fall-collisions))
+                      (water-only? (null? (remove-water-collisions fall-collisions))))
                   (if (not fall-collided?)
                       (ground-update #f #f)
                     (vertex! fall-velocity 0. 0. 0.)
                     (set! jumping? #f)
-                    (ground-update #t velocity))))))
+                    (ground-update (not water-only?) velocity))))))
+          
+          (define (remove-water-collisions fall-collisions)
+            (let ((new-collisions (new-queue)))
+              (for-each (lambda (collision)
+                          (when (liquid-filter (get-polygon~ collision))
+                            (enqueue new-collisions collision)))
+                        fall-collisions)
+              (queue-list new-collisions)))
           
           (define (foot-step fall-collisions)
             (when (and (eq? self me) (get-steps?~ model) (or ground? @not-really-nice ladder?) (not water?))
