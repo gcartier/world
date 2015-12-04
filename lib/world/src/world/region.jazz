@@ -62,6 +62,8 @@
   (slot header       <u8vector>                                      getter generate)
   (slot chunks-mutex <object>   initialize (make-mutex 'chunks)      getter generate)
   (slot chunks       <table>    initialize (make-table test: equal?) getter generate)
+  (slot modified?    <bool>     initialize #f                        accessors generate)
+  (slot compact?     <bool>     initialize #f                        accessors generate)
   
   
   (method override (initialize x z file)
@@ -79,6 +81,7 @@
   
   
   (method override (destroy)
+    (compact-region)
     (close-port port)
     (nextmethod))
   
@@ -130,6 +133,10 @@
               chunk))))))
   
   
+  (method (find-chunk sector-x <fx> sector-z <fx>) <World-Chunk+>
+    (table-ref chunks (chunk-index sector-x sector-z) #f))
+  
+  
   (method (chunk-index sector-x <fx> sector-z <fx>) <pair>
     ;; looks like we don't need to adjust for negative values like stated on the wiki
     (cons (modulo sector-x 32)
@@ -160,14 +167,20 @@
     (* (u8vector-ref header (+ header-offset 3)) chunk-padding))
   
   
-  (method (set-chunk-offset header-offset <fx> offset <fx>)
-    (let ((offset <fx> (/ offset chunk-padding)))
-      (let ((b1 (modulo (arithmetic-shift offset -16) 256))
-            (b2 (modulo (arithmetic-shift offset -8) 256))
-            (b3 (modulo offset 256)))
-        (u8vector-set! header header-offset b1)
-        (u8vector-set! header (+ header-offset 1) b2)
-        (u8vector-set! header (+ header-offset 2) b3))))
+  (method (set-chunk-offset header-offset <fx> offset <fx+>)
+    (if (not offset)
+        (begin
+          (u8vector-set! header header-offset 0)
+          (u8vector-set! header (+ header-offset 1) 0)
+          (u8vector-set! header (+ header-offset 2) 0)
+          (u8vector-set! header (+ header-offset 3) 0))
+      (let ((offset <fx> (/ offset chunk-padding)))
+        (let ((b1 (modulo (arithmetic-shift offset -16) 256))
+              (b2 (modulo (arithmetic-shift offset -8) 256))
+              (b3 (modulo offset 256)))
+          (u8vector-set! header header-offset b1)
+          (u8vector-set! header (+ header-offset 1) b2)
+          (u8vector-set! header (+ header-offset 2) b3)))))
   
   
   (method (set-chunk-size header-offset <fx> size <fx>)
@@ -217,44 +230,40 @@
                 section)))))))
   
   
-  (method (save-region (compact?: compact? #f))
-    (define (save-header port)
-      (output-port-byte-position port 0)
-      (let ((size (u8vector-length header)))
-        (write-subu8vector header 0 size port)))
-    
-    ;; we could save only modified chunks and save them
-    ;; in-place when they fit else save them at end of file
-    ;; and compact the region on quit when size goes over
-    ;; a certain threshold!?
+  (method (save-header port)
+    (output-port-byte-position port 0)
+    (let ((size (u8vector-length header)))
+      (write-subu8vector header 0 size port)))
+  
+  
+  (method (save-region)
     (define (save-chunks port)
-      (let ((end region-header-size))
-        (loop (for z from 0 below 32)
-              (loop (for x from 0 below 32)
-                    (let ((header-offset (chunk-header-offset x z))
-                          (chunk (get-chunk-at (cons x z))))
-                      (if (not chunk)
-                          (begin
-                            (set-chunk-offset header-offset 0)
-                            (set-chunk-size header-offset 0))
-                        (let ((content (serialize-chunk chunk)))
-                          (let ((deflated-size (u8vector-length content)))
-                            (let ((chunk-size (pad-chunk (+ chunk-header-size deflated-size)))
-                                  (actual-size (allege (get-chunk-size header-offset))))
-                              (let ((offset (if (or compact? (> chunk-size actual-size))
-                                                end
-                                              (allege (get-chunk-offset header-offset)))))
-                                (output-port-byte-position port offset)
-                                (let ((chunk-header (make-u8vector 5)))
-                                  (put-u32-big-endian chunk-header 0 deflated-size)
-                                  (u8vector-set! chunk-header 4 2)
-                                  (write-subu8vector chunk-header 0 5 port)
-                                  (write-subu8vector content 0 deflated-size port)
-                                  (set-chunk-offset header-offset offset)
-                                  (set-chunk-size header-offset chunk-size)
-                                  (let ((chunk-end (+ offset chunk-size)))
-                                    (when (> chunk-end end)
-                                      (set! end chunk-end))))))))))))))
+      (iterate-chunks
+        (lambda (x z)
+          (let ((header-offset (chunk-header-offset x z))
+                (chunk (find-chunk x z)))
+            (when (and chunk (get-modified?~ chunk))
+              (let ((content (serialize-chunk chunk)))
+                (let ((deflated-size (u8vector-length content)))
+                  (let ((chunk-size (pad-chunk (+ chunk-header-size deflated-size)))
+                        (actual-size (allege (get-chunk-size header-offset))))
+                    (define (position-port)
+                      (if (<= chunk-size actual-size)
+                          (let ((offset (allege (get-chunk-offset header-offset))))
+                            (output-port-byte-position port offset)
+                            offset)
+                        (output-port-byte-position port 0 2)
+                        (output-port-byte-position port)))
+                    
+                    (let ((offset (position-port)))
+                      (let ((chunk-header (make-u8vector 5)))
+                        (put-u32-big-endian chunk-header 0 deflated-size)
+                        (u8vector-set! chunk-header 4 2)
+                        (write-subu8vector chunk-header 0 5 port)
+                        (write-subu8vector content 0 deflated-size port)
+                        (set-chunk-offset header-offset offset)
+                        (set-chunk-size header-offset chunk-size))))))
+              (reset-modified~ chunk))))))
     
     (define (pad-chunk size <fx>) <fx>
       (let ((mod (modulo size chunk-padding)))
@@ -262,13 +271,92 @@
             size
           (+ size (- chunk-padding mod)))))
     
-    (let ((dest <File> (new-brother~ file "out.mca"))) ;; for tests
-      (create-directories~ dest)
-      (call-with-output-file (path-settings dest truncate: compact?)
+    (define (needs-compaction? port)
+      (define (actual-size)
+        (output-port-byte-position port 0 2)
+        (output-port-byte-position port))
+      
+      (define (compact-size)
+        (let ((size region-header-size))
+          (iterate-chunks
+            (lambda (x z)
+              (let ((header-offset (chunk-header-offset x z)))
+                (increase! size (get-chunk-size header-offset)))))
+          size))
+      
+      (let ((percentage-threshold 125.))
+        (>= (percentage (actual-size) (compact-size)) percentage-threshold)))
+    
+    (define (save)
+      (call-with-output-file (path-settings file truncate: #f)
         (lambda (port)
           (save-chunks port)
-          (save-header port)))))
+          (save-header port)
+          (when (needs-compaction? port)
+            (set! compact? #t)))))
+    
+    (when modified?
+      (save)
+      (reset-modified)))
+  
+  
+  (method (compact-region)
+    (define (read-chunks)
+      (let ((chunks (new-queue)))
+        (iterate-chunks
+          (lambda (x z)
+            (let ((header-offset (chunk-header-offset x z)))
+              (let ((offset (get-chunk-offset header-offset)))
+                (if (not offset)
+                    (enqueue chunks #f)
+                  (let ((size (get-chunk-size header-offset)))
+                    (input-port-byte-position port offset)
+                    (let ((chunk (make-u8vector size)))
+                      (read-subu8vector chunk 0 size port)
+                      (enqueue chunks chunk))))))))
+        (queue-list chunks)))
+    
+    (define (save-chunks port chunks)
+      (let ((offset region-header-size))
+        (output-port-byte-position port offset)
+        (iterate-chunks
+          (lambda (x z)
+            (let ((header-offset (chunk-header-offset x z))
+                  (chunk (car chunks)))
+              (set! chunks (cdr chunks))
+              (if (not chunk)
+                  (set-chunk-offset header-offset #f)
+                (let ((size (u8vector-length chunk)))
+                  (write-subu8vector chunk 0 size port)
+                  (set-chunk-offset header-offset offset)
+                  (set-chunk-size header-offset size)
+                  (increase! offset size))))))))
+    
+    (define (compact)
+      (let ((chunks (read-chunks)))
+        (call-with-output-file (path-settings file truncate: #t)
+          (lambda (port)
+            (save-chunks port chunks)
+            (save-header port)))))
+    
+    (when compact?
+      (compact)
+      (set! compact? #f)))
+  
+  
+  (method protected (iterate-chunks proc)
+    (loop (for z from 0 below 32)
+          (loop (for x from 0 below 32)
+                (proc x z))))
   
   
   (method protected virtual (serialize-chunk chunk) <u8vector>
-    (unimplemented))))
+    (unimplemented))
+  
+  
+  (method protected (reset-modified)
+    (set! modified? #f))
+  
+  
+  (method protected (modified)
+    (set! modified? #t))))
