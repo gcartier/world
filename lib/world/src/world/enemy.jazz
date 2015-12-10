@@ -14,7 +14,8 @@
 (module world.enemy jazz
 
 
-(import (world)
+(import (jazz.geometry)
+        (world)
         (world.actor)
         (world.audio)
         (world.autoload)
@@ -128,11 +129,12 @@
                ;; enemy
                speed tick?)
     
-    (slot path-duration       initialize #f accessors generate)
-    (slot anim-duration       initialize #f accessors generate)
-    (slot aggro-radius        initialize #f accessors generate)
-    (slot aggro-target        initialize #f accessors generate)
-    (slot spawner-coordinates initialize #f accessors generate))
+    (slot tick-count          <fx>         initialize -1 getter    generate)
+    (slot path-duration       <fl+>        initialize #f accessors generate)
+    (slot anim-duration       <fl+>        initialize #f accessors generate)
+    (slot aggro-radius        <fl+>        initialize #f accessors generate)
+    (slot aggro-target        <Player+>    initialize #f accessors generate)
+    (slot spawner-coordinates <f64vector+> initialize #f accessors generate))
   
   
   (method override (prepare rest)
@@ -141,15 +143,25 @@
   
   
   (method override (tick commands time elapse exit)
+    (set! tick-count (modulo (+ tick-count 1) 12))
     (let ((me (current-me)))
       (when (and tick? (neq? self (get-controlled~ me)))
-        (or (players-aggro)
-            (if (<= path-duration 0.)
-                (path-creature)
-              (decrease! path-duration elapse)))
+        ;; each tick
+        (when (and path-duration (> path-duration 0.))
+          (decrease! path-duration elapse))
+        (when (and anim-duration (> anim-duration 0.))
+          (decrease! anim-duration))
+        (when aggro-target
+          (let ((pos (get-position~ aggro-target)))
+            (update-lookat (vertex-normalize& (vertex-& (vertex& (vertex-x pos) (vertex-y position) (vertex-z pos)) position)))))
         (if (and aggro-target (< (vertex-distance position (get-position~ aggro-target)) (+ (get-radius) (get-radius~ aggro-target) attack-distance)))
             (attack-player aggro-target)
-          (move-enemy time elapse exit)))))
+          (move-enemy time elapse exit))
+        ;; 5 times per second
+        (when (= tick-count 0)
+          (or (players-aggro)
+              (when (<= path-duration 0.)
+                (path-creature)))))))
   
   
   (method override (hit collisions exit)
@@ -175,7 +187,7 @@
   
   
   (method (players-aggro)
-    (when aggro-radius
+    (when (and aggro-radius (not aggro-target))
       (let ((zone (current-zone)))
         (let (iter (scan (get-players~ zone)))
           (if (null? scan)
@@ -183,17 +195,40 @@
                 (set! aggro-target #f)
                 #f)
             (let ((player (car scan)))
-              (let ((dist (vertex-distance position (get-position~ player))))
-                (if (< dist aggro-radius)
-                    (when (user-role?)
-                      (aggro-player player)
-                      #t)
-                  (iter (cdr scan))))))))))
+              (if (and (user-role?) (can-aggro? player))
+                  (begin
+                    (aggro-player player)
+                    #t)
+                (let (iter1 (enemies (get-aggroed-enemies~ player)))
+                  (if (null? enemies)
+                      (iter (cdr scan))
+                    (let ((enemy (car enemies)))
+                      (if (can-aggro? enemy)
+                          (begin
+                            (aggro-player (get-aggro-target~ enemy))
+                            #t)
+                        (iter1 (cdr enemies)))))))))))))
+  
+  (method (can-aggro? obj)
+    (let ((pos (copy-vertex (get-position~ obj))))
+      (vertex-y-set! pos (+ (vertex-y pos) 1))
+      (let ((dist (vertex-distance position pos))
+            (r (get-radius~ obj)))
+        (and
+          (<= dist aggro-radius)
+          (< (vector-angle (get-sight~ lookat) (vertex-& pos position)) PI/2)
+          (let ((closest (ray-closest-polygon~ (current-world) position (vertex-normalize (vertex-& pos position)) (+ aggro-radius (get-radius) r) filter: polygon-filter ignore-entities?: #f)))
+            (and closest (equal? (get-element~ (first closest)) obj)))))))
+  
+  
+  (method (polygon-filter poly)
+    (not (or (equal? (get-element~ poly) self) (get-water-cube?~ (world.external.minecraft:blockid->block (fxround (get-data1~ poly)))))))
   
   
   (method (aggro-player player)
     (when (neq? player aggro-target)
       (set! aggro-target player)
+      (set-aggroed-enemies~ player (cons self (get-aggroed-enemies~ player)))
       (play-3d-sound (aggro-sound) position))
     (let ((pos (get-position~ player)))
       @enables-enemies-to-fly
@@ -202,16 +237,14 @@
   
   
   (method (attack-player player)
-    (if (or (not anim-duration) (<= anim-duration 0))
-        (begin
-          (play-3d-sound (attack-sound) position)
-          (wound~ player self)
-          (set! anim-duration 100))
-      (decrease! anim-duration)))
+    (when (or (not anim-duration) (<= anim-duration 0))
+      (play-3d-sound (attack-sound) position)
+      (wound~ player self)
+      (set! anim-duration 100)))
   
   
   (method (prepare-pathing)
-    (set! path-duration (random-between 1. 10.)))
+    (set! path-duration (random-between 1. 3.)))
   
   
   (method protected virtual (path-creature)
