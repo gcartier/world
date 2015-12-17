@@ -60,6 +60,7 @@
   (slot file         <File>                                          getter generate)
   (slot port         <port>                                          getter generate)
   (slot header       <u8vector>                                      getter generate)
+  (slot region-mutex <object>   initialize (make-mutex 'region)      getter generate)
   (slot chunks-mutex <object>   initialize (make-mutex 'chunks)      getter generate)
   (slot chunks       <table>    initialize (make-table test: equal?) getter generate)
   (slot modified?    <bool>     initialize #f                        accessors generate)
@@ -104,10 +105,18 @@
   
   
   (method (read-header)
-    (let ((size region-header-size))
-      (let ((content (make-u8vector size)))
-        (read-subu8vector content 0 size port)
-        content)))
+    (with-region-mutex
+      (lambda ()
+        (let ((size region-header-size))
+          (let ((content (make-u8vector size)))
+            (read-subu8vector content 0 size port)
+            content)))))
+  
+  
+  (method (with-region-mutex thunk)
+    (mutex-lock! region-mutex)
+    (prog1 (thunk)
+      (mutex-unlock! region-mutex)))
   
   
   (method (with-chunks-mutex thunk)
@@ -189,24 +198,26 @@
   
   
   (method (read-chunk chunk-index <pair>) <World-Chunk+>
-    (let ((chunk-x <fx> (car chunk-index))
-          (chunk-z <fx> (cdr chunk-index)))
-      (let ((header-offset (chunk-header-offset chunk-x chunk-z)))
-        (assert (<= header-offset 4092))
-        (let ((offset (get-chunk-offset header-offset)))
-          (if (not offset)
-              #f
-            (site (read-chunk on?: #t parent: generate)
-              (input-port-byte-position port offset)
-              (let ((chunk-header (make-u8vector 5)))
-                (read-subu8vector chunk-header 0 5 port)
-                (let ((deflated-size <fx> (scan-u32-big-endian chunk-header 0))
-                      (compression-type (u8vector-ref chunk-header 4)))
-                  (assert (= compression-type 2))
-                  (let ((chunk-raw (make-u8vector deflated-size)))
-                    (read-subu8vector chunk-raw 0 deflated-size port)
-                    (let ((chunk-data (zlib-inflate chunk-raw)))
-                      (deserialize-chunk chunk-data)))))))))))
+    (with-region-mutex
+      (lambda ()
+        (let ((chunk-x <fx> (car chunk-index))
+              (chunk-z <fx> (cdr chunk-index)))
+          (let ((header-offset (chunk-header-offset chunk-x chunk-z)))
+            (assert (<= header-offset 4092))
+            (let ((offset (get-chunk-offset header-offset)))
+              (if (not offset)
+                  #f
+                (site (read-chunk on?: #t parent: generate)
+                  (input-port-byte-position port offset)
+                  (let ((chunk-header (make-u8vector 5)))
+                    (read-subu8vector chunk-header 0 5 port)
+                    (let ((deflated-size <fx> (scan-u32-big-endian chunk-header 0))
+                          (compression-type (u8vector-ref chunk-header 4)))
+                      (assert (= compression-type 2))
+                      (let ((chunk-raw (make-u8vector deflated-size)))
+                        (read-subu8vector chunk-raw 0 deflated-size port)
+                        (let ((chunk-data (zlib-inflate chunk-raw)))
+                          (deserialize-chunk chunk-data)))))))))))))
   
   
   (method protected virtual (deserialize-chunk chunk-data)
@@ -296,8 +307,10 @@
         (set! compact? #t)))
     
     (when modified?
-      (save)
-      (reset-modified)))
+      (with-region-mutex
+        (lambda ()
+          (save)
+          (reset-modified)))))
   
   
   (method (compact-region)
@@ -342,8 +355,10 @@
     
     (if (not compact?)
         (close-port port)
-      (compact)
-      (set! compact? #f)))
+      (with-region-mutex
+        (lambda ()
+          (compact)
+          (set! compact? #f)))))
   
   
   (method protected (iterate-chunks proc)
