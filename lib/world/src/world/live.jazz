@@ -238,7 +238,6 @@
   (slot down-point             <object>          initialize #f              getter generate)
   (slot double-click?          <bool>            initialize #f              getter generate)
   (slot drag-tolerance         <object>          initialize 3               getter generate)
-  (slot paused?                <bool>            initialize #f              getter generate)
   (slot tick-procedures        <object>          initialize '()             getter generate)
   (slot tick-no                <object>          initialize 0               getter generate)
   (slot commands               <object>          initialize #f              getter generate)
@@ -250,7 +249,6 @@
   (slot models                 <object>          initialize #f              getter generate)
   (slot gc-sound?              <bool>            initialize #f              getter generate)
   (slot gc-trace?              <bool>            initialize #f              getter generate)
-  (slot history                <object>          initialize #f              getter generate)
   (slot history-camera         <Camera>          initialize (make-camera)   getter generate)
   (slot history-camera?        <bool>            initialize #f              getter generate)
   (slot history-motion         <Motion>          initialize #f              getter generate)
@@ -424,10 +422,6 @@
       (set! commands (new Commands)))
     (set-last-no~ commands tick-no)
     (increase! tick-no))
-  
-  
-  (method (setup-world)
-    (set! paused? #f))
   
   
   ;;;
@@ -749,8 +743,9 @@
   (method (tick-world time elapse)
     (unless (or debugged? (is-inactive?) (not render-ready?))
       (site (tick on?: #t)
-        (let ((zone (current-zone)))
-          (unless paused?
+        (let ((zone (current-zone))
+              (history (current-history)))
+          (unless (get-paused?~ history)
             (tick-actors #f time elapse))
           (site (tick-scene on?: #f parent: tick)
             (tick-scene~ zone elapse)
@@ -882,41 +877,42 @@
   
   (method (player-task task <Task>)
     (declare (proper-tail-calls))
-    (with-task task "player" player-id support-state
-      (lambda (log-context exit)
-        (set! player-thread (current-thread))
-        (let (iter (previous (current-seconds)))
-          (let ((time (current-seconds)))
-            (let ((elapse (- time previous))
-                  (max-elapse 10.))
-              ;; ignore ridiculous elapses like
-              ;; coming back from computer sleep
-              (unless (> elapse max-elapse)
-                (with-task-mutex player-sequential-state
-                  (lambda ()
-                    (unless (task-stopping?)
-                      (site (player on?: #t)
-                        (trace-task player (if player-boost? "P" "p"))
-                        (unless (get-focus)
-                          (process-keys))
-                        (unless paused?
-                          (let ((me (current-me)))
-                            (complete~ commands)
-                            (tick-sliced me commands time elapse)
-                            (when (not paused?)
-                              (site (history on?: #f parent: player)
-                                (add-history time elapse)))
-                            (reset-commands)))
-                        (update-transformation-time elapse)
-                        (let ((me (current-me))
-                              (motion (current-motion)))
-                          (restore-desired-distance~ motion elapse)
-                          (process-roll~ motion me))))))))
-            (unboost-player)
-            (boost-render)
-            (let ((duration (- (current-seconds) time)))
-              (task-sleep (- player-rate duration) exit #f))
-            (iter time))))))
+    (let ((history (current-history)))
+      (with-task task "player" player-id support-state
+        (lambda (log-context exit)
+          (set! player-thread (current-thread))
+          (let (iter (previous (current-seconds)))
+            (let ((time (current-seconds)))
+              (let ((elapse (- time previous))
+                    (max-elapse 10.))
+                ;; ignore ridiculous elapses like
+                ;; coming back from computer sleep
+                (unless (> elapse max-elapse)
+                  (with-task-mutex player-sequential-state
+                    (lambda ()
+                      (unless (task-stopping?)
+                        (site (player on?: #t)
+                          (trace-task player (if player-boost? "P" "p"))
+                          (unless (get-focus)
+                            (process-keys))
+                          (unless (get-paused?~ history)
+                            (let ((me (current-me)))
+                              (complete~ commands)
+                              (tick-sliced me commands time elapse)
+                              (when (not (get-paused?~ history))
+                                (site (history on?: #f parent: player)
+                                  (add-history time elapse)))
+                              (reset-commands)))
+                          (update-transformation-time elapse)
+                          (let ((me (current-me))
+                                (motion (current-motion)))
+                            (restore-desired-distance~ motion elapse)
+                            (process-roll~ motion me))))))))
+              (unboost-player)
+              (boost-render)
+              (let ((duration (- (current-seconds) time)))
+                (task-sleep (- player-rate duration) exit #f))
+              (iter time)))))))
   
   
   (method (tick-sliced actor commands time elapse)
@@ -1410,61 +1406,72 @@
   
   
   (method (setup-history)
-    (set! history (new History (world-setting 'world.history-max 250))))
+    (set-current-history (new History (world-setting 'world.history-max 250))))
   
   
   (method (historical-moment n)
-    (historical-moment~ history n))
+    (let ((history (current-history)))
+      (historical-moment~ history n)))
   
   
   (method (add-history time elapse)
-    (receive (metadata snapshot) (snapshot-metadata/world)
-      (let ((moment (new Moment metadata snapshot (object-copy commands) time elapse)))
-        (add-history~ history moment))))
+    (let ((history (current-history)))
+      (receive (metadata snapshot) (snapshot-metadata/world)
+        (let ((moment (new Moment metadata snapshot (object-copy commands) time elapse)))
+          (add-history~ history moment)))))
   
   
   (method (backward-history)
-    (when paused?
-      (backward-history~ history)))
+    (let ((history (current-history)))
+      (when (get-paused?~ history)
+        (backward-history~ history))))
   
   
   (method (forward-history)
-    (when paused?
-      (forward-history~ history)))
+    (let ((history (current-history)))
+      (when (get-paused?~ history)
+        (forward-history~ history))))
   
   
   (method (truncate-future)
-    (truncate-future~ history))
+    (let ((history (current-history)))
+      (truncate-future~ history)))
   
   
   (method (reset-history)
-    (setup~ history)
-    (display-message "History reset"))
+    (let ((history (current-history)))
+      (setup~ history)
+      (display-message "History reset")))
   
   
   (method (step-history)
-    (when paused?
-      (step-history~ history)))
+    (let ((history (current-history)))
+      (when (get-paused?~ history)
+        (step-history~ history))))
   
   
   (method (rewind-logic)
-    (when paused?
-      (rewind-logic~ history)))
+    (let ((history (current-history)))
+      (when (get-paused?~ history)
+        (rewind-logic~ history))))
   
   
   (method (step-logic)
-    (when paused?
-      (step-logic~ history)))
+    (let ((history (current-history)))
+      (when (get-paused?~ history)
+        (step-logic~ history))))
   
   
   (method (recalculate-future)
-    (when paused?
-      (recalculate-future~ history)))
+    (let ((history (current-history)))
+      (when (get-paused?~ history)
+        (recalculate-future~ history))))
   
   
   (method (update-future)
-    (when paused?
-      (recalculate-future)))
+    (let ((history (current-history)))
+      (when (get-paused?~ history)
+        (recalculate-future))))
   
   
   (method (toggle-evaluate-future)
@@ -1540,9 +1547,10 @@
   
   
   (method (process-move-up)
-    (if (or paused? (and (person-motion?) fly?))
-        (move-up)
-      (space)))
+    (let ((history (current-history)))
+      (if (or (get-paused?~ history) (and (person-motion?) fly?))
+          (move-up)
+        (space))))
   
   
   (method (move-up)
@@ -2030,7 +2038,8 @@
   (method (draw-world)
     (site (draw-world on?: #t parent: render)
       (let ((zone (current-zone))
-            (me (current-me)))
+            (me (current-me))
+            (history (current-history)))
         (draw-zone~ zone)
         (when grid?
           (draw-grid))
@@ -2038,7 +2047,7 @@
           (draw-axes))
         (when (and aim? free-aim?)
           (draw-aim))
-        (when paused?
+        (when (get-paused?~ history)
           (site (draw-history on?: #t parent: draw-world)
             (draw-history)))
         (let ((skybox (get-skybox~ zone)))
@@ -2162,7 +2171,23 @@
   
   
   (method (draw-history)
-    (draw-history~ history))
+    (let ((history (current-history)))
+      (define (draw-moment n)
+        (let ((moment (historical-moment~ history n)))
+          (let ((metadata (get-metadata~ moment))
+                (now? (= n (get-now~ history))))
+            (for-each (lambda (entity-metadata)
+                        (bind (entity model meshes matrix) entity-metadata
+                          (cond ((and now? (history-draw-now?~ entity))
+                                 (register-ghost entity model meshes matrix 0))
+                                ((and (not now?) (history-draw-trail?~ entity))
+                                 (register-ghost entity model meshes matrix 1)))))
+                      metadata))))
+      
+      (let ((max 1000))
+        (loop (for n from (history-first~ history) to (history-last~ history))
+              (repeat max)
+              (draw-moment n)))))
   
   
   (method (registered-draw name)
@@ -2307,14 +2332,15 @@
   
   
   (method (win player)
-    (let ((zone (current-zone)))
+    (let ((zone (current-zone))
+          (history (current-history)))
       (win~ player)
       (let ((block (find-element~ zone
                      (lambda (obj)
                        (and (is? obj Block)
                             (eq? (get-user-data~ obj) 'win))))))
         (set-color~ block blue-dye))
-      (unless paused?
+      (unless (get-paused?~ history)
         (sleep .5)
         (reset-position~ player)
         (reset-state~ player)
@@ -2322,12 +2348,13 @@
   
   
   (method (lose player)
-    (lose~ player)
-    (unless paused?
-      (sleep .5)
-      (reset-position~ player)
-      (reset-state~ player)
-      (reset-game)))
+    (let ((history (current-history)))
+      (lose~ player)
+      (unless (get-paused?~ history)
+        (sleep .5)
+        (reset-position~ player)
+        (reset-state~ player)
+        (reset-game))))
   
   
   (method (reset-game)
@@ -2672,13 +2699,14 @@
   
   
   (method (toggle-mount)
-    (when (not paused?)
-      (unimplemented-connected)
-      (person-motion)
-      (deactivate-fly)
-      (if mount?
-          (deactivate-mount)
-        (activate-mount))))
+    (let ((history (current-history)))
+      (when (not (get-paused?~ history))
+        (unimplemented-connected)
+        (person-motion)
+        (deactivate-fly)
+        (if mount?
+            (deactivate-mount)
+          (activate-mount)))))
   
   
   (method (activate-mount)
@@ -3566,12 +3594,13 @@
   
   (method (delete-target)
     (let ((zone (current-zone))
-          (me (current-me)))
+          (me (current-me))
+          (history (current-history)))
       (if (null? selection)
           (bell)
         (for-each (lambda (elem)
                     (unless (is? elem Player)
-                      (cond (paused?
+                      (cond ((get-paused?~ history)
                              (editor-delete (get-position~ elem)))
                             (else
                              (if (and editor-actions? (is? elem Block))
@@ -3626,18 +3655,19 @@
   
   (method (mouse-add h v)
     (let ((zone (current-zone))
-          (player? (shift-down?)))
-      (if (or (zone-editable?~ zone)
-              player?)
-          (unless (or (user-role?) (and (designer-role?) (or (not (shift-down?)) (control-down?))))
-            (receive (position direction) (screen->ray~ (current-camera) h v)
-              (let ((class (editor-element-class)))
-                (if (or (not editor-actions?) paused?)
-                    (editor-add editor-mode class grid? grid-plane grid-position floor-grid? position direction 'down)
-                  (add-action~ commands 'add (list editor-mode class grid? grid-plane grid-position floor-grid? position direction 'down))))
-              (set! editing? #t)))
-        (warn-non-editable))
-      player?))
+          (history (current-history)))
+      (let ((player? (shift-down?)))
+        (if (or (zone-editable?~ zone)
+                player?)
+            (unless (or (user-role?) (and (designer-role?) (or (not (shift-down?)) (control-down?))))
+              (receive (position direction) (screen->ray~ (current-camera) h v)
+                (let ((class (editor-element-class)))
+                  (if (or (not editor-actions?) (get-paused?~ history))
+                      (editor-add editor-mode class grid? grid-plane grid-position floor-grid? position direction 'down)
+                    (add-action~ commands 'add (list editor-mode class grid? grid-plane grid-position floor-grid? position direction 'down))))
+                (set! editing? #t)))
+          (warn-non-editable))
+        player?)))
   
   
   (method (mouse-remove h v)
@@ -3676,25 +3706,27 @@
   
   
   (method (editor-mouse-move h v)
-    (when editing?
-      (cond (removing?
-             (receive (position direction) (screen->ray~ (current-camera) h v)
-               (editor-remove editor-mode position direction 'move)))
-            (changing?
-             (receive (position direction) (screen->ray~ (current-camera) h v)
-               (editor-change position direction 'move)))
-            (else
-             (let ((player? (shift-down?)))
-               (unless player?
-                 (receive (position direction) (screen->ray~ (current-camera) h v)
-                   (let ((class (editor-element-class)))
-                     (if (or (not editor-actions?) paused?)
-                         (editor-add editor-mode class grid? grid-plane grid-position floor-grid? position direction 'move)
-                       (add-action~ commands 'add (list editor-mode class grid? grid-plane grid-position floor-grid? position direction 'move)))))))))))
+    (let ((history (current-history)))
+      (when editing?
+        (cond (removing?
+                (receive (position direction) (screen->ray~ (current-camera) h v)
+                  (editor-remove editor-mode position direction 'move)))
+              (changing?
+                (receive (position direction) (screen->ray~ (current-camera) h v)
+                  (editor-change position direction 'move)))
+              (else
+               (let ((player? (shift-down?)))
+                 (unless player?
+                   (receive (position direction) (screen->ray~ (current-camera) h v)
+                     (let ((class (editor-element-class)))
+                       (if (or (not editor-actions?) (get-paused?~ history))
+                           (editor-add editor-mode class grid? grid-plane grid-position floor-grid? position direction 'move)
+                         (add-action~ commands 'add (list editor-mode class grid? grid-plane grid-position floor-grid? position direction 'move))))))))))))
   
   
   (method (editor-mouse-up h v)
-    (let ((zone (current-zone)))
+    (let ((zone (current-zone))
+          (history (current-history)))
       (receive (position direction) (screen->ray~ (current-camera) (get-h~ down-point) (get-v~ down-point))
         (if editing?
             (cond (removing?
@@ -3703,7 +3735,7 @@
                     (editor-change position direction 'up))
                   (else
                    (let ((class (editor-element-class)))
-                     (if (or (not editor-actions?) paused?)
+                     (if (or (not editor-actions?) (get-paused?~ history))
                          (editor-add editor-mode class grid? grid-plane grid-position floor-grid? position direction 'up)
                        (add-action~ commands 'add (list editor-mode class grid? grid-plane grid-position floor-grid? position direction 'up))))))
           (let ((origin (get-position~ (current-camera))))
@@ -3830,38 +3862,41 @@
   
   
   (method (toggle-paused)
-    (unimplemented-connected)
-    (if paused?
-        (unpause-world)
-      (pause-world)))
+    (let ((history (current-history)))
+      (unimplemented-connected)
+      (if (get-paused?~ history)
+          (unpause-world)
+        (pause-world))))
   
   
   (method (pause-world)
-    (set-current~ history (snapshot-world))
-    (activate~ history)
-    (set! paused? #t)
-    (camera-copy! history-camera eye)
-    (set-current-camera history-camera)
-    (set-current-motion history-motion)
-    (update-camera-parameters)
-    (reset-profiling)
-    (set-visible?~ (child~ interface 'slider) #t)
-    (update-parameter 'paused))
+    (let ((history (current-history)))
+      (set-current~ history (snapshot-world))
+      (activate~ history)
+      (set-paused?~ history #t)
+      (camera-copy! history-camera eye)
+      (set-current-camera history-camera)
+      (set-current-motion history-motion)
+      (update-camera-parameters)
+      (reset-profiling)
+      (set-visible?~ (child~ interface 'slider) #t)
+      (update-parameter 'paused)))
   
   
   (method (unpause-world)
-    (truncate-future)
-    (set-current~ history #f)
-    (deactivate~ history)
-    (camera-copy! eye history-camera)
-    (set-current-camera eye)
-    (set-current-motion eye-motion)
-    (set! paused? #f)
-    (eye-behind-player)
-    (follow-player)
-    (reset-profiling)
-    (set-visible?~ (child~ interface 'slider) #f)
-    (update-parameter 'paused))
+    (let ((history (current-history)))
+      (truncate-future)
+      (set-current~ history #f)
+      (deactivate~ history)
+      (camera-copy! eye history-camera)
+      (set-current-camera eye)
+      (set-current-motion eye-motion)
+      (set-paused?~ history #f)
+      (eye-behind-player)
+      (follow-player)
+      (reset-profiling)
+      (set-visible?~ (child~ interface 'slider) #f)
+      (update-parameter 'paused)))
   
   
   (method (snapshot-world)
@@ -3897,16 +3932,12 @@
   
   
   (method (serialize-world)
-    (object->u8vector history serialize))
+    (let ((history (current-history)))
+      (object->u8vector history serialize)))
   
   
   (method (deserialize-world content)
     (u8vector->object content deserialize))
-  
-  
-  (method (install-history hist)
-    (set! history hist)
-    (goto-history~ history (get-now~ history)))
   
   
   (method (find-player actors)
@@ -4165,33 +4196,35 @@
             (when (> (length previous-mouses) max-moves)
               (set-cdr! (tail previous-mouses (- max-moves 1)) '()))))))
     
-    (let ((h (fxround x))
-          (v (fxround y)))
-      (cond (showcase-down?
-             (showcase-mouse-move~ showcase h v))
-            ((and (get-cursor-captured?~ window) (not (get-cursor-mode?)))
-             (move-camera)
-             (unless (or (is-moving?) paused?)
-               (follow-player)))
-            (widget-down
-             (widget-mouse-move~ widget-down h v))
-            (editing?
-             (editor-mouse-move h v))
-            ((and (not (get-autotrack-camera?)) (not (get-cursor-mode?)))
-             (setup-cursor)
-             (capture-cursor~ window)
-             (move-camera))
-            ((and down? (not (near? (new Point h v) down-point drag-tolerance)))
-             (set! viewing? #t)
-             (setup-cursor)
-             (capture-cursor~ window)))))
+    (let ((history (current-history)))
+      (let ((h (fxround x))
+            (v (fxround y)))
+        (cond (showcase-down?
+                (showcase-mouse-move~ showcase h v))
+              ((and (get-cursor-captured?~ window) (not (get-cursor-mode?)))
+               (move-camera)
+               (unless (or (is-moving?) (get-paused?~ history))
+                 (follow-player)))
+              (widget-down
+                (widget-mouse-move~ widget-down h v))
+              (editing?
+                (editor-mouse-move h v))
+              ((and (not (get-autotrack-camera?)) (not (get-cursor-mode?)))
+               (setup-cursor)
+               (capture-cursor~ window)
+               (move-camera))
+              ((and down? (not (near? (new Point h v) down-point drag-tolerance)))
+               (set! viewing? #t)
+               (setup-cursor)
+               (capture-cursor~ window))))))
   
   
   (method protected virtual (mouse-track elapse dx dy)
     (let ((zone (current-zone))
           (me (current-controlled))
           (motion (current-motion))
-          (camera (current-camera)))
+          (camera (current-camera))
+          (history (current-history)))
       (unless (mouse-track~ zone elapse dx dy)
         (cond ((orbit-motion?)
                (track-orbit~ motion dx dy))
@@ -4200,7 +4233,7 @@
                      (up (copy-vertex (get-up~ camera)))
                      (right (copy-vertex (get-right~ camera)))
                      (first? (not moved?)))
-                 (if paused?
+                 (if (get-paused?~ history)
                      (track-actor~ motion me dx dy sight up right first?)
                    (add-action~ commands 'track (list dx dy sight up right first?))
                    (boost-player))
