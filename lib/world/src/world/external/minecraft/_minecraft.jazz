@@ -37,9 +37,10 @@
 (class Minecraft-Game extends World-Game
   
   
-  (slot repeaters    initialize (new-queue) accessors generate)
-  (slot lava-blocks  initialize (new-queue) accessors generate)
-  (slot water-blocks initialize (new-queue) accessors generate)
+  (slot repeaters       initialize '()                          accessors generate)
+  (slot pressure-plates initialize (make-table)                 accessors generate)
+  (slot lava-blocks     initialize (new-queue)                  accessors generate)
+  (slot water-blocks    initialize (new-queue)                  accessors generate)
   
   
   (definition powerable-redstone-components
@@ -415,6 +416,44 @@
           (iter)))))
   
   
+  (method (pressure-plates-update add-to remove-from actor) ;; bug: getting off and on quickly
+    (define (table-remove table key)
+      (list->table (map (lambda (x) (cons x (table-ref table x))) (remove key (table-keys table) test: equal?))))
+    
+    (define (pp-test pp1 pp2)
+      (when (and (is? pp1 Pressure-Plate) (is? pp2 Pressure-Plate))
+        (equal? (location~ pp1) (location~ pp2))))
+    
+    (let ((zone (current-zone)))
+      (for-each (lambda (pos)
+                  (let ((pp (table-ref pressure-plates pos #f)))
+                    (if pp
+                        (begin
+                          (set-colliders~ pp (cons actor (get-colliders~ pp)))
+                          (table-set! pressure-plates pos pp))
+                      (call-with-position~ zone pos ;; add new pressure plate
+                        (lambda (region sector block-id data-id i j k x y z uv rendering with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set! powerlevel-ref powerlevel-set!)
+                          (table-set! pressure-plates pos (new-pressure-plate sector i j k actor with-field))
+                          (set-repeaters~ self (remove pp repeaters test: pp-test))
+                          ;; play sound
+                          (updating-sectors~ zone
+                            (lambda (add-sector)
+                              (redstone-update sector i j k block-id 'activate add-sector with-field block-ref block-set! data-ref data-set! powerlevel-ref powerlevel-set! blocklight-ref blocklight-set!))))))))
+                add-to)
+      (for-each (lambda (pos) ;; remove actor from pressure plates
+                  (let ((pp (table-ref pressure-plates pos #f)))
+                    (let ((colliders (get-colliders~ pp)))
+                      (set! colliders (remove actor colliders))
+                      (if (null? colliders)
+                          (begin
+                            (set! pressure-plates (table-remove pressure-plates pos)) ;; test weak-values
+                            (set! repeaters (cons pp repeaters))) ;; unpower
+                        (begin
+                          (set-colliders~ pp colliders)
+                          (table-set! pressure-plates pos pp))))))
+                remove-from)))
+  
+  
   (method (redstone-update sector i j k block action add-sector with-field block-ref block-set! data-ref data-set! powerlevel-ref powerlevel-set! blocklight-ref blocklight-set!)
     (let ((check-cache? #f))
       (define (with-block i j k proc)
@@ -657,7 +696,7 @@
             (add-sector (get-sector~ section)))))
       
       (define (power-button i j k)
-        (enqueue repeaters (new-repeater sector i j k 10 with-field))
+        (set! repeaters (cons (new-repeater sector i j k 10 with-field) repeaters))
         (power-lever i j k))
       
       (define (unpower-button i j k)
@@ -689,6 +728,36 @@
             (unpower-side i (+ j 1) k i j k)
             (unpower-side i j (- k 1) i j k)
             (unpower-side i j (+ k 1) i j k))))
+      
+      (define (power-pp i j k)
+        (with-field i j k
+          (lambda (section index)
+            (add-sector (get-sector~ section))
+            (data-set! section index (bit-set (data-ref section index) 0 #t))
+            (powerlevel-update section index 15)
+            (strong-power-side i (- j 1) k i j k)
+            (component-power-side (- i 1) j k i j k)
+            (component-power-side (+ i 1) j k i j k)
+            (component-power-side i j (- k 1) i j k)
+            (component-power-side i j (+ k 1) i j k)
+            (component-power-side i (+ j 1) k i j k))))
+      
+      (define (unpower-pp i j k)
+        (with-field i j k
+          (lambda (section index)
+            (add-sector (get-sector~ section))
+            (data-set! section index (bit-set (data-ref section index) 0 #f))
+            (powerlevel-update! section index 0)
+            (with-field i (- j 1) k
+              (lambda (section index)
+                (when (= (powerlevel-ref section index) 255)
+                  (powerlevel-update section index 15))))
+            (unpower-side i (- j 1) k i j k)
+            (unpower-side (- i 1) j k i j k)
+            (unpower-side (+ i 1) j k i j k)
+            (unpower-side i j (- k 1) i j k)
+            (unpower-side i j (+ k 1) i j k)
+            (unpower-side i (+ j 1) k i j k))))
       
       (define (power-block i j k power (component? #f))
         (let ((proc (if (= power 15) strong-power-side weak-power-side)))
@@ -780,19 +849,20 @@
         (with-block i j k
           (lambda (section index block data)
             (let ((delay (arithmetic-shift-right (bitwise-and data #b1100) 2)))
-              (enqueue repeaters (new-repeater sector i j k delay with-field))))))
+              (set! repeaters (cons (new-repeater sector i j k delay with-field) repeaters))))))
       
       (define (effective-power-repeater i j k)
         (with-block i j k
           (lambda (section index block data)
-            (block-set! section index 94)
-            (add-sector (get-sector~ section))
-            (case (bitwise-and data #b11)
-              ((0) (strong-power-side i j (- k 1) i j k))
-              ((1) (strong-power-side (+ i 1) j k i j k))
-              ((2) (strong-power-side i j (+ k 1) i j k))
-              ((3) (strong-power-side (- i 1) j k i j k)))
-            (add-sector (get-sector~ section)))))
+            (when (powered-repeater? i j k)
+              (block-set! section index 94)
+              (add-sector (get-sector~ section))
+              (case (bitwise-and data #b11)
+                ((0) (strong-power-side i j (- k 1) i j k))
+                ((1) (strong-power-side (+ i 1) j k i j k))
+                ((2) (strong-power-side i j (+ k 1) i j k))
+                ((3) (strong-power-side (- i 1) j k i j k)))
+              (add-sector (get-sector~ section))))))
       
       (define (powered-repeater? i j k)
         (with-block i j k
@@ -810,7 +880,7 @@
         (with-block i j k
           (lambda (section index block data)
             (let ((delay (arithmetic-shift-right (bitwise-and data #b1100) 2)))
-              (enqueue repeaters (new-repeater sector i j k delay with-field))))))
+              (set! repeaters (cons (new-repeater sector i j k delay with-field) repeaters))))))
       
       (define (effective-unpower-repeater i j k)
         (with-block i j k
@@ -1261,10 +1331,12 @@
                                   (power-redstone-component i j k power))))))
             ((activate) (case block
                           ((69) (power-lever i j k))
+                          ((70 72) (power-pp i j k))
                           ((77 143) (power-button i j k))
                           ((93) (effective-power-repeater i j k))))
             ((deactivate) (case block
                             ((77 143) (unpower-button i j k))
+                            ((70 72) (unpower-pp i j k))
                             ((69) (unpower-lever i j k))
                             ((94) (effective-unpower-repeater i j k))))
             ((delete) (case block
