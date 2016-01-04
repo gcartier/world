@@ -18,12 +18,42 @@
         (jazz.event)
         (jazz.io)
         (jazz.media)
+        (jazz.syntax (phase syntax))
         (world)
         (world.audio)
         (world.autoload)
+        (world.configure)
         (world.geometry)
         (world.settings)
-        (world.syntax (phase syntax)))
+        (world.syntax (phase syntax))
+        (world.task))
+
+
+;;;
+;;;; Task
+;;;
+
+
+(definition public (music-task task <Task>)
+  (declare (proper-tail-calls))
+  (let ((music (current-music)))
+    (with-task task
+      (lambda (exit)
+        (set-music-thread~ music (current-thread))
+        (let (iter (previous (current-seconds)))
+          (let ((time (current-seconds)))
+            (let ((elapse (- time previous)))
+              (unless (task-stopping?)
+                (site (music on?: #t)
+                  (process-music~ music)))
+              (let ((duration (- (current-seconds) time)))
+                (task-sleep task music-period duration exit))
+              (iter time))))))))
+
+
+;;;
+;;;; Music
+;;;
 
 
 (class World-Music extends Object
@@ -34,18 +64,24 @@
   (slot music-volume    <fl>     initialize #f   accessors generate)
   (slot music-playing   <object> initialize #f   getter generate)
   (slot music-path      <object> initialize #f   getter generate)
-  (slot silence-thread  <object> initialize #f   getter generate)
-  (slot silence-mutex   <object> initialize #f   getter generate)
-  (slot silence-minimum <fl>     initialize 60.  accessors generate)
-  (slot silence-maximum <fl>     initialize 180. accessors generate)
-  (slot played-actions  <object> initialize '()  getter generate)
+  (slot music-thread    <object> initialize #f   accessors generate)
+  (slot music-mutex     <object> initialize #f   getter generate)
+  (slot silence-minimum <fl>     initialize 2. @w 60.  accessors generate)
+  (slot silence-maximum <fl>     initialize 5. @w 180. accessors generate)
+  (slot silence-end     <fl+>    initialize #f   accessors generate)
   
   
   (method override (initialize)
     (set! music? (world-setting 'world.music? #t))
     (set! music-style (world-setting 'world.music-style #f))
     (set! music-volume (world-setting 'world.music-volume default-music-volume))
-    (set! silence-mutex (make-mutex 'silence)))
+    (set! music-mutex (make-mutex 'music)))
+  
+  
+  (method (with-music-mutex thunk)
+    (mutex-lock! music-mutex)
+    (prog1 (thunk)
+      (mutex-unlock! music-mutex)))
   
   
   ;;;
@@ -111,34 +147,28 @@
               (play-music (concatenate "music/" music))))))))
   
   
+  ;; music task
+  (method (process-music)
+    (with-music-mutex
+      (lambda ()
+        ;; silence ended
+        (when (and silence-end (>= (current-seconds) silence-end))
+          (set! silence-end #f)
+          (post-event
+            (lambda ()
+              (change-music))))
+        ;; music ended
+        (when (music-ended?)
+          (post-event
+            (lambda ()
+              (close-music)
+              (enter-silence)))))))
+  
+  
   (method (enter-silence (minimum: minimum #f) (maximum: maximum #f))
-    (let ((minimum (or minimum silence-minimum))
-          (maximum (or maximum silence-maximum)))
-      (mutex-lock! silence-mutex)
-      (set! silence-thread
-            (thread-start!
-              (new-thread
-                (lambda ()
-                  (sleep (random-between minimum maximum))
-                  (mutex-lock! silence-mutex)
-                  (set! silence-thread #f)
-                  (mutex-unlock! silence-mutex)
-                  (post-event
-                    (lambda ()
-                      (change-music))))
-                'silence)))
-      (mutex-unlock! silence-mutex)))
-  
-  
-  (method (exit-silence)
-    (mutex-lock! silence-mutex)
-    (if (not silence-thread)
-        (mutex-unlock! silence-mutex)
-      (let ((thread silence-thread))
-        (exit-thread silence-thread)
-        (set! silence-thread #f)
-        (mutex-unlock! silence-mutex)
-        (thread-join! thread))))
+    (with-music-mutex
+      (lambda ()
+        (set! silence-end (+ (current-seconds) (random-between (or minimum silence-minimum) (or maximum silence-maximum)))))))
   
   
   (method (play-intro-music)
@@ -149,6 +179,10 @@
     (boolean music-playing))
   
   
+  (method (music-ended?)
+    (and music-playing (ready?~ music-playing) (not (playing?~ music-playing))))
+  
+  
   (method (maybe-play-music path)
     (when music?
       (play-music path)))
@@ -156,18 +190,19 @@
   
   (method (play-music path)
     (let ((world (current-world)))
-      (let ((file (effective-music path)))
-        (when file
-          (let ((sound (new-stream-sound file)))
-            (close-music)
-            (exit-silence)
-            (set! music-playing sound)
-            (set! music-path path)
-            (set! played-actions '())
-            (set-volume~ sound music-volume)
-            (play~ sound)
-            (update-parameter~ world 'music)
-            sound)))))
+      (with-music-mutex
+        (lambda ()
+          (let ((file (effective-music path)))
+            (when file
+              (let ((sound (new-stream-sound file)))
+                (close-playing)
+                (set! music-playing sound)
+                (set! music-path path)
+                (set! silence-end #f)
+                (set-volume~ sound music-volume)
+                (play~ sound)
+                (update-parameter~ world 'music)
+                sound)))))))
   
   
   (method (effective-music path)
@@ -187,17 +222,19 @@
   
   
   (method (close-music)
+    (with-music-mutex
+      (lambda ()
+        (close-playing))))
+  
+  
+  (method (close-playing)
     (let ((world (current-world)))
       (when music-playing
         (close~ music-playing)
         (set! music-playing #f)
         (set! music-path #f)
-        (exit-silence)
+        (set! silence-end #f)
         (update-parameter~ world 'music))))
-  
-  
-  (method (register-played-action action)
-    (set! played-actions (cons action played-actions)))
   
   
   (method (display-music)
