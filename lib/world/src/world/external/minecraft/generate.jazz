@@ -4148,13 +4148,28 @@
         (spawn-enemies elapse spawners))))
   
   
-  (method (add-enemy creature)
+  (method (add-enemy enemy)
     (increase! spawned-count)
-    (set! spawned-enemies (cons creature spawned-enemies)))
+    (set! spawned-enemies (cons enemy spawned-enemies))
+    (let ((thread
+            (new-thread
+              (lambda ()
+                (enemy-task~ enemy))
+              'enemy)))
+      (set-thread~ enemy thread)
+      (thread-base-priority-set! thread enemy-priority)
+      (thread-start! thread)))
   
   
-  (method (remove-enemy creature)
-    (let ((coords (get-spawner-coordinates~ creature)))
+  (method (remove-enemy enemy)
+    (let ((thread (get-thread~ enemy)))
+      (task-stop thread)
+      (set-thread-stop?~ enemy #t)
+      (thread-base-priority-set! thread +infinity)
+      (without-task-mutex
+        (lambda ()
+          (thread-join! thread))))
+    (let ((coords (get-spawner-coordinates~ enemy)))
       (let ((spawner (find-object (lambda (spawner)
                                     (when (equal? (get-coordinates~ spawner) coords)
                                       spawner))
@@ -4162,7 +4177,7 @@
         (when spawner
           (set-enemy-count~ spawner (- (get-enemy-count~ spawner) 1))))
       (decrease! spawned-count)
-      (set! spawned-enemies (remove creature spawned-enemies))))
+      (set! spawned-enemies (remove enemy spawned-enemies))))
   
   
   (method (find-spawners sector old-spawners)
@@ -4194,22 +4209,27 @@
                     (bind (i j k) coordinates
                       (call-with-sector sector i j k
                         (lambda (region sector block-id <fx> data-id <fx> i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> uv rendering with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set! powerlevel-ref powerlevel-set!)
-                          (define (find-spawning-places)
-                            (let ((queue (new-queue)))
-                              (loop (for a from (- i 4) to (+ i 4))
-                                    (loop (for c from (- k 4) to (+ k 4))
-                                          (loop (for b from (- j 1) to (+ j 1))
-                                                (with-field a b c
-                                                  (lambda (section index)
-                                                    (when (and section (= (block-ref section index) 0) (< (blocklight-ref section index) 8))
-                                                      (enqueue queue (section/index->position section index))))))))
-                              (queue-list queue)))
+                          (define (find-spawning-places needed)
+                            (let ((places '()))
+                              (continuation-capture
+                                (lambda (done)
+                                  (loop (for a from (- i 4) to (+ i 4))
+                                        (loop (for c from (- k 4) to (+ k 4))
+                                              (loop (for b from (- j 1) to (+ j 1))
+                                                    (if (<= needed 0)
+                                                        (continuation-return done #f)
+                                                      (with-field a b c
+                                                        (lambda (section index)
+                                                          (when (and section (= (block-ref section index) 0) (< (blocklight-ref section index) 8))
+                                                            (set! places (cons (section/index->position section index) places))
+                                                            (decrease! needed))))))))))
+                              places))
                           
                           (let ((time-now (+ time-since-last elapse)))
                             (if (and (> time-now time-for-spawn))
-                                (let ((possible-spawn-places (find-spawning-places))
-                                      (spawn-count (random-integer-between spawn-minimum spawn-maximum)))
-                                  (let ((sorted-enemies (and (> (+ spawned-count spawn-count) max-enemies) (sorted-spawned-enemies))))
+                                (let ((spawn-count (min (random-integer-between spawn-minimum spawn-maximum) max-enemies)))
+                                  (let ((sorted-enemies (and (> (+ spawned-count spawn-count) max-enemies) (sorted-spawned-enemies)))
+                                        (possible-spawn-places (find-spawning-places spawn-count)))
                                     (loop (for number from 0 below spawn-count)
                                           (unless (or (null? possible-spawn-places) (>= enemy-count max-spawner-enemies))
                                             (let ((position (random-element possible-spawn-places)))
@@ -4221,8 +4241,8 @@
                                                 (increase! enemy-count 1))
                                               (when (and (> spawned-count max-enemies) (not-null? sorted-enemies))
                                                 (let ((enemy (car sorted-enemies)))
-                                                  (remove-element enemy)
                                                   (remove-enemy enemy)
+                                                  (remove-element enemy)
                                                   (set! sorted-enemies (cdr sorted-enemies)))))))
                                     (set-time-since-last~ spawner 0.)
                                     (set-time-for-spawn~ spawner (random-between (first spawn-delay) (second spawn-delay)))
