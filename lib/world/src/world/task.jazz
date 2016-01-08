@@ -58,14 +58,42 @@
       (start~ task))))
 
 
-(definition protected (stop-task name (stop-thread #f))
-  (let ((task (find-task name)))
+(definition protected (stop-task name/task (stop-thread #f))
+  (let ((task (if (symbol? name/task) (find-task name/task) name/task)))
     (when (and task (eq? (get-state~ task) 'started))
       (stop~ task stop-thread))))
 
 
 (definition protected (task-thread name)
   (get-thread~ (find-task name)))
+
+
+(definition public (with-task task proc)
+  (continuation-capture
+    (lambda (exit)
+      (ready-task~ task)
+      (let (restart-loop)
+        (with-current-loop
+          (lambda ()
+            (with-restart-catcher 'resume-loop (present-current-loop-restart)
+              (lambda ()
+                (proc exit)))))
+        (restart-loop))))
+  (stopped~ task))
+
+
+(definition protected stopping-tasks?
+  #f)
+
+
+(definition protected (shutdown-tasks zone)
+  (dynamic-wind
+    (lambda ()
+      (set! stopping-tasks? #t))
+    (lambda ()
+      (stop-tasks~ zone))
+    (lambda ()
+      (set! stopping-tasks? #f))))
 
 
 ;;;
@@ -79,6 +107,7 @@
   (slot name      getter generate)
   (slot procedure getter generate)
   (slot ready     getter generate)
+  (slot mutex     getter generate)
   (slot thread    getter generate)
   (slot state     getter generate)
   
@@ -87,6 +116,7 @@
     (set! name~self name)
     (set! procedure~self procedure)
     (set! ready~self (make-mutex))
+    (set! mutex~self (make-mutex))
     (set! thread~self #f)
     (set! state~self 'initialized))
   
@@ -95,6 +125,12 @@
     (print-unreadable self output
       (lambda (output)
         (format output "{a}" name))))
+  
+  
+  (method (with-mutex thunk)
+    (mutex-lock! mutex)
+    (prog1 (thunk)
+      (mutex-unlock! mutex)))
   
   
   (method protected (start)
@@ -114,34 +150,32 @@
   
   
   (method protected (stop stop-thread)
-    (when thread
+    (mutex-lock! mutex)
+    (unless (eq? state 'stop)
       (if stop-thread
           (stop-thread)
         (task-stop thread))
       (set! state 'stopping)
-      (thread-base-priority-set! thread +infinity)
-      (without-task-mutex
-        (lambda ()
-          (thread-join! thread)))
-      (set! thread #f)
-      (set! state 'stopped)))
+      (if (eq? thread (current-thread))
+          (mutex-unlock! mutex)
+        (thread-base-priority-set! thread +infinity)
+        (without-task-mutex
+          (lambda ()
+            (mutex-unlock! mutex)
+            (thread-join! thread))))))
+  
+  
+  (method protected (stopped)
+    (with-mutex
+      (lambda ()
+        (set! state 'stopped))))
   
   
   (method protected (stopping?)
-    (eq? state 'stopping)))
-
-
-(definition public (with-task task proc)
-  (continuation-capture
-    (lambda (exit)
-      (ready-task~ task)
-      (let (restart-loop)
-        (with-current-loop
-          (lambda ()
-            (with-restart-catcher 'resume-loop (present-current-loop-restart)
-              (lambda ()
-                (proc exit)))))
-        (restart-loop)))))
+    (with-mutex
+      (lambda ()
+        (or stopping-tasks?
+            (eq? state 'stopping))))))
 
 
 ;;;
