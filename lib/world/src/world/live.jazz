@@ -3338,7 +3338,8 @@
   
   
   (method (editor-add-at mode class grid? grid-plane grid-position floor-grid? position direction)
-    (let ((zone (current-zone)))
+    (let ((zone (current-zone))
+          (me (current-me)))
       (define (determine-filter)
         (define (plane-filter)
           (let ((accessor (cond ((/= (vertex-x editor-direction) 0.) vertex-x)
@@ -3376,8 +3377,8 @@
             (let ((cube (unit-cube inside)))
               (ray-closest-cuboid-inner-quad inside normal cube))))
         
-        (define (determine-anchor origin normal)
-          (let ((bounds (transformed-bounds~ adding)))
+        (define (determine-anchor element origin normal)
+          (let ((bounds (transformed-bounds~ element)))
             (let ((radiuses (cuboid-radiuses bounds)))
               (cond ((= (vertex-y normal) 1.)
                      origin)
@@ -3395,23 +3396,33 @@
               (let ((origin (get-origin~ quad))
                     (normal (vertex-scalar* (get-normal~ quad) -1.)))
                 (when (or (not editor-added?) (vertex=? normal editor-direction))
-                  (instantiate-element-class class)
-                  (let ((anchor (determine-anchor origin normal)))
-                    (let ((position (anchor->position~ adding anchor)))
-                      (let ((actual (element-near~ zone position)))
-                        (unless actual
-                          (let ((added (editor-add-element mode class anchor)))
-                            (if editor-added?
-                                (unless (is? added Player)
-                                  (add-target added))
-                              (set! editor-added? #t)
-                              (set! editor-origin (or polygon-center origin))
-                              (set! editor-normal (or polygon-normal normal))
-                              (set! editor-direction normal)
-                              (set! editor-floor? floor?)
-                              (unless (is? added Player)
-                                (set-selection (list added))))
-                            added)))))))))))
+                  (let ((player? (eq? class 'player)))
+                    (unless player?
+                      (instantiate-element-class class))
+                    (let ((element (if player? me adding)))
+                      (let ((anchor (determine-anchor element origin normal)))
+                        (let ((position (anchor->position~ element anchor)))
+                          (let ((actual (element-near~ zone position)))
+                            (unless actual
+                              (if player?
+                                  (begin
+                                    (set-position~ me position)
+                                    (unless (person-motion?)
+                                      (set-lookat~ me (get-lookat~ (current-camera))))
+                                    (follow-player)
+                                    (unless (person-motion?)
+                                      (person-motion feedback?: #f))
+                                    #f)
+                                (let ((added (editor-add-element mode class anchor)))
+                                  (if editor-added?
+                                      (add-target added)
+                                    (set! editor-added? #t)
+                                    (set! editor-origin (or polygon-center origin))
+                                    (set! editor-normal (or polygon-normal normal))
+                                    (set! editor-direction normal)
+                                    (set! editor-floor? floor?)
+                                    (set-selection (list added)))
+                                  added))))))))))))))
       
       (let ((filter (determine-filter)))
         (let ((poly-closest (ray-closest-polygon position direction view-radius filter: filter ignore-non-physical?: #f ignore-players?: #t))
@@ -3470,20 +3481,9 @@
             (designer (get-designer~ zone)))
         (set-parent~ element zone)
         (set-position~ element position)
-        (unless (is? element Player)
-          (add-child~ designer element zone import: '(world.data) properties: (cons position: (cons position adding-properties))))
-        (unless (is? element Player)
-          (set-property~ designer element 'position position))
+        (add-child~ designer element zone import: '(world.data) properties: (cons position: (cons position adding-properties)))
+        (set-property~ designer element 'position position)
         (add-element~ zone element)
-        (when (and (is? element Player) (not (get-world-server~ (get-process))))
-          (let ((preserved-lookat (and (person-motion?) (get-lookat~ me))))
-            (remove-element me)
-            (when (server-side?~ (get-process))
-              (set-color~ element white-dye))
-            (set-current-me element)
-            (set-lookat~ element (or preserved-lookat (get-lookat~ (current-camera))))))
-        (when (eq? element (current-me))
-          (follow-player))
         (update-future)
         (set! adding #f)
         (set! adding-properties #f)
@@ -3493,8 +3493,6 @@
   (method (instantiate-element-class class)
     (define (instantiate class/new (properties '()))
       (let ((elem (if (procedure? class/new) (class/new) (apply new class/new properties))))
-        (when (is? elem Player)
-          (set-name~ elem (effective-player-name~ (get-application))))
         (set! adding elem)
         (set! adding-properties properties)))
     
@@ -3547,7 +3545,6 @@
          (instantiate-entity class))
         (else
          (case class
-           ((player) (instantiate (player-class)))
            ((block) (instantiate Block)))))))
   
   
@@ -3695,19 +3692,20 @@
   
   (method (mouse-add h v)
     (let ((zone (current-zone))
+          (me (current-me))
+          (camera (current-camera))
           (history (current-history)))
       (let ((player? (shift-down?)))
         (if (or (zone-editable?~ zone)
                 player?)
             (unless (or (user-role?) (and (designer-role?) (or (not (shift-down?)) (control-down?))))
-              (receive (position direction) (screen->ray~ (current-camera) h v)
+              (receive (position direction) (screen->ray~ camera h v)
                 (let ((class (editor-element-class)))
                   (if (or (not editor-actions?) (get-paused?~ history))
                       (editor-add editor-mode class grid? grid-plane grid-position floor-grid? position direction 'down)
                     (add-action~ commands 'add (list editor-mode class grid? grid-plane grid-position floor-grid? position direction 'down))))
                 (set! editing? #t)))
-          (warn-non-editable))
-        player?)))
+          (warn-non-editable)))))
   
   
   (method (mouse-remove h v)
@@ -3728,9 +3726,7 @@
       (cond ((and control? alt? (not shift?))
              (mouse-change h v))
             (control?
-             (let ((player? (mouse-add h v)))
-               (when (and player? (not (person-motion?)))
-                 (person-motion feedback?: #f))))
+             (mouse-add h v))
             (alt?
              (mouse-remove h v))
             (else
@@ -4357,8 +4353,7 @@
   
   (method protected virtual (right-mouse-up h v)
     (let ((me (current-me))
-          (motion (current-motion))
-          (player? #f))
+          (motion (current-motion)))
       (reset-roll~ motion me)
       (unless (get-cursor-captured?~ window)
         (if (or (user-role?)
@@ -4366,14 +4361,12 @@
                      ;; designer can teleport
                      (not (shift-down?))))
             (right-mouse-up~ (current-game) h v)
-          (set! player? (mouse-add h v))
+          (mouse-add h v)
           (editor-up)))
       (set! down? #f)
       (set! down-point #f)
       (set! moving? #f)
-      (release-cursor~ window)
-      (when (and player? (not (person-motion?)))
-        (person-motion feedback?: #f))))
+      (release-cursor~ window)))
   
   
   (method (mouse-wheel h v delta)
