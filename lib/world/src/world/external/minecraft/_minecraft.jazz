@@ -498,7 +498,6 @@
                 remove-from)))
   
   
-  ;; TODO: add water and lava update
   (method (redstone-update sector item add-sector with-field block-ref effective-block-set! data-ref effective-data-set! blocklight-ref blocklight-set! (delayed? #f))
     (let ((update-queue (new-queue))
           (first-call? #t)
@@ -516,12 +515,14 @@
       (define (effective-block-ref i j k)
         (with-field i j k
           (lambda (section index)
-            (block-ref section index))))
+            (when section
+              (block-ref section index)))))
       
       (define (effective-data-ref i j k)
         (with-field i j k
           (lambda (section index)
-            (data-ref section index))))
+            (when section
+              (data-ref section index)))))
       
       (define (block-set! i j k block)
         (with-field i j k
@@ -554,16 +555,24 @@
       (define (with-block i j k proc)
         (with-field i j k
           (lambda (section index)
-            (proc section index (block-ref section index) (data-ref section index)))))
+            (when section
+              (proc section index (block-ref section index) (data-ref section index))))))
       
       (define (update-blocks i j k lst) ;; list of where to look for components
-        (let ((blocks '()))
+        (let ((blocks (new-queue))
+              (block #f))
           (for-each (lambda (abc)
                       (bind (a b c) abc
-                        (when (memq? (effective-block-ref (+ i a) (+ j b) (+ k c)) updatable-components)
-                          (set! blocks (cons (list (+ i a) (+ j b) (+ k c)) blocks)))))
+                        (set! block (effective-block-ref (+ i a) (+ j b) (+ k c)))
+                        (when block
+                          (if (memq? block updatable-components)
+                              (enqueue blocks (list (+ i a) (+ j b) (+ k c)))
+                            (if (id? block Water StationaryWater)
+                                (enqueue water-blocks (normalize-sector/coordinates sector i j k with-field list))
+                              (when (id? block Lava StationaryLava)
+                                (enqueue lava-blocks (normalize-sector/coordinates sector i j k with-field list))))))))
                     lst)
-          (add-range blocks)))
+          (add-range (queue-list blocks))))
       
       (define (opaque? block-id)
         (let ((block (blockid->block block-id)))
@@ -849,7 +858,24 @@
                       (unless (bit-set? 3 data)
                         (piston-extend i j k data))
                     (when (bit-set? 3 data)
-                      (piston-retract i j k block data)))))))
+                      (piston-retract i j k block data)))))
+               ((WoodenDoorBlock IronDoorBlock)
+                (let ((data (effective-data-ref i j k)))
+                  (if (bit-set? 3 data)
+                      (begin
+                        (data-set! i j k (bit-set data 1 (receives-power? i j k)))
+                        (add-queue i (- j 1) k))
+                    (let ((open? (or (receives-power? i j k) (bit-set? 1 (effective-data-ref i (+ j 1) k)))))
+                      (data-set! i j k (bit-set data 2 open?))
+                      (when change?
+                        (door-sound open?))))))))
+      
+      (define (door-sound open?)
+        (play-sound-file
+          (if open?
+              "sound/random/door_open"
+            "sound/random/door_close")
+          volume: .5))                    
       
       (define (repeater-data-out r-i r-k from-i from-k)
         (cond ((< r-i from-i) 3)
@@ -920,11 +946,12 @@
           (let ((real-block (effective-block-ref i j k)))
             (ccase block
                    ((RedstoneTorchOff RedstoneTorchOn)
-                    (if delayed?
-                        (block-set! i j k (if (eq? delayed? 'on) RedstoneTorchOn RedstoneTorchOff))
-                      (let ((power? (powered-torch? i j k)))
-                        (when (not (id? real-block (if power? RedstoneTorchOff RedstoneTorchOn)))
-                          (set! repeaters (cons (new-repeater sector i j k 1 (if power? 'off 'on) with-field) repeaters)))))
+                    (when (= block real-block)
+                      (if (or delayed? first-call?)
+                          (block-set! i j k (if (eq? delayed? 'on) RedstoneTorchOn RedstoneTorchOff))
+                        (let ((power? (powered-torch? i j k)))
+                          (when (not (id? real-block (if power? RedstoneTorchOff RedstoneTorchOn)))
+                            (set! repeaters (cons (new-repeater sector i j k 1 (if power? 'off 'on) with-field) repeaters))))))
                     (when (or (and first-call? (not delayed?)) change?)
                       (update-blocks i j k double-abc)))
                    
@@ -935,11 +962,12 @@
                       (update-blocks i j k double-abc)))
                    
                    ((RedstoneRepeaterBlockOn RedstoneRepeaterBlockOff)
-                    (if delayed?
-                        (block-set! i j k (if (eq? delayed? 'on) RedstoneRepeaterBlockOn RedstoneRepeaterBlockOff))
-                      (let ((power? (powered-repeater? i j k)))
-                        (when (not (id? real-block (if power? RedstoneRepeaterBlockOn RedstoneRepeaterBlockOff)))
-                          (set! repeaters (cons (new-repeater sector i j k (arithmetic-shift-right (bitwise-and (effective-data-ref i j k) #b1100) 2) (if power? 'on 'off) with-field) repeaters)))))
+                    (when (= block real-block)
+                      (if delayed?
+                          (block-set! i j k (if (eq? delayed? 'on) RedstoneRepeaterBlockOn RedstoneRepeaterBlockOff))
+                        (let ((power? (powered-repeater? i j k)))
+                          (when (not (id? real-block (if power? RedstoneRepeaterBlockOn RedstoneRepeaterBlockOff)))
+                            (set! repeaters (cons (new-repeater sector i j k (arithmetic-shift-right (bitwise-and (effective-data-ref i j k) #b1100) 2) (if power? 'on 'off) with-field) repeaters))))))
                     (when (or (and first-call? (not delayed?)) change?)
                       (update-blocks i j k (repeater-update-list (effective-data-ref i j k)))))
                    
@@ -961,6 +989,12 @@
                     (when (= block real-block)
                       (update-redstone-component i j k block))
                     (when (or first-call? (and change? (id? block Piston StickyPiston)))
+                      (update-blocks i j k single-abc)))
+                   
+                   ((TNT)
+                    ;; (when (receives-power? i j k)
+                    ;;   ) code for TNT activation
+                    (when first-call?
                       (update-blocks i j k single-abc)))
                    
                    ((PistonHead)
