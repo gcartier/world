@@ -4277,7 +4277,8 @@
           (if (not redstone?)
               (task-sleep task +infinity 0. exit)
             (let (iter (previous (current-seconds)))
-              (let ((time (current-seconds)))
+              (let ((time (current-seconds))
+                    (duration 0.))
                 (let ((elapse (- time previous)))
                   (unless (get-paused?~ history)
                     (with-task-mutex
@@ -4287,9 +4288,8 @@
                           (let ((current-repeaters (get-repeaters~ (current-game))))
                             (unless (null? current-repeaters)
                               (set-repeaters~ (current-game) '())
-                              (tick-repeaters elapse current-repeaters)))))))
-                  (let ((duration (- (current-seconds) time)))
-                    (task-sleep task redstone-period duration exit))
+                              (increase! duration (tick-repeaters elapse current-repeaters))))))))
+                  (task-sleep task redstone-period duration exit)
                   (iter time)))))))))
   
   
@@ -4299,30 +4299,114 @@
   
   
   (method (power-repeaters elapse repeater-list)
-    (let ((game (current-game)))
+    (let ((game (current-game))
+          (duration 0.))
       (updating-sectors~ (current-zone)
         (lambda (add-sector)
           (let (iter (repeaters repeater-list))
             (unless (null? repeaters)
-              (let ((repeater (car repeaters)))
-                (let ((sector (get-sector~ repeater))
-                      (i (get-i~ repeater))
-                      (j (get-j~ repeater))
-                      (k (get-k~ repeater))
-                      (power? (if (is? repeater Pressure-Plate) #f (get-power?~ repeater)))
-                      (delay (get-delay~ repeater)))
-                  (if (< delay 0)
-                      (call-with-sector sector i j k
-                        (lambda (region sector block-id <fx> data-id <fx> i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> uv rendering with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!)
-                          (when (id? block-id WoodenButton StoneButton WoodenPressurePlate StonePressurePlate)
-                            (with-field i j k
-                              (lambda (section index)
-                                (data-set! section index (bit-set data-id (if (id? block-id WoodenPressurePlate StonePressurePlate) 0 3) #f)))))
-                          (redstone-update~ game sector (list i j k block-id) add-sector with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! power?)))
-                    (begin
-                      (set-delay~ repeater (- delay 1))
-                      (set-repeaters~ game (cons repeater (get-repeaters~ game)))))))
+              (;with-task-mutex
+                (lambda ()
+                  (let ((time (current-seconds))
+                        (repeater (car repeaters)))
+                    (let ((sector (get-sector~ repeater))
+                          (i (get-i~ repeater))
+                          (j (get-j~ repeater))
+                          (k (get-k~ repeater))
+                          (power? (if (is? repeater Pressure-Plate) #f (get-power?~ repeater)))
+                          (delay (get-delay~ repeater)))
+                      (if (< delay 0)
+                          (call-with-sector sector i j k
+                            (lambda (region sector block-id <fx> data-id <fx> i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> uv rendering with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!)
+                              (when (id? block-id WoodenButton StoneButton WoodenPressurePlate StonePressurePlate)
+                                (with-field i j k
+                                  (lambda (section index)
+                                    (data-set! section index (bit-set data-id (if (id? block-id WoodenPressurePlate StonePressurePlate) 0 3) #f)))))
+                              (redstone-update~ game sector (list i j k block-id) add-sector with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! power?)))
+                        (begin
+                          (set-delay~ repeater (- delay 1))
+                          (set-repeaters~ game (cons repeater (get-repeaters~ game))))))
+                    (increase! duration (- (current-seconds) time)))))
               (iter (cdr repeaters)))))
+        delay-update?: #t)
+      duration))
+  
+  
+  ;;;
+  ;;;; Gravity
+  ;;;
+  
+  
+  (method override (block-gravity-task task <Task>)
+    (declare (proper-tail-calls))
+    (let ((history (current-history))
+          (game (current-game)))
+      (with-task task
+        (lambda (exit)
+          (if (not block-gravity?)
+              (task-sleep task +infinity 0. exit)
+            (let (iter (previous (current-seconds)))
+              (let ((time (current-seconds)))
+                (let ((elapse (- time previous)))
+                  (unless (get-paused?~ history)
+                    (with-task-mutex
+                      (lambda ()
+                        (unless (stopping?~ task)
+                          (trace-task block-gravity "G")
+                          (let ((blocks (get-fall-blocks~ game)))
+                            (unless (queue-empty? blocks)
+                              (set-fall-blocks~ game (new-queue))
+                              (tick-block-gravity elapse blocks)))))))
+                  (task-sleep task block-gravity-period (- (current-seconds) time) exit)
+                  (iter time)))))))))
+  
+  
+  (method (tick-block-gravity elapse blocks)
+    (site (block-gravity on?: #t)
+      (blocks-fall elapse blocks)))
+  
+  
+  (method (blocks-fall elapse blocks)
+    (let ((game (current-game)))
+      (updating-sectors~ (current-zone)
+        (lambda (add-sector)
+          (let (iter)
+            (unless (queue-empty? blocks)
+              (bind (sector i j k) (dequeue blocks)
+                (call-with-sector sector i j k
+                  (lambda (region sector block <fx> data <fx> i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> uv rendering with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!)
+                    (define (effective-block-ref i j k)
+                      (with-field i j k
+                        (lambda (section index)
+                          (if section
+                            (block-ref section index)
+                            0))))
+                    
+                    (define (add-neighbors i j k)
+                      (define (add-neighbor i j k)
+                        (with-field i j k
+                          (lambda (section index)
+                            @w(when (id? (block-ref section index) Sand Gravel)
+                              (normalize-sector/coordinates sector i j k with-field
+                                (lambda (sector i j k)
+                                  (add-fall-block~ game sector i j k))))
+                            (add-sector (get-sector~ section)))))
+                      
+                      (add-neighbor (+ i 1) j k)
+                      (add-neighbor (- i 1) j k)
+                      (add-neighbor i (+ j 1) k)
+                      (add-neighbor i (- j 1) k)
+                      (add-neighbor i j (+ k 1))
+                      (add-neighbor i j (- k 1)))
+                    
+                    (when (and (id? block Sand Gravel) (id? (effective-block-ref i (- j 1) k) Air Water StationaryWater Lava StationaryLava))
+                      (with-field i j k
+                        (lambda (section index)
+                          (block-set! section index 0)
+                          (add-neighbors i j k)
+                          (inverse-propagate-light~ game i j k add-sector with-field block-ref blocklight-ref blocklight-set!)
+                          (redstone-update~ game sector (list i j k block) add-sector with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set!)))))))
+              (iter))))
         delay-update?: #t)))
   
   
