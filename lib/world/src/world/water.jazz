@@ -1,0 +1,223 @@
+;;;===============
+;;;  WorldScheme
+;;;===============
+;;;
+;;;; World Water
+;;;
+;;;  The Initial Developer of the Original Code is Edouard Hebert.
+;;;  Portions created by the Initial Developer are Copyright (C) 2012-2015
+;;;  the Initial Developer. All Rights Reserved.
+;;;
+;;;  Contributor(s):
+
+
+(module world.water jazz
+
+
+(import (jazz.syntax (phase syntax))
+        (world)
+        (world.autoload)
+        (world.configure)
+        (world.flow)
+        (world.history)
+        (world.generation)
+        (world.support)
+        (world.syntax (phase syntax))
+        (world.task))
+
+
+(definition public (water-task task <Task>)
+  (declare (proper-tail-calls))
+  (let ((zone (current-zone))
+        (game (current-game))
+        (history (current-history))
+        (me (current-me))
+        (first-call? #t))
+    (with-task task
+      (lambda (exit)
+        (let ((water-blocks (new-queue)))
+          (let (iter (previous (current-seconds)))
+            (let ((time (current-seconds)))
+              (let ((elapse (- time previous)))
+                (unless (get-paused?~ history)
+                  (with-task-mutex
+                    (lambda ()
+                      (unless (stopping?~ task)
+                        (trace-task water "L")
+                        (if first-call?
+                            (begin
+                              (set! first-call? #f)
+                              (set! water-blocks (find-flowing-water (element-sector~ zone me))))
+                          (begin
+                            (set! water-blocks (merge-queues water-blocks (get-water-blocks~ game)))
+                            (set-water-blocks~ game (new-queue))))
+                        (unless (queue-empty? water-blocks)
+                          (set! water-blocks (tick-water elapse water-blocks)))))))
+                (let ((duration (- (current-seconds) time)))
+                  (task-sleep task water-period duration exit))
+                (iter time)))))))))
+
+
+(definition (tick-water elapse water-blocks)
+  (site (water on?: #t)
+    (water-flow elapse water-blocks)))
+
+
+(definition (find-flowing-water sector)
+  (let ((zone (current-zone))
+        (queue (new-queue)))
+    (iterate-sector-neighbors~ zone sector 1
+      (lambda (sector)
+        (sector-iterate-blocks~ zone sector '(8)
+          (lambda (index)
+            (enqueue queue (cons sector (index->coordinates index)))))))
+    queue))
+
+
+(definition (water-flow elapse water-blocks)
+  (let ((zone (current-zone))
+        (new-water-blocks (new-queue)))
+    (updating-sectors~ zone
+      (lambda (add-sector)
+        (let (iter)
+          (unless (queue-empty? water-blocks)
+            (bind (sector i j k) (dequeue water-blocks)
+              (call-with-sector~ zone sector i j k
+                (lambda (region sector block-id <fx> data-id <fx> i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> uv rendering with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!)
+                  (with-field i j k
+                    (lambda (section index)
+                      (when section
+                        (when (memq? (block-ref section index) '(8 9))
+                          (let ((data (data-ref section index)))
+                            (define (get-inward-flow i j k)
+                              (define (side-flow side-i side-j side-k)
+                                (with-field side-i side-j side-k
+                                  (lambda (section index)
+                                    (if section
+                                        (if (memq? (block-ref section index) '(8 9))
+                                            (let ((data (data-ref section index)))
+                                              (cond ((< data 7)
+                                                     (+ data 1))
+                                                    ((= data 7)
+                                                     16)
+                                                    ((> data 7)
+                                                     (with-field side-i (- side-j 1) side-k
+                                                       (lambda (section index)
+                                                         (if (memq? (block-ref section index) '(8 9))
+                                                             16
+                                                           1))))))
+                                          16)
+                                      16))))
+                              
+                              (define (top-flow)
+                                (with-field i (+ j 1) k
+                                  (lambda (section index)
+                                    (if section
+                                        (if (memq? (block-ref section index) '(8 9))
+                                            (let ((data (data-ref section index)))
+                                              (if (< data 8)
+                                                  (+ data 8)
+                                                data))
+                                          #f)
+                                      #f))))
+                              
+                              (or
+                                (top-flow)
+                                (min
+                                  (side-flow (+ i 1) j k)
+                                  (side-flow (- i 1) j k)
+                                  (side-flow i j (+ k 1))
+                                  (side-flow i j (- k 1)))))
+                            
+                            (define (flow i j k data)
+                              (with-field i j k
+                                (lambda (section1 index1)
+                                  (define (flow-direction side-i side-j side-k)
+                                    (unless (= data 7)
+                                      (with-field (+ i side-i) (+ j side-j) (+ k side-k)
+                                        (lambda (section index)
+                                          (when section
+                                            (with-field (+ i (* side-i 2)) (+ j (* side-j 2)) (+ k (* side-k 2))
+                                              (lambda (section2 index2)
+                                                (when section2
+                                                  (let ((block2 (block-ref section2 index2))
+                                                        (data2 (data-ref section2 index2))
+                                                        (block (block-ref section index))
+                                                        (data-id (data-ref section index)))
+                                                    (if (memq? block '(10 11))
+                                                        (begin
+                                                          (block-set! section1 index1 4)
+                                                          (data-set! section1 index1 0)
+                                                          (add-sector (get-sector~ section1)))
+                                                      (when (or (memq? block can-flow-in) (and (memq? block '(8 9)) (> data-id (modulo data 8)) (< data-id 8)))
+                                                        (let ((lava? (memq? block2 '(10 11)))
+                                                              (source? (= data2 0)))
+                                                          (when (or (not lava?) (and lava? source?))
+                                                            (block-set! section index 8)
+                                                            (data-set! section index (if (> data 7) 1 (+ data 1)))
+                                                            (add-sector (get-sector~ section))
+                                                            (enqueue-sector/coordinates new-water-blocks (get-sector~ section) (index->coordinates index) with-field)
+                                                            (when lava?
+                                                              (data-set! section2 index2 0)
+                                                              (block-set! section2 index2 49)
+                                                              (add-sector (get-sector~ section2))
+                                                              (enqueue-sector/coordinates new-water-blocks (get-sector~ section2) (index->coordinates index2) with-field)))
+                                                          (when (and lava? (not source?))
+                                                            (data-set! section index 0)
+                                                            (block-set! section index 4)
+                                                            (add-sector (get-sector~ section))
+                                                            (enqueue-sector/coordinates new-water-blocks (get-sector~ section1) (index->coordinates index1) with-field))))))))))))))
+                                  
+                                  (when section1
+                                    (when (memq? (block-ref section1 index1) '(8 9))
+                                      (with-field i (- j 1) k
+                                        (lambda (section index)
+                                          (when section
+                                            (let ((block (block-ref section index)))
+                                              (if (memq? block '(10 11))
+                                                  (begin
+                                                    (enqueue-sector/coordinates new-water-blocks (get-sector~ section1) (index->coordinates index1) with-field)
+                                                    (block-set! section index (if (= (data-ref section index) 0) 49 4))
+                                                    (data-set! section index 0))
+                                                (if (memq? block (cons 8 (cons 9 can-flow-in)))
+                                                    (begin
+                                                      (block-set! section index 8)
+                                                      (data-set! section index (if (> data 7) data (+ data 8)))
+                                                      (add-sector (get-sector~ section))
+                                                      (enqueue-sector/coordinates new-water-blocks (get-sector~ section) (index->coordinates index) with-field)
+                                                      (when (= data 0)
+                                                        (flow-direction -1  0  0)
+                                                        (flow-direction  1  0  0)
+                                                        (flow-direction  0  0 -1)
+                                                        (flow-direction  0  0  1)))
+                                                  (begin
+                                                    (flow-direction -1  0  0)
+                                                    (flow-direction  1  0  0)
+                                                    (flow-direction  0  0 -1)
+                                                    (flow-direction  0  0  1)))))))))))))
+                            
+                            (unless (= data 0)
+                              (let ((level-set (get-inward-flow i j k)))
+                                (if (= level-set 16)
+                                    (begin
+                                      (block-set! section index 0)
+                                      (data-set! section index 0)
+                                      (with-field i (- j 1) k
+                                        (lambda (section index)
+                                          (when section
+                                            (add-sector (get-sector~ section))
+                                            (when (memq? (block-ref section index) '(8 9))
+                                              (enqueue-sector/coordinates new-water-blocks (get-sector~ section) (index->coordinates index) with-field))))))
+                                  (when (/= level-set data)
+                                    (data-set! section index level-set)))
+                                (when (/= level-set data)
+                                  (bind (i j k) (index->coordinates index)
+                                    (enqueue-sector/coordinates new-water-blocks (get-sector~ section) (list (- i 1) j k) with-field)
+                                    (enqueue-sector/coordinates new-water-blocks (get-sector~ section) (list (+ i 1) j k) with-field)
+                                    (enqueue-sector/coordinates new-water-blocks (get-sector~ section) (list i j (- k 1)) with-field)
+                                    (enqueue-sector/coordinates new-water-blocks (get-sector~ section) (list i j (+ k 1)) with-field)))))
+                            (flow i j k (data-ref section index))))
+                        (add-sector (get-sector~ section))))))))
+            (iter))))
+      delay-update?: #t)
+    new-water-blocks)))
