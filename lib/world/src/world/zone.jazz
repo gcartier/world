@@ -102,6 +102,7 @@
   (property start-up                <f64vector+> initialize #f              accessors generate)
   (property start-distance          <fl+>        initialize #f              accessors generate)
   (property floor-level             <fl+>        initialize 0.              accessors generate)
+  (property truncate-y              <fx+>        initialize #f              accessors generate)
   (property missile-behavior        <symbol>     initialize 'destroy        accessors generate)
   (property ambient-color           <f32vector+> initialize #f              accessors generate)
   (property sun-color               <f32vector+> initialize #f              accessors generate)
@@ -114,6 +115,9 @@
   (property avatar                  <object>     initialize #f              accessors generate)
   (property draw-me?                <bool>       initialize #t              accessors generate)
   (property first-time?             <bool>       initialize #t              accessors generate)
+  (property level-dir               <Directory>  initialize #f              accessors generate)
+  (property dimension               <symbol>     initialize 'over           accessors generate)
+  (property player-glow             <fl>         initialize -1.             accessors generate)
   (property properties              <object>     initialize '()             accessors generate)
   
   ;; world override properties
@@ -121,8 +125,8 @@
   (property jump-impulsion          <object>     initialize default-jump    accessors generate)
   (property start-grid?             <object>     initialize (unspecified)   accessors generate)
   (property start-axes?             <object>     initialize (unspecified)   accessors generate)
-  
-  
+
+
   (slot regions-dir                 <Directory>  initialize #f                        getter explicit)
   (slot regions-mutex               <object>     initialize (make-mutex 'regions)     getter generate)
   (slot regions                     <table>      initialize (make-table test: equal?) getter generate)
@@ -154,6 +158,9 @@
   (slot sun-angle                   <fl>         initialize -.20                      accessors generate)
   (slot skybox                      <Skybox+>    initialize #f                        accessors generate)
   (slot designer                    <object>     initialize #f                        accessors generate)
+  (slot level-file                               initialize #f)
+  (slot level-nbt                                initialize #f)
+  (slot opened-chest                             initialize #f accessors generate)
   
   
   ;;;
@@ -257,8 +264,10 @@
       (install-interface)))
   
   
-  (method protected virtual (setup-persistence)
-    )
+  (method (setup-persistence)
+    (let ((moniker (get-moniker)))
+      (when (and moniker (not level-dir))
+        (set! level-dir (new-directory~ (get-parent~ moniker) "level")))))
   
   
   (method (setup-overrides)
@@ -458,7 +467,7 @@
   ;;;
   
   
-  (method protected virtual (start-tasks)
+  (method (start-tasks)
     (start-task 'generate)
     (start-task 'render)
     (start-task 'player)
@@ -489,10 +498,16 @@
     (thread-base-priority-set! (task-thread 'generate) generate-priority))
   
   
-  (method protected virtual (stop-tasks)
+  (method (stop-tasks)
+    (define (stop-enemies)
+      (for-each (lambda (enemy)
+                  (stop-task (get-task~ enemy)))
+                spawned-enemies))
+    
     (let ((world (current-world)))
       (set-render-boost? #f)
       (set-player-boost? #f)
+      (stop-enemies)
       (stop-task 'sun)
       (stop-task 'spawn)
       (stop-task 'redstone)
@@ -533,8 +548,13 @@
               children))
   
   
-  (method protected virtual (player-update)
-    )
+  (method (player-update)
+    (when (minecraft?)
+      (let ((world (current-world)))
+        (let ((interface (get-interface~ world)))
+          (let ((character-pane (child~ interface 'character)))
+            (view-inventory~ character-pane)
+            (update~ character-pane))))))
   
   
   ;;;
@@ -542,8 +562,202 @@
   ;;;
   
   
-  (method public virtual (target-update target face face-rank poly vertex)
-    )
+  (proclaim (not warn optimizations))
+  
+  
+  (method (target-update target face face-rank poly vert)
+    (define (center-info title center (poly #f))
+      (let ((sector (position-sector center))
+            (x (fxfloor (vertex-x center)))
+            (y (fxfloor (vertex-y center)))
+            (z (fxfloor (vertex-z center))))
+        (let ((block (vector x y z))
+              (sector-index (get-index~ sector)))
+          (let ((sector-x (vector-ref sector-index 0))
+                (sector-y (vector-ref sector-index 1))
+                (sector-z (vector-ref sector-index 2)))
+            (let ((region (sector-region sector-x sector-y sector-z)))
+              (when region
+                (let ((section (get-section~ region 'physical sector-x sector-y sector-z))
+                      (cache-uninitialized 65535))
+                  (when section
+                    (let ((bottom-section? (= sector-y (cast <fx> (or truncate-y -4))))
+                          (sections <vector> (make-vector 27 #t))
+                          (cache <u16vector> (initialize-block-cache cache-uninitialized))
+                          (blocks (get-blocks~ section))
+                          (data (get-data~ section))
+                          (blocklight (get-blocklight~ section))
+                          (skylight (get-skylight~ section)))
+                      (define (section-ref a <fx> b <fx> c <fx>) <World-Section+>
+                        (if (and (= a 0)
+                                 (= b 0)
+                                 (= c 0))
+                            section
+                          (let ((index (section-index a b c)))
+                            (let ((section (vector-ref sections index)))
+                              (if (neq? section #t)
+                                  section
+                                (let ((x (+ sector-x a))
+                                      (y (+ sector-y b))
+                                      (z (+ sector-z c)))
+                                  (let ((region (sector-region x y z)))
+                                    (let ((section (and region (get-section~ (cast <World-Region> region) 'physical x y z))))
+                                      (vector-set! sections index section)
+                                      section))))))))
+                      
+                      (define (section-index a <fx> b <fx> c <fx>) <fx>
+                        (+ (* b 9) (* c 3) a 13))
+                      
+                      (define (local-index i <fx> j <fx> k <fx>) <fx>
+                        (+ (* j 256) (* k 16) i))
+                      
+                      (define (effective-index i <fx> j <fx> k <fx>) <fx>
+                        (* (+ (* j 324) (* k 18) i 343) 4))
+                      
+                      (define (blocks-get section <World-Section>) <u8vector>
+                        (get-blocks~ section))
+                      
+                      (define (blocklight-get section <World-Section>) <u8vector>
+                        (get-blocklight~ section))
+                      
+                      (define (blocklight-ref i <fx> j <fx> k <fx>)
+                        (u4vector-ref blocklight (local-index i j k)))
+                      
+                      (define (skylight-ref i <fx> j <fx> k <fx>)
+                        (u4vector-ref skylight (local-index i j k)))
+                      
+                      (define (local-block-ref i <fx> j <fx> k <fx>)
+                        (u8vector-ref blocks (local-index i j k)))
+                      
+                      (define (local-data-ref i <fx> j <fx> k <fx>)
+                        (u4vector-ref data (local-index i j k)))
+                      
+                      (define (effective-block-ref i <fx> j <fx> k <fx>) <fx>
+                        (let ((index (effective-index i j k)))
+                          (let ((value (u16vector-ref cache index)))
+                            (if (/= value cache-uninitialized)
+                                value
+                              (let ((value (field-ref i j k blocks-get u8vector-ref 0 1)))
+                                (u16vector-set! cache index value)
+                                value)))))
+                      
+                      (define (effective-light-ref shade <fl> i <fx> j <fx> k <fx>) <fx>
+                        (field-ref i j k blocklight-get u4vector-ref 0 0))
+                      
+                      (define (u4vector-ref field <u8vector> index <fx>) <fx>
+                        (let ((byte (u8vector-ref field (quotient index 2))))
+                          (if (even? index)
+                              (bitwise-and byte #x0F)
+                            (bitwise-and (arithmetic-shift-right byte 4) #x0F))))
+                      
+                      (define (field-ref i <fx> j <fx> k <fx> get-field ref empty bottom) <fx>
+                        (define (bind-i a <fx> i <fx>)
+                          (define (bind-j b <fx> j <fx>)
+                            (define (bind-k c <fx> k <fx>)
+                              (let ((section (section-ref a b c)))
+                                (if (not section)
+                                    (if (and bottom-section? (= b -1)) bottom empty)
+                                  (let ((field (get-field section)))
+                                    (if (not field)
+                                        (if (and bottom-section? (= b -1)) bottom empty)
+                                      (ref field (local-index i j k)))))))
+                            
+                            (cond ((< k 0) (bind-k -1 (+ 16 k)))
+                                  ((> k 15) (bind-k 1 (- k 16)))
+                                  (else (bind-k 0 k))))
+                          
+                          (cond ((< j 0) (bind-j -1 (+ 16 j)))
+                                ((> j 15) (bind-j 1 (- j 16)))
+                                (else (bind-j 0 j))))
+                        
+                        (cond ((< i 0) (bind-i -1 (+ 16 i)))
+                              ((> i 15) (bind-i 1 (- i 16)))
+                              (else (bind-i 0 i))))
+                      
+                      (define (compute-lighting shade <fl> i <fx> j <fx> k <fx> ax <fx> ay <fx> az <fx> bx <fx> by <fx> bz <fx> cx <fx> cy <fx> cz <fx> dx <fx> dy <fx> dz <fx>)
+                        (format "{a} {a} {a} {a}"
+                                (effective-light-ref shade (+ i ax) (+ j ay) (+ k az))
+                                (effective-light-ref shade (+ i bx) (+ j by) (+ k bz))
+                                (effective-light-ref shade (+ i cx) (+ j cy) (+ k cz))
+                                (effective-light-ref shade (+ i dx) (+ j dy) (+ k dz))))
+                      
+                      (define (ambient-light i <fx> j <fx> k <fx> vert)
+                        (let ((origin (vertex- (vertex-& vert (vertex& (cast <fl> x) (cast <fl> y) (cast <fl> z))) (vertex& .5 .5 .5)))
+                              (normal (get-normal~ poly)))
+                          (generic-lighting i j k origin normal compute-lighting no-shade)))
+                      
+                      (define (block-info i <fx> j <fx> k <fx>)
+                        (let ((id (local-block-ref i j k))
+                              (data (local-data-ref i j k))
+                              (blocklight (blocklight-ref i j k))
+                              (skylight (skylight-ref i j k)))
+                          (let ((block (blockid->block id)))
+                            (append (list (cons title (get-name~ block))
+                                          (cons "id" id)
+                                          (cons "data" data)
+                                          (cons "block light" blocklight)
+                                          (cons "sky light" skylight))
+                                    (if (and poly (programmer-role?))
+                                        (list (cons "sector" (format "{a} {a} {a}" sector-x sector-y sector-z))
+                                              (cons "coordinates" (format "{a} {a} {a}" i j k))
+                                              (cons "global" (present-vertex (vertex (get-data2~ poly) (get-data3~ poly) (get-data4~ poly))))
+                                              (cons "ambient" (ambient-light i j k vert)))
+                                      '())))))
+                      
+                      (define (present-vertex vert)
+                        (format "{r precision: 1}, {r precision: 1}, {r precision: 1}"
+                                (vertex-x vert)
+                                (vertex-y vert)
+                                (vertex-z vert)))
+                      
+                      (let ((i (- x (* sector-x 16)))
+                            (j (- y (* sector-y 16)))
+                            (k (- z (* sector-z 16))))
+                        (block-info i j k)))))))))))
+    
+    (define (update-info)
+      (if (not poly)
+          (begin
+            (unregister-info 'block)
+            (unregister-info 'fore)
+            (let ((eye (get-position~ (current-camera))))
+              (let ((info (center-info "Eye" eye)))
+                (if (not info)
+                    (unregister-info 'eye)
+                  (register-info 'eye
+                    (lambda (add-section add-info)
+                      (let ((section (add-section "Eye")))
+                        (for-each (lambda (info)
+                                    (add-info section (car info) (cdr info)))
+                                  info))))))))
+        (let ((game (current-game)))
+          (with-polygon-interaction~ game poly
+            (lambda (poly block fore)
+              (let ((info (center-info "Block" block poly)))
+                (register-info 'block
+                  (lambda (add-section add-info)
+                    (let ((section (add-section "Block")))
+                      (for-each (lambda (info)
+                                  (add-info section (car info) (cdr info)))
+                                info)))))
+              (let ((info (center-info "Fore" fore)))
+                (if (not info)
+                    (unregister-info 'fore)
+                  (register-info 'fore
+                    (lambda (add-section add-info)
+                      (let ((section (add-section "Fore")))
+                        (for-each (lambda (info)
+                                    (add-info section (car info) (cdr info)))
+                                  info)))))))))
+        (unregister-info 'eye)))
+    
+    (when (minecraft?)
+      (with-generate-mutex
+        (lambda ()
+          (update-info)))))
+  
+  
+  (proclaim (warn optimizations))
   
   
   ;;;
@@ -980,17 +1194,37 @@
   ;;;
   
   
-  ;; until unification
-  (method protected virtual (add-enemy enemy)
-    )
+  (method (add-enemy enemy)
+    (set-spawned-count (+ spawned-count 1))
+    (set-spawned-enemies (cons enemy spawned-enemies))
+    (let ((procedure
+            (lambda (task)
+              (enemy-task~ enemy task))))
+      (let ((task (new Task 'enemy procedure)))
+        (start-task task)
+        (set-task~ enemy task)
+        (thread-base-priority-set! (get-thread~ task) enemy-priority))))
   
   
-  (method protected virtual (remove-enemy enemy)
-    )
+  (method (remove-enemy enemy)
+    (let ((pos (get-spawner-position~ enemy)))
+      (let ((spawner (find-object (lambda (spawner)
+                                    (when (equal? (get-position~ spawner) pos)
+                                      spawner))
+                                  spawner-list)))
+        (when spawner
+          (set-enemy-count~ spawner (- (get-enemy-count~ spawner) 1))))
+      (set-spawned-count (- spawned-count 1))
+      (set-spawned-enemies (remove enemy spawned-enemies)))
+    (let ((task (get-task~ enemy)))
+      (stop-task task)))
   
   
-  (method protected virtual (change-enemy-models? value)
-    )
+  (method (change-enemy-models? value)
+    (set-enemy-models? value)
+    (for-each (lambda (enemy)
+                (update-model~ enemy anchor?: #t))
+              spawned-enemies))
   
   
   ;;;
@@ -1017,8 +1251,13 @@
         (empty-table regions))))
   
   
-  (method protected virtual (get-regions-dir) <Directory>
-    (unimplemented))
+  (method (get-regions-dir) <Directory>
+    (or regions-dir (let ((dir (new-directory~ level-dir (case dimension
+                                                           ((over) "region")
+                                                           ((nether) '("DIM-1" "region"))
+                                                           ((end) '("DIM1" "region"))))))
+                      (set! regions-dir dir)
+                      dir)))
   
   
   (method (iterate-regions-dir proc)
@@ -1049,6 +1288,30 @@
             (when (> z front)
               (set! front z))))
         (values left right back front))))
+  
+  
+  (method public (change-dimension)
+    (with-generate-mutex
+      (lambda ()
+        (set! dimension (case dimension
+                          ((over) 'nether)
+                          ((nether) 'end)
+                          ((end) 'over)))
+        (set! regions-dir #f)
+        (set! regions (make-table test: equal?))
+        (set! sectors (make-table test: equal?))
+        (set! areas (make-table test: equal?)))))
+  
+  
+  ;; for exploration
+  (method (preload-regions)
+    (iterate-regions-dir
+      (lambda (file x z)
+        (let ((region (get-region x z)))
+          (loop (for sector-x from 0 below 32)
+                (loop (for sector-z from 0 below 32)
+                      (loop (for sector-y from 0 below 16)
+                            (get-section~ region 'physical sector-x sector-y sector-z))))))))
 
 
   ;; for exploration
@@ -1073,15 +1336,26 @@
                   (explore (get-region x z)))))
   
   
-  ;; for exploration
-  (method (preload-regions)
-    (iterate-regions-dir
-      (lambda (file x z)
-        (let ((region (get-region x z)))
-          (loop (for sector-x from 0 below 32)
-                (loop (for sector-z from 0 below 32)
-                      (loop (for sector-y from 0 below 16)
-                            (get-section~ region 'physical sector-x sector-y sector-z))))))))
+  ;; exploration
+  (method (explore-chests)
+    (preload-regions)
+    (let ((items '()))
+      (for-each (lambda (info)
+                  (bind (sector i j k) info
+                    (call-with-sector sector i j k
+                      (lambda (region sector block-id <fx> data-id <fx> i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> uv rendering with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!)
+                        (let ((data (block-entity-data region sector i j k)))
+                          (let ((inventory (list-payload-content (tag-assoc "Items" data))))
+                            (for-each (lambda (item)
+                                        (let ((id (tag-assoc "id" item)))
+                                          (let ((name (or (let ((item (id->item id)))
+                                                            (and item (get-name~ item)))
+                                                          id)))
+                                          (unless (memv? name items)
+                                            (set! items (cons name items))))))
+                                      inventory)))))))
+                (find-visual-blocks '(54)))
+      (sort nu<? items key: ->string)))
   
   
   (method (get-region region-x <fx> region-z <fx>) <World-Region+>
@@ -2137,10 +2411,75 @@
   ;;;
   
   
-  (method protected virtual (gravity-task task <Task>)
-    (with-task task
-      (lambda (exit)
-        (task-sleep task +infinity 0. exit))))
+  (method (gravity-task task <Task>)
+    (declare (proper-tail-calls))
+    (let ((history (current-history))
+          (game (current-game)))
+      (with-task task
+        (lambda (exit)
+          (let (iter (previous (current-seconds)))
+            (let ((time (current-seconds)))
+              (let ((elapse (- time previous)))
+                (unless (get-paused?~ history)
+                  (with-task-mutex
+                    (lambda ()
+                      (unless (stopping?~ task)
+                        (trace-task gravity "G")
+                        (let ((blocks (get-fall-blocks~ game)))
+                          (unless (queue-empty? blocks)
+                            (set-fall-blocks~ game (new-queue))
+                            (tick-gravity elapse blocks)))))))
+                (task-sleep task gravity-period (- (current-seconds) time) exit)
+                (iter time))))))))
+  
+  
+  (method (tick-gravity elapse blocks)
+    (site (gravity on?: #t)
+      (blocks-fall elapse blocks)))
+  
+  
+  (method (blocks-fall elapse blocks)
+    (let ((game (current-game)))
+      (updating-sectors~ (current-zone)
+        (lambda (add-sector)
+          (let (iter)
+            (unless (queue-empty? blocks)
+              (bind (sector i j k) (dequeue blocks)
+                (call-with-sector sector i j k
+                  (lambda (region sector block <fx> data <fx> i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> uv rendering with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!)
+                    (define (effective-block-ref i j k)
+                      (with-field i j k
+                        (lambda (section index)
+                          (if section
+                            (block-ref section index)
+                            0))))
+                    
+                    (define (add-neighbors i j k)
+                      (define (add-neighbor i j k)
+                        (with-field i j k
+                          (lambda (section index)
+                            @w(when (id? (block-ref section index) Sand Gravel)
+                              (normalize-sector/coordinates sector i j k with-field
+                                (lambda (sector i j k)
+                                  (add-fall-block~ game sector i j k))))
+                            (add-sector (get-sector~ section)))))
+                      
+                      (add-neighbor (+ i 1) j k)
+                      (add-neighbor (- i 1) j k)
+                      (add-neighbor i (+ j 1) k)
+                      (add-neighbor i (- j 1) k)
+                      (add-neighbor i j (+ k 1))
+                      (add-neighbor i j (- k 1)))
+                    
+                    (when (and (id? block Sand Gravel) (id? (effective-block-ref i (- j 1) k) Air Water StationaryWater Lava StationaryLava))
+                      (with-field i j k
+                        (lambda (section index)
+                          (block-set! section index 0)
+                          (add-neighbors i j k)
+                          (inverse-propagate-light~ game i j k add-sector with-field block-ref blocklight-ref blocklight-set!)
+                          (redstone-update~ game sector (list i j k block) add-sector with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set!)))))))
+              (iter))))
+        delay-update?: #t)))
   
   
   ;;;
@@ -2148,10 +2487,58 @@
   ;;;
   
   
-  (method protected virtual (distance-task task <Task>)
-    (with-task task
-      (lambda (exit)
-        (task-sleep task +infinity 0. exit))))
+  (method (distance-task task <Task>)
+    (declare (proper-tail-calls))
+    (let ((history (current-history)))
+      (with-task task
+        (lambda (exit)
+          (let (iter (previous (current-seconds)))
+            (let ((time (current-seconds)))
+              (let ((elapse (- time previous)))
+                (unless (get-paused?~ history)
+                  (with-task-mutex
+                    (lambda ()
+                      (unless (stopping?~ task)
+                        (trace-task distance "D")
+                        (tick-distance elapse)))))
+                (let ((duration (- (current-seconds) time)))
+                  (task-sleep task distance-period duration exit))
+                (iter time))))))))
+  
+  
+  (method (tick-distance elapse)
+    (site (distance on?: #t)
+      (check-distance elapse (current-me))))
+  
+  
+  (method (check-distance elapse me)
+    (let ((world (current-world))
+          (zone (current-zone)))
+      (let ((chest (get-opened-chest~ zone))
+            (enemies (get-aggroed-enemies~ me))
+            (pos (get-position~ me)))
+        (when chest
+          (bind (index i j k) chest
+            (let ((sector (table-ref (get-sectors~ zone) index)))
+              (let ((location (sector/coordinates->location sector i j k)))
+                (let ((dist (vertex-distance (vertex (+ (vector-ref location 0) .5)
+                                                     (- (vector-ref location 1) 63.5)
+                                                     (+ (vector-ref location 2) .5))
+                                             pos)))
+                  (when (> dist (if (user-role?)
+                                    (world-setting 'world.interaction-distance 8.)
+                                  20.))
+                    (play-sound-file "sound/random/chestclosed" volume: .5)
+                    (hide-chest~ world)
+                    (hide-bag~ world)
+                    (set-opened-chest~ zone #f)))))))
+        (when enemies
+          (for-each (lambda (enemy)
+                      (when (> (vertex-distance pos (get-position~ enemy)) (get-aggro-radius~ enemy))
+                        (set-aggro-target~ enemy #f)
+                        (set! enemies (remove enemy enemies test: equal?))))
+                    enemies))
+        (set-aggroed-enemies~ me enemies))))
   
   
   ;;;
@@ -2255,8 +2642,8 @@
       '()))
   
   
-  (method protected virtual (effective-player-glow)
-    -1.)
+  (method (effective-player-glow)
+    player-glow)
   
   
   (method protected virtual (setup-lighting)
@@ -2382,15 +2769,6 @@
   
   (method virtual (zone-destructible?)
     #t)
-  
-  
-  ;;;
-  ;;;; Evaluate
-  ;;;
-  
-  
-  (method protected virtual (evaluate-hook forms syntax str container line col)
-    )
   
   
   ;;;
@@ -2558,130 +2936,13 @@
                                  (set-vertices-uptodate?~ sector #t)
                                  (fill-lightmap~ sector (get-mesh~ sector) #f lightmap)
                                  (set-lightmap-uptodate?~ sector #t)
-                                 (generate-done))))))))))))))))))
+                                 (generate-done)))))))))))))))))
+    
+  
+  ;;;
+  ;;;; Level
+  ;;;
 
-
-;;;
-;;;; Zone
-;;;
-
-
-(definition protected day-duration <fl>
-  24000.)
-
-(definition protected dawn-daytime <fl>
-  6000.)
-
-(definition protected day-daytime <fl>
-  12000.)
-
-(definition protected dusk-daytime <fl>
-  18000.)
-
-(definition protected night-daytime <fl>
-  0.)
-
-
-(definition delay-updating? <bool>
-  (world-setting 'world.delay-updating? #t))
-
-(definition report-updating? <bool>
-  (world-setting 'world.report-updating? #f))
-
-
-(class Minecraft-Zone extends Zone
-  
-  
-  (property level-dir   <Directory> initialize #f    accessors generate)
-  (property dimension   <symbol>    initialize 'over accessors generate)
-  (property truncate-y  <fx+>       initialize #f    accessors generate)
-  (property player-glow <fl>        initialize -1.   accessors generate)
-  
-  
-  (slot level-file   initialize #f)
-  (slot level-nbt    initialize #f)
-  (slot opened-chest initialize #f accessors generate)
-
-  
-  (form
-    (<install> floor-level: #f start-grid?: #f start-axes?: #f jump-impulsion: .265))
-  
-  
-  ;; quicky for tests
-  (method override (minecraft?)
-    #t)
-  
-  
-  (method override (needs-pumps?)
-    #t)
-  
-  
-  (method override (prepare rest)
-    (nextmethod rest)
-    (set! ambient-color (dye .1 .05 0. 1.)))
-
-
-  (proclaim (not warn optimizations))
-  
-  
-  (method override (finish rest)
-    (nextmethod rest)
-    (set-daytime (effective-daytime start-time))
-    (set! sun-angle (daytime->sun-angle daytime)))
-  
-  
-  (method override (setup-persistence)
-    (nextmethod)
-    (initialize-spawned)
-    (let ((moniker (get-moniker)))
-      (when (and moniker (not level-dir))
-        (set! level-dir (new-directory~ (get-parent~ moniker) "level")))))
-  
-  
-  (method override (install-interface)
-    (let ((world (current-world)))
-      (updating-actions~ (get-application)
-        (lambda ()
-          (set-visible?~ (child~ (get-bindings) 'world-minecraft) #t)))
-      (let ((interface (get-interface~ world)))
-        (set-visible?~ (child~ interface 'minecraft) (not (user-role?)))
-        (set-visible?~ (child~ interface 'bag) #f)
-        (view-inventory~ (child~ interface 'belt))
-        (set-visible?~ (child~ interface 'belt) (get-show-belt?~ world))
-        (set-visible?~ (child~ interface 'chest) #f))))
-  
-  
-  (method override (uninstall-interface)
-    (let ((world (current-world)))
-      (updating-actions~ (get-application)
-        (lambda ()
-          (set-visible?~ (child~ (get-bindings) 'world-minecraft) #f)))
-      (let ((interface (get-interface~ world)))
-        (set-show-belt?~ world (get-visible?~ (child~ interface 'belt)))
-        (set-visible?~ (child~ interface 'minecraft) #f)
-        (set-visible?~ (child~ interface 'bag) #f)
-        (set-visible?~ (child~ interface 'belt) #f)
-        (set-visible?~ (child~ interface 'chest) #f))))
-  
-  
-  (method override (player-update)
-    (nextmethod)
-    (let ((world (current-world)))
-      (let ((interface (get-interface~ world)))
-        (let ((character-pane (child~ interface 'character)))
-          (view-inventory~ character-pane)
-          (update~ character-pane)))))
-  
-  
-  (method override (save-zone)
-    (nextmethod)
-    (save-chest save-region?: #t)
-    (save-inventory)
-    (save-level-nbt))
-
-
-  (proclaim (warn optimizations))
-  
   
   (method protected (get-level-file)
     (or level-file
@@ -2825,704 +3086,18 @@
         (add-block~ (current-game) #f block region sector block-id data-id i j k x y z uv rendering add-sector with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!))))
   
   
-  (method override (lighting-setup)
-    (let ((world (current-world)))
-      (let ((lights (effective-lights)))
-        (let ((light (/ daylight 5.)))
-          (set-ambient-color~ lighting (dye (+ (dye-red ambient-color) light)
-                                            (+ (dye-green ambient-color) light)
-                                            (+ (dye-blue ambient-color) light)
-                                            1.0)))
-        (set-lights~ lighting lights)
-        (set-lights-count~ lighting (min (get-dynamic-lights~ world) (length lights)))
-        (set-current-lighting lighting))))
-  
-  
-  (method override (block-lighting-setup)
-    (let ((world (current-world)))
-      (let ((lights '()))
-        (set-ambient-color~ block-lighting ambient-color)
-        (set-lights~ block-lighting lights)
-        (set-lights-count~ block-lighting 0)
-        (set-current-block-lighting block-lighting))))
-  
-  
-  (method override (default-lights)
-    '())
-  
-  
-  (method override (effective-player-glow)
-    player-glow)
-  
-  
-  (method override (sun-light?)
-    #f)
-  
-  
-  (method override (sun-update-lighting effective coord)
-    )
-  
-  
-  (method override (sun-update)
-    (set-daytime (sun-angle->daytime sun-angle)))
-  
-  
-  (method (goto-daytime daytime)
-    (if sun-cycle?
-        (position-sun (daytime->sun-angle daytime))
-      (set-daytime daytime)))
-  
-  
-  (method (update-daylight)
-    )
-  
-  
-  (method (sun-angle->daytime sun-angle)
-    (let ((angle (flmodulo sun-angle PI*2)))
-      (flmodulo (+ (/ (* angle day-duration) PI*2) dawn-daytime) day-duration)))
-  
-  
-  (method (daytime->sun-angle daytime)
-    (/ (* (- daytime dawn-daytime) PI*2) day-duration))
-  
-  
-  (method (effective-daytime daytime)
-    (cond ((flonum? daytime) daytime)
-          ((or (eq? daytime 'default) (ci=? daytime "default")) dawn-daytime)
-          ((or (eq? daytime 'dawn) (ci=? daytime "dawn")) dawn-daytime)
-          ((or (eq? daytime 'day) (ci=? daytime "day")) day-daytime)
-          ((or (eq? daytime 'dusk) (ci=? daytime "dusk")) dusk-daytime)
-          ((or (eq? daytime 'night) (ci=? daytime "night")) night-daytime)
-          ((string? daytime) (cast <fl> (string->number daytime)))
-          (else "Invalid daytime: {s}" daytime)))
-  
-  
-  (method override (album-name)
-    'minecraft)
-  
-  
-  (method override (create-album)
-    (let ((album (nextmethod)))
-      (update-textures-subuvs (get-atlas~ album))
-      album))
-  
-  
-  (method override (create-atlas)
-    (create-minecraft-atlas))
-  
-  
-  (method override (create-textures atlas)
-    (list->table
-      (list
-        ;; clamp to edge is necessary for joins like between the rails
-        (cons 'clamp (create-minecraft-texture atlas wrap: GL_CLAMP_TO_EDGE))
-        (cons 'repeat (create-minecraft-texture atlas min-filter: 'nearest)))))
-  
-  
-  (method override (create-opaque-material atlas texture)
-    (get-material~ (cast <Rendering> (opaque-rendering))))
-  
-  
-  (method override (create-transparent-material atlas texture)
-    (get-material~ (cast <Rendering> (transparent-rendering))))
-  
-  
-  (method override (sample-program-image program)
-    (case program
-      ((opaque) "stone")
-      ((transparent) "flower_rose")
-      (else "wool_colored_light_blue")))
-  
-  
-  (method override (default-block-class)
-    (new Minecraft-Block model: 'Stone))
-  
-  
-  (method override (zone-destructible?)
-    #f)
-  
-  
-  (method public (change-dimension)
-    (with-generate-mutex
-      (lambda ()
-        (set! dimension (case dimension
-                          ((over) 'nether)
-                          ((nether) 'end)
-                          ((end) 'over)))
-        (set! regions-dir #f)
-        (set! regions (make-table test: equal?))
-        (set! sectors (make-table test: equal?))
-        (set! areas (make-table test: equal?)))))
-  
-  
-  (method override (get-regions-dir) <Directory>
-    (or regions-dir (let ((dir (new-directory~ level-dir (case dimension
-                                                           ((over) "region")
-                                                           ((nether) '("DIM-1" "region"))
-                                                           ((end) '("DIM1" "region"))))))
-                      (set! regions-dir dir)
-                      dir)))
-  
-  
-  (method override (resurrect-player player)
-    (let ((old-position (copy-vertex (get-position~ player)))
-          (new-position (find-spawnpoint~ (current-zone))))
-      (set-position~ player new-position)
-      (set-velocity~ player (vertex 0. 0. 0.))
-      (set-fall-velocity~ player (vertex 0. 0. 0.))
-      (update-element player old-position)))
-  
-  
-  (method (on-toggle-player-glow evt)
+  (method (on-toggle-glow evt)
     (if (= player-glow -1.)
         (set! player-glow 300.)
       (set! player-glow -1.)))
   
   
-  ;; exploration
-  (method (explore-chests)
-    (preload-regions)
-    (let ((items '()))
-      (for-each (lambda (info)
-                  (bind (sector i j k) info
-                    (call-with-sector sector i j k
-                      (lambda (region sector block-id <fx> data-id <fx> i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> uv rendering with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!)
-                        (let ((data (block-entity-data region sector i j k)))
-                          (let ((inventory (list-payload-content (tag-assoc "Items" data))))
-                            (for-each (lambda (item)
-                                        (let ((id (tag-assoc "id" item)))
-                                          (let ((name (or (let ((item (id->item id)))
-                                                            (and item (get-name~ item)))
-                                                          id)))
-                                          (unless (memv? name items)
-                                            (set! items (cons name items))))))
-                                      inventory)))))))
-                (find-visual-blocks '(54)))
-      (sort nu<? items key: ->string)))
-  
-  
-  ;;;
-  ;;;; Tasks
-  ;;;
-  
-  
-  (method override (stop-tasks)
-    (for-each (lambda (enemy)
-                (stop-task (get-task~ enemy)))
-              spawned-enemies)
-    (nextmethod))
-  
-  
-  ;;;
-  ;;;; Generate
-  ;;;
-  
-  
-  (method override (generate-content?)
-    #t)
-  
-  
-  (method override (generate-content sector <Sector>)
-    (with-generate-mutex
-      (lambda ()
-        ;; is this still necessary?
-        (when (eq? self (current-zone))
-          (generate-sector sector 'render)))))
-  
-  
-  (method override (generate-physical sector <Sector>)
-    (with-generate-mutex
-      (lambda ()
-        ;; is this still necessary?
-        (when (eq? self (current-zone))
-          (generate-sector sector 'physical)))))
-  
-  
-  (method virtual (sector-generated sector)
-    )
-  
-  
-  ;;;
-  ;;;; Enemies
-  ;;;
-  
-  
-  (method override (add-enemy enemy)
-    (set-spawned-count (+ spawned-count 1))
-    (set-spawned-enemies (cons enemy spawned-enemies))
-    (let ((procedure
-            (lambda (task)
-              (enemy-task~ enemy task))))
-      (let ((task (new Task 'enemy procedure)))
-        (start-task task)
-        (set-task~ enemy task)
-        (thread-base-priority-set! (get-thread~ task) enemy-priority))))
-  
-  
-  (method override (remove-enemy enemy)
-    (let ((pos (get-spawner-position~ enemy)))
-      (let ((spawner (find-object (lambda (spawner)
-                                    (when (equal? (get-position~ spawner) pos)
-                                      spawner))
-                                  spawner-list)))
-        (when spawner
-          (set-enemy-count~ spawner (- (get-enemy-count~ spawner) 1))))
-      (set-spawned-count (- spawned-count 1))
-      (set-spawned-enemies (remove enemy spawned-enemies)))
-    (let ((task (get-task~ enemy)))
-      (stop-task task)))
-  
-  
-  (method override (change-enemy-models? value)
-    (set-enemy-models? value)
-    (for-each (lambda (enemy)
-                (update-model~ enemy anchor?: #t))
-              spawned-enemies))
-  
-  
-  ;;;
-  ;;;; Gravity
-  ;;;
-  
-  
-  (method override (gravity-task task <Task>)
-    (declare (proper-tail-calls))
-    (let ((history (current-history))
-          (game (current-game)))
-      (with-task task
-        (lambda (exit)
-          (let (iter (previous (current-seconds)))
-            (let ((time (current-seconds)))
-              (let ((elapse (- time previous)))
-                (unless (get-paused?~ history)
-                  (with-task-mutex
-                    (lambda ()
-                      (unless (stopping?~ task)
-                        (trace-task gravity "G")
-                        (let ((blocks (get-fall-blocks~ game)))
-                          (unless (queue-empty? blocks)
-                            (set-fall-blocks~ game (new-queue))
-                            (tick-gravity elapse blocks)))))))
-                (task-sleep task gravity-period (- (current-seconds) time) exit)
-                (iter time))))))))
-  
-  
-  (method (tick-gravity elapse blocks)
-    (site (gravity on?: #t)
-      (blocks-fall elapse blocks)))
-  
-  
-  (method (blocks-fall elapse blocks)
-    (let ((game (current-game)))
-      (updating-sectors~ (current-zone)
-        (lambda (add-sector)
-          (let (iter)
-            (unless (queue-empty? blocks)
-              (bind (sector i j k) (dequeue blocks)
-                (call-with-sector sector i j k
-                  (lambda (region sector block <fx> data <fx> i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> uv rendering with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!)
-                    (define (effective-block-ref i j k)
-                      (with-field i j k
-                        (lambda (section index)
-                          (if section
-                            (block-ref section index)
-                            0))))
-                    
-                    (define (add-neighbors i j k)
-                      (define (add-neighbor i j k)
-                        (with-field i j k
-                          (lambda (section index)
-                            @w(when (id? (block-ref section index) Sand Gravel)
-                              (normalize-sector/coordinates sector i j k with-field
-                                (lambda (sector i j k)
-                                  (add-fall-block~ game sector i j k))))
-                            (add-sector (get-sector~ section)))))
-                      
-                      (add-neighbor (+ i 1) j k)
-                      (add-neighbor (- i 1) j k)
-                      (add-neighbor i (+ j 1) k)
-                      (add-neighbor i (- j 1) k)
-                      (add-neighbor i j (+ k 1))
-                      (add-neighbor i j (- k 1)))
-                    
-                    (when (and (id? block Sand Gravel) (id? (effective-block-ref i (- j 1) k) Air Water StationaryWater Lava StationaryLava))
-                      (with-field i j k
-                        (lambda (section index)
-                          (block-set! section index 0)
-                          (add-neighbors i j k)
-                          (inverse-propagate-light~ game i j k add-sector with-field block-ref blocklight-ref blocklight-set!)
-                          (redstone-update~ game sector (list i j k block) add-sector with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set!)))))))
-              (iter))))
-        delay-update?: #t)))
-  
-  
-  ;;;
-  ;;;; Distance
-  ;;;
-  
-  
-  (method override (distance-task task <Task>)
-    (declare (proper-tail-calls))
-    (let ((history (current-history)))
-      (with-task task
-        (lambda (exit)
-          (let (iter (previous (current-seconds)))
-            (let ((time (current-seconds)))
-              (let ((elapse (- time previous)))
-                (unless (get-paused?~ history)
-                  (with-task-mutex
-                    (lambda ()
-                      (unless (stopping?~ task)
-                        (trace-task distance "D")
-                        (tick-distance elapse)))))
-                (let ((duration (- (current-seconds) time)))
-                  (task-sleep task distance-period duration exit))
-                (iter time))))))))
-  
-  
-  (method (tick-distance elapse)
-    (site (distance on?: #t)
-      (check-distance elapse (current-me))))
-  
-  
-  (method (check-distance elapse me)
-    (let ((world (current-world))
-          (zone (current-zone)))
-      (let ((chest (get-opened-chest~ zone))
-            (enemies (get-aggroed-enemies~ me))
-            (pos (get-position~ me)))
-        (when chest
-          (bind (index i j k) chest
-            (let ((sector (table-ref (get-sectors~ zone) index)))
-              (let ((location (sector/coordinates->location sector i j k)))
-                (let ((dist (vertex-distance (vertex (+ (vector-ref location 0) .5)
-                                                     (- (vector-ref location 1) 63.5)
-                                                     (+ (vector-ref location 2) .5))
-                                             pos)))
-                  (when (> dist (if (user-role?)
-                                    (world-setting 'world.interaction-distance 8.)
-                                  20.))
-                    (play-sound-file "sound/random/chestclosed" volume: .5)
-                    (hide-chest~ world)
-                    (hide-bag~ world)
-                    (set-opened-chest~ zone #f)))))))
-        (when enemies
-          (for-each (lambda (enemy)
-                      (when (> (vertex-distance pos (get-position~ enemy)) (get-aggro-radius~ enemy))
-                        (set-aggro-target~ enemy #f)
-                        (set! enemies (remove enemy enemies test: equal?))))
-                    enemies))
-        (set-aggroed-enemies~ me enemies))))
-  
-  
-  ;;;
-  ;;;; Model
-  ;;;
-  
-  
-  (method (minecraft-blocks)
-    blocks)
-  
-  
-  (method (minecraft-blockids)
-    blockids)
-  
-  
-  (method (minecraft-block-class)
-    Minecraft-Block)
-  
-  
-  (method (minecraft-find-model name)
-    (find-minecraft-model name))
-  
-  
-  ;;;
-  ;;;; Evaluate
-  ;;;
-  
-  
-  (method override (evaluate-hook forms syntax str container line col)
-    (let ((ids (collect (lambda (form)
-                          (when (and (pair? form) (eq? (car form) 'define-block))
-                            (third form)))
-                        forms)))
-      (cond ((not-null? ids)
-             (updating-sectors
-               (lambda (add-sector)
-                 (finding-visual-blocks ids
-                   add-sector)
-                 (finding-physical-blocks ids
-                   (lambda (area)
-                     (add-sector (area-sector area)))))))
-            ((search container "world/external/minecraft")
-             (updating-sectors
-               (lambda (add-sector)
-                 (add-sector (element-sector (current-me)))))))))
-  
-  
-  (method (find-visual-blocks ids)
-    (let ((zone (current-zone))
-          (queue (new-queue)))
-      (iterate-sectors~ zone
-        (lambda (index sector)
-          (sector-iterate-blocks sector ids
-            (lambda (found)
-              (enqueue queue (cons sector (index->coordinates found)))))))
-      (queue-list queue)))
-  
-  
-  (method (finding-visual-blocks ids proc)
-    (let ((zone (current-zone)))
-      (iterate-sectors~ zone
-        (lambda (index sector)
-          (when (sector-contains-blocks? sector ids)
-            (proc sector))))))
-  
-  
-  (method (sector-contains-blocks? sector ids)
-    (continuation-capture
-      (lambda (found)
-        (sector-iterate-blocks sector ids
-          (lambda (ignore)
-            (continuation-return found #t)))
-        #f)))
-  
-  
-  (method (sector-iterate-blocks sector ids proc)
-    (let ((sector-index (get-index~ sector)))
-      (let ((sector-x <fx> (vector-ref sector-index 0))
-            (sector-y <fx> (vector-ref sector-index 1))
-            (sector-z <fx> (vector-ref sector-index 2)))
-        (let ((region (sector-region sector-x sector-y sector-z)))
-          (when region
-            (let ((section (get-section~ region 'physical sector-x sector-y sector-z)))
-              (when section
-                (let ((blocks (get-blocks~ section)))
-                  (for-each (lambda (id)
-                              (let (iter (pos 0))
-                                (let ((found (u8vector-find id blocks (u8vector-length blocks) pos)))
-                                  (when found
-                                    (proc found)
-                                    (iter (+ found 1))))))
-                            ids)))))))))
-  
-  
-  (method (finding-physical-blocks ids proc)
-    (let ((zone (current-zone)))
-      (iterate-areas~ zone
-        (lambda (index area)
-          (iterate-polygons~ area
-            (lambda (elem polygons offset)
-              (let ((data1 (f64vector-ref polygons (+ offset 16))))
-                (when (and (/= data1 0.) (memq? (fxround data1) ids))
-                  (proc area)))))))))
-  
-  
-  ;;;
-  ;;;; Target
-  ;;;
-  
-  
-  (proclaim (not warn optimizations))
-  
-  
-  (method override (target-update target face face-rank poly vert)
-    (define (center-info title center (poly #f))
-      (let ((sector (position-sector center))
-            (x (fxfloor (vertex-x center)))
-            (y (fxfloor (vertex-y center)))
-            (z (fxfloor (vertex-z center))))
-        (let ((block (vector x y z))
-              (sector-index (get-index~ sector)))
-          (let ((sector-x (vector-ref sector-index 0))
-                (sector-y (vector-ref sector-index 1))
-                (sector-z (vector-ref sector-index 2)))
-            (let ((region (sector-region sector-x sector-y sector-z)))
-              (when region
-                (let ((section (get-section~ region 'physical sector-x sector-y sector-z))
-                      (cache-uninitialized 65535))
-                  (when section
-                    (let ((bottom-section? (= sector-y (cast <fx> (or truncate-y -4))))
-                          (sections <vector> (make-vector 27 #t))
-                          (cache <u16vector> (initialize-block-cache cache-uninitialized))
-                          (blocks (get-blocks~ section))
-                          (data (get-data~ section))
-                          (blocklight (get-blocklight~ section))
-                          (skylight (get-skylight~ section)))
-                      (define (section-ref a <fx> b <fx> c <fx>) <World-Section+>
-                        (if (and (= a 0)
-                                 (= b 0)
-                                 (= c 0))
-                            section
-                          (let ((index (section-index a b c)))
-                            (let ((section (vector-ref sections index)))
-                              (if (neq? section #t)
-                                  section
-                                (let ((x (+ sector-x a))
-                                      (y (+ sector-y b))
-                                      (z (+ sector-z c)))
-                                  (let ((region (sector-region x y z)))
-                                    (let ((section (and region (get-section~ (cast <World-Region> region) 'physical x y z))))
-                                      (vector-set! sections index section)
-                                      section))))))))
-                      
-                      (define (section-index a <fx> b <fx> c <fx>) <fx>
-                        (+ (* b 9) (* c 3) a 13))
-                      
-                      (define (local-index i <fx> j <fx> k <fx>) <fx>
-                        (+ (* j 256) (* k 16) i))
-                      
-                      (define (effective-index i <fx> j <fx> k <fx>) <fx>
-                        (* (+ (* j 324) (* k 18) i 343) 4))
-                      
-                      (define (blocks-get section <World-Section>) <u8vector>
-                        (get-blocks~ section))
-                      
-                      (define (blocklight-get section <World-Section>) <u8vector>
-                        (get-blocklight~ section))
-                      
-                      (define (blocklight-ref i <fx> j <fx> k <fx>)
-                        (u4vector-ref blocklight (local-index i j k)))
-                      
-                      (define (skylight-ref i <fx> j <fx> k <fx>)
-                        (u4vector-ref skylight (local-index i j k)))
-                      
-                      (define (local-block-ref i <fx> j <fx> k <fx>)
-                        (u8vector-ref blocks (local-index i j k)))
-                      
-                      (define (local-data-ref i <fx> j <fx> k <fx>)
-                        (u4vector-ref data (local-index i j k)))
-                      
-                      (define (effective-block-ref i <fx> j <fx> k <fx>) <fx>
-                        (let ((index (effective-index i j k)))
-                          (let ((value (u16vector-ref cache index)))
-                            (if (/= value cache-uninitialized)
-                                value
-                              (let ((value (field-ref i j k blocks-get u8vector-ref 0 1)))
-                                (u16vector-set! cache index value)
-                                value)))))
-                      
-                      (define (effective-light-ref shade <fl> i <fx> j <fx> k <fx>) <fx>
-                        (field-ref i j k blocklight-get u4vector-ref 0 0))
-                      
-                      (define (u4vector-ref field <u8vector> index <fx>) <fx>
-                        (let ((byte (u8vector-ref field (quotient index 2))))
-                          (if (even? index)
-                              (bitwise-and byte #x0F)
-                            (bitwise-and (arithmetic-shift-right byte 4) #x0F))))
-                      
-                      (define (field-ref i <fx> j <fx> k <fx> get-field ref empty bottom) <fx>
-                        (define (bind-i a <fx> i <fx>)
-                          (define (bind-j b <fx> j <fx>)
-                            (define (bind-k c <fx> k <fx>)
-                              (let ((section (section-ref a b c)))
-                                (if (not section)
-                                    (if (and bottom-section? (= b -1)) bottom empty)
-                                  (let ((field (get-field section)))
-                                    (if (not field)
-                                        (if (and bottom-section? (= b -1)) bottom empty)
-                                      (ref field (local-index i j k)))))))
-                            
-                            (cond ((< k 0) (bind-k -1 (+ 16 k)))
-                                  ((> k 15) (bind-k 1 (- k 16)))
-                                  (else (bind-k 0 k))))
-                          
-                          (cond ((< j 0) (bind-j -1 (+ 16 j)))
-                                ((> j 15) (bind-j 1 (- j 16)))
-                                (else (bind-j 0 j))))
-                        
-                        (cond ((< i 0) (bind-i -1 (+ 16 i)))
-                              ((> i 15) (bind-i 1 (- i 16)))
-                              (else (bind-i 0 i))))
-                      
-                      (define (compute-lighting shade <fl> i <fx> j <fx> k <fx> ax <fx> ay <fx> az <fx> bx <fx> by <fx> bz <fx> cx <fx> cy <fx> cz <fx> dx <fx> dy <fx> dz <fx>)
-                        (format "{a} {a} {a} {a}"
-                                (effective-light-ref shade (+ i ax) (+ j ay) (+ k az))
-                                (effective-light-ref shade (+ i bx) (+ j by) (+ k bz))
-                                (effective-light-ref shade (+ i cx) (+ j cy) (+ k cz))
-                                (effective-light-ref shade (+ i dx) (+ j dy) (+ k dz))))
-                      
-                      (define (ambient-light i <fx> j <fx> k <fx> vert)
-                        (let ((origin (vertex- (vertex-& vert (vertex& (cast <fl> x) (cast <fl> y) (cast <fl> z))) (vertex& .5 .5 .5)))
-                              (normal (get-normal~ poly)))
-                          (generic-lighting i j k origin normal compute-lighting no-shade)))
-                      
-                      (define (block-info i <fx> j <fx> k <fx>)
-                        (let ((id (local-block-ref i j k))
-                              (data (local-data-ref i j k))
-                              (blocklight (blocklight-ref i j k))
-                              (skylight (skylight-ref i j k)))
-                          (let ((block (blockid->block id)))
-                            (append (list (cons title (get-name~ block))
-                                          (cons "id" id)
-                                          (cons "data" data)
-                                          (cons "block light" blocklight)
-                                          (cons "sky light" skylight))
-                                    (if (and poly (programmer-role?))
-                                        (list (cons "sector" (format "{a} {a} {a}" sector-x sector-y sector-z))
-                                              (cons "coordinates" (format "{a} {a} {a}" i j k))
-                                              (cons "global" (present-vertex (vertex (get-data2~ poly) (get-data3~ poly) (get-data4~ poly))))
-                                              (cons "ambient" (ambient-light i j k vert)))
-                                      '())))))
-                      
-                      (define (present-vertex vert)
-                        (format "{r precision: 1}, {r precision: 1}, {r precision: 1}"
-                                (vertex-x vert)
-                                (vertex-y vert)
-                                (vertex-z vert)))
-                      
-                      (let ((i (- x (* sector-x 16)))
-                            (j (- y (* sector-y 16)))
-                            (k (- z (* sector-z 16))))
-                        (block-info i j k)))))))))))
-    
-    (define (update-info)
-      (if (not poly)
-          (begin
-            (unregister-info 'block)
-            (unregister-info 'fore)
-            (let ((eye (get-position~ (current-camera))))
-              (let ((info (center-info "Eye" eye)))
-                (if (not info)
-                    (unregister-info 'eye)
-                  (register-info 'eye
-                    (lambda (add-section add-info)
-                      (let ((section (add-section "Eye")))
-                        (for-each (lambda (info)
-                                    (add-info section (car info) (cdr info)))
-                                  info))))))))
-        (let ((game (current-game)))
-          (with-polygon-interaction~ game poly
-            (lambda (poly block fore)
-              (let ((info (center-info "Block" block poly)))
-                (register-info 'block
-                  (lambda (add-section add-info)
-                    (let ((section (add-section "Block")))
-                      (for-each (lambda (info)
-                                  (add-info section (car info) (cdr info)))
-                                info)))))
-              (let ((info (center-info "Fore" fore)))
-                (if (not info)
-                    (unregister-info 'fore)
-                  (register-info 'fore
-                    (lambda (add-section add-info)
-                      (let ((section (add-section "Fore")))
-                        (for-each (lambda (info)
-                                    (add-info section (car info) (cdr info)))
-                                  info)))))))))
-        (unregister-info 'eye)))
-    
-    (with-generate-mutex
-      (lambda ()
-        (update-info))))
-  
-  
-  (proclaim (warn optimizations))
-  
-  
   ;;;
   ;;;; Update
   ;;;
+  
+  
+  (proclaim (warn optimizations))
   
   
   (method (call-with-position pos <f64vector> proc)
@@ -3723,7 +3298,353 @@
           (let ((world (current-world)))
             (let ((count (length sectors))
                   (duration (real-duration-in-milliseconds~ timer)))
-              (display-message~ world (format "Updated {a} sector{a} ({a}ms)" count (format-plural count) duration)))))))))
+              (display-message~ world (format "Updated {a} sector{a} ({a}ms)" count (format-plural count) duration))))))))
+  
+  
+  ;;;
+  ;;;; Evaluate
+  ;;;
+  
+  
+  (method (evaluate-hook forms syntax str container line col)
+    (let ((ids (collect (lambda (form)
+                          (when (and (pair? form) (eq? (car form) 'define-block))
+                            (third form)))
+                        forms)))
+      (cond ((not-null? ids)
+             (updating-sectors
+               (lambda (add-sector)
+                 (finding-visual-blocks ids
+                   add-sector)
+                 (finding-physical-blocks ids
+                   (lambda (area)
+                     (add-sector (area-sector area)))))))
+            ((search container "world/external/minecraft")
+             (updating-sectors
+               (lambda (add-sector)
+                 (add-sector (element-sector (current-me)))))))))
+  
+  
+  ;;;
+  ;;;; Find
+  ;;;
+  
+  
+  (method (find-visual-blocks ids)
+    (let ((zone (current-zone))
+          (queue (new-queue)))
+      (iterate-sectors~ zone
+        (lambda (index sector)
+          (sector-iterate-blocks sector ids
+            (lambda (found)
+              (enqueue queue (cons sector (index->coordinates found)))))))
+      (queue-list queue)))
+  
+  
+  (method (finding-visual-blocks ids proc)
+    (let ((zone (current-zone)))
+      (iterate-sectors~ zone
+        (lambda (index sector)
+          (when (sector-contains-blocks? sector ids)
+            (proc sector))))))
+  
+  
+  (method (sector-contains-blocks? sector ids)
+    (continuation-capture
+      (lambda (found)
+        (sector-iterate-blocks sector ids
+          (lambda (ignore)
+            (continuation-return found #t)))
+        #f)))
+  
+  
+  (method (sector-iterate-blocks sector ids proc)
+    (let ((sector-index (get-index~ sector)))
+      (let ((sector-x <fx> (vector-ref sector-index 0))
+            (sector-y <fx> (vector-ref sector-index 1))
+            (sector-z <fx> (vector-ref sector-index 2)))
+        (let ((region (sector-region sector-x sector-y sector-z)))
+          (when region
+            (let ((section (get-section~ region 'physical sector-x sector-y sector-z)))
+              (when section
+                (let ((blocks (get-blocks~ section)))
+                  (for-each (lambda (id)
+                              (let (iter (pos 0))
+                                (let ((found (u8vector-find id blocks (u8vector-length blocks) pos)))
+                                  (when found
+                                    (proc found)
+                                    (iter (+ found 1))))))
+                            ids)))))))))
+  
+  
+  (method (finding-physical-blocks ids proc)
+    (let ((zone (current-zone)))
+      (iterate-areas~ zone
+        (lambda (index area)
+          (iterate-polygons~ area
+            (lambda (elem polygons offset)
+              (let ((data1 (f64vector-ref polygons (+ offset 16))))
+                (when (and (/= data1 0.) (memq? (fxround data1) ids))
+                  (proc area))))))))))
+
+
+;;;
+;;;; Zone
+;;;
+
+
+(definition protected day-duration <fl>
+  24000.)
+
+(definition protected dawn-daytime <fl>
+  6000.)
+
+(definition protected day-daytime <fl>
+  12000.)
+
+(definition protected dusk-daytime <fl>
+  18000.)
+
+(definition protected night-daytime <fl>
+  0.)
+
+
+(definition delay-updating? <bool>
+  (world-setting 'world.delay-updating? #t))
+
+(definition report-updating? <bool>
+  (world-setting 'world.report-updating? #f))
+
+
+(class Minecraft-Zone extends Zone
+
+  
+  (form
+    (<install> floor-level: #f start-grid?: #f start-axes?: #f jump-impulsion: .265))
+  
+  
+  ;; quicky for tests
+  (method override (minecraft?)
+    #t)
+  
+  
+  (method override (needs-pumps?)
+    #t)
+  
+  
+  (method override (prepare rest)
+    (nextmethod rest)
+    (set! ambient-color (dye .1 .05 0. 1.)))
+
+
+  (proclaim (not warn optimizations))
+  
+  
+  (method override (finish rest)
+    (nextmethod rest)
+    (initialize-spawned)
+    (set-daytime (effective-daytime start-time))
+    (set! sun-angle (daytime->sun-angle daytime)))
+  
+  
+  (method override (install-interface)
+    (let ((world (current-world)))
+      (let ((interface (get-interface~ world)))
+        (set-visible?~ (child~ interface 'bag) #f)
+        (view-inventory~ (child~ interface 'belt))
+        (set-visible?~ (child~ interface 'belt) (get-show-belt?~ world))
+        (set-visible?~ (child~ interface 'chest) #f))))
+  
+  
+  (method override (uninstall-interface)
+    (let ((world (current-world)))
+      (let ((interface (get-interface~ world)))
+        (set-show-belt?~ world (get-visible?~ (child~ interface 'belt)))
+        (set-visible?~ (child~ interface 'bag) #f)
+        (set-visible?~ (child~ interface 'belt) #f)
+        (set-visible?~ (child~ interface 'chest) #f))))
+  
+  
+  (method override (save-zone)
+    (nextmethod)
+    (save-chest save-region?: #t)
+    (save-inventory)
+    (save-level-nbt))
+
+
+  (proclaim (warn optimizations))
+  
+  
+  (method override (lighting-setup)
+    (let ((world (current-world)))
+      (let ((lights (effective-lights)))
+        (let ((light (/ daylight 5.)))
+          (set-ambient-color~ lighting (dye (+ (dye-red ambient-color) light)
+                                            (+ (dye-green ambient-color) light)
+                                            (+ (dye-blue ambient-color) light)
+                                            1.0)))
+        (set-lights~ lighting lights)
+        (set-lights-count~ lighting (min (get-dynamic-lights~ world) (length lights)))
+        (set-current-lighting lighting))))
+  
+  
+  (method override (block-lighting-setup)
+    (let ((world (current-world)))
+      (let ((lights '()))
+        (set-ambient-color~ block-lighting ambient-color)
+        (set-lights~ block-lighting lights)
+        (set-lights-count~ block-lighting 0)
+        (set-current-block-lighting block-lighting))))
+  
+  
+  (method override (default-lights)
+    '())
+  
+  
+  (method override (sun-light?)
+    #f)
+  
+  
+  (method override (sun-update-lighting effective coord)
+    )
+  
+  
+  (method override (sun-update)
+    (set-daytime (sun-angle->daytime sun-angle)))
+  
+  
+  (method (goto-daytime daytime)
+    (if sun-cycle?
+        (position-sun (daytime->sun-angle daytime))
+      (set-daytime daytime)))
+  
+  
+  (method (update-daylight)
+    )
+  
+  
+  (method (sun-angle->daytime sun-angle)
+    (let ((angle (flmodulo sun-angle PI*2)))
+      (flmodulo (+ (/ (* angle day-duration) PI*2) dawn-daytime) day-duration)))
+  
+  
+  (method (daytime->sun-angle daytime)
+    (/ (* (- daytime dawn-daytime) PI*2) day-duration))
+  
+  
+  (method (effective-daytime daytime)
+    (cond ((flonum? daytime) daytime)
+          ((or (eq? daytime 'default) (ci=? daytime "default")) dawn-daytime)
+          ((or (eq? daytime 'dawn) (ci=? daytime "dawn")) dawn-daytime)
+          ((or (eq? daytime 'day) (ci=? daytime "day")) day-daytime)
+          ((or (eq? daytime 'dusk) (ci=? daytime "dusk")) dusk-daytime)
+          ((or (eq? daytime 'night) (ci=? daytime "night")) night-daytime)
+          ((string? daytime) (cast <fl> (string->number daytime)))
+          (else "Invalid daytime: {s}" daytime)))
+  
+  
+  (method override (album-name)
+    'minecraft)
+  
+  
+  (method override (create-album)
+    (let ((album (nextmethod)))
+      (update-textures-subuvs (get-atlas~ album))
+      album))
+  
+  
+  (method override (create-atlas)
+    (create-minecraft-atlas))
+  
+  
+  (method override (create-textures atlas)
+    (list->table
+      (list
+        ;; clamp to edge is necessary for joins like between the rails
+        (cons 'clamp (create-minecraft-texture atlas wrap: GL_CLAMP_TO_EDGE))
+        (cons 'repeat (create-minecraft-texture atlas min-filter: 'nearest)))))
+  
+  
+  (method override (create-opaque-material atlas texture)
+    (get-material~ (cast <Rendering> (opaque-rendering))))
+  
+  
+  (method override (create-transparent-material atlas texture)
+    (get-material~ (cast <Rendering> (transparent-rendering))))
+  
+  
+  (method override (sample-program-image program)
+    (case program
+      ((opaque) "stone")
+      ((transparent) "flower_rose")
+      (else "wool_colored_light_blue")))
+  
+  
+  (method override (default-block-class)
+    (new Minecraft-Block model: 'Stone))
+  
+  
+  (method override (zone-destructible?)
+    #f)
+  
+  
+  (method override (resurrect-player player)
+    (let ((old-position (copy-vertex (get-position~ player)))
+          (new-position (find-spawnpoint~ (current-zone))))
+      (set-position~ player new-position)
+      (set-velocity~ player (vertex 0. 0. 0.))
+      (set-fall-velocity~ player (vertex 0. 0. 0.))
+      (update-element player old-position)))
+  
+  
+  ;;;
+  ;;;; Generate
+  ;;;
+  
+  
+  (method override (generate-content?)
+    #t)
+  
+  
+  (method override (generate-content sector <Sector>)
+    (with-generate-mutex
+      (lambda ()
+        ;; is this still necessary?
+        (when (eq? self (current-zone))
+          (generate-sector sector 'render)))))
+  
+  
+  (method override (generate-physical sector <Sector>)
+    (with-generate-mutex
+      (lambda ()
+        ;; is this still necessary?
+        (when (eq? self (current-zone))
+          (generate-sector sector 'physical)))))
+  
+  
+  (method virtual (sector-generated sector)
+    )
+  
+  
+  ;;;
+  ;;;; Model
+  ;;;
+  
+  
+  (method (minecraft-blocks)
+    blocks)
+  
+  
+  (method (minecraft-blockids)
+    blockids)
+  
+  
+  (method (minecraft-block-class)
+    Minecraft-Block)
+  
+  
+  (method (minecraft-find-model name)
+    (find-minecraft-model name)))
 
 
 ;;;
