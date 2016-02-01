@@ -127,20 +127,21 @@
       (mutex-unlock! chunks-mutex)))
   
   
-  (method (get-chunk sector-x <fx> sector-z <fx>) <World-Chunk+>
-    (get-chunk-at (chunk-index sector-x sector-z)))
+  (method (get-chunk sector-x <fx> sector-z <fx> (create?: create? #f)) <World-Chunk+>
+    (get-chunk-at (chunk-index sector-x sector-z) create?))
   
   
-  (method (get-chunk-at chunk-index <pair>) <World-Chunk+>
+  (method (get-chunk-at chunk-index <pair> create?) <World-Chunk+>
     (with-chunks-mutex
       (lambda ()
-        (let ((value (table-ref chunks chunk-index #t)))
-          (if (neq? value #t)
-              value
-            (let ((chunk (read-chunk chunk-index)))
-              (refcount-increase)
-              (table-set! chunks chunk-index chunk)
-              chunk))))))
+        (let ((not-found (if create? #f #t)))
+          (let ((value (table-ref chunks chunk-index not-found)))
+            (if (neq? value not-found)
+                value
+              (let ((chunk (read-chunk chunk-index create?)))
+                (refcount-increase)
+                (table-set! chunks chunk-index chunk)
+                chunk)))))))
   
   
   (method (find-chunk sector-x <fx> sector-z <fx>) <World-Chunk+>
@@ -200,7 +201,7 @@
       (u8vector-set! header (+ header-offset 3) count)))
   
   
-  (method (read-chunk chunk-index <pair>) <World-Chunk+>
+  (method (read-chunk chunk-index <pair> create?) <World-Chunk+>
     (with-region-mutex
       (lambda ()
         (let ((chunk-x <fx> (car chunk-index))
@@ -209,7 +210,19 @@
             (assert (<= header-offset 4092))
             (let ((offset (get-chunk-offset header-offset)))
               (if (not offset)
-                  #f
+                  (when create?
+                    (let ((heightmap (make-tag "HeightMap" TAG_Int_Array (make-vector 256 0)))
+                          (entities (make-tag "Entities" TAG_List (make-list-payload 0 '())))
+                          (block-entities (make-tag "TileEntities" TAG_List (make-list-payload 0 '())))
+                          (sections (make-tag "Sections" TAG_List (make-list-payload TAG_Compound '()))))
+                      (let ((tag (make-tag "" TAG_Compound
+                                   (list
+                                     (make-tag "Level" TAG_Compound
+                                       (list
+                                         heightmap entities block-entities sections))))))
+                        (let ((chunk (new World-Chunk self tag (tag-value heightmap) (tag-value entities) (tag-value block-entities) (tag-value sections))))
+                          (modified~ chunk)
+                          chunk))))
                 (site (read-chunk on?: #t parent: generate)
                   (input-port-byte-position port offset)
                   (let ((chunk-header (make-u8vector 5)))
@@ -250,24 +263,27 @@
   
   (method (get-section what sector-x <fx> sector-y <fx> sector-z <fx> (create?: create? #f)) <World-Section+>
     (let ((zone (current-zone)))
-      (let ((chunk (get-chunk sector-x sector-z)))
-        (when chunk
+      (let ((chunk (get-chunk sector-x sector-z create?: create?)))
+        (define (existing-section)
           (let ((sections-table (get-sections-table~ chunk)))
             (when sections-table
-              (let ((section (table-ref sections-table sector-y #f)))
-                ;; create new section
-                (when (and (not section) create?)
-                  (set! section (add-section~ chunk sector-y)))
-                ;; until unification, associate section with sector
-                (when (and section (not (get-sector~ section)))
-                  (let ((sector (let ((index (vector sector-x sector-y sector-z)))
-                                  (if (eq? what 'render)
-                                      (find-eye-sector~ zone index)
-                                    (index-sector~ zone index)))))
-                    (set-sector~ section sector)
-                    (when sector
-                      (set-section~ sector section))))
-                section)))))))
+              (table-ref sections-table sector-y #f))))
+        
+        (when chunk
+          (let ((section (existing-section)))
+            ;; create new section
+            (when (and (not section) create?)
+              (set! section (add-section~ chunk sector-y)))
+            ;; until unification, associate section with sector
+            (when (and section (not (get-sector~ section)))
+              (let ((sector (let ((index (vector sector-x sector-y sector-z)))
+                              (if (eq? what 'render)
+                                  (find-eye-sector~ zone index)
+                                (index-sector~ zone index)))))
+                (set-sector~ section sector)
+                (when sector
+                  (set-section~ sector section))))
+            section)))))
   
   
   (method (save-header port)
@@ -280,10 +296,10 @@
     (define (save-chunks port)
       (iterate-chunks
         (lambda (x z)
-          (let ((header-offset (chunk-header-offset x z))
-                (chunk (find-chunk x z)))
+          (let ((chunk (find-chunk x z)))
             (when (and chunk (get-modified?~ chunk))
-              (let ((content (serialize-chunk chunk)))
+              (let ((header-offset (chunk-header-offset x z))
+                    (content (serialize-chunk chunk)))
                 (let ((deflated-size (u8vector-length content)))
                   (let ((chunk-size (pad-chunk (+ chunk-header-size deflated-size)))
                         (actual-size (allege (get-chunk-size header-offset))))
