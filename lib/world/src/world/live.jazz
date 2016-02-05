@@ -2406,7 +2406,7 @@
   
   (method (missile-hit missile collision)
     (let ((zone (current-zone))
-          (element (get-element~ collision)))
+          (element (effective-element (get-polygon~ collision))))
       (cond ((is? element Actor)
              (case (get-kind~ missile)
                ((bullet)
@@ -2435,19 +2435,23 @@
                         (editor-remove-element element)
                       (remove-element element)))
                   
-                  (when (and element (or editable? destructible?))
-                    (play-3d-sound "sound/combat/explosion" (get-position~ element))
-                    (case (get-kind~ missile)
-                      ((bullet)
-                       (remove element))
-                      ((arrow)
-                       (let ((pos (get-position~ element)))
-                         (iterate-position-neighbor-areas~ zone pos 1
-                           (lambda (area)
-                             (for-each (lambda (block)
-                                         (when (< (vertex-distance pos (get-position~ block)) 1.9)
-                                           (remove block)))
-                                       (get-blocks~ area)))))))))
+                  (when (or editable? destructible?)
+                    (let ((pos (get-position~ element)))
+                      (play-3d-sound "sound/combat/explosion" pos)
+                      (case (get-kind~ missile)
+                        ((bullet)
+                         (if (virtual-block? element)
+                             (delete-block-at~ (current-game) pos)
+                           (remove element)))
+                        ((arrow)
+                         @minecraft-convert
+                         (let ((pos (get-position~ element)))
+                           (iterate-position-neighbor-areas~ zone pos 1
+                             (lambda (area)
+                               (for-each (lambda (block)
+                                           (when (< (vertex-distance pos (get-position~ block)) 1.9)
+                                             (remove block)))
+                                         (get-blocks~ area))))))))))
                 'remove))))))
   
   
@@ -3338,6 +3342,19 @@
      (display-status (format "Grid at {a}" grid-position))))
   
   
+  (method (effective-element poly)
+    (or (get-element~ poly)
+        (let ((id (fxround (get-data1~ poly)))
+              (pos (vertex (get-data2~ poly) (get-data3~ poly) (get-data4~ poly))))
+          (let ((block (id->block id)))
+            (new Block-Entity model: (get-name~ block) position: pos)))))
+  
+  
+  (method (virtual-block? elem)
+    (and (is? elem Block-Entity)
+         (not (get-parent~ elem))))
+  
+  
   (method (floor-level)
     (and grid? (eq? grid-plane 'y) grid-position))
     
@@ -3396,7 +3413,7 @@
             ((free) free-filter)
             ((crazy) #f))))
       
-      (define (add-at origin normal polygon-center polygon-normal floor?)
+      (define (add-at origin normal poly floor?)
         (define (collision-quad origin normal)
           (let ((inside (vertex+ origin (vertex-scalar* normal -.01))))
             (let ((cube (unit-cube inside)))
@@ -3415,39 +3432,59 @@
                                                          (vertex-x radiuses)
                                                        (vertex-z radiuses)))))))))
         
-        (let ((closest (collision-quad origin normal)))
-          (when closest
-            (bind (quad dist) closest
-              (let ((origin (get-origin~ quad))
-                    (normal (vertex-scalar* (get-normal~ quad) -1.)))
-                (when (or (not editor-added?) (vertex=? normal editor-direction))
-                  (let ((player? (eq? class 'player)))
-                    (unless player?
-                      (instantiate-element-class class))
-                    (let ((element (if player? me adding)))
-                      (let ((anchor (determine-anchor element origin normal)))
-                        (let ((position (anchor->position~ element anchor)))
-                          (let ((actual (element-near~ zone position)))
-                            (unless actual
-                              (if player?
-                                  (begin
-                                    (set-position~ me position)
-                                    (unless (person-motion?)
-                                      (set-lookat~ me (get-lookat~ (current-camera))))
-                                    (follow-player)
-                                    (unless (person-motion?)
-                                      (person-motion feedback?: #f))
-                                    #f)
-                                (let ((added (editor-add-element mode class anchor)))
-                                  (if editor-added?
-                                      (add-target added)
-                                    (set! editor-added? #t)
-                                    (set! editor-origin (or polygon-center origin))
-                                    (set! editor-normal (or polygon-normal normal))
-                                    (set! editor-direction normal)
-                                    (set! editor-floor? floor?)
-                                    (set-selection (list added)))
-                                  added))))))))))))))
+        (define (determine-anchor/position element origin normal)
+          (if (is? class Block-Entity)
+              (values origin origin)
+            (let ((anchor (determine-anchor element origin normal)))
+              (let ((position (anchor->position~ element anchor)))
+                (values anchor position)))))
+        
+        (define (determine-polygon)
+          (if (and (is? class Block-Entity) poly)
+              (values origin normal)
+            (let ((closest (collision-quad origin normal)))
+              (when closest
+                (bind (quad dist) closest
+                  (let ((origin (get-origin~ quad))
+                        (normal (vertex-scalar* (get-normal~ quad) -1.)))
+                    (values origin normal)))))))
+        
+        (let ((info (determine-polygon)))
+          (when info
+            (receive (origin normal) info
+              (when (or (not editor-added?) (vertex=? normal editor-direction))
+                (let ((player? (eq? class 'player)))
+                  (unless player?
+                    (instantiate-element-class class))
+                  (let ((element (if player? me adding)))
+                    (receive (anchor position) (determine-anchor/position element origin normal)
+                      (let ((actual (if (is? class Block-Entity)
+                                        (call-with-position~ zone position
+                                          (lambda (region sector block-id data-id i j k x y z uv rendering with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!)
+                                            (/= block-id Air)))
+                                      (element-near~ zone position))))
+                        (unless actual
+                          (if player?
+                              (begin
+                                (set-position~ me position)
+                                (unless (person-motion?)
+                                  (set-lookat~ me (get-lookat~ (current-camera))))
+                                (follow-player)
+                                (unless (person-motion?)
+                                  (person-motion feedback?: #f))
+                                #f)
+                            (let ((added (editor-add-element mode class poly anchor)))
+                              (if editor-added?
+                                  (unless (is? class Block-Entity)
+                                    (add-target added))
+                                (set! editor-added? #t)
+                                (set! editor-origin (if poly (get-center~ poly) origin))
+                                (set! editor-normal (if poly (get-normal~ poly) normal))
+                                (set! editor-direction normal)
+                                (set! editor-floor? floor?)
+                                (unless (is? class Block-Entity)
+                                  (set-selection (list added))))
+                              added))))))))))))
       
       (let ((filter (determine-filter)))
         (let ((poly-closest (ray-closest-polygon position direction view-radius filter: filter ignore-non-physical?: #f ignore-players?: #t))
@@ -3459,40 +3496,49 @@
                 (grid-distance (and grid-closest (vertex-distance position (car grid-closest)))))
             (if (and poly-closest (or (not grid-closest) (<= poly-distance grid-distance)))
                 (bind (poly distance) poly-closest
-                  (let ((element (get-element~ poly))
-                        (normal (get-normal~ poly)))
-                    (let ((target (vertex+ position (vertex-scalar* direction view-radius)))
-                          (lookat (get-lookat~ (current-camera)))
-                          (radiuses (vertex .001 .001 .001)))
-                      (receive (new-position new-direction collisions) (collide&stop position target lookat radiuses max-distance: view-radius polygon-filter: filter ignore-entities?: #t ignore-players?: #t)
-                        (when (not-null? collisions)
-                          (let ((coll (car collisions)))
-                            (let ((plane (get-plane~ coll)))
-                              (add-at (get-origin~ plane) (get-normal~ plane) (get-center~ poly) (get-normal~ poly) #f))))))))
+                  (if (is? class Block-Entity)
+                      (with-polygon-interaction~ (current-game) poly
+                        (lambda (poly block fore)
+                          (add-at fore (get-normal~ poly) poly #f)))
+                    (let ((element (get-element~ poly))
+                          (normal (get-normal~ poly)))
+                      (let ((target (vertex+ position (vertex-scalar* direction view-radius)))
+                            (lookat (get-lookat~ (current-camera)))
+                            (radiuses (vertex .001 .001 .001)))
+                        (receive (new-position new-direction collisions) (collide&stop position target lookat radiuses max-distance: view-radius polygon-filter: filter ignore-entities?: #t ignore-players?: #t)
+                          (when (not-null? collisions)
+                            (let ((coll (car collisions)))
+                              (let ((plane (get-plane~ coll)))
+                                (add-at (get-origin~ plane) (get-normal~ plane) poly #f)))))))))
               (when grid-closest
                 (bind (vert . normal) grid-closest
                   (let ((normal (if (and (is? class Block-Entity)
                                          (get-flat?~ (cache-model~ class)))
                                     (vertex-negate normal)
                                   normal)))
-                    (add-at vert normal #f #f #t))))))))))
+                    (add-at vert normal #f #t))))))))))
   
   
-  (method (editor-add-element mode class anchor)
-    (let ((zone (current-zone))
-          (me (current-me)))
-      (let ((element adding)
-            (position (anchor->position~ adding anchor))
-            (designer (get-designer~ zone)))
-        (set-parent~ element zone)
-        (set-position~ element position)
-        (add-child~ designer element zone import: '(world.data) properties: (cons position: (cons position adding-properties)))
-        (set-property~ designer element 'position position)
-        (add-element~ zone element)
-        (update-future)
-        (set! adding #f)
-        (set! adding-properties #f)
-        element)))
+  (method (editor-add-element mode class poly anchor)
+    (if (is? class Block-Entity)
+        (let ((pos anchor)
+              (block (name->block (get-name~ (cache-model~ class)))))
+          (add-block-at~ (current-game) poly pos (get-id~ block))
+          (new Block-Entity model: (get-name~ block) position: pos))
+      (let ((zone (current-zone))
+            (me (current-me)))
+        (let ((element adding)
+              (position (anchor->position~ adding anchor))
+              (designer (get-designer~ zone)))
+          (set-parent~ element zone)
+          (set-position~ element position)
+          (add-child~ designer element zone import: '(world.data) properties: (cons position: (cons position adding-properties)))
+          (set-property~ designer element 'position position)
+          (add-element~ zone element)
+          (update-future)
+          (set! adding #f)
+          (set! adding-properties #f)
+          element))))
   
   
   (method (instantiate-element-class class)
@@ -3502,19 +3548,8 @@
         (set! adding-properties properties)))
     
     (define (instantiate-block block)
-      (define (determine-rotation)
-        (let ((sight (get-sight~ (current-camera))))
-          (let ((angle (plane-angle 1. 0. (vertex-x sight) (vertex-z sight))))
-            (cond ((or (between? angle 0. PI/4) (between? angle (- PI*2 PI/4) PI*2)) 'north)
-                  ((between? angle PI/4 (* 3. PI/4)) 'west)
-                  ((between? angle (* 3. PI/4) (* 5. PI/4)) 'south)
-                  (else 'east)))))
-      
-      (let ((model (get-model~ block))
-            (rotation (determine-rotation)))
-        (instantiate (lambda ()
-                       (new (class-of block) model: model))
-                     (list model: model rotation: rotation))))
+      (set! adding (new Block-Entity model: (get-name~ (cache-model~ block))))
+      (set! adding-properties #f))
     
     (define (instantiate-entity entity)
       (let ((class (class-of entity)))
@@ -3672,7 +3707,7 @@
     (let ((anchor (position->anchor~ element (get-position~ element))))
       (editor-remove-element element)
       (instantiate-element-class class)
-      (editor-add-element editor-mode class anchor)))
+      (editor-add-element editor-mode class #f anchor)))
   
   
   (method (editor-element-class)
@@ -3680,7 +3715,7 @@
       (if (shift-down?)
           'player
         (or (and showcase (selection-addable?~ showcase) (get-selection~ showcase))
-            (default-block-class~ zone)))))
+            (new Block-Entity model: 'Stone)))))
   
   
   (method (mouse-change h v)
