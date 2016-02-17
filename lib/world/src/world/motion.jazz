@@ -117,6 +117,10 @@
     (set! camera~self camera))
   
   
+  (method protected virtual (motion-target)
+    #f)
+  
+  
   (method protected virtual (move-forward)
     )
   
@@ -222,10 +226,10 @@
     (rotate-vertical~ camera pitch))
   
   
-  (method (track-camera dh <fl> dv <fl>)
+  (method (track-camera dx <fl> dy <fl>)
     (when (hook-eye~ world)
-      (rotate-camera (/ (- dh) track-sensitivity)
-                     (/ (- dv) track-sensitivity)))))
+      (rotate-camera (/ (- dx) track-sensitivity)
+                     (/ (- dy) track-sensitivity)))))
 
 
 ;;;
@@ -242,14 +246,19 @@
   (slot distance-override <fl+>     initialize #f   getter generate)
   (slot distance-goal     <fl+>     initialize #f   getter generate)
   (slot distance-restore  <fl+>     initialize #f   getter generate)
+  (slot relative-yaw      <fl>      initialize 0.   getter generate)
+  (slot absolute-pitch    <fl>      initialize 0.   getter generate)
   
   
   (method override (initialize world camera target)
     (nextmethod world camera)
-    (set! target~self target))
+    (set! target~self target)
+    ;; do not consider roll as a first draft
+    (set! relative-yaw (vector-angle (get-sight~ camera) (get-sight~ (motion-target))))
+    (set! absolute-pitch (- (pitch-angle (get-lookat~ camera) (get-world-up~ world)))))
   
   
-  (method protected virtual (motion-target)
+  (method override (motion-target)
     target)
   
   
@@ -283,22 +292,47 @@
   
   
   (method (adjust-player-alpha)
-    (let ((me (current-me)))
-      (let ((alpha (if (<= (vertex-distance (lens-center~ me) (get-position~ camera)) (get-radius~ me))
+    (let ((target (motion-target)))
+      (let ((alpha (if (<= (vertex-distance (lens-center~ target) (get-position~ camera)) (get-radius~ target))
                        0.
                      (max 0.2 (min 1. (/ (effective-distance) 2.))))))
-        (dye-alpha-set! (get-color~ me) alpha)
-        (dye-alpha-set! (get-overlay~ me) alpha))))
+        (dye-alpha-set! (get-color~ target) alpha)
+        (dye-alpha-set! (get-overlay~ target) alpha))))
   
   
   (method override (follow-player)
-    (follow-actor (current-controlled~ world)))
+    ;; until planets camera doesn't follow gravity fixed
+    (unless (planets?~ (current-zone))
+      (reposition-camera)))
+  
+  
+  (method (reposition-camera)
+    (let ((lookat (get-lookat~ camera))
+          (target (motion-target)))
+      (standardize-lookat! lookat)
+      ;; quick not correct doesn't work if lookat has roll
+      ;; quick not correct hack to remove pitch
+      (let ((sight (vertex-normalize (vertex (vertex-x (get-sight~ target)) 0. (vertex-z (get-sight~ target))))))
+        (let ((up (get-up~ lookat)))
+          (let ((right (cross-normal& sight up)))
+            (lookat! lookat
+                     sight
+                     up
+                     right))))
+      (rotate-lookat! lookat lookat relative-yaw (get-up~ lookat))
+      (rotate-lookat! lookat lookat absolute-pitch (get-right~ lookat))
+      (when target
+        (align-eye-behind (lens-center~ target)))))
+  
+  
+  (method override (rotate-camera yaw <fl> pitch <fl>)
+    (nextmethod yaw pitch)
+    (increase! relative-yaw yaw)
+    (increase! absolute-pitch pitch))
   
   
   (method override (follow-actor actor)
     (when (person-motion?)
-      @w(unless (or (get-viewing?~ world) (eq? (get-first-camera~ world) 'free))
-        (eye-behind-actor actor))
       (when actor
         (align-eye-behind (lens-center~ actor)))))
   
@@ -338,7 +372,7 @@
   ;;
   ;; distance-restore : constant restore velocity
   (method override (restore-desired-distance elapse)
-    (let ((me (current-me)))
+    (let ((target (motion-target)))
       (when distance-goal
         (let ((augmented-override (+ distance-override (* elapse distance-restore))))
           (cond ((>= augmented-override desired-distance)
@@ -349,7 +383,7 @@
                  (set! distance-goal #f))
                 (else
                  (set! distance-override augmented-override))))
-        (align-eye-behind-no-occlusion (lens-center~ me))
+        (align-eye-behind-no-occlusion (lens-center~ target))
         (adjust-player-alpha))))
   
   
@@ -359,7 +393,7 @@
         (not (get-water-cube?~ (world.generation:id->block (fxround (get-data1~ poly))))))
       
       (define (determine-eye-occlusion lens)
-        (receive (center direction collisions) (collide&stop lens (vertex+ lens (vertex-scalar*& direction desired-distance)) (get-lookat~ (current-me)) occlusion-radiuses max-distance: desired-distance polygon-filter: liquid-filter ignore-players?: #t)
+        (receive (center direction collisions) (collide&stop lens (vertex+ lens (vertex-scalar*& direction desired-distance)) (get-lookat~ (motion-target)) occlusion-radiuses max-distance: desired-distance polygon-filter: liquid-filter ignore-players?: #t)
           (if (null? collisions)
               #f
             (vertex-distance lens center))))
@@ -404,7 +438,19 @@
   (method override (eye-center-player)
     (let ((history (current-history)))
       (unless (get-paused?~ history)
-        (follow-player)))))
+        (follow-player))))
+  
+  
+  (method override (zoom-in)
+    (desired-distance-closer)
+    (eye-center-player)
+    (adjust-player-alpha))
+  
+  
+  (method override (zoom-out)
+    (desired-distance-further)
+    (eye-center-player)
+    (adjust-player-alpha)))
 
 
 ;;;
@@ -415,50 +461,9 @@
 (class Person-Motion extends Target-Motion
   
   
-  (slot relative-yaw   <fl>  initialize 0. getter generate)
-  (slot absolute-pitch <fl>  initialize 0. getter generate)
   (slot desired-roll   <fl>  initialize 0. getter generate)
   (slot roll-speed     <fl+> initialize #f getter generate)
   (slot last-roll-time <fl+> initialize #f getter generate)
-  
-  
-  (method override (initialize world camera target)
-    (nextmethod world camera target)
-    ;; do not consider pitch and roll to start
-    (set! relative-yaw (vector-angle (get-sight~ camera) (get-sight~ (motion-target))))
-    (set! absolute-pitch (- (pitch-angle (get-lookat~ camera) (get-world-up~ world)))))
-  
-  
-  (method override (follow-player)
-    ;; until planets camera doesn't follow gravity fixed
-    (if (planets?~ (current-zone))
-        (nextmethod)
-      (reposition-camera)))
-  
-  
-  (method (reposition-camera)
-    (let ((lookat (get-lookat~ camera))
-          (target (motion-target)))
-      (standardize-lookat! lookat)
-      ;; quick not correct doesn't work if lookat has roll
-      ;; quick not correct hack to remove pitch
-      (let ((sight (vertex-normalize (vertex (vertex-x (get-sight~ target)) 0. (vertex-z (get-sight~ target))))))
-        (let ((up (get-up~ lookat)))
-          (let ((right (cross-normal& sight up)))
-            (lookat! lookat
-                     sight
-                     up
-                     right))))
-      (rotate-lookat! lookat lookat relative-yaw (get-up~ lookat))
-      (rotate-lookat! lookat lookat absolute-pitch (get-right~ lookat))
-      (when target
-        (align-eye-behind (lens-center~ target)))))
-  
-  
-  (method override (rotate-camera yaw <fl> pitch <fl>)
-    (nextmethod yaw pitch)
-    (increase! relative-yaw yaw)
-    (increase! absolute-pitch pitch))
   
   
   (method override (motion-target)
@@ -519,18 +524,6 @@
   
   (method override (rotate-right)
     (rotate-right~ (motion-target) (get-commands~ world)))
-  
-  
-  (method override (zoom-in)
-    (desired-distance-closer)
-    (eye-center-player)
-    (adjust-player-alpha))
-  
-  
-  (method override (zoom-out)
-    (desired-distance-further)
-    (eye-center-player)
-    (adjust-player-alpha))
   
   
   (method (force-up distance)
@@ -724,23 +717,7 @@
   
   (method override (rotate-right)
     (rotate-left~ camera)
-    (orbit-behind (motion-target)))
-  
-  
-  (method override (zoom-in)
-    (desired-distance-closer)
-    (orbit-behind (motion-target)))
-  
-  
-  (method override (zoom-out)
-    (desired-distance-further)
-    (orbit-behind (motion-target)))
-  
-  
-  (method (track-orbit dx <fl> dy <fl>)
-    (rotate-horizontal~ camera (/ (- dx) track-sensitivity))
-    (rotate-vertical~ camera (/ (- dy) track-sensitivity))
-    (orbit-behind-target)))
+    (orbit-behind (motion-target))))
 
 
 ;;;
