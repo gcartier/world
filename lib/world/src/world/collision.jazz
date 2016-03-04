@@ -83,7 +83,7 @@
   
   
   (slot polygon      <Polygon>                      getter generate)
-  (slot colliders    <object>                       accessors generate)
+  (slot colliders    <list>    initialize '()       accessors generate)
   (slot plane        <Plane>                        getter generate)
   (slot distance     <fl>      initialize (make-fl) getter generate)
   (slot back-facing? <bool>                         getter generate)
@@ -94,7 +94,15 @@
     (debug-allocation Collision)
     (nextmethod)
     (set! polygon~self polygon)
-    (set! colliders~self (list polygon))
+    (set! plane~self plane)
+    (fl! distance~self distance)
+    (set! back-facing?~self back-facing?)
+    (set! type~self type))
+  
+  
+  (method (init polygon colliders plane distance <fl> back-facing? type)
+    (set! polygon~self polygon)
+    (set! colliders~self colliders)
     (set! plane~self plane)
     (fl! distance~self distance)
     (set! back-facing?~self back-facing?)
@@ -111,34 +119,36 @@
     (get-element~ polygon)))
 
 
-(definition public (copy-collision coll <Collision>) <Collision>
+(definition (allocate-collision)
   (allocate Collision
-            (copy-polygon~ (get-polygon~ coll))
-            (map copy-polygon~ (get-colliders~ coll))
-            (copy-plane (get-plane~ coll))
-            (get-distance~ coll)
-            (get-type~ coll)))
-
-(definition public (copy-collisions cl)
-  (map copy-collision cl))
+            #f
+            '()
+            #f
+            (make-fl)
+            #f
+            #f))
 
 
-(definition (transform-collisions cl matrix inverse-matrix)
+(definition (init-collision$ polygon colliders plane distance back-facing? type)
+  (let ((coll (alloc-collision$)))
+    (init~ coll polygon colliders plane distance back-facing? type)
+    coll))
+
+
+(definition (transform-collisions$ cl matrix inverse-matrix)
   (map (lambda (coll)
-         (transform-collision coll matrix inverse-matrix))
+         (transform-collision$ coll matrix inverse-matrix))
        cl))
 
 
-(definition (transform-collision coll <Collision> matrix <f64vector> inverse-matrix <f64vector>) <Collision>
-  (let ((poly (transform-polygon~ (get-polygon~ coll) matrix inverse-matrix))
-        (colliders (map (lambda (poly <Polygon>) (transform-polygon~ poly matrix inverse-matrix)) (get-colliders~ coll)))
-        (plane (transform-plane (get-plane~ coll) matrix inverse-matrix))
-        (distance (get-distance~ coll))
-        (back-facing? (get-back-facing?~ coll))
-        (type (get-type~ coll)))
-    (let ((new-coll (new Collision poly plane distance back-facing? type)))
-      (set-colliders~ new-coll colliders)
-      new-coll)))
+(definition (transform-collision$ coll <Collision> matrix <f64vector> inverse-matrix <f64vector>) <Collision>
+  (init-collision$
+    (transform-polygon$ (get-polygon~ coll) matrix inverse-matrix)
+    (map (lambda (poly <Polygon>) (transform-polygon$ poly matrix inverse-matrix)) (get-colliders~ coll))
+    (transform-plane (get-plane~ coll) matrix inverse-matrix)
+    (get-distance~ coll)
+    (get-back-facing?~ coll)
+    (get-type~ coll)))
 
 
 ;;;
@@ -163,22 +173,27 @@
   1.)
 
 
-(definition public (calculate-colliders sphere-matrix <f64vector> inverse-matrix <f64vector> mvt <Movement> travel-breadth <fx> max-distance <fl+> area-cube <Area-Cube+> polygon-filter <procedure+> skip-list <list> include-back-facing? <bool> ignore-entities? <bool> ignore-players? <bool> ignore-me? <bool>) <list>
+(definition public (calculate-colliders$ sphere-matrix <f64vector> inverse-matrix <f64vector> mvt <Movement> travel-breadth <fx> max-distance <fl+> area-cube <Area-Cube+> polygon-filter <procedure+> skip-list <list> include-back-facing? <bool> ignore-entities? <bool> ignore-players? <bool> ignore-me? <bool>) <list>
   (define (collide poly <Polygon> result)
     (define (add-collision collision)
       (enqueue result collision))
     
-    (unless (member? poly skip-list test: polygon=?)
-      (let ((collision (collide-polygon poly mvt include-back-facing?)))
-        (when collision
-          (unless (skimming-surface? collision)
+    (if (member? poly skip-list test: polygon=?)
+        (free-polygon$~ poly)
+      (let ((collision (collide-polygon$ poly mvt include-back-facing?)))
+        (if (not collision)
+            (free-polygon$~ poly)
+          (if (skimming-surface? collision)
+              (free-collision$ collision)
             (if (null? (queue-list result))
                 (add-collision collision)
               (let ((collision-distance (get-distance~ collision))
                     (result0 <Collision> (car (queue-list result))))
                 (let ((d <fl> (abs (- collision-distance (get-distance~ result0)))))
                   (if (> d EPSILON)
-                      (when (< collision-distance (get-distance~ result0))
+                      (if (>= collision-distance (get-distance~ result0))
+                          (free-collision$ collision)
+                        (free-collisions$ (queue-list result))
                         (reset-queue result)
                         (add-collision collision))
                     ;; Make sure it's not already in the list (this plane's normal)
@@ -189,7 +204,9 @@
                                            coll))
                                        (queue-list result))))
                         (if old-coll
-                            (set-colliders~ old-coll (cons (copy-polygon~ poly) (get-colliders~ old-coll)))
+                            (begin
+                              (free-collision-only$ collision)
+                              (set-colliders~ old-coll (cons poly (get-colliders~ old-coll))))
                           (add-collision collision)))))))))))))
   
   (define (skimming-surface? collision <Collision>)
@@ -198,23 +215,24 @@
       (< (abs (dot-product& (vertex-& contact-point contact-position) (get-normal~ mvt))) EPSILON)))
   
   ;; Go through our list of potential colliders
-  (site (calculate-colliders on?: #f)
+  (site (calculate-colliders$ on?: #f)
     (let ((zone (current-zone)))
       (receive (orig dir) (transform-ray/normalize (get-origin~ mvt) (get-vector~ mvt) inverse-matrix)
-        (or (travel-ray-polygons&
+        (or (travel-ray-polygons$
               (lambda (iterate)
-                (site (collide on?: #f parent: calculate-colliders)
+                (site (collide on?: #f parent: calculate-colliders$)
                   (let ((result (new-queue)))
                     (iterate
                       (lambda (poly <Polygon>)
                         @show-collision-polygons
                         (when (testing?)
-                          (add-mark~ zone (new Polygon-Mark (transform-polygon~ poly inverse-matrix sphere-matrix))))
-                        (when (let ((lst (queue-list result)))
-                                (or (null? lst)
-                                    (>= (+ sphere-radius (get-radius~ poly) (get-distance~ (cast <Collision> (car lst))) EPSILON)
-                                        (vertex-distance& (get-origin~ mvt) (get-center~ poly)))))
-                          (collide poly result))))
+                          (add-mark~ zone (new Polygon-Mark (transform-polygon$ poly inverse-matrix sphere-matrix))))
+                        (if (let ((lst (queue-list result)))
+                              (or (null? lst)
+                                  (>= (+ sphere-radius (get-radius~ poly) (get-distance~ (cast <Collision> (car lst))) EPSILON)
+                                      (vertex-distance& (get-origin~ mvt) (get-center~ poly)))))
+                            (collide poly result)
+                          (free-polygon$~ poly))))
                     (let ((result (queue-list result)))
                       (and (not-null? result) result)))))
               orig
@@ -231,7 +249,7 @@
             '())))))
 
 
-(definition (collide-polygon poly <Polygon> mvt <Movement> include-back-facing? <bool>) <Collision+>
+(definition (collide-polygon$ poly <Polygon> mvt <Movement> include-back-facing? <bool>) <Collision+>
   ;; The goal is to calculate the collision plane
   (let ((back-facing? (<= (plane-to-point-distance& poly (get-origin~ mvt)) 0.)))
     ;; Ignore back-facing polygons
@@ -239,14 +257,18 @@
         #f
       (let ((poly (if back-facing? (flip-polygon~ poly) poly)))
         (define (find-edge/point-collision)
-          (let ((edge-collision (find-edge-collision poly mvt back-facing?))
-                (point-collision (find-point-collision poly mvt back-facing?)))
+          (let ((edge-collision (find-edge-collision$ poly mvt back-facing?))
+                (point-collision (find-point-collision$ poly mvt back-facing?)))
             (cond ((not edge-collision) point-collision)
                   ((not point-collision) edge-collision)
                   (else
                    (if (< (get-distance~ edge-collision) (get-distance~ point-collision))
-                       edge-collision
-                     point-collision)))))
+                       (begin
+                         (free-collision-only$ point-collision)
+                         edge-collision)
+                     (begin
+                       (free-collision-only$ edge-collision)
+                       point-collision))))))
         
         ;; Ignore polygons parallel to movement
         @introduces-a-regression-in-the-stairs (if (< (abs (dot-product& (get-normal~ mvt) (get-normal~ poly))) EPSILON) #f)
@@ -265,7 +287,7 @@
                   (if (and inner-most-point (not (megahack)))
                       (let ((collision-distance (f64& (- (vertex-distance& inner-most-point (get-origin~ mvt)) sphere-radius)))
                             (collision-plane (new Plane inner-most-point (vertex-normalize-safe& (vertex-& (get-origin~ mvt) inner-most-point)))))
-                        (new Collision (copy-polygon~ poly) collision-plane collision-distance back-facing? 'embedded))
+                        (init-collision$ poly '() collision-plane collision-distance back-facing? 'embedded))
                     ;; Surface/Edge/Point collision
                     (let ((plane-intersection-point (vertex+& sphere-intersection-point (vertex-scalar*& (get-normal~ mvt) collision-distance))))
                       ;; Surface collision?
@@ -281,7 +303,7 @@
                                   (>= (dot-product& (get-normal~ collision-plane) (get-normal~ mvt)) 0.))
                                 #f
                               ;; Is it closer farther away or the same distance as what we've found so far?
-                              (new Collision (copy-polygon~ poly) collision-plane collision-distance back-facing? 'surface)))
+                              (init-collision$ poly '() collision-plane collision-distance back-facing? 'surface)))
                         ;; Edge/Point collision
                         (find-edge/point-collision)))))))))))))
 
@@ -319,7 +341,7 @@
     (mutex-unlock! collide-mutex)))
 
 
-(definition public (collide&stop origin <f64vector> target <f64vector> lookat <LookAt> radiuses <f64vector> (max-distance: max-distance #f) (area-cube: area-cube #f) (polygon-filter: polygon-filter #f) (include-back-facing?: include-back-facing? #f) (ignore-entities?: ignore-entities? #t) (ignore-players?: ignore-players? #f) (ignore-me?: ignore-me? #f) (proportional-slide?: proportional-slide? #t) (debuggable-collisions?: debuggable-collisions? #f))
+(definition public (collide&stop$ origin <f64vector> target <f64vector> lookat <LookAt> radiuses <f64vector> (max-distance: max-distance #f) (area-cube: area-cube #f) (polygon-filter: polygon-filter #f) (include-back-facing?: include-back-facing? #f) (ignore-entities?: ignore-entities? #t) (ignore-players?: ignore-players? #f) (ignore-me?: ignore-me? #f) (proportional-slide?: proportional-slide? #t) (debuggable-collisions?: debuggable-collisions? #f))
   (if (vertex=? origin target)
       (values origin (get-sight~ lookat) '())
     @show-collision-line
@@ -334,15 +356,15 @@
               (travel-breadth (determine-travel-breadth radiuses)))
           (sphere-matrices! sphere-matrix inverse-matrix origin lookat radiuses)
           (let ((mvt (collide-movement& sphere-matrix origin target)))
-            (let ((cl (site (calculate-stop-colliders on?: #f parent: collide&stop) (calculate-colliders sphere-matrix inverse-matrix mvt travel-breadth max-distance area-cube polygon-filter '() include-back-facing? ignore-entities? ignore-players? ignore-me?))))
+            (let ((cl (site (calculate-stop-colliders on?: #f parent: collide&stop$) (calculate-colliders$ sphere-matrix inverse-matrix mvt travel-breadth max-distance area-cube polygon-filter '() include-back-facing? ignore-entities? ignore-players? ignore-me?))))
               (when (and debug-collisions? debuggable-collisions? (not-null? cl))
                 (add-mark~ zone
-                  (new Collisions-Mark (transform-collisions cl inverse-matrix sphere-matrix) #f)))
+                  (new Collisions-Mark (transform-collisions$ cl inverse-matrix sphere-matrix) #f)))
               (let ((dest (if (null? cl)
                               (movement-end mvt)
                             (let ((cl0 <Collision> (car cl)))
                               ;; quick hack for a case that should only happen if the player is moved without
-                              ;; going through collide&slide logic which is the case when we rotate the player
+                              ;; going through collide&slide$ logic which is the case when we rotate the player
                               (if (eq? (get-type~ cl0) 'embedded)
                                   (vertex- (get-origin~ mvt) (vertex-scalar*& (get-normal~ (get-plane~ cl0)) (get-distance~ cl0)))
                                 (let ((dist (get-distance~ cl0)))
@@ -350,9 +372,11 @@
                                       (movement-end-to mvt dist)
                                     (movement-end mvt))))))))
                 (receive (dest dir) (transform-ray/normalize dest (get-vector~ mvt) inverse-matrix)
-                  (values dest
-                          dir
-                          (transform-collisions cl inverse-matrix sphere-matrix)))))))))))
+                  (let ((collisions (transform-collisions$ cl inverse-matrix sphere-matrix)))
+                    (free-collisions$ cl)
+                    (values dest
+                            dir
+                            collisions)))))))))))
 
 
 (definition collide-max-slide <fx>
@@ -375,7 +399,7 @@
   (set! debug-collisions? flag))
 
 
-(definition public (collide&slide origin <f64vector> target <f64vector> lookat <LookAt> radiuses <f64vector> (max-distance: max-distance #f) (area-cube: area-cube #f) (polygon-filter: polygon-filter #f) (include-back-facing?: include-back-facing? #f) (ignore-entities?: ignore-entities? #t) (ignore-players?: ignore-players? #f) (ignore-me?: ignore-me? #f) (proportional-slide?: proportional-slide? #t) (debuggable-collisions?: debuggable-collisions? #f))
+(definition public (collide&slide$ origin <f64vector> target <f64vector> lookat <LookAt> radiuses <f64vector> (max-distance: max-distance #f) (area-cube: area-cube #f) (polygon-filter: polygon-filter #f) (include-back-facing?: include-back-facing? #f) (ignore-entities?: ignore-entities? #t) (ignore-players?: ignore-players? #f) (ignore-me?: ignore-me? #f) (proportional-slide?: proportional-slide? #t) (debuggable-collisions?: debuggable-collisions? #f))
   (if (vertex=? origin target)
       (values origin (get-sight~ lookat) '())
     @show-collision-line
@@ -393,11 +417,13 @@
           (let ((ray (collide-movement& sphere-matrix origin target)))
             (let ((dist (get-length~ ray))
                   (max-loops collide-max-slide)
-                  (last-direction (copy-vertex (get-vector~ ray)))
-                  (last-cl '())
-                  (second-to-last-cl '())
+                  (current-direction (copy-vertex (get-vector~ ray)))
+                  (current-cl '())
+                  (world-current '())
+                  (world-last '())
                   (skip-list <list> '()))
               (define (skip-polygons coll <Collision>)
+                (set! skip-list (cons (get-polygon~ coll) skip-list))
                 (for-each (lambda (poly)
                             (set! skip-list (cons poly skip-list)))
                           (get-colliders~ coll)))
@@ -408,26 +434,28 @@
                            (not (vertex-near-zero? (get-vector~ ray)))
                            (> (get-length~ ray) EPSILON))
                   ;; This is handy
-                  (vertex-copy! last-direction (get-vector~ ray))
+                  (vertex-copy! current-direction (get-vector~ ray))
                   ;; Quicky to not redo the sphere-matrices! we did above
                   (when (> loop-no 0)
                     (movement-transform-3x4! ray inverse-matrix)
                     (sphere-matrices! sphere-matrix inverse-matrix (get-origin~ ray) lookat radiuses)
                     (movement-transform-3x4! ray sphere-matrix))
                   (let (;; Get the colliders
-                        (cl (site (calculate-slide-colliders on?: #f parent: collide&slide) (calculate-colliders sphere-matrix inverse-matrix ray travel-breadth max-distance area-cube polygon-filter skip-list include-back-facing? ignore-entities? ignore-players? ignore-me?))))
+                        (cl (site (calculate-slide-colliders on?: #f parent: collide&slide$) (calculate-colliders$ sphere-matrix inverse-matrix ray travel-breadth max-distance area-cube polygon-filter skip-list include-back-facing? ignore-entities? ignore-players? ignore-me?))))
                     (when (and debug-collisions? debuggable-collisions? (not-null? cl))
                       (add-mark~ zone
-                        (new Collisions-Mark (transform-collisions cl inverse-matrix sphere-matrix) loop-no)))
-                    (when (not-null? cl)
-                      (set! second-to-last-cl last-cl)
-                      ;; Transform now with these iteration matrices
-                      (set! last-cl (transform-collisions cl inverse-matrix sphere-matrix)))
+                        (new Collisions-Mark (transform-collisions$ cl inverse-matrix sphere-matrix) loop-no)))
                     ;; We can consider these polygons again
                     (set! skip-list '())
                     ;; If we didn't hit anything just return the destination
                     (if (null? cl)
                         (set-origin~ ray (movement-end& ray))
+                      (free-collisions$ current-cl)
+                      (set! current-cl cl)
+                      (free-collisions$ world-last)
+                      (set! world-last world-current)
+                      ;; Transform now with these iteration matrices
+                      (set! world-current (transform-collisions$ cl inverse-matrix sphere-matrix))
                       (let ((hit-count <fx> (length cl))
                             (hit-list cl)
                             (cl0 <Collision> (car cl)))
@@ -495,7 +523,7 @@
                                               (let ((scalar (dot-product& n1 n2)))
                                                 ;; New vector is new direction vector scaled
                                                 (set-vector~ ray (vertex-scalar*& temp-v scalar))))
-                                            (vertex-copy! last-direction (get-vector~ ray))
+                                            (vertex-copy! current-direction (get-vector~ ray))
                                             ;; Don't collide with these next time
                                             (skip-polygons (cast <Collision> (element hit-list c0)))
                                             (skip-polygons (cast <Collision> (element hit-list c1)))
@@ -513,14 +541,15 @@
                                                     (vertex-scalar*& (vertex-normalize& vector) dist))))))
                                         (unless (vertex-near-zero? new-vector)
                                           (set-vector~ ray new-vector)
-                                          (vertex-copy! last-direction new-vector)
+                                          (vertex-copy! current-direction new-vector)
                                           ;; Don't collide with this one next time
                                           (skip-polygons cl0)
                                           (iter (+ loop-no 1))))))))))))))))
-              (receive (dest dir) (transform-ray/normalize (get-origin~ ray) last-direction inverse-matrix)
+              (free-collisions$ current-cl)
+              (receive (dest dir) (transform-ray/normalize (get-origin~ ray) current-direction inverse-matrix)
                 (values dest
                         dir
-                        (append last-cl second-to-last-cl))))))))))
+                        (append world-current world-last))))))))))
 
 
 ;;;
@@ -534,7 +563,7 @@
 
 
 
-(definition (find-edge-collision poly <Polygon> mvt <Movement> back-facing? <bool>) <Collision+>
+(definition (find-edge-collision$ poly <Polygon> mvt <Movement> back-facing? <bool>) <Collision+>
   (if (megahack)
       #f
   (let ((closest-contact-point (make-vertex&))
@@ -555,7 +584,7 @@
                     (set-box! closest? #t)))))))
     (and (unbox closest?)
          (< closest-distance (get-length~ mvt))
-         (new Collision (copy-polygon~ poly) (new Plane closest-contact-point (vertex-normalize& (vertex-& closest-contact-position closest-contact-point))) closest-distance back-facing? 'edge)))))
+         (init-collision$ poly '() (new Plane closest-contact-point (vertex-normalize& (vertex-& closest-contact-position closest-contact-point))) closest-distance back-facing? 'edge)))))
 
 
 (definition (edge-sphere-collision& p1 <f64vector> p2 <f64vector> mvt <Movement> closest-contact-point closest-contact-position closest-distance closest? proc) <void>
@@ -592,7 +621,7 @@
                       (proc contact-dist contact-point contact-position closest-contact-point closest-contact-position closest-distance closest?))))))))))))
 
 
-(definition (find-point-collision poly <Polygon> mvt <Movement> back-facing? <bool>) <Collision+>
+(definition (find-point-collision$ poly <Polygon> mvt <Movement> back-facing? <bool>) <Collision+>
   (if (megahack)
       #f
   (let ((closest-contact-point (make-vertex&))
@@ -611,7 +640,7 @@
                     (f64-copy! closest-distance contact-dist)
                     (set-box! closest? #t)))))))
     (and (unbox closest?)
-         (new Collision (copy-polygon~ poly) (new Plane closest-contact-point (vertex-normalize& (vertex-& closest-contact-position closest-contact-point))) closest-distance back-facing? 'point)))))
+         (init-collision$ poly '() (new Plane closest-contact-point (vertex-normalize& (vertex-& closest-contact-position closest-contact-point))) closest-distance back-facing? 'point)))))
 
 
 (definition (point-sphere-collision& pt <f64vector> mvt <Movement> closest-contact-point closest-contact-position closest-distance closest? proc) <void>
@@ -668,6 +697,50 @@
 
 
 ;;;
+;;;; Pool
+;;;
+
+
+(definition protected collisions-pool <vector>
+  (make-vector 128 #f))
+
+(definition protected collisions-allocated <fx>
+  0)
+
+(definition protected collisions-available <fx>
+  0)
+
+
+(definition protected (alloc-collision$) <Collision>
+  (if (= collisions-available 0)
+      (assert (< collisions-allocated 128)
+        (increase! collisions-allocated)
+        (allocate-collision))
+    (decrease! collisions-available)
+    (let ((collision (vector-ref collisions-pool collisions-available)))
+      (vector-set! collisions-pool collisions-available #f)
+      collision)))
+
+
+(definition protected (free-collision$ collision <Collision>) <void>
+  (free-polygon$~ (get-polygon~ collision))
+  (for-each (lambda (poly <Polygon>)
+              (free-polygon$~ poly))
+            (get-colliders~ collision))
+  (free-collision-only$ collision))
+
+
+(definition protected (free-collision-only$ collision <Collision>) <void>
+  (assert (< collisions-available 128))
+  (vector-set! collisions-pool collisions-available collision)
+  (increase! collisions-available))
+
+
+(definition protected (free-collisions$ cl <list>)
+  (for-each free-collision$ cl))
+
+
+;;;
 ;;;; Collisions-Mark
 ;;;
 
@@ -708,7 +781,8 @@
                     (for-each (lambda (poly)
                                 (draw-polygon poly dye)
                                 (set! dye yellow-dye))
-                              (reverse (get-colliders~ collision)))))
+                              (cons (get-polygon~ collision)
+                                    (reverse (get-colliders~ collision))))))
                 collisions))
     
     (define (draw-planes)
