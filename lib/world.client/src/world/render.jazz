@@ -14,6 +14,24 @@
 (module world.render jazz
 
 
+(import (jazz.opengl)
+        (jazz.opengl.glew)
+        (jazz.syntax (phase syntax))
+        (world)
+        (world.autoload)
+        (world.configure)
+        (world.lighting)
+        (world.material)
+        (world.mesh)
+        (world.overlay)
+        (world.renderer)
+        (world.renderers)
+        (world.syntax (phase syntax)))
+
+
+(proclaim (warn optimizations))
+
+
 ;;;
 ;;;; Mutex
 ;;;
@@ -26,4 +44,125 @@
 (definition public (with-render-mutex thunk)
   (mutex-lock! render-mutex)
   (prog1 (thunk)
-    (mutex-unlock! render-mutex))))
+    (mutex-unlock! render-mutex)))
+
+
+;;;
+;;;; Draw
+;;;
+
+
+(definition x-rays-overlay <f32vector>
+  (f32vector 1. 1. 1. .6))
+
+
+(definition protected visited-sectors <fx>
+  0)
+
+(definition protected rendered-sectors <fx>
+  0)
+
+(definition protected rendered-meshes <fx>
+  0)
+
+(definition protected rendered-triangles <fx>
+  0)
+
+(definition protected rendered-entities <fx>
+  0)
+
+
+(definition protected (draw-sectors) <void>
+  (declare (proper-tail-calls))
+  (declare (optimize-dead-local-variables))
+  (declare (inline))
+  (declare (inlining-limit 1000))
+  (site (draw-sectors on?: #t parent: draw-world)
+    (let ((world (current-world)))
+      (let ((block-program (get-block-program~ world))
+            (block-opaque (get-block-opaque~ world))
+            (block-matrix (get-block-matrix~ world))
+            (x-rays? (get-x-rays?~ world))
+            (x-rays-category (get-x-rays-category~ world))
+            (view-distance (get-view-distance~ world))
+            (draw-blocks? (get-draw-blocks?~ world))
+            (draw-entities? (get-draw-entities?~ world)))
+        (set! visited-sectors 0)
+        (set! rendered-sectors 0)
+        (set! rendered-meshes 0)
+        (set! rendered-triangles 0)
+        (set! rendered-entities 0)
+        
+        (reset-renderes)
+        
+        (use~ block-program)
+        (bind-material~ block-program block-opaque)
+        (bind-uniforms~ block-program block-matrix #f (if x-rays? x-rays-overlay no-overlay) 0. (current-block-lighting))
+        
+        (let ((zone (current-zone))
+              (camera (current-camera)))
+          (let ((camera-index (get-sector-index~ camera)))
+            (let ((sectors (eye-neighbor-sectors~ zone camera-index view-distance)))
+              (loop (for i from 0 below (vector-length sectors))
+                    (when (or (not render-triangles-max) (< rendered-triangles render-triangles-max))
+                      (let ((sector <Sector> (vector-ref sectors i)))
+                        (let ((center (get-center~ sector)))
+                          (when (in-frustum?~ camera center)
+                            (update-visual~ sector)
+                            ;; blocks
+                            (when draw-blocks?
+                              ;; sector
+                              (increase! visited-sectors)
+                              ;; mesh
+                              (let ((mesh (get-mesh~ sector)))
+                                (when mesh
+                                  (if (not x-rays?)
+                                      (draw-mesh~ block-program mesh)
+                                    ;; x-rays
+                                    (glEnable GL_SAMPLE_ALPHA_TO_COVERAGE_ARB)
+                                    (draw-mesh~ block-program mesh)
+                                    (glDisable GL_SAMPLE_ALPHA_TO_COVERAGE_ARB))
+                                  (increase! rendered-sectors)
+                                  (increase! rendered-meshes)
+                                  (increase! rendered-triangles (get-indices~ (get-vertices-buffer~ mesh)))))
+                              ;; other-meshes
+                              (unless x-rays-category
+                                (site (register-meshes on?: #f parent: draw-sectors)
+                                  (let ((other-meshes (get-other-meshes~ sector)))
+                                    (when other-meshes
+                                      (iterate-table other-meshes
+                                        (lambda (material <Material> mesh <Mesh>)
+                                          (let ((renderer <Mesh-Renderer> (or (get-override-renderer) (get-renderer~ material))))
+                                            (add-mesh~ renderer mesh)
+                                            (increase! rendered-meshes)
+                                            (increase! rendered-triangles (get-indices~ (get-vertices-buffer~ mesh)))))))))))
+                            ;; categorized-mesh
+                            (when x-rays-category
+                              (let ((mesh (get-categorized-mesh~ sector)))
+                                (when mesh
+                                  (let ((material (get-material~ mesh)))
+                                    (when (eq? (get-name~ material) x-rays-category)
+                                      (let ((renderer <Mesh-Renderer> (get-renderer~ material)))
+                                        (add-mesh~ renderer mesh)
+                                        (increase! rendered-meshes)
+                                        (increase! rendered-triangles (get-indices~ (get-vertices-buffer~ mesh)))))))))
+                            ;; entities
+                            (when draw-entities?
+                              (site (register-entities on?: #f parent: draw-sectors)
+                                (let ((entities (get-entities~ sector)))
+                                  (when (not-null? entities)
+                                    (let ((me (current-me)))
+                                      (for-each (lambda (entity)
+                                                  (unless (eq? entity me)
+                                                    (register-entity entity)
+                                                    (increase! rendered-entities)))
+                                                entities))))))
+                            (when draw-blocks?
+                              ;; texture-elements
+                              (let ((elements (get-texture-elements~ sector)))
+                                (when (not-null? elements)
+                                  (register-texture-elements elements))))))))))))
+        
+        (unbind-uniforms~ block-program)
+        (unuse~ block-program)
+        (gl-check-error))))))
