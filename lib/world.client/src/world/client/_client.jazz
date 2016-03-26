@@ -43,6 +43,7 @@
         (world.client.configuration)
         (world.client.parameters)
         (world.commands)
+        (world.geometry)
         (world.interface.bars)
         (world.interface.skin)
         (world.settings)
@@ -140,23 +141,6 @@
   ;;;; Closing
   ;;;
   
-
-  (method override (quit-process (status 0))
-    (define (save-settings)
-      (let ((zone (current-zone)))
-        (let ((path (zone-path~ zone)))
-          (set-setting~ user-settings 'world.last-zone path)
-          (save-content~ user-settings))))
-    
-    (let ((world (current-world))
-          (zone (current-zone)))
-      (if (not world)
-          (nextmethod status)
-        (close~ zone)
-        (close~ world)
-        (save-settings)
-        (nextmethod status))))
-  
   
   (method override (close-environment)
     (disconnect)
@@ -246,18 +230,18 @@
                   (client (load-object~ (get-local-register) 'world.client.remote 'world-remote-client)))
               (set! remote-server server)
               (set! remote-client client)
-              (register-client~ server client)
+              (client-register~ server client)
               (add-exit-job! disconnect)))))))
   
   
   (method (disconnect)
-    (quit-world)
+    (exit-world)
     (disconnect-server))
 
 
   (method (disconnect-server)
     (when (and remote-server remote-client)
-      (unregister-client~ remote-server remote-client)
+      (client-unregister~ remote-server remote-client)
       (set! remote-server #f)
       (set! remote-client #f)))
   
@@ -268,22 +252,120 @@
   
   (method (enter-world)
     (when remote-server
-      (enter-world~ remote-server remote-client player-name player-avatar)))
+      (client-enter~ remote-server remote-client player-name player-avatar)))
   
   
-  (method (quit-world)
+  (method (exit-world)
     (when remote-server
-      (quit-world~ remote-server remote-client player-name)))
+      (client-exit~ remote-server remote-client player-name)))
   
   
   (method (update-client)
     (when remote-server
-      (update-client~ remote-server remote-client)))
+      (client-update~ remote-server remote-client)))
   
   
   (method (tick-server commands elapse)
     (when remote-server
       (client-tick~ remote-server remote-client (serialize-commands commands) elapse)))
+  
+  
+  ;;;
+  ;;;; Stub
+  ;;;
+  
+  
+  (method (server-update players)
+    (let ((world (current-world))
+          (me (current-me)))
+      (when (world-setting 'world.client.debug? #f)
+        (terminal (effective-player-name~ (get-application)) 'server-update players))
+      (for-each (lambda (info)
+                  (bind (player-name player-avatar player-position player-sight player-up player-right) info
+                    (let ((player (find-named-player~ world player-name)))
+                      (if (not player)
+                          (add-player~ world player-name player-avatar player-position player-sight player-up player-right)
+                        (let ((lookat (get-lookat~ player)))
+                          (let ((in-sync? (and (vertex=? (get-position~ player) player-position)
+                                               (vertex=? (get-sight~ lookat) player-sight)
+                                               (vertex=? (get-up~ lookat) player-up)
+                                               (vertex=? (get-right~ lookat) player-right))))
+                            (when (not in-sync?)
+                              (set-position~ player player-position)
+                              (init-lookat~ player player-sight player-up player-right)
+                              (when (eq? player me)
+                                (eye-behind-player~ world)
+                                (follow-player~ world)))))))))
+                players)
+      (when (world-setting 'world.client.debug? #f)
+        (debug-players))))
+  
+  
+  (method (server-enter player-name player-avatar player-position player-lookat)
+    (let ((world (current-world)))
+      (when (world-setting 'world.client.debug? #f)
+        (terminal (effective-player-name~ (get-application)) 'server-enter player-name player-avatar player-position player-lookat))
+      (bind (sight up right) player-lookat
+        (add-player~ world player-name player-avatar player-position sight up right))
+      (display-message~ world (format "{a} entered world" player-name))
+      (when (world-setting 'world.client.debug? #f)
+        (debug-players))))
+  
+  
+  (method (server-exit player-name)
+    (let ((world (current-world)))
+      (when (world-setting 'world.client.debug? #f)
+        (terminal (effective-player-name~ (get-application)) 'server-exit player-name))
+      (let ((player (find-named-player~ world player-name)))
+        (when player
+          (remove-element~ world player))
+        (when (and (client-side?) (equal? player-name (get-player-name)))
+          (set-current-me #f))
+        (display-message~ world (format "{a} exited world" player-name)))
+      (when (world-setting 'world.client.debug? #f)
+        (debug-players))))
+  
+  
+  (definition empty-commands
+    (let ((commands (new Commands)))
+      (complete~ commands)
+      commands))
+  
+  
+  (method (server-tick player-commands time elapse)
+    (let ((world (current-world))
+          (zone (current-zone))
+          (me (current-me)))
+      (unless (null? player-commands)
+        (when (world-setting 'world.client.debug? #f)
+          (terminal (effective-player-name~ (get-application)) 'server-tick player-commands time elapse)))
+      (unless (get-state~ me)
+        (for-each (lambda (actor)
+                    (let ((name (and (is? actor Player) (get-name~ actor))))
+                      (let ((pair (and name (assoc name player-commands))))
+                        (let ((commands (if pair (deserialize-commands (cdr pair)) empty-commands)))
+                          (tick-sliced~ world actor commands time elapse)))))
+                  (get-actors~ zone)))
+      (unless (null? player-commands)
+        (when (world-setting 'world.client.debug? #f)
+          (debug-players)))))
+  
+  
+  (method (server-test argument)
+    (1)
+    (debug 'server-test)
+    argument)
+  
+  
+  (method (debug-players)
+    (let ((zone (current-zone)))
+      (for-each (lambda (player)
+                  (unless (equal? (get-name~ player) "Server")
+                    (terminal '->
+                              (get-name~ player)
+                              (get-position~ player)
+                              (present-vertex (get-sight~ (get-lookat~ player))))))
+                (get-players~ zone))))
 
   
   ;;;
