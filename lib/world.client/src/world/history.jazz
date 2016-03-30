@@ -22,50 +22,6 @@
 
 
 ;;;
-;;;; Moment
-;;;
-
-
-(class Moment extends Object
-  
-  
-  (slot metadata <object> accessors generate)
-  (slot snapshot <object> accessors generate)
-  (slot commands <object> accessors generate)
-  (slot time     <object> accessors generate)
-  (slot elapse   <object> accessors generate)
-  
-  
-  (method override (initialize metadata snapshot commands time elapse)
-    (nextmethod)
-    (set! metadata~self metadata)
-    (set! snapshot~self snapshot)
-    (set! commands~self commands)
-    (set! time~self time)
-    (set! elapse~self elapse))
-  
-  
-  (method meta override (marshall-object obj)
-    (serialize-object (class-of obj)
-                      (vector
-                        (serialize (get-metadata~ obj))
-                        (serialize (get-snapshot~ obj))
-                        (serialize (get-commands~ obj))
-                        (serialize (get-time~ obj))
-                        (serialize (get-elapse~ obj)))))
-  
-  
-  (method meta override (unmarshall-object content)
-    (bind-vector (metadata snapshot commands time elapse) content
-      (new self
-        (deserialize metadata)
-        (deserialize snapshot)
-        (deserialize commands)
-        (deserialize time)
-        (deserialize elapse)))))
-
-
-;;;
 ;;;; Logic
 ;;;
 
@@ -186,6 +142,25 @@
 
 
 ;;;
+;;;; Change
+;;;
+
+
+(class Change extends Object
+  
+  
+  (slot metadata getter generate)
+  (slot forward  getter generate)
+  (slot backward getter generate)
+  
+  
+  (method override (initialize metadata forward backward)
+    (set! metadata~self metadata)
+    (set! forward~self forward)
+    (set! backward~self backward)))
+
+
+;;;
 ;;;; History
 ;;;
 
@@ -193,71 +168,35 @@
 (class History extends Object
   
   
-  (slot moments  <object> initialize #f accessors generate)
+  (slot changes  <object> initialize #f accessors generate)
   (slot now      <object> initialize #f accessors generate)
-  (slot current  <object> initialize #f accessors generate)
   (slot maximum  <fx+>    initialize #f accessors generate)
   (slot first    <fx+>    initialize #f accessors generate)
   (slot count    <fx+>    initialize #f accessors generate)
   (slot paused?  <bool>   initialize #f accessors generate)
-  (slot log-file <object> initialize #f getter generate)
-  (slot log-port <object> initialize #f getter generate)
   
   
   (method override (initialize maximum)
     (nextmethod)
     (set! maximum~self maximum)
-    (setup)
-    (setup-log))
+    (setup))
   
   
   (method (setup)
-    (cond ((not maximum)
-           (set! moments (new Axis 0))
-           (set! now 0))
-          (else
-           (set! moments (make-vector maximum))
-           (set! now 0)
-           (set! first 0)
-           (set! count 0))))
+    (set! changes (make-vector maximum))
+    (set! now 0)
+    (set! first 0)
+    (set! count 0))
   
   
-  (method (setup-log)
-    @wait
-    (let ((file (timestamped-file (logger-directory) "history" "log")))
-      (create-directories~ file)
-      (set! log-file file)
-      (set! log-port (open-output-file (path-settings log-file)))))
+  (method (pause)
+    (set! paused? #t))
   
   
-  (method meta override (marshall-object obj)
-    (serialize-object (class-of obj)
-                      (vector
-                        (serialize (accumulate (get-moments~ obj) serialize Vector))
-                        (serialize (get-now~ obj))
-                        (serialize (get-current~ obj))
-                        (serialize (get-maximum~ obj))
-                        (serialize (get-first~ obj))
-                        (serialize (get-count~ obj)))))
-  
-  
-  (method meta override (unmarshall-object content)
-    (bind-vector (moments now current maximum first count) content
-      (let ((obj (new self maximum)))
-        (set-moments~ obj (accumulate moments deserialize Vector))
-        (set-now~ obj (deserialize now))
-        (set-current~ obj (deserialize current))
-        (set-first~ obj (deserialize first))
-        (set-count~ obj (deserialize count)))))
-  
-  
-  (method (activate)
-    )
-  
-  
-  (method (deactivate)
+  (method (unpause)
     (clear-logic #t)
-    (clear-exit))
+    (clear-exit)
+    (set! paused? #f))
 
   
   (method (history-start)
@@ -265,9 +204,7 @@
   
   
   (method (history-end)
-    (if (not maximum)
-        (cardinality moments)
-      count))
+    count)
   
   
   (method (history-first)
@@ -282,28 +219,23 @@
     (modulo (+ first n) maximum))
   
   
-  (method (historical-moment n)
-    (if (not maximum)
-        (element moments n)
-      (element moments (historical-index n))))
+  (method (historical-change n)
+    (element changes (historical-index n)))
   
   
   (method (in-history n)
     (max (history-first) (min n (history-end))))
   
   
-  (method (add-history moment)
-    (cond ((not maximum)
-           (axis-add moments moment)
-           (increase! now))
-          (else
-           (let ((index (historical-index count)))
-             (set-element! moments index moment)
-             (if (< count maximum)
-                 (begin
-                   (increase! count)
-                   (increase! now))
-               (set! first (modulo (+ first 1) maximum)))))))
+  (method (add-history forward backward (metadata: metadata #f))
+    (let ((change (new Change metadata forward backward))
+          (index (historical-index count)))
+      (set-element! changes index change)
+      (if (< count maximum)
+          (begin
+            (increase! count)
+            (increase! now))
+        (set! first (modulo (+ first 1) maximum)))))
   
   
   (method (backward-history)
@@ -315,23 +247,24 @@
   
   
   (method (goto-now)
-    (goto-history now force?: #t))
+    (goto-history now))
   
   
-  (method (goto-history n (force?: force? #f))
+  (method (goto-history n)
     (let ((world (current-world)))
-      (clear-logic)
-      (clear-exit)
       (let ((n (in-history n)))
-        (when (or (/= n now) force?)
+        (when (/= n now)
+          (cond ((> n now)
+                 (loop (for s from now below n)
+                       (let ((forward (get-forward~ (historical-change s))))
+                         (forward))))
+                (else
+                 (loop (for s from (- now 1) downto n)
+                       (let ((backward (get-backward~ (historical-change s))))
+                         (backward)))))
           (set! now n)
-          (let ((snapshot
-                  (if (= n (history-end))
-                      current
-                    (get-snapshot~ (historical-moment now)))))
-            (load-world~ world snapshot)
-            (invalidate-slider)
-            (set-?n now))))))
+          (invalidate-slider)
+          (set-?n now)))))
   
   
   (method (stepped-history)
@@ -347,13 +280,11 @@
   
   
   (method (slide-history where)
-    (goto-history (fxround (* where (history-end)))))
+    (goto-history (fxround (* where (cast <fl> (history-end))))))
   
   
-  (method (truncate-future)
-    (if (not maximum)
-        (axis-adjust moments now)
-      (set! count now)))
+  (method (truncate-history)
+    (set! count now))
   
   
   ;;;
@@ -422,6 +353,7 @@
   
   
   (method (step-history)
+    @convert
     (let ((world (current-world))
           (me (current-me)))
       (clear-logic)
@@ -443,88 +375,6 @@
   ;;;
   
   
+  ;; convert
   (method (recalculate-future)
-    (let ((world (current-world))
-          (me (current-me)))
-      (let ((end (history-end)))
-        (loop (for n from now below end)
-              (let ((moment (historical-moment n)))
-                (let ((commands (get-commands~ moment))
-                      (time (get-time~ moment))
-                      (elapse (get-elapse~ moment)))
-                  (complete~ commands)
-                  (tick-sliced~ world me commands time elapse)
-                  (tick-actors~ world commands time elapse)
-                  (let ((next (+ n 1)))
-                    (let ((moment (historical-moment next)))
-                      (bind-values (metadata snapshot) (snapshot-metadata/world~ world)
-                        (if (= next end)
-                            (set! current snapshot)
-                          (set-metadata~ moment metadata)
-                          (set-snapshot~ moment snapshot))))))))
-        ;; for now
-        (if (= now end)
-            (load-world~ world current)
-          (load-world~ world (get-snapshot~ (historical-moment now)))))))
-  
-  
-  ;;;
-  ;;;; Log
-  ;;;
-  
-  
-  (method (log-commands commands elapse)
-    @wait (
-    (format log-port "(commands {s} {s}){%}" (->symbolic~ commands) elapse)
-    (force-output log-port)))
-  
-  
-  (method (log-action name arguments)
-    @wait (
-    (format log-port "({s} {l}){%}" name arguments)
-    (force-output log-port)))
-  
-  
-  (method (flush-log)
-    @wait (
-    (close~ log-port)
-    (set! log-port (open-output-file (path-settings log-file append: #t))))))
-
-
-;;;
-;;;; Snapshot
-;;;
-
-
-(class Snapshot extends Object
-  
-  
-  (slot actors    getter generate)
-  (slot gadgets   getter generate)
-  (slot marks     getter generate)
-  (slot camera    getter generate)
-  (slot sun-angle getter generate)
-  
-  
-  (method override (initialize actors gadgets marks camera sun-angle)
-    (nextmethod)
-    (set! actors~self actors)
-    (set! gadgets~self gadgets)
-    (set! marks~self marks)
-    (set! camera~self camera)
-    (set! sun-angle~self sun-angle))
-  
-  
-  (method meta override (marshall-object obj)
-    (serialize-object (class-of obj)
-                      (vector
-                        (get-actors~ obj)
-                        (get-gadgets~ obj)
-                        (get-marks~ obj)
-                        (get-camera~ obj)
-                        (get-sun-angle~ obj))))
-  
-  
-  (method meta override (unmarshall-object content)
-    (bind-vector (actors gadgets marks camera sun-angle) content
-      (new self actors gadgets marks camera sun-angle)))))
+    )))
