@@ -166,55 +166,73 @@
     (let ((world (current-world))
           (zone (current-zone)))
       (debug-server 'client-enter player-name player-avatar)
-      (if (find-player~ world player-name)
-          (format "Name {a} is unavailable" player-name)
-        ;; register client
-        (let ((client-id (next-unique-id!)))
-          (let ((server-client (new Server-Client client-id player-client player-name)))
-            (set! clients (cons server-client clients))
-            ;; retrieve player
-            (let ((player (player-retrieve player-name player-avatar))
-                  (player-server-client (find-server-client player-client)))
-              ;; collect other players for client
-              (define (collect-other-players)
-                (define (player-info player)
-                  (let ((id (get-id~ player))
-                        (name (get-name~ player))
-                        (avatar (get-avatar~ player))
-                        (position (get-position~ player))
-                        (lookat (get-lookat~ player)))
-                    (list id name avatar position lookat)))
+      (let ((existing-player (find-player~ world player-name)))
+        ;; open test first draft at reconnection
+        (let ((reconnected-server-client
+                (and existing-player
+                     (let ((server-client (find-server-client-by-name player-name)))
+                       (and server-client
+                            (get-exception~ server-client)
+                            server-client)))))
+          (if (and existing-player
+                   (not reconnected-server-client))
+              (format "Name {a} is unavailable" player-name)
+            ;; register client
+            (let ((server-client (if (not reconnected-server-client)
+                                     (new Server-Client client-id player-client player-name)
+                                   (set-client~ reconnected-server-client player-client)
+                                   (set-exception~ reconnected-server-client #f)
+                                   (set-exception-time~ reconnected-server-client #f)
+                                   reconnected-server-client)))
+              (unless reconnected-server-client
+                (set! clients (cons server-client clients)))
+              ;; retrieve player
+              (let ((player (player-retrieve player-name player-avatar))
+                    (player-server-client (find-server-client player-client)))
+                ;; collect other players for client
+                (define (collect-other-players)
+                  (define (player-info player)
+                    (let ((id (get-id~ player))
+                          (name (get-name~ player))
+                          (avatar (get-avatar~ player))
+                          (position (get-position~ player))
+                          (lookat (get-lookat~ player)))
+                      (list id name avatar position lookat)))
+                  
+                  (let ((players
+                          (collect (lambda (server-client)
+                                     (unless (eq? server-client player-server-client)
+                                       (let ((name (get-name~ server-client)))
+                                         (let ((existing (find-player~ world name)))
+                                           (player-info existing)))))
+                                   clients)))
+                    (if (admin?)
+                        players
+                      (cons (player-info (current-me)) players))))
                 
-                (let ((players
-                        (collect (lambda (server-client)
-                                   (unless (eq? server-client player-server-client)
-                                     (let ((name (get-name~ server-client)))
-                                       (let ((existing (find-player~ world name)))
-                                         (player-info existing)))))
-                                 clients)))
-                  (if (admin?)
-                      players
-                    (cons (player-info (current-me)) players))))
-              
-              ;; broadcast entering player to other clients
-              (let ((player-id (get-id~ player))
-                    (player-position (get-position~ player))
-                    (player-lookat (get-lookat~ player))
-                    (other-players (collect-other-players)))
-                (for-each (lambda (server-client)
-                            (unless (eq? server-client player-server-client)
-                              (let ((client (get-client~ server-client)))
-                                (calling-client server-client
-                                  (lambda ()
-                                    (server-entered~ client player-id player-name player-avatar player-position player-lookat))))))
-                          clients)
-                (when (application?)
-                  (display-message~ world (format "{a} entered world" player-name)))
-                (let ((welcome (if open-test? "Welcome to the Yownu multiplayer test!" "Welcome to Yownu!"))
-                      ;; open test quicky to send form as a string
-                      (form (call-with-input-file (path-settings (get-moniker~ zone)) read-content-string))
-                      (spawnpoint (get-spawnpoint~ zone)))
-                  (list client-id welcome form spawnpoint player-id player-position player-lookat other-players)))))))))
+                (let ((player-id (get-id~ player))
+                      (player-position (get-position~ player))
+                      (player-lookat (get-lookat~ player))
+                      (other-players (collect-other-players)))
+                  ;; broadcast entering player to other clients
+                  (unless reconnected-server-client
+                    (for-each (lambda (server-client)
+                                (unless (eq? server-client player-server-client)
+                                  (let ((client (get-client~ server-client)))
+                                    (calling-client server-client
+                                      (lambda ()
+                                        (server-entered~ client player-id player-name player-avatar player-position player-lookat))))))
+                              clients))
+                  (when (application?)
+                    (if reconnected-server-client
+                        (display-message~ world (format "{a} reconnected" player-name))
+                      (display-message~ world (format "{a} entered world" player-name))))
+                  (let ((client-id (get-id~ server-client))
+                        (welcome (if open-test? "Welcome to the Yownu multiplayer test!" "Welcome to Yownu!"))
+                        ;; open test quicky to send form as a string
+                        (form (call-with-input-file (path-settings (get-moniker~ zone)) read-content-string))
+                        (spawnpoint (get-spawnpoint~ zone)))
+                    (list client-id welcome form spawnpoint player-id player-position player-lookat other-players))))))))))
   
   
   (method (client-exit player-client player-name)
@@ -348,6 +366,12 @@
   (method (find-server-client target)
     (find-if (lambda (client)
                (proxy=? (get-client~ client) target))
+             clients))
+  
+  
+  (method (find-server-client-by-name target)
+    (find-if (lambda (client)
+               (equal? (get-name~ client) target))
              clients))
   
   
