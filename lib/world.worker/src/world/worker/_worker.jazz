@@ -31,7 +31,9 @@
   (thread-start!
     (new-thread
       (lambda ()
-        (process-work port feedback hide))
+        (set! worker-feedback feedback)
+        (set! worker-hide hide)
+        (process-work port))
       'worker)))
 
 
@@ -45,6 +47,12 @@
   #f)
 
 (definition worker-debug?
+  #f)
+
+(definition worker-feedback
+  #f)
+
+(definition worker-hide
   #f)
 
 (definition worker-repositories
@@ -117,7 +125,115 @@
         (newline port)))))
 
 
-(definition (process-work port feedback hide)
+(definition (handling-exceptions thunk problem (debug? worker-debug?))
+  (if debug?
+      (thunk)
+    (with-exception-catcher
+      (lambda (exc)
+        (problem (list 'error (exception-reason exc) #f)))
+      (lambda ()
+        (catch (Walk-Problems exc
+                 (problem (list 'walk (exception-reason exc) (exception-detail exc))))
+          (thunk))))))
+
+
+(definition (handling-worker-exceptions thunk)
+  (handling-exceptions thunk
+    (lambda (info)
+      info)))
+
+
+(definition protected (worker-process-repositories repositories)
+  (handling-worker-exceptions
+    (lambda ()
+      (setup-worker-repositories repositories)
+      (list 'result #f))))
+
+
+(definition protected (worker-process-unit mode feedback? time? unit-name)
+  (handling-worker-exceptions
+    (lambda ()
+      (let ((resource (find-unit-src unit-name)))
+        (let ((pathname (resource-pathname resource))
+              (path (resource-path resource)))
+          (let ((output-dir (new-directory~ worker-cache-dir (cons "unit" (tokenise-filename (extract-dir path)))))
+                (base (extract-base path)))
+            (define (compile-unit)
+              (when feedback?
+                (feedback (format "Compiling {a}..." unit-name)))
+              (let ((timer (new Timer)))
+                (prog1 (expanding-unit unit-name
+                         (lambda ()
+                           (with-resource-reader resource
+                             (lambda ()
+                               (compile-file pathname options: compile-options cc-options: "-U___SINGLE_HOST -O0" output: (parse~ output-dir))))))
+                  (when (and feedback? time?)
+                    (let ((duration (real-duration~ timer)))
+                      (feedback (format "Compiling {a}... {r precision: 1}s" unit-name duration))
+                      (cond ((> duration 5.) (sleep 1.))
+                            (else (sleep .5))))))))
+            
+            (create-directories~ output-dir)
+            (case mode
+              ((interpret)
+               (let ((digests (load-digests output-dir base))
+                     (exp (parse~ (new-file~ output-dir (add-extension base "exp")))))
+                 (if (lookup/update-digests digests 'interpret pathname)
+                     (list 'evaload exp)
+                   (let ((expansion (expand-unit unit-name)))
+                     (call-with-output-file exp
+                       (lambda (port)
+                         (write-binary expansion port)))
+                     (save-digests digests output-dir base)
+                     (list 'evaload exp)))))
+              ((compile)
+               (let ((digests (load-digests output-dir base)))
+                 (if (lookup/update-digests digests 'compile pathname)
+                     (list 'load (parse~ (new-file~ output-dir base)))
+                   (let ((object-path (compile-unit)))
+                     (save-digests digests output-dir base)
+                     (list 'load object-path))))))))))))
+
+
+;; because gambit doesn't support loading the same object file twice, it would be
+;; very tricky to cache script compilation as scripts are meant to be ran over and over.
+;; in fact this is probably a good thing giving the user the freedom to choose between
+;; scripts that stay interpreted and load fast, and modules that get compiled to cache
+(definition protected (worker-process-script mode path)
+  (handling-worker-exceptions
+    (lambda ()
+      (list 'eval (expand-script path)))))
+
+
+(definition protected (worker-process-evaluate mode feedback? syntax str container line col evaluation-mode)
+  (handling-worker-exceptions
+    (lambda ()
+      (case mode
+        ((interpret)
+         (list 'eval (evaluate-forms syntax str container line col 'interpret evaluate?: #f outline?: #f)))
+        ((compile)
+         (when feedback?
+           (feedback "Compiling evaluation..."))
+         (list 'load (evaluate-forms syntax str container line col 'compile file: worker-evaluation-file evaluate?: #f)))))))
+
+
+(definition protected (worker-process-console unit-name expr)
+  (handling-worker-exceptions
+    (lambda ()
+      (let ((module-declaration (outline-unit unit-name)))
+        (let ((form `(module ,unit-name ,(get-dialect-name~ module-declaration) ,expr)))
+          (load-unit 'dialect.development)
+          (list 'eval (expand-form form unit-name: unit-name walk-for: 'eval)))))))
+
+
+(definition protected (worker-process-hide)
+  (handling-worker-exceptions
+    (lambda ()
+      (worker-hide)
+      (list 'result #f))))
+
+
+(definition (process-work port)
   (declare (proper-tail-calls))
   (let ((port (open-tcp-client (string->number port))))
     (let (iter)
@@ -127,120 +243,12 @@
             (begin
               (close-port port)
               (post-event quit))
-          (bind (command . rest) form
-            (define (handling-exceptions thunk (debug? worker-debug?))
-              (if debug?
-                  (thunk)
-                (with-exception-catcher
-                  (lambda (exc)
-                    (write-binary (list 'error (exception-reason exc) #f) port))
-                  (lambda ()
-                    (catch (Walk-Problems exc
-                             (write-binary (list 'walk (exception-reason exc) (exception-detail exc)) port))
-                      (thunk))))))
-            
-            (define (write-result what result)
-              (write-binary (list what result #f) port))
-            
-            (case command
-              ((setup)
-               (bind (crashes cache debug? repositories) rest
-                 (handling-exceptions
-                   (lambda ()
-                     (setup-worker crashes cache debug? repositories)
-                     (write-result 'result (list (listening-host~ (get-remote-listener)) (listening-port~ (get-remote-listener)))))
-                   debug?)))
-              ((repositories)
-               (handling-exceptions
-                 (lambda ()
-                   (bind (repositories) rest
-                     (setup-worker-repositories repositories))
-                   (write-result 'result #f))))
-              (else
-               (bind (command mode feedback? time? . arguments) form
-                 (define (process-unit unit-name)
-                   (let ((resource (find-unit-src unit-name)))
-                     (let ((pathname (resource-pathname resource))
-                           (path (resource-path resource)))
-                       (let ((output-dir (new-directory~ worker-cache-dir (cons "unit" (tokenise-filename (extract-dir path)))))
-                             (base (extract-base path)))
-                         (define (compile-unit)
-                           (when feedback?
-                             (feedback (format "Compiling {a}..." unit-name)))
-                           (let ((timer (new Timer)))
-                             (prog1 (expanding-unit unit-name
-                                      (lambda ()
-                                        (with-resource-reader resource
-                                          (lambda ()
-                                            (compile-file pathname options: compile-options cc-options: "-U___SINGLE_HOST -O0" output: (parse~ output-dir))))))
-                               (when (and feedback? time?)
-                                 (let ((duration (real-duration~ timer)))
-                                   (feedback (format "Compiling {a}... {r precision: 1}s" unit-name duration))
-                                   (cond ((> duration 5.) (sleep 1.))
-                                         (else (sleep .5))))))))
-                         
-                         (create-directories~ output-dir)
-                         (case mode
-                           ((interpret)
-                            (let ((digests (load-digests output-dir base))
-                                  (exp (parse~ (new-file~ output-dir (add-extension base "exp")))))
-                              (if (lookup/update-digests digests 'interpret pathname)
-                                  (write-result 'evaload exp)
-                                (let ((expansion (expand-unit unit-name)))
-                                  (call-with-output-file exp
-                                    (lambda (port)
-                                      (write-binary expansion port)))
-                                  (save-digests digests output-dir base)
-                                  (write-result 'evaload exp)))))
-                           ((compile)
-                            (let ((digests (load-digests output-dir base)))
-                              (if (lookup/update-digests digests 'compile pathname)
-                                  (write-result 'load (parse~ (new-file~ output-dir base)))
-                                (let ((object-path (compile-unit)))
-                                  (save-digests digests output-dir base)
-                                  (write-result 'load object-path))))))))))
-                 
-                 ;; because gambit doesn't support loading the same object file twice, it would be
-                 ;; very tricky to cache script compilation as scripts are meant to be ran over and over.
-                 ;; in fact this is probably a good thing giving the user the freedom to choose between
-                 ;; scripts that stay interpreted and load fast, and modules that get compiled to cache
-                 (define (process-script path)
-                   (write-result 'eval (expand-script path)))
-                 
-                 (define (process-evaluate syntax str container line col evaluation-mode)
-                   (case mode
-                     ((interpret)
-                      (write-result 'eval (evaluate-forms syntax str container line col 'interpret evaluate?: #f outline?: #f)))
-                     ((compile)
-                      (when feedback?
-                        (feedback "Compiling evaluation..."))
-                      (write-result 'load (evaluate-forms syntax str container line col 'compile file: worker-evaluation-file evaluate?: #f)))))
-                 
-                 (define (process-console unit-name expr)
-                   (let ((module-declaration (outline-unit unit-name)))
-                     (let ((form `(module ,unit-name ,(get-dialect-name~ module-declaration) ,expr)))
-                       (load-unit 'dialect.development)
-                       (write-result 'eval (expand-form form unit-name: unit-name walk-for: 'eval)))))
-                 
-                 (case command
-                   ((unit)
-                    (handling-exceptions
-                      (lambda ()
-                        (apply process-unit arguments))))
-                   ((script)
-                    (handling-exceptions
-                      (lambda ()
-                        (apply process-script arguments))))
-                   ((evaluate)
-                    (handling-exceptions
-                      (lambda ()
-                        (apply process-evaluate arguments))))
-                   ((console)
-                    (handling-exceptions
-                      (lambda ()
-                        (apply process-console arguments))))
-                   ((hide)
-                    (hide))
-                   (else
-                    (error "Unknown worker command" command)))))))
+          (bind (crashes cache debug? repositories) form
+            (handling-exceptions
+              (lambda ()
+                (setup-worker crashes cache debug? repositories)
+                (write-binary (list 'result (list (listening-host~ (get-remote-listener)) (listening-port~ (get-remote-listener))) #f) port))
+              (lambda (info)
+                (write-binary info port))
+              debug?))
           (iter)))))))

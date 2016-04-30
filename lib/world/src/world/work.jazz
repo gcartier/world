@@ -49,12 +49,8 @@
 
 (definition protected (set-world-repositories repositories)
   (set! world-repositories repositories)
-  ;; worker is already running so update repositories
-  (when worker-port
-    (let ((port (get-worker-port)))
-      (write-binary `(repositories ,repositories) port)
-      (force-output port)
-      (check-exception port))))
+  (bind (what expr) (process-repositories~ (require-worker) repositories)
+    (worker-result what expr #f)))
 
 
 (definition (worker-crashes)
@@ -108,7 +104,7 @@
         stderr-redirection: #f
         show-console: #f))
     (let ((port (read server-port)))
-      (write-binary `(setup ,crashes ,cache ,debug? ,world-repositories) port)
+      (write-binary (list crashes cache debug? world-repositories) port)
       (force-output port)
       (bind (what expr detail) (read-binary port)
         (if (neq? what 'result)
@@ -134,8 +130,8 @@
 
 
 (definition protected (hide-worker)
-  (when worker-port
-    (worker-work 'hide #f #f #f #f)))
+  (bind (what expr) (process-hide~ (require-worker))
+    (worker-result what expr #f)))
 
 
 ;;;
@@ -166,8 +162,8 @@
 
 
 (definition public (worker-evaluate syntax str container line col walk-handler error-handler)
-  (worker-work 'evaluate 'interpret #f #f syntax str container line col 'interpret)
-  (worker-result walk-handler: walk-handler error-handler: error-handler))
+  (bind (what expr) (process-evaluate~ (require-worker) 'interpret #f syntax str container line col 'interpret)
+    (worker-result what expr #f walk-handler: walk-handler error-handler: error-handler)))
 
 
 ;;;
@@ -190,8 +186,8 @@
     (let ((mode (worker-mode)))
       (with-feedback mode unit-name
         (lambda (feedback? time?)
-          (worker-work 'unit mode feedback? time? unit-name)
-          (worker-result))))
+          (bind (what expr) (process-unit~ (require-worker) mode feedback? time? unit-name)
+            (worker-result what expr #f)))))
     #t))
 
 
@@ -200,8 +196,8 @@
     (when (world-setting 'world.worker-verbose? #f)
       (debug 'script path))
     (let ((mode 'interpret))
-      (worker-work 'script mode #f #f path)
-      (worker-result))
+      (bind (what expr) (process-script~ (require-worker) mode path)
+        (worker-result what expr #f)))
     #t))
 
 
@@ -212,9 +208,9 @@
     (let ((mode (worker-mode)))
       (with-feedback mode 'evaluation
         (lambda (feedback? time?)
-          (worker-work 'evaluate mode feedback? time? syntax str container line col evaluation-mode)
-          (when (worker-result walk-debugger: walk-debugger walk-cookie: walk-cookie)
-            (hook-evaluate forms syntax str container line col)))))
+          (bind (what expr) (process-evaluate~ (require-worker) mode feedback? syntax str container line col evaluation-mode)
+            (when (worker-result what expr #f walk-debugger: walk-debugger walk-cookie: walk-cookie)
+              (hook-evaluate forms syntax str container line col))))))
     #t))
 
 
@@ -224,11 +220,11 @@
     (when (world-setting 'world.worker-verbose? #f)
       (debug 'console))
     (let ((mode 'interpret))
-      (worker-work 'console mode #f #f unit-name expr)
-      (values (wrap-evaluate
-                (lambda ()
-                  (worker-result evaluator: evaluator)))
-              #t))))
+      (bind (what expr) (process-console~ (require-worker) unit-name expr)
+        (values (wrap-evaluate
+                  (lambda ()
+                    (worker-result what expr #f evaluator: evaluator)))
+                #t)))))
 
 
 (definition (with-feedback mode name proc)
@@ -252,45 +248,42 @@
     (force-output port)))
 
 
-(definition (worker-result (evaluator: evaluator #f) (walk-handler: walk-handler #f) (walk-debugger: walk-debugger #f) (walk-cookie: walk-cookie #f) (error-handler: error-handler #f))
-  (let ((info (read-binary (get-worker-port))))
-    (unless (eof-object? info)
-      (bind (what expr detail) info
-        (when (world-setting 'world.worker-verbose-result? #f)
-          (debug 'result what))
-        (case what
-          ((eval evaload)
-           (parameterize ((generate-symbol-for "%")
-                          (generate-symbol-context (gensym))
-                          (generate-symbol-counter 0))
-             (let ((expansion (if (eq? what 'eval)
-                                  expr
-                                (call-with-input-file expr
-                                  read-binary))))
-               (if evaluator
-                   (evaluator expansion)
-                 (eval expansion)
-                 #t))))
-          ((load)
-           (load-file expr #t))
-          ((walk)
-           (if walk-handler
-               (walk-handler expr detail)
-             (let ((world (current-world+))
-                   (zone (current-zone+)))
-               (cond (walk-debugger
-                       (report-walk-problems~ walk-debugger (get-local-process) detail walk-cookie))
-                     ((and world zone (get-ready?~ zone) (not (get-controller-debugger)))
-                      (display-walk-problems~ world detail))
-                     (else
-                      (error "{a}" expr))))
-             (if evaluator
-                 (unspecified)
-               #f)))
-          ((error)
-           (if error-handler
-               (error-handler expr)
-             (error "{a}" expr))))))))
+(definition (worker-result what expr detail (evaluator: evaluator #f) (walk-handler: walk-handler #f) (walk-debugger: walk-debugger #f) (walk-cookie: walk-cookie #f) (error-handler: error-handler #f))
+  (when (world-setting 'world.worker-verbose-result? #f)
+    (debug 'result what))
+  (case what
+    ((eval evaload)
+     (parameterize ((generate-symbol-for "%")
+                    (generate-symbol-context (gensym))
+                    (generate-symbol-counter 0))
+       (let ((expansion (if (eq? what 'eval)
+                            expr
+                          (call-with-input-file expr
+                            read-binary))))
+         (if evaluator
+             (evaluator expansion)
+           (eval expansion)
+           #t))))
+    ((load)
+     (load-file expr #t))
+    ((walk)
+     (if walk-handler
+         (walk-handler expr detail)
+       (let ((world (current-world+))
+             (zone (current-zone+)))
+         (cond (walk-debugger
+                 (report-walk-problems~ walk-debugger (get-local-process) detail walk-cookie))
+               ((and world zone (get-ready?~ zone) (not (get-controller-debugger)))
+                (display-walk-problems~ world detail))
+               (else
+                (error "{a}" expr))))
+       (if evaluator
+           (unspecified)
+         #f)))
+    ((error)
+     (if error-handler
+         (error-handler expr)
+       (error "{a}" expr)))))
 
 
 (add-exit-job! close-worker-port)
