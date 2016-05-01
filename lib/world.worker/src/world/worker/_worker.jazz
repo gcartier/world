@@ -22,20 +22,15 @@
         (jazz.event)
         (jazz.io)
         (jazz.jrm)
+        (jazz.network)
         (jazz.runtime)
+        (jazz.settings)
         (jazz.snapshot)
         (jazz.time))
 
 
-(definition protected (start-worker-thread port feedback hide)
-  (thread-start!
-    (new-thread
-      (lambda ()
-        (set! worker-feedback feedback)
-        (set! worker-hide hide)
-        (connect-to-master port))
-      'worker)))
-
+(definition worker-mutex
+  (make-mutex 'worker))
 
 (definition worker-cache-dir
   #f)
@@ -57,6 +52,19 @@
 
 (definition worker-repositories
   (make-table test: equal?))
+
+
+(definition protected (ready-worker feedback hide)
+  (set! worker-feedback feedback)
+  (set! worker-hide hide)
+  (start-remote-listener)
+  (let ((master (command-argument "master"))
+        (cookie (integer-argument "master-cookie")))
+    (receive (host port alternate-port) (parse-host/service master)
+      (let ((remote-register (connect-remote-register host port)))
+        (let ((master (load-object~ remote-register 'world.master 'world-remote-master))
+              (worker (load-object~ (get-local-register) 'world.worker.remote 'world-remote-worker)))
+          (slave-ready~ master worker cookie))))))
 
 
 (definition (setup-worker crashes cache debug? repositories)
@@ -125,33 +133,39 @@
         (newline port)))))
 
 
-(definition (handling-exceptions thunk problem (debug? worker-debug?))
-  (if debug?
-      (thunk)
-    (with-exception-catcher
-      (lambda (exc)
-        (problem (list 'error (exception-reason exc) #f)))
-      (lambda ()
-        (catch (Walk-Problems exc
-                 (problem (list 'walk (exception-reason exc) (exception-detail exc))))
-          (thunk))))))
+(definition (with-worker thunk (debug?: debug? worker-debug?))
+  (unwind-protect
+      (begin
+        (mutex-lock! worker-mutex)
+        (if worker-debug?
+            (thunk)
+          (with-exception-catcher
+            (lambda (exc)
+              (list 'error (exception-reason exc) #f))
+            (lambda ()
+              (catch (Walk-Problems exc
+                       (list 'walk (exception-reason exc) (exception-detail exc)))
+                (thunk))))))
+    (mutex-unlock! worker-mutex)))
 
 
-(definition (handling-worker-exceptions thunk)
-  (handling-exceptions thunk
-    (lambda (info)
-      info)))
+(definition protected (worker-process-setup crashes cache debug? repositories)
+  (with-worker
+    (lambda ()
+      (setup-worker crashes cache debug? repositories)
+      (list 'result #f))
+    debug?: debug?))
 
 
 (definition protected (worker-process-repositories repositories)
-  (handling-worker-exceptions
+  (with-worker
     (lambda ()
       (setup-worker-repositories repositories)
       (list 'result #f))))
 
 
 (definition protected (worker-process-unit mode feedback? time? unit-name)
-  (handling-worker-exceptions
+  (with-worker
     (lambda ()
       (let ((resource (find-unit-src unit-name)))
         (let ((pathname (resource-pathname resource))
@@ -200,13 +214,13 @@
 ;; in fact this is probably a good thing giving the user the freedom to choose between
 ;; scripts that stay interpreted and load fast, and modules that get compiled to cache
 (definition protected (worker-process-script mode path)
-  (handling-worker-exceptions
+  (with-worker
     (lambda ()
       (list 'eval (expand-script path)))))
 
 
 (definition protected (worker-process-evaluate mode feedback? syntax str container line col evaluation-mode)
-  (handling-worker-exceptions
+  (with-worker
     (lambda ()
       (case mode
         ((interpret)
@@ -218,7 +232,7 @@
 
 
 (definition protected (worker-process-console unit-name expr)
-  (handling-worker-exceptions
+  (with-worker
     (lambda ()
       (let ((module-declaration (outline-unit unit-name)))
         (let ((form `(module ,unit-name ,(get-dialect-name~ module-declaration) ,expr)))
@@ -227,28 +241,11 @@
 
 
 (definition protected (worker-process-hide)
-  (handling-worker-exceptions
+  (with-worker
     (lambda ()
       (worker-hide)
       (list 'result #f))))
 
 
-(definition (connect-to-master port)
-  (declare (proper-tail-calls))
-  (let ((port (open-tcp-client (string->number port))))
-    (let (iter)
-      (let ((form (read-binary port)))
-        (if (or (eof-object? form)
-                (null? form))
-            (begin
-              (close-port port)
-              (post-event quit))
-          (bind (crashes cache debug? repositories) form
-            (handling-exceptions
-              (lambda ()
-                (setup-worker crashes cache debug? repositories)
-                (write-binary (list 'result (list (listening-host~ (get-remote-listener)) (listening-port~ (get-remote-listener))) #f) port))
-              (lambda (info)
-                (write-binary info port))
-              debug?))
-          (iter)))))))
+(definition protected (worker-process-quit)
+  (quit)))

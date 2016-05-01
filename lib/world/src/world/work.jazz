@@ -18,8 +18,10 @@
         (jazz.debuggee)
         (jazz.io)
         (jazz.jrm)
+        (jazz.network)
         (world)
         (world.autoload)
+        (world.master)
         (world.settings)
         (world.syntax (phase syntax)))
 
@@ -74,86 +76,29 @@
 (definition protected (setup-worker-process)
   (unless (get-controller-debugger)
     (start-remote-listener))
-  (get-worker-port))
+  (spawn-worker-process))
 
 
-(definition (spawn-worker-process)
-  (define (determine-worker-path)
-    (let ((filename (add-extension (get-worker-filename) (executable-extension kernel-platform))))
-      (or (find-kernel-file filename)
-          (error "Unable to find worker executable"))))
-  
-  (let ((worker-path (determine-worker-path))
-        (master-port (open-tcp-server 0))
-        (crashes (worker-crashes))
+(definition protected (spawn-worker-process)
+  (let ((crashes (worker-crashes))
         (cache (worker-cache))
         (debug? (worker-debug?)))
-    (open-process
-      (list
-        path: worker-path
-        arguments: `("-:daqQ-"
-                     ;; it is not completly correct at the moment to always debug
-                     ;; the worker because of the evaluate always hack done in yownu
-                     ,@(let ((arg (command-argument "debugger")))
-                         (if (and debug? arg)
-                             (list "-debugger" arg)
-                           '()))
-                     "-master" ,(number->string (socket-info-port-number (tcp-server-socket-info master-port))))
-        stdin-redirection: #f
-        stdout-redirection: #f
-        stderr-redirection: #f
-        show-console: #f))
-    (let ((port (read master-port)))
-      (write-binary (list crashes cache debug? world-repositories) port)
-      (force-output port)
-      (bind (what expr detail) (read-binary port)
-        (if (neq? what 'result)
-            (error "Worker error: {a}" expr)
-          (bind (host port) expr
-            (let ((remote-register (connect-remote-register host port)))
-              (set! worker (load-object~ remote-register 'world.worker.remote 'world-remote-worker))))))
-      port)))
+    (spawn-slave-process "worker" (get-worker-filename)
+      (lambda (slave cookie)
+        (process-setup~ slave crashes cache debug? world-repositories)
+        (set! worker slave))
+      debug?: debug?
+      wait?: #t)))
 
 
-(definition (kill-worker-process port)
-  (write '() port)
-  (force-output port)
-  ;; we should do this to wait for the worker to exit else
-  ;; the worker can get a broken pipe if we exit too soon
-  ;; (process-status port)
-  (close-port port))
-
-
-;;;
-;;;; Feedback
-;;;
-
-
-(definition protected (hide-worker)
+(definition protected (hide-worker-process)
   (bind (what expr) (process-hide~ (require-worker))
     (worker-result what expr #f)))
 
 
-;;;
-;;;; Port
-;;;
-
-
-(definition worker-port
-  #f)
-
-
-(definition protected (get-worker-port)
-  (or worker-port
-      (let ((port (spawn-worker-process)))
-        (set! worker-port port)
-        port)))
-
-
-(definition protected (close-worker-port)
-  (when worker-port
-    (kill-worker-process worker-port)
-    (set! worker-port #f)))
+(definition protected (kill-worker-process)
+  (process-quit~ (require-worker))
+  (set! worker #f))
 
 
 ;;;
@@ -242,12 +187,6 @@
       (proc (not visible?) time?))))
 
 
-(definition (worker-work command mode feedback? time? . arguments)
-  (let ((port (get-worker-port)))
-    (write-binary `(,command ,mode ,feedback? ,time? ,@arguments) port)
-    (force-output port)))
-
-
 (definition (worker-result what expr detail (evaluator: evaluator #f) (walk-handler: walk-handler #f) (walk-debugger: walk-debugger #f) (walk-cookie: walk-cookie #f) (error-handler: error-handler #f))
   (when (world-setting 'world.worker-verbose-result? #f)
     (debug 'result what))
@@ -286,7 +225,7 @@
        (error "{a}" expr)))))
 
 
-(add-exit-job! close-worker-port)
+(add-exit-job! kill-worker-process)
 
 
 (set-load-interpreted-hook
