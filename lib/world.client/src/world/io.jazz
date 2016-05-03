@@ -97,9 +97,9 @@
 (definition public (make-world form (start-zone: start-zone #f))
   (close-world)
   (let ((world (instantiate~ form)))
-    (define (open-safe name (kind 'local))
+    (define (open-safe name kind)
       (define (open)
-        (let ((file (find-zone name kind)))
+        (let ((file (find-tier name kind)))
           (if file
               (case kind
                 ((local) (open-local file))
@@ -130,15 +130,15 @@
           (client-arg (command-argument "client"))
           (server-arg (command-argument "server")))
       (cond (start-zone
-             (open-safe start-zone))
+             (open-safe start-zone 'local))
             (zone-arg
-             (open-safe zone-arg))
+             (open-safe zone-arg 'local))
             (client-arg
              (open-safe client-arg 'client))
             (server-arg
              (open-safe server-arg 'server))
             (last
-             (open-safe last))
+             (open-safe last 'local))
             (else
              (open-welcome-zone))))
     (load-point 'world-ready)
@@ -196,7 +196,7 @@
 (definition protected (quit-world)
   (define (save-settings)
     (let ((zone (current-zone)))
-      (let ((path (zone-path~ zone)))
+      (let ((path (zone-path~ zone zone-kind)))
         (set-setting~ options-settings 'world.last-zone path)
         (save-content~ options-settings))))
   
@@ -234,9 +234,6 @@
         (world.history))
 
 (definition protected (setup-tier kind dir)
-  (define (make-settings filename)
-    (new File-Settings file: (new-file~ dir filename)))
-  
   ;; open test quick hacks
   (reset-literals)
   (reset-entities)
@@ -244,11 +241,11 @@
   
   (case kind
     ((local)
-     (new Local-Tier))
+     (new Local-Tier dir))
     ((client)
-     (new Client-Tier (make-settings ".client")))
+     (new Client-Tier dir))
     ((server)
-     (new Server-Tier (make-settings ".server")))))
+     (new Server-Tier dir))))
 
 
 (definition protected (shutdown-tier)
@@ -279,10 +276,11 @@
   
   (catch (problem? obj
            obj)
-    (let ((tier (setup-tier 'client (get-parent~ file))))
-      (let ((form (get-form~ tier)))
-        (set-origin~ form file)
-        (open-zone file form: form kind: 'client tier: tier)))))
+    (let ((dir (get-parent~ file)))
+      (let ((tier (setup-tier 'client dir)))
+        (let ((form (get-form~ tier)))
+          (set-origin~ form file)
+          (open-zone (zone-file dir 'client) form: form kind: 'client tier: tier))))))
 
 
 (definition public (open-server file)
@@ -331,10 +329,10 @@
           (when script
             (execute-script~ world script))))
       (let ((appl (get-application))
-            (moniker (get-moniker~ zone)))
-        (unless (admin?)
-          (unless (and moniker (member? (zone-name moniker) '("welcome" "tutorial") test: filename=?))
-            (check-news~ appl))))
+            (dir (get-directory~ zone)))
+        (unless (or (admin?)
+                    (member? (get-name~ dir) '("welcome" "tutorial") test: filename=?))
+          (check-news~ appl)))
       (zone-ready~ zone)
       (load-point 'zone-ready)
       (start-tasks~ zone)
@@ -352,16 +350,16 @@
     (uninstall-tier)))
 
 
-(definition public (find-zone name (kind 'local))
+(definition public (find-tier name kind)
   (let ((world (current-world)))
-    (let ((directory (get-zones-directory~ world kind)))
+    (let ((directory (get-tiers-directory~ world kind)))
       (continuation-capture
         (lambda (return)
           (when (exists?~ directory)
             (iterate-directory~ directory
-              (lambda (path kind)
+              (lambda (path path-kind)
                 (let ((dir (new-directory~ directory path)))
-                  (let ((file (zone-file dir)))
+                  (let ((file (tier-file dir kind)))
                     (when (and (exists?~ file)
                                (filename=? (extract-spine (join path "/")) name))
                       (continuation-return return file)))))
@@ -371,41 +369,65 @@
           #f)))))
 
 
-(definition protected (zone-file dir)
-  (new-file~ dir ".zone"))
+(definition public (find-zone name kind)
+  (let ((world (current-world)))
+    (let ((directory (get-tiers-directory~ world kind)))
+      (continuation-capture
+        (lambda (return)
+          (when (exists?~ directory)
+            (iterate-directory~ directory
+              (lambda (path path-kind)
+                (let ((dir (new-directory~ directory path)))
+                  (let ((file (zone-file dir kind)))
+                    (when (and (exists?~ file)
+                               (filename=? (extract-spine (join path "/")) name))
+                      (continuation-return return file)))))
+              full?: #f
+              files?: #f
+              directories?: #t))
+          #f)))))
+
+
+(definition protected (tier-name file)
+  (get-name~ (get-parent~ file)))
+
+
+(definition protected (tier-file dir kind)
+  (new-file~ dir (case kind
+                   ((local) ".zone")
+                   ((client) ".client")
+                   ((server) ".server"))))
+
+
+(definition protected (zone-file dir kind)
+  (new-file~ dir (if (eq? kind 'local)
+                     ".zone"
+                   '("zone" ".zone"))))
 
 
 (definition protected (zone-name moniker)
-  (get-name~ (zone-directory moniker)))
+  (get-name~ (get-parent~ moniker)))
 
 
-(definition protected (zone-directory moniker)
-  (get-parent~ moniker))
-
-
-(definition protected (zone-container moniker)
-  (get-parent~ (zone-directory moniker)))
-
-
-(definition protected (new-zone-file base (kind 'local))
+(definition protected (new-zone-file base kind)
   (let ((world (current-world)))
-    (let ((directory (get-zones-directory~ world kind))
+    (let ((directory (get-tiers-directory~ world kind))
           (path (split base "/")))
-      (new-file~ directory (append path (list ".zone"))))))
+      (zone-file (new-directory~ directory path) kind))))
 
 
 (definition public (open-welcome-zone)
-  (open-zone (find-zone (copy-zone-template "welcome" force-copy?: #t))))
+  (open-zone (find-tier (copy-zone-template "welcome" 'local force-copy?: #t) 'local)))
 
 
 (definition public (open-tutorial-zone (force-copy?: force-copy? #f) (start-script?: start-script? #t))
-  (open-zone (find-zone (copy-zone-template "tutorial" force-copy?: force-copy?)) start-script?: start-script?))
+  (open-zone (find-tier (copy-zone-template "tutorial" 'local force-copy?: force-copy?) 'local) start-script?: start-script?))
 
 
-(definition public (copy-zone-template name (force-copy?: force-copy? #f))
+(definition public (copy-zone-template name kind (force-copy?: force-copy? #f))
   (let ((world (current-world)))
     (let ((from-dir (new-directory~ (new-directory~ (get-world-directory~ world) "templates") name))
-          (to-dir (get-parent~ (new-zone-file name))))
+          (to-dir (get-parent~ (new-zone-file name kind))))
       (when (or force-copy? (not (exists?~ to-dir)))
         (copy-directory~ from-dir to-dir))
       name)))
@@ -413,7 +435,7 @@
 
 (definition public (tutorial-template?)
   (let ((zone (current-zone)))
-    (equal? (zone-path~ zone) "tutorial")))
+    (equal? (zone-path~ zone 'local) "tutorial")))
 
 
 (definition (convert-zone form)
