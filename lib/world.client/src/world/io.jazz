@@ -129,7 +129,8 @@
     (let ((last (world-setting 'world.last-zone #f))
           (zone-arg (command-argument "zone"))
           (client-arg (command-argument "client"))
-          (server-arg (command-argument "server")))
+          (server-arg (command-argument "server"))
+          (instance-arg (command-argument "instance")))
       (cond (start-zone
              (open-safe start-zone 'local))
             (zone-arg
@@ -138,6 +139,8 @@
              (open-safe client-arg 'client))
             (server-arg
              (open-safe server-arg 'server))
+            (instance-arg
+             (open-instance instance-arg))
             (last
              (open-safe last 'local))
             (else
@@ -225,11 +228,6 @@
 ;;;
 
 
-(definition protected (install-tier kind dir)
-  (set-zone-kind kind)
-  (set-current-tier (setup-tier kind dir)))
-
-
 ;; open test quick hack
 (import (world.entity)
         (world.history))
@@ -246,7 +244,9 @@
     ((client)
      (new Client-Tier dir))
     ((server)
-     (new Server-Tier dir))))
+     (new Server-Tier dir))
+    ((processor)
+     (new Processor-Tier dir))))
 
 
 (definition protected (shutdown-tier)
@@ -255,19 +255,18 @@
       (shutdown~ tier))))
 
 
-(definition protected (uninstall-tier)
-  (shutdown-tier)
-  (set-zone-kind #f)
-  (set-current-tier #f))
-
-
 ;;;
 ;;;; Zone
 ;;;
 
 
-(definition public (open-local file)
-  (open-zone file kind: 'local))
+(definition public (open-local file (start-script?: start-script? #t) (start-script: start-script #f))
+  (close-zone)
+  (let ((dir (get-parent~ file)))
+    (let ((tier (setup-tier 'local dir)))
+      (set-zone-kind 'local)
+      (set-current-tier tier)
+      (open-zone file start-script?: start-script? start-script: start-script))))
 
 
 (definition public (open-client file)
@@ -275,6 +274,7 @@
     (or (connection-problem? obj)
         (string? obj)))
   
+  (close-zone)
   (catch (problem? obj
            obj)
     (let ((dir (get-parent~ file)))
@@ -282,43 +282,47 @@
             (zone (zone-file dir 'client)))
         (let ((zone-form (get-form~ tier)))
           (set-origin~ zone-form zone)
-          (open-zone zone form: zone-form kind: 'client tier: tier))))))
+          (set-zone-kind 'client)
+          (set-current-tier tier)
+          (open-zone zone form: zone-form))))))
 
 
 (definition public (open-server file)
+  (close-zone)
   (let ((dir (get-parent~ file)))
-    (let ((tier (setup-tier 'server dir))
-          (zone (zone-file dir 'server)))
-      (open-zone zone kind: 'server tier: tier))))
+    (let ((tier (setup-tier 'server dir)))
+      (let ((processor (new Processor)))
+        (let ((zone (zone-file dir 'server)))
+          (set-zone-kind 'server)
+          (set-current-tier tier)
+          (set-current-processor processor)
+          (open-zone zone))))))
 
 
 (definition public (open-instance instance)
-  ;; TEST
-  (let ((file {File Settings "servers" "Flat" ".server"}))
+  ;; FOR TEST
+  (let ((file (new-file~ {Directory Settings "servers" "Test" "instances"} (list instance ".zone"))))
     (let ((dir (get-parent~ file)))
-      (let ((tier (processor-server))
-            (zone (zone-file dir 'server)))
-        (open-zone zone kind: 'server tier: tier)))))
+      (let ((tier (setup-tier 'processor dir))
+            (zone (zone-file dir 'processor)))
+        (set-zone-kind 'processor)
+        (set-current-tier tier)
+        (open-zone zone)))))
 
 
-(definition public (open-zone file (form: form #f) (kind: kind 'local) (tier: tier #f) (start-script?: start-script? #t) (start-script: start-script #f))
+(definition public (open-zone file (form: form #f) (start-script?: start-script? #t) (start-script: start-script #f))
   (close-all-popups)
-  (close-zone)
   (let ((form (or form (convert-zone (read-form file)))))
     (load-point 'zone-form)
-    (make-zone file form kind tier start-script? start-script)))
+    (make-zone file form start-script? start-script)))
 
 
-(definition public (make-zone file form kind tier start-script? start-script)
+(definition public (make-zone file form start-script? start-script)
   (let ((world (current-world)))
     ;; done before instantiating to enable custom zone class
     (let ((dir (get-parent~ file)))
-      (if (not tier)
-          (install-tier kind dir)
-        (set-zone-kind kind)
-        (set-current-tier tier))
       (set-zone-assets~ world (gather-assets~ world 'zone (new-directory~ dir "assets")))
-      (prepare-modules~ world (new-file~ dir ".template")))
+      (prepare-modules~ world (new-file~ dir ".instance")))
     (let ((zone (instantiate~ form)))
       (load-point 'zone-instantiate)
       (unless (get-title~ zone)
@@ -360,8 +364,10 @@
 (definition (close-zone)
   (let ((zone (current-zone+)))
     (when zone
-      (close~ zone))
-    (uninstall-tier)))
+      (close~ zone)
+      (shutdown-tier)
+      (set-zone-kind #f)
+      (set-current-tier #f))))
 
 
 (definition public (find-tier name kind)
@@ -414,7 +420,8 @@
 
 
 (definition protected (zone-file dir kind)
-  (new-file~ dir (if (eq? kind 'local)
+  (new-file~ dir (if (or (eq? kind 'local)
+                         (eq? kind 'processor))
                      ".zone"
                    '("zone" ".zone"))))
 
@@ -431,11 +438,11 @@
 
 
 (definition public (open-welcome-zone)
-  (open-zone (find-tier (copy-zone-template "welcome" 'local force-copy?: #t) 'local)))
+  (open-local (find-tier (copy-zone-template "welcome" 'local force-copy?: #t) 'local)))
 
 
 (definition public (open-tutorial-zone (force-copy?: force-copy? #f) (start-script?: start-script? #t))
-  (open-zone (find-tier (copy-zone-template "tutorial" 'local force-copy?: force-copy?) 'local) start-script?: start-script?))
+  (open-local (find-tier (copy-zone-template "tutorial" 'local force-copy?: force-copy?) 'local) start-script?: start-script?))
 
 
 (definition public (copy-zone-template name kind (force-copy?: force-copy? #f))
