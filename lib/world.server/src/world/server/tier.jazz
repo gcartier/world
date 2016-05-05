@@ -32,28 +32,28 @@
         (world.io)
         (world.network)
         (world.server.client)
-        (world.server.configuration)
         (world.settings)
         (world.syntax (phase syntax))
         (world.tier)
         (world.window))
 
 
-(class Server-Tier extends Tier implements Server
+(class Server-Tier extends Tier implements Server-Interface
   
   
-  (slot clients initialize '() getter generate)
-  (slot hits    initialize 0   getter generate)
+  (slot configuration                getter generate)
+  (slot clients       initialize '() getter generate)
+  (slot instances     initialize '() getter generate)
+  (slot hits          initialize 0   getter generate)
   
   
   (method override (initialize dir)
     (nextmethod dir)
-    (set! settings~self (new File-Settings file: (new-file~ dir ".server")))
+    (set! configuration (instantiate~ (read-form (new-file~ dir ".server"))))
     (setup))
   
   
   (method override (setup)
-    (register-settings settings)
     (set-client-id (next-unique-id!))
     ;; aec quicky
     (set-remote-problem-handler
@@ -62,20 +62,20 @@
                  obj)
           (process))))
     (unless (get-controller-debugger)
-      (let ((host (world-server-host))
-            (service (world-server-service)))
-        (start-remote-listener host: host service: service))))
+      (let ((host (get-host~ configuration))
+            (service (get-service~ configuration)))
+        (start-remote-listener host: host service: service)))
+    (setup-instances))
   
   
   (method override (enter)
     (unless (admin?)
       (let ((me (current-me)))
-        (set-name~ me (world-setting 'world.server.player-name #f))
-        (set-avatar~ me (world-setting 'world.server.player-avatar #f)))))
+        (set-name~ me (get-player-name~ configuration))
+        (set-avatar~ me (get-player-avatar~ configuration)))))
   
   
   (method override (shutdown)
-    (unregister-settings settings)
     (unless (get-controller-debugger)
       (stop-remote-listener)))
   
@@ -138,6 +138,31 @@
   
   
   ;;;
+  ;;;; Instances
+  ;;;
+
+
+  (method (setup-instances)
+    (let ((instances-dir (instances-dir))
+          (queue (new-queue)))
+      (when (exists?~ instances-dir)
+        (iterate-directory~ instances-dir
+          (lambda (instance-dir)
+            (let ((file (new-file~ instance-dir ".instance")))
+              (when (exists?~ file)
+                (let ((instance (instantiate~ (read-form file))))
+                  (enqueue queue instance)))))
+          files?: #f
+          directories?: #t
+          recursive?: #f))
+      (set! instances (queue-list queue))))
+  
+  
+  (method (instances-dir)
+    (new-directory~ directory "instances"))
+  
+  
+  ;;;
   ;;;; Player
   ;;;
   
@@ -184,15 +209,15 @@
   ;;;
   
   
-  (method (client-enter player-client player-name player-avatar)
+  (method (client-enter client character-name character-avatar)
     (let ((world (current-world))
           (zone (current-zone)))
-      (debug-server 'client-enter player-name player-avatar)
-      (let ((existing-player (find-player~ world player-name)))
+      (debug-server 'client-enter character-name character-avatar)
+      (let ((existing-player (find-player~ world character-name)))
         ;; open test first draft at reconnection
         (let ((reconnected-client-state
                 (and existing-player
-                     (let ((client-state (find-client-state-by-name player-name)))
+                     (let ((client-state (find-client-state-by-name character-name)))
                        (and client-state
                             (or (get-exception~ client-state)
                                 (not (still-alive? client-state))
@@ -200,91 +225,131 @@
                             client-state)))))
           (if (and existing-player
                    (not reconnected-client-state))
-              (format "Name {a} is unavailable" player-name)
+              (format "Name {a} is unavailable" character-name)
             ;; register client
             (let ((client-state (if (not reconnected-client-state)
-                                    (new Client-State (next-unique-id!) player-client player-name)
-                                  (set-client~ reconnected-client-state player-client)
+                                    (new Client-State (next-unique-id!) client character-name)
+                                  (set-client~ reconnected-client-state client)
                                   (set-alive~ reconnected-client-state (current-seconds))
                                   (set-exception~ reconnected-client-state #f)
                                   (set-exception-time~ reconnected-client-state #f)
                                   reconnected-client-state)))
               (unless reconnected-client-state
                 (set! clients (cons client-state clients)))
-              ;; retrieve player
-              (let ((player (or existing-player (player-retrieve player-name player-avatar)))
-                    (player-client-state client-state))
-                ;; collect other players for client
-                (define (collect-other-players)
-                  (define (player-info player)
-                    (let ((id (get-id~ player))
-                          (name (get-name~ player))
-                          (avatar (get-avatar~ player))
-                          (position (get-position~ player))
-                          (lookat (get-lookat~ player)))
-                      (list id name avatar position lookat)))
+              ;; retrieve character
+              (let ((character (character-retrieve character-name character-avatar))
+                    (character-client-state client-state))
+                ;; retrieve player
+                (let ((player (or existing-player (player-retrieve character-name character-avatar))))
+                  ;; collect other players for client
+                  (define (collect-other-players)
+                    (define (player-info player)
+                      (let ((id (get-id~ player))
+                            (name (get-name~ player))
+                            (avatar (get-avatar~ player))
+                            (position (get-position~ player))
+                            (lookat (get-lookat~ player)))
+                        (list id name avatar position lookat)))
+                    
+                    (let ((players
+                            (collect (lambda (client-state)
+                                       (unless (eq? client-state character-client-state)
+                                         (let ((name (get-name~ client-state)))
+                                           (let ((existing (find-player~ world name)))
+                                             (player-info existing)))))
+                                     clients)))
+                      (if (admin?)
+                          players
+                        (cons (player-info (current-me)) players))))
                   
-                  (let ((players
-                          (collect (lambda (client-state)
-                                     (unless (eq? client-state player-client-state)
-                                       (let ((name (get-name~ client-state)))
-                                         (let ((existing (find-player~ world name)))
-                                           (player-info existing)))))
-                                   clients)))
-                    (if (admin?)
-                        players
-                      (cons (player-info (current-me)) players))))
-                
-                (let ((player-id (get-id~ player))
-                      (player-position (get-position~ player))
-                      (player-lookat (get-lookat~ player))
-                      (other-players (collect-other-players)))
-                  ;; broadcast entering player to other clients
-                  (unless reconnected-client-state
-                    (for-each (lambda (client-state)
-                                (unless (eq? client-state player-client-state)
-                                  (let ((client (get-client~ client-state)))
-                                    (calling-client client-state
-                                      (lambda ()
-                                        (server-entered~ client player-id player-name player-avatar player-position player-lookat))))))
-                              clients))
-                  (when (application?)
-                    (if reconnected-client-state
-                        (display-message~ world (format "{a} reconnected" player-name))
-                      (display-message~ world (format "{a} entered world" player-name))))
-                  (let ((client-id (get-id~ client-state))
-                        (processor (spawn-processor "935CF3C7-704C-433E-959C-60689C184E71") @TEST (get-remote-processor~ (current-processor)))
-                        (welcome (cond ((arc-en-ciel?) "Bienvenue Arc-en-ciel!")
-                                       (open-test? "Welcome to the Yownu multiplayer test!")
-                                       (else "Welcome to Yownu!")))
-                        ;; open test quicky to send form as a string
-                        (form (call-with-input-file (path-settings (get-moniker~ zone)) read-content-string))
-                        (spawnpoint (get-spawnpoint~ zone)))
-                    (list client-id processor welcome form spawnpoint player-id player-position player-lookat other-players))))))))))
+                  (let ((player-id (get-id~ player))
+                        (player-position (get-position~ player))
+                        (player-lookat (get-lookat~ player))
+                        (other-players (collect-other-players)))
+                    ;; broadcast entering player to other clients
+                    (unless reconnected-client-state
+                      (for-each (lambda (client-state)
+                                  (unless (eq? client-state character-client-state)
+                                    (let ((client (get-client~ client-state)))
+                                      (calling-client client-state
+                                        (lambda ()
+                                          (server-entered~ client player-id character-name character-avatar player-position player-lookat))))))
+                                clients))
+                    (when (application?)
+                      (if reconnected-client-state
+                          (display-message~ world (format "{a} reconnected" character-name))
+                        (display-message~ world (format "{a} entered world" character-name))))
+                    (let ((client-id (get-id~ client-state))
+                          (processor (spawn-processor "935CF3C7-704C-433E-959C-60689C184E71") @TEST (get-remote-processor~ (current-processor)))
+                          (welcome (cond ((arc-en-ciel?) "Bienvenue Arc-en-ciel!")
+                                         (open-test? "Welcome to the Yownu multiplayer test!")
+                                         (else "Welcome to Yownu!")))
+                          ;; open test quicky to send form as a string
+                          (form (call-with-input-file (path-settings (get-moniker~ zone)) read-content-string))
+                          (spawnpoint (get-spawnpoint~ zone)))
+                      (list client-id processor welcome form spawnpoint player-id player-position player-lookat other-players)))))))))))
   
   
-  (method (client-exit player-client player-name)
+  (method (client-exit client character-name)
     (let ((world (current-world)))
-      (debug-server 'client-exit player-name)
+      (debug-server 'client-exit character-name)
       ;; aec robust
-      (let ((player (find-player~ world player-name)))
+      (let ((player (find-player~ world character-name)))
         (when player
           ;; store player
           (player-store player)
           ;; find server client
-          (let ((player-client-state (find-client-state player-client)))
+          (let ((player-client-state (find-client-state client)))
             ;; broadcast exiting player to other clients
             (for-each (lambda (client-state)
                         (unless (eq? client-state player-client-state)
                           (let ((client (get-client~ client-state)))
                             (calling-client client-state
                               (lambda ()
-                                (server-exited~ client player-name))))))
+                                (server-exited~ client character-name))))))
                       clients)
             ;; unregister client
             (set! clients (remove! player-client-state clients)))
           (when (application?)
-            (display-message~ world (format "{a} exited world" player-name)))))))
+            (display-message~ world (format "{a} exited world" character-name)))))))
+  
+  
+  (method (character-retrieve character-name character-avatar)
+    (let ((zone (current-zone)))
+      (let ((file (new-file~ (characters-dir) (format "{a}.character" character-name))))
+        (let ((character
+                (if (exists?~ file)
+                    (let ((character (instantiate~ (read-form file))))
+                      (set-name~ character character-name)
+                      (set-avatar~ character character-avatar)
+                      character)
+                  (let ((units '(world.data)))
+                    (let ((tag '(<Character>))
+                          (data (new Data zone-version 'jazz units #f)))
+                      (let ((form (construct-form tag (imports-locator units) data)))
+                        (set-origin~ form file)
+                        (let ((character (instantiate~ form)))
+                          (set-name~ character character-name)
+                          (set-avatar~ character character-avatar)
+                          character)))))))
+          character))))
+  
+  
+  (method (character-store character)
+    (let ((world (current-world))
+          (zone (current-zone)))
+      (let ((file (new-file~ (characters-dir) (format "{a}.character" (get-name~ character)))))
+        (create-directories~ file)
+        (let ((designer (new Former form: (get-form~ character) reference: character)))
+          (define (save-character)
+            (set-property~ designer character 'instance (get-instance~ character)))
+          
+          (save-character)
+          (save~ designer)))))
+  
+  
+  (method (characters-dir)
+    (new-directory~ directory "characters"))
   
   
   (method (player-retrieve player-name player-avatar)
