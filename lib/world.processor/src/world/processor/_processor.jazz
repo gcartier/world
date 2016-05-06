@@ -16,11 +16,13 @@
 
 (require (dialect.development))
 
-(import (jazz.debuggee)
+(import (jazz.component)
+        (jazz.debuggee)
         (jazz.digest)
         (jazz.evaluate)
         (jazz.event)
         (jazz.io)
+        (jazz.jml)
         (jazz.jrm)
         (jazz.network)
         (jazz.runtime)
@@ -30,6 +32,8 @@
         (world)
         (world.autoload)
         (world.settings)
+        (world.server.client)
+        (world.server.serving)
         (world.syntax (phase syntax))
         (world.tier)
         (world.work))
@@ -40,7 +44,7 @@
 ;;;
 
 
-(class Processor-Tier extends Tier)
+(class Processor-Tier extends Serving-Tier)
 
 
 ;;;
@@ -76,12 +80,140 @@
     (quit))
   
   
-  (method (client-join)
-    )
+  (method (client-join client client-id character-name character-avatar)
+    (let ((tier (current-tier))
+          (zone (current-zone)))
+      (debug-processor 'client-join character-name character-avatar)
+      (let ((reconnected-client-state (find-client-state-by-name character-name))
+            (existing-player (find-player~ zone character-name)))
+        (let ((client-state (if (not reconnected-client-state)
+                                (new Client-State client client-id character-name)
+                              (set-client~ reconnected-client-state client)
+                              (set-alive~ reconnected-client-state (current-seconds))
+                              (set-exception~ reconnected-client-state #f)
+                              (set-exception-time~ reconnected-client-state #f)
+                              reconnected-client-state)))
+          ;; retrieve player
+          (let ((player (or existing-player (player-retrieve character-name character-avatar)))
+                (player-client-state client-state))
+            ;; collect other players for client
+            (define (collect-other-players)
+              (define (player-info player)
+                (let ((id (get-id~ player))
+                      (name (get-name~ player))
+                      (avatar (get-avatar~ player))
+                      (position (get-position~ player))
+                      (lookat (get-lookat~ player)))
+                  (list id name avatar position lookat)))
+              
+              (let ((players
+                      (collect (lambda (client-state)
+                                 (unless (eq? client-state player-client-state)
+                                   (let ((name (get-name~ client-state)))
+                                     (let ((existing (find-player~ zone name)))
+                                       (player-info existing)))))
+                               clients)))
+                (if (admin?)
+                    players
+                  (cons (player-info (current-me)) players))))
+            
+            (let ((player-id (get-id~ player))
+                  (player-position (get-position~ player))
+                  (player-lookat (get-lookat~ player))
+                  (other-players (collect-other-players)))
+              ;; broadcast entering player to other players
+              (for-each (lambda (client-state)
+                          (unless (eq? client-state player-client-state)
+                            (let ((client (get-client~ client-state)))
+                              (calling-client~ tier client-state
+                                (lambda ()
+                                  (server-entered~ client player-id character-name character-avatar player-position player-lookat))))))
+                        clients)
+              (let (;; open test quicky to send form as a string
+                    (form (call-with-input-file (path-settings (get-moniker~ zone)) read-content-string))
+                    (spawnpoint (get-spawnpoint~ zone)))
+                (list form spawnpoint player-id player-position player-lookat other-players))))))))
   
   
-  (method (client-leave)
-    )
+  (method (client-leave client character-name)
+    (let ((tier (current-tier))
+          (zone (current-zone)))
+      (debug-processor 'client-leave character-name)
+      ;; aec robust
+      (let ((player (find-player~ zone character-name)))
+        (when player
+          ;; store player
+          (player-store player)
+          ;; find server client
+          (let ((player-client-state (find-client-state client)))
+            ;; broadcast exiting player to other players
+            (for-each (lambda (client-state)
+                        (unless (eq? client-state player-client-state)
+                          (let ((client (get-client~ client-state)))
+                            (calling-client~ tier client-state
+                              (lambda ()
+                                (server-exited~ client character-name))))))
+                      clients)
+            ;; unregister client
+            (set! clients (remove! player-client-state clients)))))))
+  
+  
+  (method (player-retrieve player-name player-avatar)
+    (let ((zone (current-zone)))
+      (let ((file (new-file~ (players-dir) (format "{a}.player" player-name))))
+        (let ((player
+                (if (exists?~ file)
+                    (let ((player (instantiate~ (read-form file))))
+                      (set-name~ player player-name)
+                      (set-avatar~ player player-avatar)
+                      (set-parent~ player zone)
+                      player)
+                  (let ((units '(world.data)))
+                    (let ((tag '(<Player> (<Camera>)))
+                          (data (new Data zone-version 'jazz units #f)))
+                      (let ((form (construct-form tag (imports-locator units) data)))
+                        (set-origin~ form file)
+                        (let ((player (instantiate~ form)))
+                          (set-name~ player player-name)
+                          (set-avatar~ player player-avatar)
+                          (set-parent~ player zone)
+                          (set-position~ player (find-spawnpoint~ zone))
+                          (set-lookat~ player (find-spawnlookat~ zone))
+                          player)))))))
+          (set-billboard-name~ player player-name)
+          (add-element~ zone player)
+          (when (application?)
+            (add-simulation~ zone player))
+          player))))
+  
+  
+  (method (player-store player)
+    (let ((world (current-world))
+          (zone (current-zone)))
+      (let ((file (new-file~ (players-dir) (format "{a}.player" (get-name~ player)))))
+        (create-directories~ file)
+        (let ((designer (new Former form: (get-form~ player) reference: player)))
+          (define (save-camera)
+            (let ((eye (get-eye~ world))
+                  (camera (player-camera~ player)))
+              (set-property~ designer camera 'position (get-position~ eye))
+              (set-property~ designer camera 'lookat (get-lookat~ eye))))
+          
+          (define (save-player)
+            (set-property~ designer player 'position (get-position~ player))
+            (set-property~ designer player 'lookat (get-lookat~ player)))
+          
+          (save-camera)
+          (save-player)
+          (save~ designer)))
+      (when (application?)
+        (remove-simulation~ zone player))
+      (remove-element~ zone player)))
+  
+  
+  (method (players-dir)
+    (let ((tier (current-tier)))
+      (new-directory~ (get-directory~ tier) "players")))
   
   
   (method (retrieve-region region-x region-z)
