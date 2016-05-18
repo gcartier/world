@@ -40,7 +40,16 @@
 (class Compass-Pane extends World-Pane
   
   
-  (slot scale initialize 1. accessors generate)
+  (slot scale   initialize 1.                  accessors generate)
+  (slot players initialize (make-vector 64 #f) getter generate)
+  (slot xs      initialize (make-f64vector 64) getter generate)
+  (slot ys      initialize (make-f64vector 64) getter generate)
+  (slot count   initialize 0                   getter generate)
+  
+  
+  ;;;
+  ;;;; Drawing
+  ;;;
 
 
   (method override (draw surface context)
@@ -52,7 +61,8 @@
               (height (cast <fl> (- (rect-height bounds) 10))))
           (let ((cx (+ 5. (/ width 2.)))
                 (cy (+ 5. (/ height 2.)))
-                (radius (- (/ width 2.) 2.)))
+                (radius (- (/ width 2.) 2.))
+                (old-count count))
             ;; background
             (cairo_arc context cx cy radius 0. PI*2)
             (cairo_clip context)
@@ -79,36 +89,107 @@
                   (cairo_set_source_rgba context 1. 1. 0. 1.)
                   (cairo_fill context))))
             ;; players
+            (vector-set! players 0 me)
+            (f64vector-set! xs 0 cx)
+            (f64vector-set! ys 0 cy)
+            (set! count 1)
             (let ((position (get-position~ me))
                   (sight (get-sight~ me)))
-              (for-each (lambda (player)
-                          (unless (eq? player me)
-                            (with-preserved-matrix~ surface
-                              (lambda ()
-                                (cairo_translate context cx cy)
-                                (let ((delta (vertex- (get-position~ player) position)))
-                                  (define (draw-player x y near?)
-                                    (let ((radius 4.5))
-                                      (cairo_set_source_rgba context 1. 0. 0. 1.)
-                                      (cairo_arc context x y radius 0. PI*2)
-                                      (if near?
-                                          (cairo_fill context)
-                                        (cairo_stroke context))))
-                                  
-                                  (let ((dx (vertex-x delta))
-                                        (dz (vertex-z delta)))
-                                    (if (and (= dx 0.)
-                                             (= dz 0.))
-                                        (draw-player 0. 0. #t)
-                                      ;; there must be a simpler way
-                                      (let ((dir (vertex-scalar/ (vertex& dx 0. dz) scale)))
-                                        (let ((distance (vertex-norm dir)))
-                                          (let ((near? (<= distance (- radius 3.)))
-                                                (angle (vector-signed-angle sight (get-sight~ player) (vertex 0. 1. 0.))))
-                                            (let ((dir (rotate-upon angle (vertex 0. 1. 0.) dir)))
-                                              (cairo_rotate context angle)
-                                              (if near?
-                                                  (draw-player (vertex-x dir) (vertex-z dir) #t)
-                                                (let ((dir (vertex-scalar* (vertex-normalize dir) radius)))
-                                                  (draw-player (vertex-x dir) (vertex-z dir) #f))))))))))))))
-                        (get-actors~ zone))))))))))
+              (receive (left top) (cairo_user_to_device context 0. 0.)
+                (for-each (lambda (player)
+                            (unless (eq? player me)
+                              (with-preserved-matrix~ surface
+                                (lambda ()
+                                  (let ((delta (vertex- (get-position~ player) position)))
+                                    (define (draw-player x y near?)
+                                      (let ((radius 4.5))
+                                        (cairo_set_source_rgba context 1. 0. 0. 1.)
+                                        (cairo_arc context x y radius 0. PI*2)
+                                        (if near?
+                                            (cairo_fill context)
+                                          (cairo_stroke context)))
+                                      (receive (x y) (cairo_user_to_device context x y)
+                                        (vector-set! players count player)
+                                        (f64vector-set! xs count (- x left))
+                                        (f64vector-set! ys count (- y top))
+                                        (increase! count)))
+                                    
+                                    (let ((dx (vertex-x delta))
+                                          (dz (vertex-z delta)))
+                                      (if (and (= dx 0.)
+                                               (= dz 0.))
+                                          (draw-player 0. 0. #t)
+                                        (let ((dir (vertex-scalar/ (vertex& dx 0. dz) scale)))
+                                          (let ((distance (vertex-norm dir)))
+                                            (let ((near? (<= distance (- radius 3.)))
+                                                  (angle (vector-signed-angle sight (get-sight~ player) (vertex 0. 1. 0.))))
+                                              (let ((dir (rotate-upon angle (vertex 0. 1. 0.) dir)))
+                                                (cairo_translate context cx cy)
+                                                (cairo_rotate context angle)
+                                                (if near?
+                                                    (draw-player (vertex-x dir) (vertex-z dir) #t)
+                                                  (let ((dir (vertex-scalar* (vertex-normalize dir) radius)))
+                                                    (draw-player (vertex-x dir) (vertex-z dir) #f))))))))))))))
+                          (get-players~ zone))))
+            ;; so we do not leak memory
+            (when (> old-count count)
+              (loop (for n from count below old-count)
+                    (vector-set! players n #f))))))))
+  
+  
+  ;;;
+  ;;;; Tooltip
+  ;;;
+  
+  
+  (method override (get-tooltip?)
+    #t)
+  
+  
+  (method override (get-tooltip-bounds pos)
+    (let ((nearest (nearest-player pos)))
+      (when nearest
+        (nearest-bounds nearest))))
+  
+  
+  (definition nearest-tolerance
+    7)
+  
+  
+  (method (nearest-player pos)
+    (let ((nearest #f))
+      (loop (for rank from 0 below count)
+            (when (and (in-rect? pos (nearest-bounds rank))
+                       (or (not nearest)
+                           (< (distance (nearest-position rank) pos) (distance (nearest-position nearest) pos))))
+              (set! nearest rank)))
+      nearest))
+  
+  
+  (method (nearest-position rank)
+    (let ((h (fxround (f64vector-ref xs rank)))
+          (v (fxround (f64vector-ref ys rank))))
+      (new Point h v)))
+  
+  
+  (method (nearest-bounds rank)
+    (let ((h (fxround (f64vector-ref xs rank)))
+          (v (fxround (f64vector-ref ys rank))))
+      (new Rect (- h nearest-tolerance) (- v nearest-tolerance) (+ h nearest-tolerance) (+ v nearest-tolerance))))
+  
+  
+  (method override (tooltip-default-popup?)
+    #t)
+  
+  
+  (method override (get-tooltip-context pos)
+    (define (present-player player)
+      `(<span>
+         (<paragraph>
+           (<text> color: World-Green ,(->string (or (get-name~ player) (anonymous~ (current-tier))))))))
+    
+    (let ((nearest (nearest-player pos)))
+      (when nearest
+        (let ((text (present-player (vector-ref players nearest)))
+              (bounds (nearest-bounds nearest)))
+          (tooltip-context self text bounds padding: 0)))))))
