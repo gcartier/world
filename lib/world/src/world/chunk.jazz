@@ -16,6 +16,7 @@
 
 (import (world)
         (world.autoload)
+        (world.geometry)
         (world.section)
         (world.syntax (phase syntax))
         (world.tag))
@@ -44,9 +45,10 @@
   (slot sections                                     getter generate)
   (slot sections-table       <table+>  initialize #f getter generate)
   (slot modified?            <bool>    initialize #f accessors generate)
+  (slot index                <pair>                  getter generate)
   
   
-  (method override (initialize digest raw region tag heightmap entities block-entities sections)
+  (method override (initialize digest raw region tag heightmap entities block-entities sections chunk-index)
     (set! digest~self digest)
     (set! raw~self raw)
     (set! region~self region)
@@ -55,7 +57,8 @@
     (set! entities~self entities)
     (set! block-entities~self block-entities)
     (set! block-entities-index~self (index-block-entities (list-payload-content block-entities)))
-    (set! sections~self sections))
+    (set! sections~self sections)
+    (set! index~self chunk-index))
   
   
   (method (refcount-increase)
@@ -121,12 +124,13 @@
   
   
   (method (add-section sector-y)
-    (let ((blocks (make-u8vector 4096))
+    (let ((blocks (make-u8vector 4096 0))
           (data (make-u8vector 2048))
           (blocklight (make-u8vector 2048))
           (skylight (make-u8vector 2048 255))) ;; quicky
       (let ((section (new World-Section self blocks data blocklight skylight)))
         (register-section sector-y section)
+        (modified)
         (let ((section-tag (list (make-tag "Blocks" TAG_Byte_Array blocks)
                                  (make-tag "Data" TAG_Byte_Array data)
                                  (make-tag "BlockLight" TAG_Byte_Array blocklight)
@@ -149,7 +153,9 @@
       
       (case (get-generator~ zone)
         ((flat)
-         (generate-flat block-ref block-set!)))))
+         (generate-flat block-ref block-set!))
+        ((diamond)
+         (generate-diamond-square block-ref block-set!)))))
   
   
   (method (generate-flat block-ref block-set!)
@@ -160,6 +166,89 @@
                   (block-set! section i 1 k world.generation:Dirt)
                   (block-set! section i 2 k world.generation:Dirt)
                   (block-set! section i 3 k world.generation:Grass)))))
+  
+  
+  (method (generate-diamond-square block-ref block-set!)
+    (set! heightmap~self (generate-diamond-square-heightmap))
+    (generate-blocks block-ref block-set!)
+    (modified))
+  
+  
+  (method (generate-blocks block-ref block-set!)
+    (let ((sections (make-vector 16 #f)))
+      (define (heightmap-index x <fx> z <fx>) <fx>
+        (+ x (* z 16)))
+      
+      (define (get-section y)
+        (let ((section-y (fxfloor/ y 16)))
+          (or (vector-ref sections section-y)
+              (let ((section (add-section section-y)))
+                (vector-set! sections section-y section)
+                section))))
+      
+      (loop (for x from 0 below 16)
+            (loop (for z from 0 below 16)
+                  (let ((height (vector-ref heightmap (heightmap-index x z))))
+                    (loop (for y from 0 below height)
+                          (block-set! (get-section y) x (modulo y 16) z 3)))))))
+  
+  
+  (method (generate-diamond-square-heightmap)
+    (let ((height (make-vector 289 0)))
+      (define (vector-index x <fx> z <fx>) <fx>
+        (+ x (* z 17)))
+      
+      (define (diamond-step n)
+        (let ((average-hop (/ 16 (expt 2 n))))
+          (let ((move-hop (* average-hop 2)))
+            (define (diamond-average x z)
+              (fxfloor (/ (+ (vector-ref height (vector-index (- x average-hop) (- z average-hop)))
+                             (vector-ref height (vector-index (+ x average-hop) (- z average-hop)))
+                             (vector-ref height (vector-index (- x average-hop) (+ z average-hop)))
+                             (vector-ref height (vector-index (+ x average-hop) (+ z average-hop))))
+                          4.)))
+            
+            (loop (for a from 0 below (expt 2 (- n 1)))
+                  (loop (for c from 0 below (expt 2 (- n 1)))
+                        (let ((x (+ average-hop (* a move-hop)))
+                              (z (+ average-hop (* c move-hop))))
+                          (vector-set! height (vector-index x z) (+ (diamond-average x z) (if (> n 1) 0 (random-integer-between -1 1))))))))))
+      
+      (define (square-step n)
+        (let ((average-hop (/ 16 (expt 2 n))))
+          (let ((move-hop (* average-hop 2)))
+            (define (square-average x z)
+              (let ((edge? (or (= x 0) (= x 16) (= z 0) (= z 16))))
+                (fxfloor (/ (+ (if (= x 0) 0 (vector-ref height (vector-index (- x average-hop) z)))
+                               (if (= x 16) 0 (vector-ref height (vector-index (+ x average-hop) z)))
+                               (if (= z 0) 0 (vector-ref height (vector-index x (- z average-hop))))
+                               (if (= z 16) 0 (vector-ref height (vector-index x (+ z average-hop)))))
+                            (if edge? 3. 4.)))))
+            
+            (loop (for c from 0 below (+ (expt 2 n) 1))
+                  (if (even? c)
+                      (loop (for a from 0 below (expt 2 (- n 1)))
+                            (let ((x (+ average-hop (* a move-hop)))
+                                  (z (* c average-hop)))
+                              (vector-set! height (vector-index x z) (+ (square-average x z) (if (> n 1) 0 (random-integer-between -1 1))))))
+                    (loop (for a from 0 below (+ (expt 2 (- n 1)) 1))
+                          (let ((x (* a move-hop))
+                                (z (* c average-hop)))
+                            (vector-set! height (vector-index x z) (+ (square-average x z) (if (> n 1) 0 (random-integer-between -1 1)))))))))))
+      
+      (vector-set! height (vector-index 0  0 ) 64)
+      (vector-set! height (vector-index 0  16) 64)
+      (vector-set! height (vector-index 16 0 ) 64)
+      (vector-set! height (vector-index 16 16) 64)
+      (loop (for n from 1 to 4)
+            (diamond-step n)
+            (square-step n))
+      (subvector height 0 256)))
+  
+  
+  (method (generate-heightmap)
+    (let ((x-variation (lambda (x y) ;; todo polynomial interpolation of random functions in x and y
+                         )))))
   
   
   (method protected (reset-modified)
