@@ -36,6 +36,8 @@
   
   
   (slot refcount             <fx>      initialize 0  getter generate)
+  (slot x                    <fx>                    getter generate)
+  (slot z                    <fx>                    getter generate)
   (slot digest                                       accessors generate)
   (slot raw                                          accessors generate)
   (slot region                                       getter generate)
@@ -47,7 +49,6 @@
   (slot sections                                     getter generate)
   (slot sections-table       <table+>  initialize #f getter generate)
   (slot modified?            <bool>    initialize #f accessors generate)
-  (slot index                <pair>                  getter generate)
   
   
   (method override (initialize digest raw region tag heightmap entities block-entities sections chunk-index)
@@ -60,7 +61,8 @@
     (set! block-entities~self block-entities)
     (set! block-entities-index~self (index-block-entities (list-payload-content block-entities)))
     (set! sections~self sections)
-    (set! index~self chunk-index))
+    (set! x~self (car chunk-index))
+    (set! z~self (cdr chunk-index)))
   
   
   (method (refcount-increase)
@@ -158,7 +160,11 @@
         ((simplex)
          (generate-simplex block-ref block-set!))
         ((diamond)
-         (generate-diamond-square block-ref block-set!)))))
+         (generate-diamond-square block-ref block-set!))
+        ((poly)
+         (set! heightmap~self (generate-polynomial-heightmap))
+         (generate-blocks block-ref block-set!)
+         (modified)))))
   
   
   (method (generate-flat block-ref block-set!)
@@ -174,8 +180,8 @@
   (method (generate-simplex block-ref block-set!)
     (define (generate-heightmap)
       (let ((heights (make-vector 256 1.))
-            (base-x (* (planar-index-x index) 16.))
-            (base-z (* (planar-index-z index) 16.)))
+            (base-x (* x 16.))
+            (base-z (* z 16.)))
         (define (vector-index x <fx> z <fx>) <fx>
           (+ x (* z 16)))
         
@@ -224,7 +230,7 @@
             (loop (for z from 0 below 16)
                   (let ((height (vector-ref heightmap (heightmap-index x z))))
                     (loop (for y from 0 below height)
-                          (block-set! (get-section y) x (modulo y 16) z 3)))))))
+                          (block-set! (get-section y) x (modulo y 16) z (if (= y (fxfloor height)) 2 3))))))))
   
   
   (method (generate-diamond-square-heightmap)
@@ -280,9 +286,104 @@
       (subvector height 0 256)))
   
   
-  (method (generate-heightmap)
-    (let ((x-variation (lambda (x y) ;; todo polynomial interpolation of random functions in x and y
-                         )))))
+  (method (generate-polynomial-heightmap)
+    (let ((zone (current-zone))
+          (heights (make-vector 256 0))
+          (region #f)
+          (chunk #f))
+      (define (corner-height n x z)
+        (set! region (cond ((< x 0) (increase! x 32) (table-ref (get-regions~ zone) (cons (- (get-x~ region~self) 1) (get-z~ region~self)) #f))
+                           ((> x 31) (decrease! x 32) (table-ref (get-regions~ zone) (cons (+ (get-x~ region~self) 1) (get-z~ region~self)) #f))
+                           ((< z 0) (increase! z 32) (table-ref (get-regions~ zone) (cons (get-x~ region~self) (- (get-z~ region~self) 1)) #f))
+                           ((> z 31) (decrease! z 32) (table-ref (get-regions~ zone) (cons (get-x~ region~self) (+ (get-z~ region~self) 1)) #f))
+                           (else region~self)))
+        (when region
+          (set! chunk (table-ref (get-chunks~ region) (cons x z) #f))
+          (when chunk
+            (get-corner~ chunk n))))
+      
+      (define (make-heightmap fx fz ax az mx mz ac)
+        (loop (for x from 0 below 16)
+              (loop (for z from 0 below 16)
+                    (vector-set! heights (+ (ax x) (* (az z) 16)) (min 255 (max 1 (+ 16 (fxround (cast <fl> (+ (* (/ x (max 1 (+ x z))) (/ (fx x) mx)) (* (/ z (max 1 (+ x z))) (/ (fz z) mz)) (* (/ (+ x z) 30) (- 1 (/ (abs (- z x)) 15)) ac)))))))))))
+      
+      (define (approx row)
+        #f)
+      
+      (let ((corner1 (corner-height 2 (- x 1) z))
+            (corner2 (corner-height 4 x (- z 1)))
+            (corner3 (corner-height 1 x (+ z 1)))
+            (corner4 (corner-height 3 (+ x 1) z))
+            (x-ajust (lambda (x) x))
+            (z-ajust (lambda (z) z)))
+        (let ((nb 0))
+          (when corner1
+            (increase! nb))
+          (when corner2
+            (increase! nb))
+          (when corner3
+            (increase! nb))
+          (when corner4
+            (increase! nb))
+          (when (= nb 0)
+            (set! corner1 64))
+          (case nb
+            ((1) (let ((corner (or corner1 (cond (corner2 (set! x-ajust (lambda (x) (- 15 x))) corner2)
+                                                 (corner3 (set! z-ajust (lambda (z) (- 15 z))) corner3)
+                                                 (corner4 (set! x-ajust (lambda (x) (- 15 x))) (set! z-ajust (lambda (z) (- 15 z))) corner4)))))
+                   (let ((x-var (lambda (x) (+ (* x x x (- (random-real) .5) 3) (* x x (- (random-real) .5) 10) (* x (- (random-real) .5) 14) corner)))
+                         (z-var (lambda (z) (+ (* z z (- (random-real) .5) 3) (* z (- (random-real) .5) 10) corner)))
+                         (max-x (max 1 (fxround (* (random-real) (random-real) 3))))
+                         (max-z (max 1 (fxround (* (random-real) (random-real) 3)))))
+                     (let ((x-factor (abs (/ (- (x-var 16) (x-var 0)) max-x)))
+                           (z-factor (abs (/ (- (z-var 16) (z-var 0)) max-z))))
+                       (make-heightmap x-var z-var x-ajust z-ajust x-factor z-factor (random-integer-between -3 3))))))
+            ((2) (if (or (and corner1 corner4) (and corner2 corner3))
+                     (let ((c1 (or corner1 (begin (set! x-ajust (lambda (x) (- 15 x))) corner2)))
+                           (c2 (or corner3 corner4)))
+                       (let ((x-var (lambda (x) (+ (* x x x (- (random-real) .5) 6) (* x x (- (random-real) .5) 10) (* x (- (random-real) .5) 14) c1)))
+                             (z-var (lambda (z) (+ (* z z z (- (random-real) .5) 4) (* z z (- (random-real) .5) 8) (* z (- (random-real) .5) 12) c1)))
+                             (max-x (max 1 (fxround (* (random-real) (random-real) 3))))
+                             (max-z (max 1 (fxround (* (random-real) (random-real) 3)))))
+                         (let ((x-factor (abs (/ (- (x-var 16) (x-var 0)) max-x)))
+                               (z-factor (abs (/ (- (z-var 16) (z-var 0)) max-z))))
+                           (make-heightmap x-var z-var x-ajust z-ajust x-factor z-factor (- c2 (+ (* .5 (/ (x-var 15) x-factor)) (* .5 (/ (z-var 15) z-factor))))))))
+                   (make-heightmap
+                     (lambda (x) (+ (* x x x (- (random-real) .5) 6) (* x x (- (random-real) .5) 10) (* x (- (random-real) .5) 14) 64))
+                     (lambda (z) (+ (* z z z (- (random-real) .5) 4) (* z z (- (random-real) .5) 8) (* z (- (random-real) .5) 12) 64))
+                     (lambda (x) x)
+                     (lambda (z) z)
+                     (* (+ (random-real) 1) 800)
+                     (* (+ (random-real) 1) 800)
+                     3)))
+            (else (make-heightmap
+                    (lambda (x) (+ (* x x x (- (random-real) .5) 3) (* x x (- (random-real) .5) 4) (* x (- (random-real) .5) 5) 64))
+                    (lambda (z) (+ (* z z z (- (random-real) .5) 2) (* z z (- (random-real) .5) 3) (* z (- (random-real) .5) 4) 64))
+                    (lambda (x) x)
+                    (lambda (z) z)
+                    (* (+ (random-real) 1) 800)
+                    (* (+ (random-real) 1) 800)
+                    1)))))
+      heights))
+  
+  
+  (method (get-corner index)
+    (vector-ref heightmap (case index
+                            ((1) 0)
+                            ((2) 15)
+                            ((3) 240)
+                            ((4) 255))))
+  
+  
+  (method (get-row index)
+    (let ((row (make-vector 16 0)))
+      (loop (for i from 0 below 16)
+            (vector-set! row i (vector-ref heightmap (case index
+                                                       ((1) (* 16 i))
+                                                       ((2) i)
+                                                       ((3) (+ i 240))
+                                                       ((4) (+ 15 (* 16 i)))))))
+      row))
   
   
   (method protected (reset-modified)
