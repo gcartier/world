@@ -19,15 +19,24 @@
         (jazz.graphic.image)
         (jazz.io)
         (jazz.jml)
+        (jazz.opengl.glew)
         (jazz.view)
         (jazz.view.dnd)
         (world)
         (world.audio)
         (world.autoload)
+        (world.block)
+        (world.camera)
         (world.configure)
+        (world.dye)
+        (world.geometry)
         (world.interface.pane)
         (world.interface.syntax (phase syntax))
         (world.interface.tooltip)
+        (world.light)
+        (world.lighting)
+        (world.renderer)
+        (world.renderers)
         (world.settings)
         (world.syntax (phase syntax))
         (world.tag)
@@ -1133,27 +1142,36 @@
           (sender-durability (get-durability~ sender)))
       (when sender-id
         (cond ;; move
-              ((not id)
-               (set! id sender-id)
-               (set! count sender-count)
-               (set! durability sender-durability)
-               (set-id~ sender #f)
-               (set-count~ sender #f)
-               (set-durability~ sender #f))
-              ;; merge
-              ((and (= id sender-id) (stackable-id? id))
-               (set! count (+ count sender-count))
-               (set-id~ sender #f)
-               (set-count~ sender #f)
-               (set-durability~ sender #f))
-              ;; toggle
-              (else
-               (set-id~ sender id)
-               (set-count~ sender count)
-               (set-durability~ sender durability)
-               (set! id sender-id)
-               (set! count sender-count)
-               (set! durability sender-durability)))
+          ((not id)
+           (set! id sender-id)
+           (set! count sender-count)
+           (set! durability sender-durability)
+           (when (< sender-id 256)
+             (let ((effective-rank (if (is? parent Chest-Pane) (+ rank 36) rank)))
+               (set-model~ (find-block-entity effective-rank sender-id (typecase parent ((Chest-Pane) 'chest) ((Bag-Pane) 'bag) ((Belt-Pane) 'belt))) (get-name~ (vector-ref world.generation:blockids sender-id)))))
+           (set-id~ sender #f)
+           (set-count~ sender #f)
+           (set-durability~ sender #f))
+          ;; merge
+          ((and (= id sender-id) (stackable-id? id))
+           (set! count (+ count sender-count))
+           (set-id~ sender #f)
+           (set-count~ sender #f)
+           (set-durability~ sender #f))
+          ;; toggle
+          (else
+           (set-id~ sender id)
+           (set-count~ sender count)
+           (set-durability~ sender durability)
+           (when (< id 256)
+             (let ((effective-rank (if (is? parent Chest-Pane) (+ rank 36) rank)))
+               (set-model~ (find-block-entity effective-rank id (typecase parent ((Chest-Pane) 'chest) ((Bag-Pane) 'bag) ((Belt-Pane) 'belt))) (get-name~ (vector-ref world.generation:blockids id)))))
+           (set! id sender-id)
+           (set! count sender-count)
+           (set! durability sender-durability)
+           (when (< sender-id 256)
+             (let ((effective-rank (if (is? parent Chest-Pane) (+ rank 36) rank)))
+               (set-model~ (find-block-entity effective-rank sender-id (typecase parent ((Chest-Pane) 'chest) ((Bag-Pane) 'bag) ((Belt-Pane) 'belt))) (get-name~ (vector-ref world.generation:blockids sender-id)))))))
         (invalidate-view)
         (invalidate-view~ sender))))
   
@@ -1224,7 +1242,8 @@
                            (fill-rect~ surface (inflate-rect bounds -1 -1) {Color World-Red alpha: .5}))
                           ((<= percentage 25.)
                            (fill-rect~ surface (inflate-rect bounds -1 -1) {Color Dark-Yellow alpha: .6}))))))
-              (blit-surface~ surface (get-slot-image id) destination: {Point 1 1})
+              (when (> id 255)
+                (blit-surface~ surface (get-slot-image id) destination: {Point 1 1}))
               (when (and (> count 1) (stackable-id? id))
                 (let ((str (->string count)))
                   (let ((extent (get-text-extent~ surface str)))
@@ -1239,6 +1258,115 @@
   
   (method protected virtual (right/bottom-color)
     {Color Entry-Border alpha: .6}))
+
+
+(definition protected block-entities
+  (make-vector 63 #f))
+
+
+(definition private inventory-camera
+  #f)
+
+
+(definition protected (cache-inventory-camera)
+  (or inventory-camera
+      (let ((world (current-world))
+            (cam (make-camera)))
+        (set-screen-width~ cam (get-width~ world))
+        (set-screen-height~ cam (get-height~ world))
+        (set-frustum-radius~ cam .8)
+        (set-position~ cam (vertex -10. 4.84 3.2))
+        (set-projection~ cam 'orthographic)
+        (set-zoom-factor~ cam 10.)
+        (let ((sight (vertex 1. 0. 0.))
+              (up (vertex 0. 1. 0.)))
+          (init-lookat~ cam
+            sight
+            up
+            (cross-normal sight up)))
+        (derive-target~ cam)
+        (camera-update~ cam)
+        (prepare-projection~ cam)
+        (prepare-view~ cam)
+        (set! inventory-camera cam)
+        cam)))
+
+
+(definition inventory-lighting
+  #f)
+  
+
+(definition (cache-inventory-lighting)
+  (or inventory-lighting
+      (let ((lighting (new Lighting))
+            (lookat (make-standard-lookat)))
+        (rotate-lookat! lookat lookat PI/4 (get-up~ lookat))
+        (rotate-lookat! lookat lookat .52359877559 (vertex& 0. 0. 1.))
+        (set-ambient-color~ lighting (dye 0. 0. 0. 1.0))
+        (set-lights~ lighting (list (new Light-Directional position: (vertex-scalar* (get-sight~ lookat) 1000.) color: #f32(.8 .8 .8 1.))
+                                    (new Light-Directional position: (vertex-scalar* (get-up~ lookat) 1000.) color: #f32(1. 1. 1. 1.))
+                                    (new Light-Directional position: (vertex-scalar* (get-right~ lookat) -1000.) color: #f32(.6 .6 .6 1.))))
+        (set-lights-count~ lighting (length (get-lights~ lighting)))
+        (set! inventory-lighting lighting)
+        lighting)))
+
+
+(definition public (draw-slots)
+  (let ((preserved-camera (current-camera))
+        (preserved-lighting (current-lighting)))
+    (prepare-view~ (cache-inventory-camera))
+    
+    (set-current-camera (cache-inventory-camera))
+    (set-current-lighting (cache-inventory-lighting))
+    
+    (glClear GL_DEPTH_BUFFER_BIT)
+    
+    (draw-items)
+    
+    (set-current-lighting preserved-lighting)
+    (set-current-camera preserved-camera)))
+
+
+(definition private (find-block-entity slot-rank id which)
+  (or (vector-ref block-entities slot-rank)
+      (let ((entity (new Block-Entity parent: #f position: (rank->position slot-rank which) scale: (vertex .4 .4 .4))))
+        (rotate~ entity PI/4)
+        (rotate-upon~ entity .52359877559 (vertex& 0. 0. 1.))
+        (set-camera~ entity (cache-inventory-camera))
+        (vector-set! block-entities slot-rank entity)
+        (set-model~ entity (get-name~ (vector-ref world.generation:blockids id)))
+        entity)))
+
+
+(definition private (rank->position rank which)
+  (vertex 0.
+          (case which
+            ((belt) 0.)
+            ((bag) (- 3.65 (* .8 (cast <fl> (fxfloor/ rank 9)))))
+            ((chest) (- 5.7 (* .8 (cast <fl> (fxfloor/ (- rank 36) 9))))))
+          (* (cast <fl> (modulo rank 9)) .8)))
+
+
+(definition public (draw-items)
+  (reset-renderers)
+  (let ((belt (child~ (current-interface) 'belt))
+        (bag (child~ (current-interface) 'bag))
+        (chest (child~ (current-interface) 'chest))
+        (camera (cache-inventory-camera)))
+    (define (draw-pane pane which)
+      (when (get-visible?~ pane)
+        (iterate-table (get-slot-table~ pane)
+          (lambda (rank slot)
+            (let ((id (get-id~ slot)))
+              (when (and id (< id 256))
+                (let ((block (find-block-entity (if (eq? which 'chest) (+ rank 36) rank) id which)))
+                  (register-ghost block (cache-model~ block) (get-meshes~ block) (copy-matrix (get-matrix~ block)) 0))))))))
+    
+    (draw-pane belt 'belt)
+    (draw-pane bag 'bag)
+    (draw-pane chest 'chest))
+  (render-opaque)
+  (render-transparent))
 
 
 ;;;
