@@ -1126,7 +1126,7 @@
   (method (drop-action sender)
     (define (update-model slot id)
       (when (< id 256)
-        (set-model~ (cache-block-entity slot id) (get-name~ (vector-ref world.generation:blockids id)))))
+        (set-model~ (cache-block-entity slot id) (world.generation:id->name id))))
     
     (let ((sender-id (get-id~ sender))
           (sender-count (get-count~ sender))
@@ -1245,25 +1245,34 @@
     {Color Entry-Border alpha: .6}))
 
 
-(definition protected cache-block-entity
-  (let ((block-entities (make-vector 63 #f)))
-    (lambda (slot id)
-      (let ((slot-rank (if (is? (get-parent~ slot) Chest-Pane) (+ (get-rank~ slot) 36) (get-rank~ slot))))
-        (or (vector-ref block-entities slot-rank)
-            (let ((world (current-world)))
-              (define (slot-position)
-                (let ((pos (acquire~ (get-root~ slot) slot {Point 0 0})))
-                  (vertex 0.
-                          (- (/ (get-height~ world) 2.) (cast <fl> (get-v~ pos)))
-                          (- (cast <fl> (get-h~ pos)) (/ (get-width~ world) 2.)))))
-              
-              (let ((scaling (* .4 (/ (get-width~ world) 10.))))
-                (let ((entity (new Block-Entity parent: #f position: (slot-position) scale: (vertex scaling scaling scaling))))
-                  (rotate~ entity PI/4)
-                  (rotate-upon~ entity .52359877559 (vertex& 0. 0. 1.))
-                  (set-model~ entity (get-name~ (vector-ref world.generation:blockids id)))
-                  (vector-set! block-entities slot-rank entity)
-                  entity))))))))
+(definition protected block-entities
+  (make-vector 63 #f))
+
+(definition protected (cache-block-entity slot id)
+  (let ((slot-rank (entity-slot-rank~ (get-parent~ slot) slot)))
+    (let ((info (vector-ref block-entities slot-rank)))
+      (if info
+          (cdr info)
+        (let ((scaling 24.))
+          (let ((entity (new Block-Entity parent: #f position: (block-entity-position slot) scale: (vertex scaling scaling scaling))))
+            (rotate~ entity PI/4)
+            (rotate-upon~ entity .52359877559 (vertex& 0. 0. 1.))
+            (set-model~ entity (get-name~ (vector-ref world.generation:blockids id)))
+            (vector-set! block-entities slot-rank (cons slot entity))
+            entity))))))
+
+(definition protected (reposition-block-entities)
+  (loop (for info in-vector block-entities)
+        (when info
+          (bind (slot . entity) info
+            (set-position~ entity (block-entity-position slot))))))
+
+(definition protected (block-entity-position slot)
+  (let ((world (current-world)))
+    (let ((pos (acquire~ (get-root~ slot) slot {Point 0 0})))
+      (vertex 0.
+              (- (- (/ (get-height~ world) 2.) (cast <fl> (get-v~ pos))) (/ (cast <fl> slot-size) 2.))
+              (+ (- (cast <fl> (get-h~ pos)) (/ (get-width~ world) 2.)) (/ (cast <fl> slot-size) 2.))))))
 
 
 (definition protected cache-inventory-camera
@@ -1275,14 +1284,8 @@
             (set-screen-width~ cam (get-width~ world))
             (set-screen-height~ cam (get-height~ world))
             (set-position~ cam (vertex -100. 0. 0.))
+            (init-lookat~ cam (vertex 1. 0. 0.) (vertex 0. 1. 0.))
             (set-projection~ cam 'orthographic)
-            (set-zoom-factor~ cam (/ (get-width~ world) 2.))
-            (let ((sight (vertex 1. 0. 0.))
-                  (up (vertex 0. 1. 0.)))
-              (init-lookat~ cam
-                sight
-                up
-                (cross-normal sight up)))
             (derive-target~ cam)
             (camera-update~ cam)
             (prepare-projection~ cam)
@@ -1325,27 +1328,23 @@
 
 
 (definition private (draw-items)
-  (reset-renderers)
-  (let ((belt (child~ (current-interface) 'belt))
-        (bag (child~ (current-interface) 'bag))
-        (chest (child~ (current-interface) 'chest)))
-    (define (draw-pane pane which)
-      (when (get-visible?~ pane)
-        (iterate-table (get-slot-table~ pane)
-          (lambda (rank slot)
-            (let ((id (get-id~ slot)))
-              (when (and id (< id 256))
-                (let ((block (cache-block-entity slot id)))
-                  ;; what is that
-                  (when (eq? which 'chest)
-                    (set-model~ block (get-name~ (vector-ref world.generation:blockids id))))
-                  (register-ghost block (cache-model~ block) (get-meshes~ block) (copy-matrix (get-matrix~ block)) 0))))))))
+  (let ((interface (current-interface)))
+    (define (draw-pane name)
+      (let ((pane (child~ interface name)))
+        (when (get-visible?~ pane)
+          (iterate-table (get-slot-table~ pane)
+            (lambda (rank slot)
+              (let ((id (get-id~ slot)))
+                (when (and id (< id 256))
+                  (let ((entity (cache-block-entity slot id)))
+                    (register-entity entity)))))))))
     
-    (draw-pane belt 'belt)
-    (draw-pane bag 'bag)
-    (draw-pane chest 'chest))
-  (render-opaque)
-  (render-transparent))
+    (reset-renderers)
+    (draw-pane 'belt)
+    (draw-pane 'bag)
+    (draw-pane 'chest)
+    (render-opaque)
+    (render-transparent)))
 
 
 ;;;
@@ -1365,6 +1364,10 @@
   
   (method (rank->slot rank)
     (table-ref slot-table rank))
+  
+  
+  (method protected virtual (entity-slot-rank slot)
+    (get-rank~ slot))
   
   
   ;;;
@@ -1502,6 +1505,10 @@
     (setup-inventory 0 9 3))
   
   
+  (method override (entity-slot-rank slot)
+    (+ 36 (get-rank~ slot)))
+  
+  
   (method (view-chest section data)
     (set! section~self section)
     (set! data~self data)
@@ -1548,7 +1555,7 @@
                         (set-id~ slot id)
                         (set-count~ slot count)
                         (when (< id 256)
-                          (set-model~ (cache-block-entity slot id) (get-name~ (vector-ref world.generation:blockids id))))
+                          (set-model~ (cache-block-entity slot id) (world.generation:id->name id)))
                         (invalidate-view~ slot)
                         (save&return slot)))
                     (get-children~ view)))
