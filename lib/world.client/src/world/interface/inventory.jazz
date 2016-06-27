@@ -60,13 +60,36 @@
 
 (definition protected (get-slot-image id)
   (let ((world (current-world)))
+    (define (determine-file)
+      (if (< id 256)
+          (let ((block (world.generation:id->block id)))
+            (let ((present (get-present~ block)))
+              (if (or (eq? present 'texture)
+                      (string? present))
+                  (let ((name (if (eq? present 'texture)
+                                  (get-texture~ block)
+                                present)))
+                    (or (world.generation:get-generated-texture name)
+                        (image-file~ (get-block-atlas~ world) name error?: #f)
+                        ;; aec quicky
+                        ;; we should generate colored png files
+                        (or (table-ref (get-item-table) name #f)
+                            (new-file~ {Directory Yownu-World "assets" "minecraft" "textures"} (list world.generation:texture-dir "templates" (add-extension name "png"))))
+                        @wait
+                        (table-ref (get-item-table) name)))
+                #f)))
+        (item-image id)))
+    
     (or (table-ref slot-images id #f)
-        (let ((file (item-image id)))
-          (assert file)
-          (bind-values (width height image) (cairo-surface-from-file file)
-            (let ((resized-image (resize-image image slot-size slot-size)))
-              (table-set! slot-images id resized-image)
-              resized-image))))))
+        (let ((file/surface (determine-file)))
+          (when file/surface
+            (bind-values (width height image) (if (pair? file/surface)
+                                                  (bind (width height surface) file/surface
+                                                    (values width height (get-handle~ surface)))
+                                                (cairo-surface-from-file file/surface))
+              (let ((resized-image (resize-image image slot-size slot-size)))
+                (table-set! slot-images id resized-image)
+                resized-image)))))))
 
 
 ;;;
@@ -976,10 +999,14 @@
     (and item (table-ref (get-item-table) (get-texture~ item) #f))))
 
 
+(definition protected (block-id? id)
+  (< id 256))
+
+
 (definition protected (known-id? id)
   ;; integer test is a quick hack for minecraft 1.8 format
   (and (integer? id)
-       (or (< id 256)
+       (or (block-id? id)
            (id->item id))))
 
 
@@ -990,14 +1017,14 @@
 
 
 (definition protected (useful-id? id)
-  (or (< id 256)
+  (or (block-id? id)
       (let ((item (id->item id)))
         (and item (or (get-category~ item)
                       show-useless?)))))
 
 
 (definition protected (stackable-id? id)
-  (or (< id 256)
+  (or (block-id? id)
       (let ((item (id->item id)))
         (or (not item)
             (stackable?~ item)))))
@@ -1125,7 +1152,7 @@
   
   (method (drop-action sender)
     (define (update-model slot id)
-      (when (< id 256)
+      (when (inventory-block-id? id)
         (set-model~ (cache-inventory-block slot id) (world.generation:id->name id))))
     
     (let ((sender-id (get-id~ sender))
@@ -1175,7 +1202,7 @@
   (method override (get-tooltip-context pos)
     (define (present-text)
       (when (and id (integer? id))
-        (if (< id 256)
+        (if (block-id? id)
             (let ((block (world.generation:id->block id)))
               `(<span>
                  (<paragraph>
@@ -1227,8 +1254,9 @@
                            (fill-rect~ surface (inflate-rect bounds -1 -1) {Color World-Red alpha: .5}))
                           ((<= percentage 25.)
                            (fill-rect~ surface (inflate-rect bounds -1 -1) {Color Dark-Yellow alpha: .6}))))))
-              (when (> id 255)
-                (blit-surface~ surface (get-slot-image id) destination: {Point 1 1}))
+              (let ((image (get-slot-image id)))
+                (when image
+                  (blit-surface~ surface image destination: {Point 1 1})))
               (when (and (> count 1) (stackable-id? id))
                 (let ((str (->string count)))
                   (let ((extent (get-text-extent~ surface str)))
@@ -1245,27 +1273,45 @@
     {Color Entry-Border alpha: .6}))
 
 
-(definition protected inventory-blocks
-  (make-vector 63 #f))
+(definition protected (inventory-block-id? id)
+  (and (block-id? id)
+       (let ((present (get-present~ (world.generation:id->block id))))
+         (and (neq? present 'texture)
+              (not (string? present))))))
+
 
 (definition protected (cache-inventory-block slot id)
-  (let ((slot-rank (entity-slot-rank~ (get-parent~ slot) slot)))
-    (let ((info (vector-ref inventory-blocks slot-rank)))
-      (if info
-          (cdr info)
-        (let ((scaling 24.))
-          (let ((entity (new Block-Entity parent: #f position: (inventory-block-position slot) scale: (vertex scaling scaling scaling))))
-            (rotate~ entity PI/4)
-            (rotate-upon~ entity .52359877559 (vertex& 0. 0. 1.))
-            (set-model~ entity (get-name~ (vector-ref world.generation:blockids id)))
-            (vector-set! inventory-blocks slot-rank (cons slot entity))
-            entity))))))
-
-(definition protected (reposition-inventory-blocks)
-  (loop (for info in-vector inventory-blocks)
-        (when info
-          (bind (slot . entity) info
-            (set-position~ entity (inventory-block-position slot))))))
+  (let ((zone (current-zone)))
+    (let ((inventory-blocks (get-inventory-blocks~ zone))
+          (slot-rank (entity-slot-rank~ (get-parent~ slot) slot)))
+      (let ((info (vector-ref inventory-blocks slot-rank)))
+        (if info
+            (cdr info)
+          (let ((block (world.generation:id->block id))
+                (scaling 28.))
+            (let ((entity (new Block-Entity parent: #f position: (inventory-block-position slot) scale: (vertex scaling scaling scaling)))
+                  (present (get-present~ block)))
+              (if present
+                  (for-each-property (lambda (property value)
+                                       (case property
+                                         ((translate-y:)
+                                          (set-position~ entity (vertex+& (get-position~ entity) (vertex& 0. value 0.))))
+                                         ((translate-z:)
+                                          (set-position~ entity (vertex+& (get-position~ entity) (vertex& 0. 0. value))))
+                                         ((scaling:)
+                                          (set-scale~ entity (vertex value value value)))
+                                         ((rotate-x:)
+                                          (rotate-upon~ entity (degree->radian value) (vertex& 1. 0. 0.)))
+                                         ((rotate-y:)
+                                          (rotate-upon~ entity (degree->radian value) (vertex& 0. 1. 0.)))
+                                         ((rotate-z:)
+                                          (rotate-upon~ entity (degree->radian value) (vertex& 0. 0. 1.)))))
+                                     present)
+                (rotate~ entity (degree->radian -45.))
+                (rotate-upon~ entity (degree->radian 30.) (vertex& 0. 0. 1.)))
+              (set-model~ entity (get-name~ block))
+              (vector-set! inventory-blocks slot-rank (cons slot entity))
+              entity)))))))
 
 (definition protected (inventory-block-position slot)
   (let ((world (current-world)))
@@ -1273,6 +1319,13 @@
       (vertex 0.
               (- (- (/ (get-height~ world) 2.) (cast <fl> (get-v~ pos))) (/ (cast <fl> slot-size) 2.))
               (+ (- (cast <fl> (get-h~ pos)) (/ (get-width~ world) 2.)) (/ (cast <fl> slot-size) 2.))))))
+
+(definition protected (reset-inventory-blocks)
+  (let ((zone (current-zone+)))
+    (when zone
+      (let ((inventory-blocks (get-inventory-blocks~ zone)))
+        (loop (for rank from 0 below (vector-length inventory-blocks))
+              (vector-set! inventory-blocks rank #f))))))
 
 
 (definition protected cache-inventory-camera
@@ -1303,9 +1356,21 @@
             (rotate-lookat! lookat lookat PI/4 (get-up~ lookat))
             (rotate-lookat! lookat lookat .52359877559 (vertex& 0. 0. 1.))
             (set-ambient-color~ lighting (dye 0. 0. 0. 1.0))
-            (set-lights~ lighting (list (new Light-Directional position: (vertex-scalar* (get-up~ lookat) 1000.) color: #f32(1. 1. 1. 1.))
-                                        (new Light-Directional position: (vertex-scalar* (get-sight~ lookat) 1000.) color: #f32(.8 .8 .8 1.))
-                                        (new Light-Directional position: (vertex-scalar* (get-right~ lookat) -1000.) color: #f32(.6 .6 .6 1.))))
+            (set-lights~ lighting (list (new Light-Directional position: (vertex-scalar* (get-up~ lookat) 10000.) color: #f32(1. 1. 1. 1.))
+                                        (new Light-Directional position: (vertex-scalar* (get-sight~ lookat) 10000.) color: #f32(.8 .8 .8 1.))
+                                        (new Light-Directional position: (vertex-scalar* (get-right~ lookat) -10000.) color: #f32(.6 .6 .6 1.))))
+            (set-lights-count~ lighting (length (get-lights~ lighting)))
+            (set! inventory-lighting lighting)
+            lighting)))))
+
+
+(definition protected cache-inventory-ambient-lighting
+  (let ((inventory-lighting #f))
+    (lambda ()
+      (or inventory-lighting
+          (let ((lighting (new Lighting)))
+            (set-ambient-color~ lighting (dye 1. 1. 1. 1.0))
+            (set-lights~ lighting '())
             (set-lights-count~ lighting (length (get-lights~ lighting)))
             (set! inventory-lighting lighting)
             lighting)))))
@@ -1335,9 +1400,12 @@
           (iterate-table (get-slot-table~ pane)
             (lambda (rank slot)
               (let ((id (get-id~ slot)))
-                (when (and id (< id 256))
-                  (let ((entity (cache-inventory-block slot id)))
-                    (register-entity entity)))))))))
+                (when (and id (inventory-block-id? id))
+                  (let ((entity (cache-inventory-block slot id))
+                        (block (world.generation:id->block id)))
+                    (if (get-ambient?~ block)
+                        (register-entity entity #f #f (cache-inventory-ambient-lighting))
+                      (register-entity entity))))))))))
     
     (reset-renderers)
     (draw-pane 'belt)
@@ -1554,7 +1622,7 @@
                       (when (not (get-id~ slot))
                         (set-id~ slot id)
                         (set-count~ slot count)
-                        (when (< id 256)
+                        (when (inventory-block-id? id)
                           (set-model~ (cache-inventory-block slot id) (world.generation:id->name id)))
                         (invalidate-view~ slot)
                         (save&return slot)))
