@@ -1,0 +1,2988 @@
+;;;===============
+;;;  WorldScheme
+;;;===============
+;;;
+;;;; World Generation
+;;;
+;;;  The Initial Developer of the Original Code is Guillaume Cartier.
+;;;  Portions created by the Initial Developer are Copyright (C) 2012-2016
+;;;  the Initial Developer. All Rights Reserved.
+;;;
+;;;  Contributor(s):
+;;;    Edouard Hebert
+
+
+(module world.generation jazz
+
+
+(import (jazz.cairo)
+        (jazz.geometry)
+        (jazz.graphic)
+        (jazz.io)
+        (jazz.json)
+        (jazz.opengl.glew)
+        (jazz.syntax (phase syntax))
+        (jazz.time)
+        (profiler)
+        (world)
+        (world.album)
+        (world.area)
+        (world.atlas)
+        (world.audio)
+        (world.autoload)
+        (world.block)
+        (world.chunk)
+        (world.configure)
+        (world.creature)
+        (world.draw)
+        (world.dye)
+        (world.entity)
+        (world.face)
+        (world.foreign)
+        (world.generate)
+        (world.generation.categories)
+        (world.geometry)
+        (world.history)
+        (world.homogeneous)
+        (world.index)
+        (world.info)
+        (world.interface.inventory)
+        (world.interface.sign)
+        (world.light-syntax)
+        (world.lighting)
+        (world.material)
+        (world.mesh)
+        (world.model)
+        (world.models)
+        (world.polygon)
+        (world.profiling)
+        (world.quad)
+        (world.quad-texture)
+        (world.region)
+        (world.render)
+        (world.renderers)
+        (world.section)
+        (world.sector)
+        (world.settings)
+        (world.support)
+        (world.syntax (phase syntax))
+        (world.tag)
+        (world.task)
+        (world.template)
+        (world.texture)
+        (world.triangle))
+
+
+;; LEXICON
+;; - index: sector-local i j k coordinates
+;; - location: integer vector representing a block in the block entities format
+;; - position: block center position
+
+
+;; WARNING
+;; - the temporary hack of duplicating non thread-safe geometry functions
+;;   like horizon-lookat&^ is super dangerous and should be improved upon
+
+
+(proclaim (warn optimizations))
+
+
+(definition protected aa 0) ;; 10421010
+(definition protected oo 0) ;; 12248627
+(definition protected gg 0) ;; 745240
+(definition protected ww 0) ;; 697473
+(definition protected cc 0) ;; 54050
+
+
+;;;
+;;;; Atlas
+;;;
+
+
+(definition (cache-atlas) <Atlas>
+  (let ((world (current-world)))
+    (get-block-atlas~ world)))
+
+
+(definition (cache-texture) <Image-Texture>
+  (let ((world (current-world)))
+    (get-block-texture~ world)))
+
+
+(definition (cache-texture-repeat) <Image-Texture>
+  (let ((world (current-world)))
+    (get-block-texture-repeat~ world)))
+
+
+(definition protected (create-block-atlas) <Atlas>
+  (define (find-assets)
+    (let ((world (current-world)))
+      (find-if (lambda (assets)
+                 (and (eq? (get-where~ assets) 'world)
+                      (equal? (get-spine~ assets) '("minecraft"))))
+               (get-world-assets~ world))))
+  
+  (let ((atlas (new Atlas uniform-size: (new Dimension tile-resolution tile-resolution)))
+        (assets (find-assets))
+        (path (list "textures" texture-dir)))
+    (add-assets-directory~ atlas assets (append path '("blocks")))
+    (add-assets-directory~ atlas assets (append path '("blocks_alt_static")))
+    (add-assets-directory~ atlas assets (append path '("generated")))
+    (generate-textures atlas assets path)
+    atlas))
+
+
+(definition protected (create-texture atlas (min-filter: min-filter #f) (mag-filter: mag-filter #f) (wrap: wrap #f)) <Image-Texture>
+  (let ((mipmap? (world-setting 'world.generate-mipmap? 32))
+        (min-filter (world-setting 'world.min-filter (or min-filter 'nearest)))
+        (mag-filter (world-setting 'world.mag-filter (or mag-filter 'linear))))
+    (let ((effective-mipmap? (if (integer? mipmap?) (>= tile-resolution (cast <fx> mipmap?)) mipmap?)))
+      (let ((min-filter (if (not effective-mipmap?)
+                            (case min-filter
+                              ((nearest) GL_NEAREST)
+                              ((linear) GL_LINEAR))
+                          (case min-filter
+                            ((nearest) GL_NEAREST_MIPMAP_LINEAR)
+                            ((linear) GL_LINEAR_MIPMAP_LINEAR))))
+            (mag-filter (case mag-filter
+                          ((nearest) GL_NEAREST)
+                          ((linear) GL_LINEAR))))
+        (extract-texture~ atlas min-filter: min-filter mag-filter: mag-filter wrap: wrap mipmap?: effective-mipmap?)))))
+
+
+;;;
+;;;; Textures
+;;;
+
+
+(definition textures-subuvs
+  '())
+
+(definition (add-textures-subuv name subuv)
+  (set! textures-subuvs (cons (cons name subuv) textures-subuvs)))
+
+(definition protected (update-textures-subuvs atlas)
+  (for-each (lambda (info)
+              (bind (name . subuv) info
+                (update-coordinates~ atlas name subuv)))
+            textures-subuvs)
+  (set! textures-subuvs '()))
+
+
+(definition protected generated-textures
+  (make-table test: equal?))
+
+(definition protected (get-generated-texture name)
+  (table-ref generated-textures name #f))
+
+
+(definition (generate-textures atlas assets path)
+  (let ((blocks-dir (make-directory~ assets (append path '("blocks"))))
+        (templates-dir (make-directory~ assets (append path '("templates")))))
+    (define (add-colored base suffix color (overlay: overlay #f) (preserve?: preserve? #f))
+      (let ((gray (new-file~ templates-dir (add-extension (or overlay base) "png")))
+            (overlaid (and overlay (new-file~ blocks-dir (add-extension base "png"))))
+            (name (format "{a}_{a}" base suffix)))
+        (define (preserve-texture surface width height)
+          (when preserve?
+            (let ((copy (new Image-Surface #f (new Dimension width height))))
+              (blit-surface~ copy surface)
+              (table-set! generated-textures name (list width height copy)))))
+        
+        (assert (exists?~ gray))
+        (apply-operator CAIRO_OPERATOR_MULTIPLY gray color
+          (lambda (surface width height)
+            (if (not overlay)
+                (begin
+                  (preserve-texture surface width height)
+                  (add-surface~ atlas name surface width height))
+              (bind-values (width height overlaid) (cairo-surface-from-png overlaid)
+                (let ((overlaid (new Surface overlaid)))
+                  (blit-surface~ overlaid surface)
+                  (close~ surface)
+                  (preserve-texture overlaid width height)
+                  (add-surface~ atlas name overlaid width height))))))))
+
+    (define (apply-operator operator gray color proc)
+      (bind-values (width height msk) (cairo-surface-from-png gray)
+        (bind-values (width height dst) (cairo-surface-from-png gray)
+          (let ((size (new Dimension width height))
+                (mask (new Surface msk))
+                (dest (new Surface dst)))
+            (set-operator~ dest operator)
+            (set-color~ dest color)
+            (draw-rectangle~ dest (size-rect size))
+            (set-mask-surface~ dest mask)
+            (close~ mask)
+            (proc dest width height)))))
+    
+    (define (redstone-dust base)
+      (let ((off .35)
+            (on 1.))
+        (loop (for n from 0 to 15)
+              (add-colored base (->string n) (new Color red: (+ off (* (- on off) (/ (cast <fl> n) 15.)))) preserve?: (= n 12)))))
+    
+    (define (mirror-pad name left top right bottom (save-to #f))
+      (bind (surface width height depth) (get-image~ atlas name)
+        (let ((cairo-surface
+                (when (u8vector? surface)
+                  (let ((cairo-format CAIRO_FORMAT_ARGB32))
+                    (let ((stride (cairo_format_stride_for_width cairo-format width)))
+                      (new Surface (cairo_image_surface_create_for_data (still-u8vector-body surface) CAIRO_FORMAT_ARGB32 width height stride)))))))
+          (let ((surface (or cairo-surface surface))
+                (l (* left width))
+                (t (* top height))
+                (r (* right width))
+                (b (* bottom height)))
+            (let ((w (- r l))
+                  (h (- b t)))
+              (let ((subimage (new Image-Surface surface (new Dimension (fxround w) (fxround h))))
+                    (pattern (cairo_pattern_create_for_surface (get-handle~ surface))))
+                (let ((surface (if (not save-to) surface (new Image-Surface surface (new Dimension width height)))))
+                  (let ((cr (get-context~ subimage))
+                        (matrix (cairo_matrix_t-make)))
+                    (cairo_set_source cr pattern)
+                    (cairo_matrix_init_translate matrix l t)
+                    (cairo_pattern_set_matrix pattern matrix)
+                    (cairo_rectangle cr 0. 0. (fl w) (fl h))
+                    (cairo_fill cr)
+                    (cairo_matrix_t-free matrix)
+                    (cairo_pattern_destroy pattern)
+                    (loop (for i from -1 to 1)
+                          (loop (for j from -1 to 1)
+                                (let ((sx (if (= i 0) 1 -1))
+                                      (sy (if (= j 0) 1 -1)))
+                                  (let ((l (if (= sx 1) l (+ l w)))
+                                        (t (if (= sy 1) t (+ t h))))
+                                    (let ((tx (+ l (* i w)))
+                                          (ty (+ t (* j h))))
+                                      (cairo_identity_matrix (get-context~ surface))
+                                      (translate~ surface tx ty)
+                                      (scale~ surface sx sy)
+                                      (blit-surface~ surface subimage))))))
+                    (close~ subimage)
+                    (when cairo-surface
+                      (close~ cairo-surface))
+                    (if (not save-to)
+                        (add-textures-subuv name (uv left top right bottom (cast <fl> depth)))
+                      (add-surface~ atlas save-to surface width height)
+                      (bind (surface width height depth) (get-image~ atlas save-to)
+                        (add-textures-subuv save-to (uv left top right bottom (cast <fl> depth)))))))))))))
+    
+    (add-colored "tallgrass" "green" {Color red: .403 green: .577 blue: .336} preserve?: #t)
+    (add-colored "leaves_oak" "green" {Color red: .235 green: .361 blue: .247})
+    (add-colored "leaves_spruce" "green" {Color red: .196 green: .306 blue: .196})
+    (add-colored "leaves_birch" "green" {Color red: .403 green: .577 blue: .336})
+    (add-colored "leaves_jungle" "green" {Color red: .270 green: .416 blue: .286})
+    (add-colored "leaves_big_oak" "green" {Color red: .275 green: .435 blue: .157})
+    (add-colored "leaves_acacia" "green" {Color red: .275 green: .435 blue: .157})
+    (add-colored "double_plant_grass_top" "green" {Color red: .329 green: .482 blue: .153})
+    (add-colored "double_plant_grass_bottom" "green" {Color red: .329 green: .482 blue: .153})
+    (add-colored "double_plant_fern_top" "green" {Color red: .329 green: .482 blue: .153})
+    (add-colored "double_plant_fern_bottom" "green" {Color red: .329 green: .482 blue: .153})
+    (add-colored "melon_stem_disconnected" "ochre" {Color red: .747 green: .563 blue: .004} preserve?: #t)
+    (add-colored "pumpkin_stem_disconnected" "ochre" {Color red: .747 green: .563 blue: .004} preserve?: #t)
+    (add-colored "vine" "green" {Color red: .160 green: .619 blue: .160} preserve?: #t)
+    (add-colored "waterlily" "green" {Color red: .003 green: .619 blue: .003})
+    (add-colored "grass_top" "green" {Color red: .403 green: .577 blue: .336})
+    (add-colored "grass_side" "green" {Color red: .403 green: .577 blue: .336} overlay: "grass_side_overlay")
+    
+    (redstone-dust "redstone_dust_cross")
+    (redstone-dust "redstone_dust_line")
+    
+    (mirror-pad "cake_side"             1m 8m 15m 16m)
+    (mirror-pad "cake_top"              1m 1m 15m 15m)
+    (mirror-pad "cake_bottom"           1m 1m 15m 15m)
+    (mirror-pad "chest_side"            1m 2m 15m 16m)
+    (mirror-pad "chest_front"           1m 2m 15m 16m)
+    (mirror-pad "chest_back"            1m 2m 15m 16m)
+    (mirror-pad "chest_bottom"          1m 1m 15m 15m)
+    (mirror-pad "chest_top"             1m 1m 15m 15m)
+    (mirror-pad "bed_head_side"         0m 7m 16m 16m)
+    (mirror-pad "bed_head_end"          0m 7m 16m 16m)
+    (mirror-pad "bed_feet_side"         0m 7m 16m 16m)
+    (mirror-pad "bed_feet_end"          0m 7m 16m 16m)
+    (mirror-pad "enchanting_table_side" 0m 4m 16m 16m)
+    (mirror-pad "endframe_side"         0m 3m 16m 16m)
+    (mirror-pad "endframe_eye"          4m 0m 12m 4m "endframe_eye_side")
+    (mirror-pad "endframe_eye"          4m 4m 12m 12m)))
+
+
+;;;
+;;;; Face
+;;;
+
+
+(class Lighted-Face extends Face
+  
+  
+  (method protected virtual (iterate-lighting proc)
+    ))
+
+
+(class Triangle-Face extends Lighted-Face
+  
+  
+  (slot l1 accessors generate)
+  (slot l2 accessors generate)
+  (slot l3 accessors generate)
+  
+  
+  (method override (initialize material texture-coordinates <f32vector> texture-depth triangle <Triangle> l1 <f32vector> l2 <f32vector> l3 <f32vector>)
+    (nextmethod material texture-coordinates texture-depth triangle)
+    (set! l1~self l1)
+    (set! l2~self l2)
+    (set! l3~self l3))
+  
+  
+  (method override (iterate-lighting proc)
+    (proc l1 l2 l3)))
+
+
+(class Quad-Face extends Lighted-Face
+  
+  
+  (slot l1 accessors generate)
+  (slot l2 accessors generate)
+  (slot l3 accessors generate)
+  (slot l4 accessors generate)
+  
+  
+  (method override (initialize material texture-coordinates <f32vector> texture-depth quad <Quad> l1 <f32vector> l2 <f32vector> l3 <f32vector> l4 <f32vector>)
+    (nextmethod material texture-coordinates texture-depth quad)
+    (set! l1~self l1)
+    (set! l2~self l2)
+    (set! l3~self l3)
+    (set! l4~self l4))
+  
+  
+  (method override (iterate-lighting proc)
+    (proc l1 l2 l3)
+    (proc l3 l4 l1)))
+
+
+;;;
+;;;; Mesher
+;;;
+
+
+(class Lighted-Mesher extends Mesher
+  
+  
+  (method (add-lighting template l1 l2 l3 l4 inverse?)
+    (iterate-lighting~ template self l1 l2 l3 l4 inverse?
+      ;; lambda-lift
+      (lambda (mesher <Lighted-Mesher> l1 l2 l3)
+        (let ((lightmap (get-lightmap~ mesher)))
+          (define (blocklight! offset <fx> lighting <f32vector>) <void>
+            (f32vector-set! lightmap offset (f32vector-ref lighting 0)))
+          
+          (define (skylight! offset <fx> lighting <f32vector>) <void>
+            (f32vector-set! lightmap offset (f32vector-ref lighting 1)))
+          
+          (define (ambience! offset <fx> lighting <f32vector>) <void>
+            (f32vector-set! lightmap offset (/ (f32vector-ref lighting 2) 4.)))
+          
+          (let ((li (get-li~ mesher)))
+            (blocklight!    li    l1)
+            (skylight!   (+ li 1) l1)
+            (ambience!   (+ li 2) l1)
+            (blocklight! (+ li 3) l2)
+            (skylight!   (+ li 4) l2)
+            (ambience!   (+ li 5) l2)
+            (blocklight! (+ li 6) l3)
+            (skylight!   (+ li 7) l3)
+            (ambience!   (+ li 8) l3)
+            (increase-li!~ mesher 9)))))))
+
+
+;;;
+;;;; Rendering
+;;;
+
+
+(class Rendering extends Object
+  
+  
+  (slot material        <Material> getter generate)
+  (slot entity-material <Material> getter generate)
+  (slot mesher          <Mesher>   getter generate)
+  
+  
+  (method override (initialize initial-reserved material entity-material)
+    (set! material~self material)
+    (set! entity-material~self entity-material)
+    (set! mesher~self (new Lighted-Mesher initial-reserved 0 material: material)))
+  
+  
+  (method (reset-mesher)
+    (reset~ mesher)))
+
+
+(definition (make-rendering initial-reserved material-name atlas texture renderer entity-renderer)
+  (let ((material (new Material name: material-name atlas: atlas texture: texture renderer: renderer))
+        (entity-material (new Material name: material-name atlas: atlas texture: texture renderer: entity-renderer)))
+    (new Rendering initial-reserved material entity-material)))
+
+
+(definition package opaque-rendering
+  (let ((rendering #f))
+    (lambda ()
+      (or rendering
+          (let ((atlas (cache-atlas))
+                (texture (cache-texture)))
+            (let ((rend (make-rendering 8192 'opaque atlas texture (get-opaque-terrain-renderer) (get-opaque-renderer))))
+              (set! rendering rend)
+              rend))))))
+
+
+(definition package transparent-rendering
+  (let ((rendering #f))
+    (lambda ()
+      (or rendering
+          (let ((atlas (cache-atlas))
+                (texture (cache-texture)))
+            (let ((rend (make-rendering 20480 'transparent atlas texture (get-transparent-terrain-renderer) (get-transparent-renderer))))
+              (set! rendering rend)
+              rend))))))
+
+
+(definition package coverage-rendering
+  (let ((rendering #f))
+    (lambda ()
+      (or rendering
+          (let ((atlas (cache-atlas))
+                (texture (cache-texture)))
+            (let ((rend (make-rendering 2048 'coverage atlas texture (get-coverage-terrain-renderer) (get-coverage-renderer))))
+              (set! rendering rend)
+              rend))))))
+
+
+(definition package water-rendering
+  (let ((rendering #f))
+    (lambda ()
+      (or rendering
+          (let ((atlas (cache-atlas))
+                (texture (cache-texture-repeat)))
+            (let ((rend (make-rendering 2048 'water atlas texture (get-water-terrain-renderer) (get-water-renderer))))
+              (set! rendering rend)
+              rend))))))
+
+
+(definition package wet-rendering
+  (let ((rendering #f))
+    (lambda ()
+      (or rendering
+          (let ((atlas (cache-atlas))
+                (texture (cache-texture)))
+            (let ((rend (make-rendering 2048 'wet atlas texture (get-wet-terrain-renderer) #f)))
+              (set! rendering rend)
+              rend))))))
+
+
+(definition package multitexture-rendering
+  (let ((rendering #f))
+    (lambda ()
+      (or rendering
+          (let ((atlas (cache-atlas))
+                (texture (cache-texture-repeat)))
+            (let ((rend (make-rendering 2048 'multitexture atlas texture (get-multitexture-terrain-renderer) (get-multitexture-renderer))))
+              (set! rendering rend)
+              rend))))))
+
+
+(definition package redstone-rendering
+  (let ((rendering #f))
+    (lambda ()
+      (or rendering
+          (let ((atlas (cache-atlas))
+                (texture (cache-texture)))
+            (let ((rend (make-rendering 20480 'redstone atlas texture (get-transparent-terrain-renderer) (get-transparent-renderer))))
+              (set! rendering rend)
+              rend))))))
+
+
+(definition package other-renderings
+  (let ((renderings #f))
+    (lambda ()
+      (or renderings
+          (let ((lst
+                  (list
+                    (transparent-rendering)
+                    (coverage-rendering)
+                    (water-rendering)
+                    (wet-rendering)
+                    (multitexture-rendering))))
+            (set! renderings lst)
+            lst)))))
+
+
+(definition package (dr)
+  (define (d rendering <Rendering>)
+    (let ((mesher (get-mesher~ rendering)))
+      (list (get-used~ mesher) (get-reserved~ mesher))))
+
+  (list (d (opaque-rendering))
+        (d (transparent-rendering))
+        (d (coverage-rendering))
+        (d (water-rendering))
+        (d (wet-rendering))
+        (d (multitexture-rendering))
+        (d (redstone-rendering))))
+
+
+;;;
+;;;; Block
+;;;
+
+
+(class Block extends Object
+  
+  
+  (slot name                                        getter generate)
+  (slot id                  <fx>                    getter generate)
+  (slot subid                                       getter generate)
+  (slot category                                    getter explicit)
+  (slot kind                                        getter explicit)
+  (slot texture                                     getter generate)
+  (slot texture-coordinates                         accessors generate)
+  (slot rendering                                   getter explicit)
+  (slot rendering-cache                             getter generate)
+  (slot opaque-cube?        <bool>                  getter generate)
+  (slot translucent-cube?   <bool>                  getter generate)
+  (slot water-cube?         <bool>                  getter generate)
+  (slot physical?           <bool>                  getter generate)
+  (slot cube?               <bool>                  accessors generate)
+  (slot ambient?            <bool>                  getter generate)
+  (slot present                                     getter explicit)
+  (slot brightness                                  getter generate)
+  (slot configurations                              getter generate)
+  (slot generate                                    getter explicit)
+  (slot visual                                      getter explicit)
+  (slot physical                                    getter explicit)
+  (slot right-mouse                                 getter explicit)
+  (slot double-click                                getter explicit)
+  (slot generic?            <bool>                  getter generate)
+  (slot visuals             <vector+> initialize #f accessors generate)
+  (slot physicals           <vector+> initialize #f accessors generate)
+  
+  
+  (method override (initialize name id subid category kind texture rendering opaque-cube? translucent-cube? water-cube? physical? cube? ambient? present brightness configurations generate visual physical right-mouse double-click generic?)
+    (set! name~self name)
+    (set! id~self id)
+    (set! subid~self subid)
+    (set! category~self category)
+    (set! kind~self kind)
+    (set! texture~self texture)
+    (set! texture-coordinates~self #f)
+    (set! rendering~self (or rendering opaque-rendering))
+    (set! rendering-cache~self #f)
+    (set! opaque-cube?~self opaque-cube?)
+    (set! translucent-cube?~self translucent-cube?)
+    (set! water-cube?~self water-cube?)
+    (set! physical?~self physical?)
+    (set! cube?~self cube?)
+    (set! ambient?~self ambient?)
+    (set! present~self present)
+    (set! brightness~self brightness)
+    (set! configurations~self configurations)
+    (set! generate~self generate)
+    (set! visual~self visual)
+    (set! physical~self physical)
+    (set! right-mouse~self right-mouse)
+    (set! double-click~self double-click)
+    (set! generic?~self generic?))
+  
+  
+  (method override (print output readably)
+    (print-unreadable self output
+      (lambda (output)
+        (format output "{a}" name))))
+  
+  
+  (method (cache-rendering)
+    (or rendering-cache
+        (let ((rend ((get-rendering))))
+          (set! rendering-cache rend)
+          rend)))
+  
+  (method public (get-category)
+    (or category
+        (when subid
+          (set! category (get-category~ (id->block id)))
+          category)))
+  
+  (method public (get-kind)
+    (or kind
+        (when subid
+          (set! kind (get-kind~ (id->block id)))
+          kind)))
+  
+  (method public (get-rendering)
+    (or rendering
+        (when subid
+          (set! rendering (get-rendering~ (id->block id)))
+          rendering)))
+  
+  (method public (get-present)
+    (or present
+        (when subid
+          (set! present (get-present~ (id->block id)))
+          present)))
+  
+  (method public (get-right-mouse)
+    (or right-mouse
+        (when subid
+          (set! right-mouse (get-right-mouse~ (id->block id)))
+          right-mouse)))
+  
+  (method public (get-generate)
+    (or generate
+        (when subid
+          (set! generate (get-generate~ (id->block id)))
+          generate)))
+  
+  (method public (get-double-click)
+    (or double-click
+        (when subid
+          (set! double-click (get-double-click~ (id->block id)))
+          double-click)))
+  
+  (method public (get-visual)
+    (or visual
+        (when subid
+          (set! visual (get-visual~ (id->block id)))
+          visual)))
+  
+  (method public (get-physical)
+    (or physical
+        (when subid
+          (set! physical (get-physical~ (id->block id)))
+          physical))))
+
+
+(constant block-variants <fx>
+  17)
+
+
+(definition protected blocks <table>
+  (make-table test: eq?))
+
+(definition protected blockids <vector>
+  (make-vector (* 256 block-variants) #f))
+
+
+(definition protected (register-block name id (category: category #f) (kind: kind #f) (texture: texture #f) (rendering: rendering #f) (opaque-cube?: opaque-cube? #t) (translucent-cube?: translucent-cube? #f) (water-cube?: water-cube? #f) (physical?: physical? #t) (cube?: cube? #t) (ambient?: ambient? #f) (present: present #f) (brightness: brightness #f) (configurations: configurations 16) (generate: generate #f) (visual: visual #f) (physical: physical #f) (right-mouse: right-mouse #f) (double-click: double-click #f) (generic?: generic? #f))
+  (let ((id <fx> (if (pair? id) (car id) id))
+        (subid (if (pair? id) (cadr id) #f)))
+    (when subid
+      (inherit-block-attributes id opaque-cube? translucent-cube? water-cube? physical? cube? ambient?))
+    (let ((block (new Block name id subid category kind texture rendering opaque-cube? translucent-cube? water-cube? physical? cube? ambient? present brightness configurations generate visual physical right-mouse double-click generic?)))
+      (table-set! blocks name block)
+      (vector-set! blockids (+ (* id block-variants) (if subid (+ subid 1) 0)) block)
+      (unspecified))))
+
+(definition (inherit-block-attributes id opaque-cube? translucent-cube? water-cube? physical? cube? ambient?)
+  (let ((parent (id->block id)))
+    (when parent
+      (set! opaque-cube? (get-opaque-cube?~ parent))
+      (set! translucent-cube? (get-translucent-cube?~ parent))
+      (set! water-cube? (get-water-cube?~ parent))
+      (set! physical? (get-physical?~ parent))
+      (set! cube? (get-cube?~ parent))
+      (set! ambient? (get-ambient?~ parent)))))
+
+
+(definition public (encode-id id <fx> subid <fx>) <fx>
+  (+ (* id block-variants) (+ subid 1)))
+
+(definition public (decode-id id <fl>) <fx>
+  (fxfloor/ (flonum->fixnum id) block-variants))
+
+(definition public (decode-ids id <fl>) <list>
+  (let ((id (flonum->fixnum id)))
+    (list (fxfloor/ id block-variants) (- (modulo id block-variants) 1))))
+
+(definition public inline (name->block name) <Block>
+  (table-ref blocks name))
+
+(definition public inline (id->block id <fx>) <Block>
+  (vector-ref blockids (* id block-variants)))
+
+(definition public inline (id/subid->block id <fx> subid <fx+>) <Block>
+  (or (and subid (vector-ref blockids (encode-id id subid)))
+      (id->block id)))
+
+(definition public (generic-data-id block-id <fx> data-id <fx>) <fx>
+  (case block-id
+    ((6 126 175) (modulo data-id 8))
+    ((17 162) (bitwise-and data-id #b11))
+    ((18 161) (modulo data-id 4))
+    ((43) (modulo data-id 7))
+    ((44) (min (modulo data-id 8) 6))
+    (else data-id)))
+
+
+(definition protected tile-resolution <fx>
+  (world-setting 'world.tile-resolution 128))
+
+(definition protected tile-size <fl>
+  (cast <fl> tile-resolution))
+
+(definition protected tile-period <fx>
+  16)
+
+(definition protected texture-size <fl>
+  (* tile-size (cast <fl> tile-period)))
+
+(definition protected texture-dir
+  (format "{a}x{a}" tile-resolution tile-resolution))
+
+(definition protected texture-mipmap?
+  #f)
+
+
+(definition protected (block-texture-coordinates block <Block>)
+  (or (get-texture-coordinates~ block)
+      (let ((texture (get-texture~ block)))
+        (let ((coords (and texture (image-rect~ (cache-atlas) texture))))
+          (set-texture-coordinates~ block coords)
+          coords))))
+
+
+(definition coordinates-mutex
+  (make-mutex 'coordinates))
+
+(definition coordinates <table>
+  (make-table test: equal?))
+
+(definition protected (get-coordinates name <string>) <f32vector>
+  (mutex-lock! coordinates-mutex)
+  (prog1 (or (table-ref coordinates name #f)
+             (let ((coords (if (window?) (image-rect~ (cache-atlas) name) dummy-uv)))
+               (table-set! coordinates name coords)
+               coords))
+    (mutex-unlock! coordinates-mutex)))
+
+
+(definition dummy-uv
+  (uv 0. 0. 1. 1. 0.))
+
+
+(definition dummy-rendering
+  (make-rendering 0 'dummy #f #f #f #f))
+
+
+(definition public (liquid-filter poly) <bool>
+  (not (get-water-cube?~ (id->block (decode-id (get-data1~ poly))))))
+
+
+(definition public (only-water-filter poly) <bool>
+  (memq? (get-id~ (id->block (decode-id (get-data1~ poly)))) '(8 9)))
+
+
+;;;
+;;;; Blocks
+;;;
+
+
+(constant inline block-radius <fl>
+  .5)
+
+
+(constant inline air-id <fx>
+  0)
+
+
+(constant inline mixel
+  .0625)
+
+(constant inline  0m 0.)
+(constant inline  1m .0625)
+(constant inline  2m .125)
+(constant inline  3m .1875)
+(constant inline  4m .25)
+(constant inline  5m .3125)
+(constant inline  6m .375)
+(constant inline  7m .4375)
+(constant inline  8m .5)
+(constant inline  9m .5625)
+(constant inline 10m .625)
+(constant inline 11m .6875)
+(constant inline 12m .75)
+(constant inline 13m .8125)
+(constant inline 14m .875)
+(constant inline 15m .9375)
+(constant inline 16m 1.)
+
+
+;;;
+;;;; Generate
+;;;
+
+
+(definition protected generate-mutex
+  (make-mutex 'generate))
+
+
+(definition protected (with-generate-mutex thunk)
+  (unwind-protect
+      (begin
+        (mutex-lock! generate-mutex)
+        (thunk))
+    (mutex-unlock! generate-mutex)))
+
+
+;; we need to go two in every direction instead of just one
+;; because of door tops that are rendered by door bottom blocks
+(definition block-cache-size <fx>
+  (* 20 20 20 4))
+
+(definition block-cache <u16vector>
+  (make-u16vector block-cache-size))
+
+(definition protected (initialize-block-cache cache-uninitialized <fx>) <u16vector>
+  (loop (for i from 0 below block-cache-size)
+        (u16vector-set! block-cache i cache-uninitialized))
+  block-cache)
+
+
+;;;
+;;;; Visual
+;;;
+
+
+(definition protected (instantiate-visual sector <Sector>)
+  (let ((zone (current-zone)))
+    (define (generate-done)
+      (set-visual-uptodate?~ sector #t)
+      (set-visual-revision~ sector (get-revision~ (get-generator~ zone)))
+      (set-generating?~ sector #f)
+      (decrease-sectors-generating~ zone 1))
+    
+    (declare (proper-tail-calls))
+    (declare (optimize-dead-local-variables))
+    (declare (inline))
+    (declare (inlining-limit 1000))
+    (let ((sector-index (get-index~ sector)))
+      (let ((sector-x <fx> (vector-ref sector-index 0))
+            (sector-y <fx> (vector-ref sector-index 1))
+            (sector-z <fx> (vector-ref sector-index 2)))
+        (let ((region (sector-region~ zone sector-x sector-y sector-z)))
+          (let ((region-x (get-x~ region))
+                (region-z (get-z~ region))
+                (section (get-section~ region 'visual sector-x sector-y sector-z))
+                (chunk-x (sector->chunk sector-x))
+                (chunk-z (sector->chunk sector-z))
+                (truncate-y (get-truncate-y~ zone))
+                (cache-uninitialized 65535))
+            (if (not section)
+                (begin
+                  (free-mesh~ sector)
+                  (generate-done))
+              (let ((bottom-section? (= sector-y (cast <fx> (or truncate-y 0))))
+                    (section-x (+ (* region-x 32 16) (* chunk-x 16)))
+                    (section-y (* sector-y 16))
+                    (section-z (+ (* region-z 32 16) (* chunk-z 16)))
+                    (sections <vector> (make-vector 27 #t))
+                    (cache <u16vector> (initialize-block-cache cache-uninitialized))
+                    (blocks <u8vector> (get-blocks~ section))
+                    (data <u8vector> (get-data~ section))
+                    (blocklight <u8vector> (get-blocklight~ section))
+                    (skylight <u8vector> (get-skylight~ section))
+                    (opaque-rendering <Rendering> (opaque-rendering))
+                    (transparent-rendering <Rendering> (transparent-rendering))
+                    (coverage-rendering <Rendering> (coverage-rendering))
+                    (water-rendering <Rendering> (water-rendering))
+                    (wet-rendering <Rendering> (wet-rendering))
+                    (multitexture-rendering <Rendering> (multitexture-rendering))
+                    (redstone-rendering <Rendering> (redstone-rendering))
+                    (texture-elements '()))
+                (define (section-ref a <fx> b <fx> c <fx>) <World-Section+>
+                  (if (and (= a 0)
+                           (= b 0)
+                           (= c 0))
+                      section
+                    (let ((index (section-index a b c)))
+                      (let ((section (vector-ref sections index)))
+                        (if (neq? section #t)
+                            section
+                          (let ((x (+ sector-x a))
+                                (y (+ sector-y b))
+                                (z (+ sector-z c)))
+                            (let ((region (sector-region~ zone x y z)))
+                              (let ((section (and region (get-section~ (cast <World-Region> region) 'visual x y z))))
+                                (vector-set! sections index section)
+                                section))))))))
+                
+                (define (section-index a <fx> b <fx> c <fx>) <fx>
+                  (+ (* b 9) (* c 3) a 13))
+                
+                (define (local-index i <fx> j <fx> k <fx>) <fx>
+                  (+ (* j 256) (* k 16) i))
+                
+                (define (effective-index i <fx> j <fx> k <fx>) <fx>
+                  (* (+ (* j 400) (* k 20) i 842) 4))
+                
+                (define (blocks-get section <World-Section>) <u8vector>
+                  (get-blocks~ section))
+                
+                (define (data-get section <World-Section>) <u8vector>
+                  (get-data~ section))
+                
+                (define (blocklight-get section <World-Section>) <u8vector>
+                  (get-blocklight~ section))
+                
+                (define (skylight-get section <World-Section>) <u8vector>
+                  (get-skylight~ section))
+                
+                (define (local-block-ref i <fx> j <fx> k <fx>) <fx>
+                  (u8vector-ref blocks (local-index i j k)))
+                
+                (define (local-data-ref i <fx> j <fx> k <fx>) <fx>
+                  (u4vector-ref data (local-index i j k)))
+                
+                (define (effective-block-ref i <fx> j <fx> k <fx>) <fx>
+                  (let ((index (effective-index i j k)))
+                    (let ((value (u16vector-ref cache index)))
+                      (if (/= value cache-uninitialized)
+                          value
+                        (let ((value (field-ref i j k blocks-get u8vector-ref 0 1)))
+                          (u16vector-set! cache index value)
+                          value)))))
+                
+                (define (effective-data-ref i <fx> j <fx> k <fx>) <fx>
+                  (field-ref i j k data-get u4vector-ref 0 0))
+                
+                (define (effective-light-ref! i <fx> j <fx> k <fx> lighting <f32vector>) <void>
+                  (unless (get-opaque-cube?~ (id->block (effective-block-ref i j k)))
+                    (let ((index (effective-index i j k)))
+                      (let ((value (u16vector-ref cache (+ index 1))))
+                        (if (/= value cache-uninitialized)
+                            (begin
+                              (f32vector-set! lighting 0 (+ (f32vector-ref lighting 0) (cast <fl> value)))
+                              (f32vector-set! lighting 1 (+ (f32vector-ref lighting 1) (cast <fl> (u16vector-ref cache (+ index 2)))))
+                              (f32vector-set! lighting 2 (+ (f32vector-ref lighting 2) (cast <fl> (u16vector-ref cache (+ index 3)))))
+                              (f32vector-set! lighting 3 (+ (f32vector-ref lighting 3) 1.)))
+                          (let ((blocklight (field-ref i j k blocklight-get u4vector-ref 0 0))
+                                (skylight (field-ref i j k skylight-get u4vector-ref 15 15))
+                                (ambience (if (= (effective-block-ref i j k) air-id) 1 0)))
+                            (u16vector-set! cache (+ index 1) blocklight)
+                            (u16vector-set! cache (+ index 2) skylight)
+                            (u16vector-set! cache (+ index 3) ambience)
+                            (f32vector-set! lighting 0 (+ (f32vector-ref lighting 0) (cast <fl> blocklight)))
+                            (f32vector-set! lighting 1 (+ (f32vector-ref lighting 1) (cast <fl> skylight)))
+                            (f32vector-set! lighting 2 (+ (f32vector-ref lighting 2) (cast <fl> ambience)))
+                            (f32vector-set! lighting 3 (+ (f32vector-ref lighting 3) 1.))))))))
+                
+                (define (inner-light-ref! i <fx> j <fx> k <fx> lighting <f32vector>) <void>
+                  (unless (get-opaque-cube?~ (id->block (effective-block-ref i j k)))
+                    (let ((index (effective-index i j k)))
+                      (let ((value (u16vector-ref cache (+ index 1))))
+                        (if (/= value cache-uninitialized)
+                            (begin
+                              (f32vector-set! lighting 0 (+ (f32vector-ref lighting 0) (cast <fl> value)))
+                              (f32vector-set! lighting 1 (+ (f32vector-ref lighting 1) (cast <fl> (u16vector-ref cache (+ index 2)))))
+                              (f32vector-set! lighting 2 (+ (f32vector-ref lighting 2) (cast <fl> (u16vector-ref cache (+ index 3)))))
+                              (f32vector-set! lighting 3 (+ (f32vector-ref lighting 3) 1.)))
+                          (let ((local-index (local-index i j k)))
+                            (let ((blocklight (u4vector-ref blocklight local-index))
+                                  (skylight (u4vector-ref skylight local-index))
+                                  (ambience (if (= (u8vector-ref blocks local-index) air-id) 1 0)))
+                              (u16vector-set! cache (+ index 1) blocklight)
+                              (u16vector-set! cache (+ index 2) skylight)
+                              (u16vector-set! cache (+ index 3) ambience)
+                              (f32vector-set! lighting 0 (+ (f32vector-ref lighting 0) (cast <fl> blocklight)))
+                              (f32vector-set! lighting 1 (+ (f32vector-ref lighting 1) (cast <fl> skylight)))
+                              (f32vector-set! lighting 2 (+ (f32vector-ref lighting 2) (cast <fl> ambience)))
+                              (f32vector-set! lighting 3 (+ (f32vector-ref lighting 3) 1.)))))))))
+                
+                (define (u4vector-ref field <u8vector> index <fx>) <fx>
+                  (let ((byte (u8vector-ref field (quotient index 2))))
+                    (if (even? index)
+                        (bitwise-and byte #x0F)
+                      (bitwise-and (arithmetic-shift-right byte 4) #x0F))))
+                
+                (define (field-ref i <fx> j <fx> k <fx> get-field ref empty bottom) <fx>
+                  (define (bind-i a <fx> i <fx>)
+                    (define (bind-j b <fx> j <fx>)
+                      (define (bind-k c <fx> k <fx>)
+                        (let ((section (section-ref a b c)))
+                          (if (not section)
+                              (if (and bottom-section? (= b -1)) bottom empty)
+                            (let ((field (get-field section)))
+                              (if (not field)
+                                  (if (and bottom-section? (= b -1)) bottom empty)
+                                (ref field (local-index i j k)))))))
+                      
+                      (cond ((< k 0) (bind-k -1 (+ 16 k)))
+                            ((> k 15) (bind-k 1 (- k 16)))
+                            (else (bind-k 0 k))))
+                    
+                    (cond ((< j 0) (bind-j -1 (+ 16 j)))
+                          ((> j 15) (bind-j 1 (- j 16)))
+                          (else (bind-j 0 j))))
+                  
+                  (cond ((< i 0) (bind-i -1 (+ 16 i)))
+                        ((> i 15) (bind-i 1 (- i 16)))
+                        (else (bind-i 0 i))))
+                
+                (define (add-template i j k x y z template <Face-Template> rendering <Rendering> category)
+                  (let ((mesher <Lighted-Mesher> (get-mesher~ rendering))
+                        (l1 (static (f32vector 0. 0. 0. 0.)))
+                        (l2 (static (f32vector 0. 0. 0. 0.)))
+                        (l3 (static (f32vector 0. 0. 0. 0.)))
+                        (l4 (static (f32vector 0. 0. 0. 0.))))
+                    (let ((inverse? (setup-lighting~ template i j k compute-lighting l1 l2 l3 l4)))
+                      (add-template~ mesher x y z template inverse?)
+                      (add-lighting~ mesher template l1 l2 l3 l4 inverse?))
+                    (when (and mesh-categories? (eq? category redstone))
+                      (let ((mesher <Lighted-Mesher> (get-mesher~ redstone-rendering)))
+                        (let ((inverse? (setup-lighting~ template i j k full-lighting l1 l2 l3 l4)))
+                          (add-template~ mesher x y z template inverse?)
+                          (add-lighting~ mesher template l1 l2 l3 l4 inverse?))))))
+                
+                (define (add-opaque-cube i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> left-uv <f32vector> right-uv <f32vector> bottom-uv <f32vector> top-uv <f32vector> back-uv <f32vector> front-uv <f32vector> rendering category block-id add-template)
+                  (let ((data-id (local-data-ref i j k)))
+                    (let ((template (find-visual-template block-id data-id)))
+                      (let ((rendering (effective-rendering (effective-block-ref (- i 1) j k) rendering))) (when rendering (add-template i j k x y z (vector-ref template 0) rendering category)))
+                      (let ((rendering (effective-rendering (effective-block-ref (+ i 1) j k) rendering))) (when rendering (add-template i j k x y z (vector-ref template 1) rendering category)))
+                      (let ((rendering (effective-rendering (effective-block-ref i (- j 1) k) rendering))) (when rendering (add-template i j k x y z (vector-ref template 2) rendering category)))
+                      (let ((rendering (effective-rendering (effective-block-ref i (+ j 1) k) rendering))) (when rendering (add-template i j k x y z (vector-ref template 3) rendering category)))
+                      (let ((rendering (effective-rendering (effective-block-ref i j (- k 1)) rendering))) (when rendering (add-template i j k x y z (vector-ref template 4) rendering category)))
+                      (let ((rendering (effective-rendering (effective-block-ref i j (+ k 1)) rendering))) (when rendering (add-template i j k x y z (vector-ref template 5) rendering category))))))
+                
+                (define (add-inner-opaque-cube i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> left-uv <f32vector> right-uv <f32vector> bottom-uv <f32vector> top-uv <f32vector> back-uv <f32vector> front-uv <f32vector> rendering category block-id add-template)
+                  (let ((index (local-index i j k)))
+                    (let ((data-id (u4vector-ref data index)))
+                      (let ((template (find-visual-template block-id data-id)))
+                        (let ((rendering (effective-rendering (u8vector-ref blocks (- index   1)) rendering))) (when rendering (add-template i j k x y z (vector-ref template 0) rendering category)))
+                        (let ((rendering (effective-rendering (u8vector-ref blocks (+ index   1)) rendering))) (when rendering (add-template i j k x y z (vector-ref template 1) rendering category)))
+                        (let ((rendering (effective-rendering (u8vector-ref blocks (- index 256)) rendering))) (when rendering (add-template i j k x y z (vector-ref template 2) rendering category)))
+                        (let ((rendering (effective-rendering (u8vector-ref blocks (+ index 256)) rendering))) (when rendering (add-template i j k x y z (vector-ref template 3) rendering category)))
+                        (let ((rendering (effective-rendering (u8vector-ref blocks (- index  16)) rendering))) (when rendering (add-template i j k x y z (vector-ref template 4) rendering category)))
+                        (let ((rendering (effective-rendering (u8vector-ref blocks (+ index  16)) rendering))) (when rendering (add-template i j k x y z (vector-ref template 5) rendering category)))))))
+                
+                (define (effective-rendering neighbor-id <fx> rendering <Rendering>)
+                  (let ((neighbor (id->block neighbor-id)))
+                    (cond ((get-opaque-cube?~ neighbor)
+                           #f)
+                          ((get-water-cube?~ neighbor)
+                           wet-rendering)
+                          (else
+                           rendering))))
+                
+                (define (add-translucent-cube i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> left-uv <f32vector> right-uv <f32vector> bottom-uv <f32vector> top-uv <f32vector> back-uv <f32vector> front-uv <f32vector> rendering category block-id add-template)
+                  (let ((data-id (local-data-ref i j k)))
+                    (let ((template (find-visual-template block-id data-id)))
+                      (unless (translucent-translucent? block-id (effective-block-ref (- i 1) j k)) (add-template i j k x y z (vector-ref template 0) rendering category))
+                      (unless (translucent-opaque? block-id (effective-block-ref (+ i 1) j k)) (add-template i j k x y z (vector-ref template 1) rendering category))
+                      (unless (translucent-translucent? block-id (effective-block-ref i (- j 1) k)) (add-template i j k x y z (vector-ref template 2) rendering category))
+                      (unless (translucent-opaque? block-id (effective-block-ref i (+ j 1) k)) (add-template i j k x y z (vector-ref template 3) rendering category))
+                      (unless (translucent-translucent? block-id (effective-block-ref i j (- k 1))) (add-template i j k x y z (vector-ref template 4) rendering category))
+                      (unless (translucent-opaque? block-id (effective-block-ref i j (+ k 1))) (add-template i j k x y z (vector-ref template 5) rendering category)))))
+                
+                (define (add-inner-translucent-cube i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> left-uv <f32vector> right-uv <f32vector> bottom-uv <f32vector> top-uv <f32vector> back-uv <f32vector> front-uv <f32vector> rendering category block-id add-template)
+                  (let ((index (local-index i j k)))
+                    (let ((data-id (u4vector-ref data index)))
+                      (let ((template (find-visual-template block-id data-id)))
+                        (unless (translucent-translucent? block-id (u8vector-ref blocks (- index   1))) (add-template i j k x y z (vector-ref template 0) rendering category))
+                        (unless (translucent-opaque? block-id (u8vector-ref blocks (+ index   1))) (add-template i j k x y z (vector-ref template 1) rendering category))
+                        (unless (translucent-translucent? block-id (u8vector-ref blocks (- index 256))) (add-template i j k x y z (vector-ref template 2) rendering category))
+                        (unless (translucent-opaque? block-id (u8vector-ref blocks (+ index 256))) (add-template i j k x y z (vector-ref template 3) rendering category))
+                        (unless (translucent-translucent? block-id (u8vector-ref blocks (- index  16))) (add-template i j k x y z (vector-ref template 4) rendering category))
+                        (unless (translucent-opaque? block-id (u8vector-ref blocks (+ index  16))) (add-template i j k x y z (vector-ref template 5) rendering category))))))
+                
+                (define (translucent-opaque? block-id <fx> neighbor-id <fx>)
+                  (or (= block-id neighbor-id)
+                      (get-opaque-cube?~ (id->block neighbor-id))))
+                
+                (define (translucent-translucent? block-id <fx> neighbor-id <fx>)
+                  (get-opaque-cube?~ (id->block neighbor-id)))
+                
+                (define (add-water-cube i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> left-uv <f32vector> right-uv <f32vector> bottom-uv <f32vector> top-uv <f32vector> back-uv <f32vector> front-uv <f32vector> rendering category block-id add-template)
+                  (let ((data-id (local-data-ref i j k)))
+                    (let ((template (find-visual-template block-id data-id)))
+                      (unless (water-opaque? (effective-block-ref (- i 1) j k)) (add-template i j k x y z (vector-ref template 0) rendering category))
+                      (unless (water-opaque? (effective-block-ref (+ i 1) j k)) (add-template i j k x y z (vector-ref template 1) rendering category))
+                      (unless (water-opaque? (effective-block-ref i (- j 1) k)) (add-template i j k x y z (vector-ref template 2) rendering category))
+                      (unless (water-opaque? (effective-block-ref i (+ j 1) k)) (add-template i j k x y z (vector-ref template 3) rendering category))
+                      (unless (water-opaque? (effective-block-ref i j (- k 1))) (add-template i j k x y z (vector-ref template 4) rendering category))
+                      (unless (water-opaque? (effective-block-ref i j (+ k 1))) (add-template i j k x y z (vector-ref template 5) rendering category)))))
+                
+                (define (add-inner-water-cube i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> left-uv <f32vector> right-uv <f32vector> bottom-uv <f32vector> top-uv <f32vector> back-uv <f32vector> front-uv <f32vector> rendering category block-id add-template)
+                  (let ((index (local-index i j k)))
+                    (let ((data-id (u4vector-ref data index)))
+                      (let ((template (find-visual-template block-id data-id)))
+                        (unless (water-opaque? (u8vector-ref blocks (- index   1))) (add-template i j k x y z (vector-ref template 0) rendering category))
+                        (unless (water-opaque? (u8vector-ref blocks (+ index   1))) (add-template i j k x y z (vector-ref template 1) rendering category))
+                        (unless (water-opaque? (u8vector-ref blocks (- index 256))) (add-template i j k x y z (vector-ref template 2) rendering category))
+                        (unless (water-opaque? (u8vector-ref blocks (+ index 256))) (add-template i j k x y z (vector-ref template 3) rendering category))
+                        (unless (water-opaque? (u8vector-ref blocks (- index  16))) (add-template i j k x y z (vector-ref template 4) rendering category))
+                        (unless (water-opaque? (u8vector-ref blocks (+ index  16))) (add-template i j k x y z (vector-ref template 5) rendering category))))))
+                
+                (define (water-opaque? neighbor-id <fx>)
+                  (let ((neighbor (id->block neighbor-id)))
+                    (or (get-water-cube?~ neighbor)
+                        (get-opaque-cube?~ neighbor))))
+                
+                (define (compute-lighting lighting <f32vector> i <fx> j <fx> k <fx> t <Light-Template>)
+                  (let ((shade (get-shade~ t))
+                        (s1 (get-s1~ t))
+                        (s2 (get-s2~ t))
+                        (s3 (get-s3~ t))
+                        (s4 (get-s4~ t)))
+                    (f32vector-set! lighting 0 0.)
+                    (f32vector-set! lighting 1 0.)
+                    (f32vector-set! lighting 2 0.)
+                    (f32vector-set! lighting 3 0.)
+                    (effective-light-ref! (+ i (s8vector-ref s1 0)) (+ j (s8vector-ref s1 1)) (+ k (s8vector-ref s1 2)) lighting)
+                    (effective-light-ref! (+ i (s8vector-ref s2 0)) (+ j (s8vector-ref s2 1)) (+ k (s8vector-ref s2 2)) lighting)
+                    (effective-light-ref! (+ i (s8vector-ref s3 0)) (+ j (s8vector-ref s3 1)) (+ k (s8vector-ref s3 2)) lighting)
+                    (effective-light-ref! (+ i (s8vector-ref s4 0)) (+ j (s8vector-ref s4 1)) (+ k (s8vector-ref s4 2)) lighting)
+                    (adjust-lighting lighting 0 shade)
+                    (adjust-lighting lighting 1 shade)
+                    lighting))
+                
+                (define (full-lighting lighting <f32vector> i <fx> j <fx> k <fx> t <Light-Template>)
+                  (f32vector-set! lighting 0 60.)
+                  (f32vector-set! lighting 1 60.)
+                  (f32vector-set! lighting 2 15.)
+                  (f32vector-set! lighting 3 1.))
+                
+                (define (add-texture-element proc)
+                  (proc region sector texture-element-adder))
+                
+                (define (texture-element-adder element)
+                  (set! texture-elements (cons element texture-elements)))
+                
+                (reset-mesher~ opaque-rendering)
+                (reset-mesher~ transparent-rendering)
+                (reset-mesher~ coverage-rendering)
+                (reset-mesher~ water-rendering)
+                (reset-mesher~ wet-rendering)
+                (reset-mesher~ multitexture-rendering)
+                (when mesh-categories?
+                  (reset-mesher~ redstone-rendering))
+                
+                ;; inner
+                (loop (for j from 1 below 15)
+                      (loop (for k from 1 below 15)
+                            (loop (for i from 1 below 15)
+                                  (let ((block-id (local-block-ref i j k))
+                                        (data-id (local-data-ref i j k)))
+                                    (when (/= block-id air-id)
+                                      (let ((x (+ section-x i))
+                                            (y (+ section-y j))
+                                            (z (+ section-z k))
+                                            (block (id->block block-id)))
+                                        (when (get-generic?~ block)
+                                          (set! block (id/subid->block block-id (generic-data-id block-id data-id))))
+                                        (let ((x (fl& (+ block-radius (cast <fl> x))))
+                                              (y (fl& (+ block-radius (cast <fl> y))))
+                                              (z (fl& (+ block-radius (cast <fl> z))))
+                                              (uv (block-texture-coordinates block))
+                                              (rendering (cache-rendering~ block))
+                                              (category (get-category~ block)))
+                                          (let ((visual (get-visual~ block)))
+                                            (cond (visual
+                                                   (visual block-id data-id i j k x y z uv rendering category add-template add-opaque-cube add-inner-translucent-cube add-texture-element effective-block-ref effective-data-ref))
+                                                  ((get-opaque-cube?~ block)
+                                                   (add-inner-opaque-cube i j k x y z uv uv uv uv uv uv rendering category block-id add-template))
+                                                  ((get-translucent-cube?~ block)
+                                                   (add-inner-translucent-cube i j k x y z uv uv uv uv uv uv rendering category block-id add-template))
+                                                  ((get-water-cube?~ block)
+                                                   (add-inner-water-cube i j k x y z uv uv uv uv uv uv rendering category block-id add-template))
+                                                  (else
+                                                   (add-visual-template block-id data-id data-id i j k x y z uv rendering category add-template add-opaque-cube effective-block-ref effective-data-ref)))))))))))
+                
+                ;; outer
+                (let ()
+                  (define (add i <fx> j <fx> k <fx>)
+                    (let ((block-id (local-block-ref i j k))
+                          (data-id (local-data-ref i j k)))
+                      (when (/= block-id air-id)
+                        (let ((x (+ section-x i))
+                              (y (+ section-y j))
+                              (z (+ section-z k))
+                              (block (id->block block-id)))
+                          (when (get-generic?~ block)
+                            (set! block (id/subid->block block-id (generic-data-id block-id data-id))))
+                          (let ((x (fl& (+ block-radius (cast <fl> x))))
+                                (y (fl& (+ block-radius (cast <fl> y))))
+                                (z (fl& (+ block-radius (cast <fl> z))))
+                                (uv (block-texture-coordinates block))
+                                (rendering (cache-rendering~ block))
+                                (category (get-category~ block)))
+                            (let ((visual (get-visual~ block)))
+                              (cond (visual
+                                     (visual block-id data-id i j k x y z uv rendering category add-template add-opaque-cube add-translucent-cube add-texture-element effective-block-ref effective-data-ref))
+                                    ((get-opaque-cube?~ block)
+                                     (add-opaque-cube i j k x y z uv uv uv uv uv uv rendering category block-id add-template))
+                                    ((get-translucent-cube?~ block)
+                                     (add-translucent-cube i j k x y z uv uv uv uv uv uv rendering category block-id add-template))
+                                    ((get-water-cube?~ block)
+                                     (add-water-cube i j k x y z uv uv uv uv uv uv rendering category block-id add-template))
+                                    (else
+                                     (add-visual-template block-id data-id data-id i j k x y z uv rendering category add-template add-opaque-cube effective-block-ref effective-data-ref)))))))))
+                  
+                  ;; left
+                  (let ((i 0))
+                    (loop (for j from 0 to 15)
+                          (loop (for k from 0 to 15)
+                                (add i j k))))
+                  ;; right
+                  (let ((i 15))
+                    (loop (for j from 0 to 15)
+                          (loop (for k from 0 to 15)
+                                (add i j k))))
+                  ;; bottom
+                  (let ((j 0))
+                    (loop (for i from 1 to 14)
+                          (loop (for k from 0 to 15)
+                                (add i j k))))
+                  ;; top
+                  (let ((j 15))
+                    (loop (for i from 1 to 14)
+                          (loop (for k from 0 to 15)
+                                (add i j k))))
+                  ;; back
+                  (let ((k 0))
+                    (loop (for i from 1 to 14)
+                          (loop (for j from 1 to 14)
+                                (add i j k))))
+                  ;; front
+                  (let ((k 15))
+                    (loop (for i from 1 to 14)
+                          (loop (for j from 1 to 14)
+                                (add i j k)))))
+                
+                (with-render-mutex
+                  (lambda ()
+                    (define (prepare-mesh)
+                      (let ((mesher (get-mesher~ opaque-rendering)))
+                        (let ((triangles (get-used~ mesher)))
+                          (when (> triangles 0)
+                            (setup-mesh~ sector)
+                            (let ((mesh (get-mesh~ sector)))
+                              (allege mesh
+                                (fill-vertices/neighbors~ sector mesh triangles (get-content~ mesher) (get-neighbors~ mesher))
+                                (fill-lightmap~ sector mesh triangles (get-lightmap~ mesher))
+                                (setup-array~ mesh)))))))
+                    
+                    (define (prepare-other-meshes)
+                      (let ((renderings (other-renderings))
+                            (count 0))
+                        (for-each (lambda (rendering)
+                                    (when (> (get-used~ (get-mesher~ rendering)) 0)
+                                      (increase! count)))
+                                  renderings)
+                        (when (> count 0)
+                          (let ((meshes (make-vector count))
+                                (rank 0))
+                            (loop (for rendering in renderings)
+                                  (let ((material (get-material~ rendering))
+                                        (mesher (get-mesher~ rendering)))
+                                    (let ((triangles (get-used~ mesher)))
+                                      (when (> (get-used~ mesher) 0)
+                                        (let ((mesh (new Mesh material: material)))
+                                          (let ((material (get-material~ mesh)))
+                                            (vector-set! meshes rank mesh)
+                                            (fill-vertices/neighbors~ sector mesh triangles (get-content~ mesher) (get-neighbors~ mesher))
+                                            (fill-lightmap~ sector mesh triangles (get-lightmap~ mesher))
+                                            (setup-array~ mesh)
+                                            (increase! rank)))))))
+                            (setup-other-meshes~ sector meshes)))))
+                    
+                    (define (prepare-redstone-mesh)
+                      (let ((material (get-material~ redstone-rendering))
+                            (mesher (get-mesher~ redstone-rendering)))
+                        (let ((triangles (get-used~ mesher)))
+                          (when (> triangles 0)
+                            (let ((mesh (new Mesh material: material)))
+                              (let ((material (get-material~ mesh)))
+                                (setup-categorized-mesh~ sector mesh)
+                                (fill-vertices/neighbors~ sector mesh triangles (get-content~ mesher) (get-neighbors~ mesher))
+                                (fill-lightmap~ sector mesh triangles (get-lightmap~ mesher))
+                                (setup-array~ mesh)))))))
+                    
+                    (when (eq? zone (current-zone))
+                      (free-mesh~ sector)
+                      (prepare-mesh)
+                      (prepare-other-meshes)
+                      (when mesh-categories?
+                        (prepare-redstone-mesh))
+                      (refcount-increase~ section)
+                      (set-section~ sector section)
+                      (when (not-null? texture-elements)
+                        (set-texture-elements~ sector texture-elements))
+                      (generate-done))))))))))))
+
+
+(class Light-Template extends Object
+  
+  
+  (slot shade getter generate)
+  (slot s1    getter generate)
+  (slot s2    getter generate)
+  (slot s3    getter generate)
+  (slot s4    getter generate)
+  
+  
+  (method override (initialize shade s1 s2 s3 s4)
+    (set! shade~self shade)
+    (set! s1~self s1)
+    (set! s2~self s2)
+    (set! s3~self s3)
+    (set! s4~self s4)))
+
+
+(definition (allocate-light-template shade s1 s2 s3 s4)
+  (allocate Light-Template shade s1 s2 s3 s4))
+
+
+(class Lighted-Template extends Face-Template
+  
+  
+  (method protected virtual (setup-lighting l1 l2 l3 l4)
+    )
+  
+  
+  (method protected virtual (iterate-lighting mesher l1 l2 l3 l4 inverse? proc)
+    ))
+
+
+(class Triangle-Template extends Lighted-Template
+  
+  
+  (slot t1 getter generate)
+  (slot t2 getter generate)
+  (slot t3 getter generate)
+  
+  
+  (method override (initialize texture-coordinates <f32vector> texture-depth triangle <Triangle> t1 t2 t3)
+    (nextmethod texture-coordinates texture-depth triangle)
+    (set! t1~self t1)
+    (set! t2~self t2)
+    (set! t3~self t3))
+  
+  
+  (method override (setup-lighting i j k compute-lighting l1 <f32vector> l2 <f32vector> l3 <f32vector> l4 <f32vector>)
+    (compute-lighting l1 i j k t1)
+    (compute-lighting l2 i j k t2)
+    (compute-lighting l3 i j k t3)
+    #f)
+  
+  
+  (method override (iterate-lighting mesher l1 l2 l3 l4 inverse? proc)
+    (proc mesher l1 l2 l3)))
+
+
+(class Quad-Template extends Lighted-Template
+  
+  
+  (slot t1 getter generate)
+  (slot t2 getter generate)
+  (slot t3 getter generate)
+  (slot t4 getter generate)
+  
+  
+  (method override (initialize texture-coordinates <f32vector> texture-depth quad <Quad> t1 t2 t3 t4)
+    (nextmethod texture-coordinates texture-depth quad)
+    (set! t1~self t1)
+    (set! t2~self t2)
+    (set! t3~self t3)
+    (set! t4~self t4))
+  
+  
+  (method override (setup-lighting i j k compute-lighting l1 <f32vector> l2 <f32vector> l3 <f32vector> l4 <f32vector>)
+    (compute-lighting l1 i j k t1)
+    (compute-lighting l2 i j k t2)
+    (compute-lighting l3 i j k t3)
+    (compute-lighting l4 i j k t4)
+    ;; inversing the quad solves lighting anisotropy
+    (let ((a00 (max (f32vector-ref l1 0) (f32vector-ref l1 1)))
+          (a01 (max (f32vector-ref l2 0) (f32vector-ref l2 1)))
+          (a11 (max (f32vector-ref l3 0) (f32vector-ref l3 1)))
+          (a10 (max (f32vector-ref l4 0) (f32vector-ref l4 1))))
+      (< (+ a00 a11) (+ a01 a10))))
+  
+  
+  (method override (iterate-lighting mesher l1 l2 l3 l4 inverse? proc)
+    (cond ((not inverse?)
+           (proc mesher l1 l2 l3)
+           (proc mesher l3 l4 l1))
+          (else
+           (proc mesher l4 l1 l2)
+           (proc mesher l2 l3 l4)))))
+
+
+(definition protected (create-visual-template block <Block> data-id <fx>)
+  (let ((templates (new-queue))
+        (block-id (get-id~ block))
+        (subid (or (get-subid~ block) -1))
+        (category (get-category~ block))
+        (uv (block-texture-coordinates block))
+        (generate (get-generate~ block))
+        (rendering (cache-rendering~ block))
+        (transparent-rendering (transparent-rendering)))
+    (define (block-ref i <fx> j <fx> k <fx>) <fx>
+      air-id)
+    
+    (define (data-ref i <fx> j <fx> k <fx>) <fx>
+      0)
+    
+    (define (add-face template <Face-Template> rendering <Rendering> category)
+      (enqueue templates template))
+    
+    (define (add-cube what i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> left-uv <f32vector> right-uv <f32vector> bottom-uv <f32vector> top-uv <f32vector> back-uv <f32vector> front-uv <f32vector> lighting rendering category block-id data-id add-face)
+      (add-face (left-side   what i j k x y z left-uv lighting rendering block-id data-id) rendering category)
+      (add-face (right-side  what i j k x y z right-uv lighting rendering block-id data-id) rendering category)
+      (add-face (bottom-side what i j k x y z bottom-uv lighting rendering block-id data-id) rendering category)
+      (add-face (top-side    what i j k x y z top-uv lighting rendering block-id data-id) rendering category)
+      (add-face (back-side   what i j k x y z back-uv lighting rendering block-id data-id) rendering category)
+      (add-face (front-side  what i j k x y z front-uv lighting rendering block-id data-id) rendering category))
+    
+    (define (lighting shade <fl> i <fx> j <fx> k <fx> ax <fx> ay <fx> az <fx> bx <fx> by <fx> bz <fx> cx <fx> cy <fx> cz <fx> dx <fx> dy <fx> dz <fx>)
+      (allocate-light-template shade
+                               (s8vector ax ay az)
+                               (s8vector bx by bz)
+                               (s8vector cx cy cz)
+                               (s8vector dx dy dz)))
+    
+    (cond (generate
+           (generate 'visual block-id data-id 0 0 0 0. 0. 0. uv lighting rendering category add-face add-cube block-ref data-ref))
+          ((or (get-opaque-cube?~ block)
+               (get-translucent-cube?~ block))
+           (add-cube 'visual 0 0 0 0. 0. 0. uv uv uv uv uv uv lighting rendering category block-id subid add-face))
+          (else
+           (add-cross-faces 'visual 0 0 0 0. 0. 0. uv lighting transparent-rendering category block-id subid add-face)))
+    (list->vector (queue-list templates))))
+
+
+(definition protected (find-visual-template block-id <fx> data-id <fx> (config-data <fx+> #f)) <vector>
+  (let ((block (id/subid->block block-id data-id))
+        (config-data (or config-data data-id)))
+    (let ((templates (get-visuals~ block)))
+      (if (not templates)
+          (let ((template (create-visual-template block config-data))
+                (templates (make-vector (get-configurations~ block) #f)))
+            (vector-set! templates config-data template)
+            (set-visuals~ block templates)
+            template)
+        (or (vector-ref templates config-data)
+            (let ((template (create-visual-template block config-data)))
+              (vector-set! templates config-data template)
+              template))))))
+
+
+(definition protected (add-visual-template block-id <fx> data-id <fx> config-data <fx> i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> uv <f32vector+> rendering category add-template add-opaque-cube block-ref data-ref)
+  (let ((template (find-visual-template block-id data-id config-data)))
+    (loop (for template in-vector template)
+          (add-template i j k x y z template rendering category))))
+
+
+;;;
+;;;; Physical
+;;;
+
+
+(definition protected (instantiate-physical sector <Sector> revision-update?)
+  (let ((zone (current-zone)))
+    (declare (proper-tail-calls))
+    (declare (optimize-dead-local-variables))
+    (declare (inline))
+    (declare (inlining-limit 1000))
+    (let ((sector-index (get-index~ sector)))
+      (let ((sector-x <fx> (vector-ref sector-index 0))
+            (sector-y <fx> (vector-ref sector-index 1))
+            (sector-z <fx> (vector-ref sector-index 2)))
+        (let ((region (sector-region~ zone sector-x sector-y sector-z)))
+          (let ((region-x (get-x~ region))
+                (region-z (get-z~ region))
+                (section (get-section~ region 'physical sector-x sector-y sector-z))
+                (chunk-x (sector->chunk sector-x))
+                (chunk-z (sector->chunk sector-z))
+                (truncate-y (get-truncate-y~ zone))
+                (cache-uninitialized 65535))
+            (if (not section)
+                (when revision-update?
+                  (iterate-sector-areas~ zone sector
+                    (lambda (area)
+                      (clear-polygons~ area))))
+              (let ((bottom-section? (= sector-y (cast <fx> (or truncate-y 0))))
+                    (section-x (+ (* region-x 32 16) (* chunk-x 16)))
+                    (section-y (* sector-y 16))
+                    (section-z (+ (* region-z 32 16) (* chunk-z 16)))
+                    (sections <vector> (make-vector 27 #t))
+                    (cache <u16vector> (initialize-block-cache cache-uninitialized))
+                    (blocks <u8vector> (get-blocks~ section))
+                    (data <u8vector> (get-data~ section))
+                    (areas (make-table test: eq?))
+                    (areas-bounds (sector-areas-bounds~ zone sector)))
+                (define (section-ref a <fx> b <fx> c <fx>) <World-Section+>
+                  (if (and (= a 0)
+                           (= b 0)
+                           (= c 0))
+                      section
+                    (let ((index (section-index a b c)))
+                      (let ((section (vector-ref sections index)))
+                        (if (neq? section #t)
+                            section
+                          (let ((x (+ sector-x a))
+                                (y (+ sector-y b))
+                                (z (+ sector-z c)))
+                            (let ((region (sector-region~ zone x y z)))
+                              (let ((section (and region (get-section~ (cast <World-Region> region) 'physical x y z))))
+                                (vector-set! sections index section)
+                                section))))))))
+                
+                (define (section-index a <fx> b <fx> c <fx>) <fx>
+                  (+ (* b 9) (* c 3) a 13))
+                
+                (define (local-index i <fx> j <fx> k <fx>) <fx>
+                  (+ (* j 256) (* k 16) i))
+                
+                (define (effective-index i <fx> j <fx> k <fx>) <fx>
+                  (* (+ (* j 400) (* k 20) i 842) 4))
+                
+                (define (blocks-get section <World-Section>) <u8vector>
+                  (get-blocks~ section))
+                
+                (define (data-get section <World-Section>) <u8vector>
+                  (get-data~ section))
+                
+                (define (local-block-ref i <fx> j <fx> k <fx>) <fx>
+                  (u8vector-ref blocks (local-index i j k)))
+                
+                (define (local-data-ref i <fx> j <fx> k <fx>) <fx>
+                  (u4vector-ref data (local-index i j k)))
+                
+                (define (effective-block-ref i <fx> j <fx> k <fx>) <fx>
+                  (let ((index (effective-index i j k)))
+                    (let ((value (u16vector-ref cache index)))
+                      (if (/= value cache-uninitialized)
+                          value
+                        (let ((value (field-ref i j k blocks-get u8vector-ref 0 1)))
+                          (u16vector-set! cache index value)
+                          value)))))
+                
+                (define (effective-data-ref i <fx> j <fx> k <fx>) <fx>
+                  (field-ref i j k data-get u4vector-ref 0 0))
+                
+                (define (u4vector-ref field <u8vector> index <fx>) <fx>
+                  (let ((byte (u8vector-ref field (quotient index 2))))
+                    (if (even? index)
+                        (bitwise-and byte #x0F)
+                      (bitwise-and (arithmetic-shift-right byte 4) #x0F))))
+                
+                (define (field-ref i <fx> j <fx> k <fx> get-field ref empty bottom) <fx>
+                  (define (bind-i a <fx> i <fx>)
+                    (define (bind-j b <fx> j <fx>)
+                      (define (bind-k c <fx> k <fx>)
+                        (let ((section (section-ref a b c)))
+                          (if (not section)
+                              (if (and bottom-section? (= b -1)) bottom empty)
+                            (let ((field (get-field section)))
+                              (if (not field)
+                                  (if (and bottom-section? (= b -1)) bottom empty)
+                                (ref field (local-index i j k)))))))
+                      
+                      (cond ((< k 0) (bind-k -1 (+ 16 k)))
+                            ((> k 15) (bind-k 1 (- k 16)))
+                            (else (bind-k 0 k))))
+                    
+                    (cond ((< j 0) (bind-j -1 (+ 16 j)))
+                          ((> j 15) (bind-j 1 (- j 16)))
+                          (else (bind-j 0 j))))
+                  
+                  (cond ((< i 0) (bind-i -1 (+ 16 i)))
+                        ((> i 15) (bind-i 1 (- i 16)))
+                        (else (bind-i 0 i))))
+                
+                (define (add-template x <fl> y <fl> z <fl> poly <Polygon>)
+                  (let ((center (vertex+xyz& (get-center~ poly) x y z)))
+                    (let ((index (position-area-index~ zone center)))
+                      ;; it is critical for clearing polygons that every
+                      ;; areas polygons are registered to belong to the zone
+                      (let ((in-sector-index (vector (between (vector-ref areas-bounds 0) (vector-ref index 0) (vector-ref areas-bounds 3))
+                                                     (between (vector-ref areas-bounds 1) (vector-ref index 1) (vector-ref areas-bounds 4))
+                                                     (between (vector-ref areas-bounds 2) (vector-ref index 2) (vector-ref areas-bounds 5)))))
+                        (let ((area (index-area~ zone in-sector-index #f)))
+                          ;; quicky for tests
+                          (let ((poly (copy-polygon~ poly)))
+                            (vertex+xyz! (get-origin~ poly) (get-origin~ poly) x y z)
+                            (loop (for vert in-vector (get-vertices~ poly))
+                                  (vertex+xyz! vert vert x y z))
+                            (set-data2~ poly (+ (get-data2~ poly) x))
+                            (set-data3~ poly (+ (get-data3~ poly) y))
+                            (set-data4~ poly (+ (get-data4~ poly) z))
+                            (table-add areas area poly)))))))
+                
+                (define (add-opaque-cube i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> block-id add-template)
+                  (let ((data-id (local-data-ref i j k)))
+                    (let ((template (find-physical-template block-id data-id)))
+                      (unless (opaque? (effective-block-ref (- i 1) j k)) (add-template x y z (vector-ref template 0)))
+                      (unless (opaque? (effective-block-ref (+ i 1) j k)) (add-template x y z (vector-ref template 1)))
+                      (unless (opaque? (effective-block-ref i (- j 1) k)) (add-template x y z (vector-ref template 2)))
+                      (unless (opaque? (effective-block-ref i (+ j 1) k)) (add-template x y z (vector-ref template 3)))
+                      (unless (opaque? (effective-block-ref i j (- k 1))) (add-template x y z (vector-ref template 4)))
+                      (unless (opaque? (effective-block-ref i j (+ k 1))) (add-template x y z (vector-ref template 5))))))
+                
+                (define (add-inner-opaque-cube i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> block-id add-template)
+                  (let ((data-id (local-data-ref i j k)))
+                    (let ((template (find-physical-template block-id data-id)))
+                      (unless (opaque? (local-block-ref (- i 1) j k)) (add-template x y z (vector-ref template 0)))
+                      (unless (opaque? (local-block-ref (+ i 1) j k)) (add-template x y z (vector-ref template 1)))
+                      (unless (opaque? (local-block-ref i (- j 1) k)) (add-template x y z (vector-ref template 2)))
+                      (unless (opaque? (local-block-ref i (+ j 1) k)) (add-template x y z (vector-ref template 3)))
+                      (unless (opaque? (local-block-ref i j (- k 1))) (add-template x y z (vector-ref template 4)))
+                      (unless (opaque? (local-block-ref i j (+ k 1))) (add-template x y z (vector-ref template 5))))))
+                
+                (define (opaque? block-id <fx>)
+                  (let ((block (id->block block-id)))
+                    (get-opaque-cube?~ block)))
+                
+                (define (add-water-cube i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> block-id add-template)
+                  (let ((data-id (local-data-ref i j k)))
+                    (let ((template (find-physical-template block-id data-id)))
+                      (unless (water-opaque? (effective-block-ref (- i 1) j k)) (add-template x y z (vector-ref template 0)))
+                      (unless (water-opaque? (effective-block-ref (+ i 1) j k)) (add-template x y z (vector-ref template 1)))
+                      (unless (water-opaque? (effective-block-ref i (- j 1) k)) (add-template x y z (vector-ref template 2)))
+                      (unless (water-opaque? (effective-block-ref i (+ j 1) k)) (add-template x y z (vector-ref template 3)))
+                      (unless (water-opaque? (effective-block-ref i j (- k 1))) (add-template x y z (vector-ref template 4)))
+                      (unless (water-opaque? (effective-block-ref i j (+ k 1))) (add-template x y z (vector-ref template 5))))))
+                
+                (define (add-inner-water-cube i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> block-id add-template)
+                  (let ((data-id (local-data-ref i j k)))
+                    (let ((template (find-physical-template block-id data-id)))
+                      (unless (water-opaque? (local-block-ref (- i 1) j k)) (add-template x y z (vector-ref template 0)))
+                      (unless (water-opaque? (local-block-ref (+ i 1) j k)) (add-template x y z (vector-ref template 1)))
+                      (unless (water-opaque? (local-block-ref i (- j 1) k)) (add-template x y z (vector-ref template 2)))
+                      (unless (water-opaque? (local-block-ref i (+ j 1) k)) (add-template x y z (vector-ref template 3)))
+                      (unless (water-opaque? (local-block-ref i j (- k 1))) (add-template x y z (vector-ref template 4)))
+                      (unless (water-opaque? (local-block-ref i j (+ k 1))) (add-template x y z (vector-ref template 5))))))
+                
+                (define (water-opaque? neighbor-id <fx>)
+                  (let ((neighbor (id->block neighbor-id)))
+                    (or (get-water-cube?~ neighbor)
+                        (get-opaque-cube?~ neighbor))))
+                
+                ;; inner
+                (loop (for j from 1 below 15)
+                      (loop (for k from 1 below 15)
+                            (loop (for i from 1 below 15)
+                                  (let ((block-id (local-block-ref i j k))
+                                        (data-id (local-data-ref i j k)))
+                                    (when (/= block-id air-id)
+                                      (let ((x (+ section-x i))
+                                            (y (+ section-y j))
+                                            (z (+ section-z k))
+                                            (block (id->block block-id)))
+                                        (when (get-generic?~ block)
+                                          (set! block (id/subid->block block-id (generic-data-id block-id data-id))))
+                                        (let ((x (fl& (+ block-radius (cast <fl> x))))
+                                              (y (fl& (+ block-radius (cast <fl> y))))
+                                              (z (fl& (+ block-radius (cast <fl> z)))))
+                                          (let ((physical (get-physical~ block)))
+                                            (cond (physical
+                                                   (physical block-id data-id i j k x y z add-template effective-block-ref effective-data-ref))
+                                                  ((get-opaque-cube?~ block)
+                                                   (add-inner-opaque-cube i j k x y z block-id add-template))
+                                                  ((get-water-cube?~ block)
+                                                   (add-inner-water-cube i j k x y z block-id add-template))
+                                                  (else
+                                                   (add-physical-template block-id data-id data-id i j k x y z add-template effective-block-ref effective-data-ref)))))))))))
+                
+                ;; outer
+                (let ()
+                  (define (add i <fx> j <fx> k <fx>)
+                    (let ((block-id (local-block-ref i j k))
+                          (data-id (local-data-ref i j k)))
+                      (when (/= block-id air-id)
+                        (let ((x (+ section-x i))
+                              (y (+ section-y j))
+                              (z (+ section-z k))
+                              (block (id->block block-id)))
+                          (when (get-generic?~ block)
+                            (set! block (id/subid->block block-id (generic-data-id block-id data-id))))
+                          (let ((x (fl& (+ block-radius (cast <fl> x))))
+                                (y (fl& (+ block-radius (cast <fl> y))))
+                                (z (fl& (+ block-radius (cast <fl> z)))))
+                            (let ((physical (get-physical~ block)))
+                              (cond (physical
+                                     (physical block-id data-id i j k x y z add-template effective-block-ref effective-data-ref))
+                                    ((get-opaque-cube?~ block)
+                                     (add-opaque-cube i j k x y z block-id add-template))
+                                    ((get-water-cube?~ block)
+                                     (add-water-cube i j k x y z block-id add-template))
+                                    (else
+                                     (add-physical-template block-id data-id data-id i j k x y z add-template effective-block-ref effective-data-ref)))))))))
+                  
+                  ;; left
+                  (let ((i 0))
+                    (loop (for j from 0 to 15)
+                          (loop (for k from 0 to 15)
+                                (add i j k))))
+                  ;; right
+                  (let ((i 15))
+                    (loop (for j from 0 to 15)
+                          (loop (for k from 0 to 15)
+                                (add i j k))))
+                  ;; bottom
+                  (let ((j 0))
+                    (loop (for i from 1 to 14)
+                          (loop (for k from 0 to 15)
+                                (add i j k))))
+                  ;; top
+                  (let ((j 15))
+                    (loop (for i from 1 to 14)
+                          (loop (for k from 0 to 15)
+                                (add i j k))))
+                  ;; back
+                  (let ((k 0))
+                    (loop (for i from 1 to 14)
+                          (loop (for j from 1 to 14)
+                                (add i j k))))
+                  ;; front
+                  (let ((k 15))
+                    (loop (for i from 1 to 14)
+                          (loop (for j from 1 to 14)
+                                (add i j k)))))
+                (when (eq? zone (current-zone))
+                  (iterate-table areas
+                    (lambda (area <Area> polygons)
+                      (add-polygons~ area #f polygons #f))))))))))))
+
+
+(definition protected (create-physical-template block <Block> data-id <fx>)
+  (let ((polygons (new-queue))
+        (block-id (get-id~ block))
+        (subid (or (get-subid~ block) -1))
+        (category (get-category~ block))
+        (uv dummy-uv)
+        (generate (get-generate~ block))
+        (rendering dummy-rendering)
+        (transparent-rendering dummy-rendering))
+    (define (block-ref i <fx> j <fx> k <fx>) <fx>
+      air-id)
+    
+    (define (data-ref i <fx> j <fx> k <fx>) <fx>
+      0)
+    
+    (define (add-face polygon <Polygon> rendering <Rendering> category)
+      (enqueue polygons polygon))
+    
+    (define (add-cube what i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> left-uv <f32vector> right-uv <f32vector> bottom-uv <f32vector> top-uv <f32vector> back-uv <f32vector> front-uv <f32vector> lighting rendering category block-id data-id add-face)
+      (add-face (left-side   what i j k x y z left-uv lighting rendering block-id data-id) rendering category)
+      (add-face (right-side  what i j k x y z right-uv lighting rendering block-id data-id) rendering category)
+      (add-face (bottom-side what i j k x y z bottom-uv lighting rendering block-id data-id) rendering category)
+      (add-face (top-side    what i j k x y z top-uv lighting rendering block-id data-id) rendering category)
+      (add-face (back-side   what i j k x y z back-uv lighting rendering block-id data-id) rendering category)
+      (add-face (front-side  what i j k x y z front-uv lighting rendering block-id data-id) rendering category))
+    
+    (define (lighting shade <fl> i <fx> j <fx> k <fx> ax <fx> ay <fx> az <fx> bx <fx> by <fx> bz <fx> cx <fx> cy <fx> cz <fx> dx <fx> dy <fx> dz <fx>)
+      #f)
+    
+    (cond (generate
+           (generate 'physical block-id data-id 0 0 0 0. 0. 0. uv lighting rendering category add-face add-cube block-ref data-ref))
+          ((or (get-opaque-cube?~ block)
+               (get-translucent-cube?~ block))
+           (add-cube 'physical 0 0 0 0. 0. 0. uv uv uv uv uv uv lighting rendering category block-id subid add-face))
+          (else
+           (add-cross-faces 'physical 0 0 0 0. 0. 0. uv lighting transparent-rendering category block-id subid add-face)))
+    (list->vector (queue-list polygons))))
+
+
+(definition protected (find-physical-template block-id <fx> data-id <fx> (config-data <fx+> #f)) <vector>
+  (let ((block (id/subid->block block-id data-id))
+        (config-data (or config-data data-id)))
+    (let ((templates (get-physicals~ block)))
+      (if (not templates)
+          (let ((template (create-physical-template block config-data))
+                (templates (make-vector (get-configurations~ block) #f)))
+            (vector-set! templates config-data template)
+            (set-physicals~ block templates)
+            template)
+        (or (vector-ref templates config-data)
+            (let ((template (create-physical-template block data-id)))
+              (vector-set! templates config-data template)
+              template))))))
+
+
+(definition protected (add-physical-template block-id <fx> data-id <fx> config-data <fx> i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> add-template block-ref data-ref)
+  (let ((polygons (find-physical-template block-id data-id config-data)))
+    (loop (for poly in-vector polygons)
+          (add-template x y z poly))))
+
+
+;;;
+;;;; Coordinates
+;;;
+
+
+(definition protected (index->coordinates index)
+  (let ((i (modulo index 16))
+        (k (modulo (quotient index 16) 16))
+        (j (modulo (quotient (quotient index 16) 16) 16)))
+    (list i j k)))
+
+
+(definition protected (normalize-sector/coordinates sector i <fx> j <fx> k <fx> with-field proc)
+  (if (and (between? i 0 15)
+           (between? j 0 15)
+           (between? k 0 15))
+      (proc sector i j k)
+    (with-field i j k
+      (lambda (section index)
+        (let ((sector (get-sector~ section)))
+          (bind (i j k) (index->coordinates index)
+            (proc sector i j k)))))))
+
+
+(definition protected (enqueue-sector/coordinates queue sector coordinates with-field)
+  (bind (i j k) coordinates
+    (normalize-sector/coordinates sector i j k with-field
+      (lambda (sector i j k)
+        (enqueue queue (list sector i j k))))))
+
+
+(definition protected (sector/coordinates->location sector <Sector> i <fx> j <fx> k <fx>)
+  (let ((index (get-index~ sector)))
+    (let ((sector-x (vector-ref index 0))
+          (sector-y (vector-ref index 1))
+          (sector-z (vector-ref index 2)))
+      (vector (+ i (* sector-x 16))
+              (+ j (* sector-y 16))
+              (+ k (* sector-z 16))))))
+
+
+(definition protected (section/index->position section index)
+  (sector/index->position (get-sector~ section) index))
+
+
+(definition protected (sector/index->position sector index)
+  (bind (i j k) (index->coordinates index)
+    (let ((location (sector/coordinates->location sector i j k)))
+      (let ((x (vector-ref location 0))
+            (y (vector-ref location 1))
+            (z (vector-ref location 2)))
+        (vertex (+ (cast <fl> x) .5)
+                (+ (cast <fl> y) .5)
+                (+ (cast <fl> z) .5))))))
+
+
+(definition protected (position->location pos)
+  (let ((x (vertex-x pos))
+        (y (vertex-y pos))
+        (z (vertex-z pos)))
+    (vector (fxround (- x .5))
+            (fxround (- y .5))
+            (fxround (- z .5)))))
+
+
+(definition protected (location->position loc)
+  (vertex (+ (cast <fl> (vector-ref loc 0)) .5)
+          (+ (cast <fl> (vector-ref loc 1)) .5)
+          (+ (cast <fl> (vector-ref loc 2)) .5)))
+
+
+(definition protected (taxicab-distance sector1 <Sector> sector2 <Sector>)
+  (let ((index1 (get-index~ sector1))
+        (index2 (get-index~ sector2)))
+    (+ (abs (- (vector-ref index1 0) (vector-ref index2 0)))
+       (abs (- (vector-ref index1 1) (vector-ref index2 1)))
+       (abs (- (vector-ref index1 2) (vector-ref index2 2))))))
+
+
+(definition protected (block-entity-data region <World-Region> sector <Sector> i <fx> j <fx> k <fx>)
+  (let ((index (get-index~ sector)))
+    (let ((sector-x (vector-ref index 0))
+          (sector-z (vector-ref index 2)))
+      (let ((chunk <World-Chunk> (sector-chunk~ region sector-x sector-z))
+            (index (sector/coordinates->location sector i j k)))
+        (find-block-entity~ chunk index)))))
+
+
+(definition protected (block-entity-add region <World-Region> sector <Sector> i <fx> j <fx> k <fx>)
+  (let ((index (get-index~ sector)))
+    (let ((sector-x (vector-ref index 0))
+          (sector-z (vector-ref index 2)))
+      (let ((chunk <World-Chunk> (sector-chunk~ region sector-x sector-z))
+            (index (sector/coordinates->location sector i j k)))
+        (add-block-entity~ chunk index)))))
+
+
+;;;
+;;;; Components
+;;;
+
+
+(definition protected (new-repeater sector i j k delay power? with-field)
+  (normalize-sector/coordinates sector i j k with-field
+    (lambda (sector i j k)
+      (new Repeater sector i j k delay power?))))
+
+
+(definition protected (new-pressure-plate sector i j k delay actor with-field)
+  (normalize-sector/coordinates sector i j k with-field
+    (lambda (sector i j k)
+      (new Pressure-Plate sector i j k delay actor))))
+
+
+(class Redstone-Component extends Object
+  
+  
+  (slot sector getter generate)
+  (slot i      getter generate)
+  (slot j      getter generate)
+  (slot k      getter generate)
+  (slot delay  accessors generate)
+  
+  
+  (method override (initialize sector i j k delay)
+    (set! sector~self sector)
+    (set! i~self i)
+    (set! j~self j)
+    (set! k~self k)
+    (set! delay~self delay))
+  
+  (method (location)
+    (list sector i j k)))
+
+
+(class Pressure-Plate extends Redstone-Component
+  
+  
+  (slot colliders accessors generate)
+  
+  
+  (method override (initialize sector i j k delay actor)
+    (nextmethod sector i j k delay)
+    (set! colliders~self (cons actor '()))))
+
+
+(class Repeater extends Redstone-Component
+  
+  
+  (slot power? accessors generate)
+  
+  
+  (method override (initialize sector i j k delay power?)
+    (nextmethod sector i j k delay)
+    (set! power?~self power?)))
+
+
+;;;
+;;;; Spawner
+;;;
+
+
+(class Spawner extends Object
+  
+  
+  (slot sector          getter generate)
+  (slot coordinates     getter generate)
+  (slot time-since-last accessors generate)
+  (slot time-for-spawn  accessors generate)
+  (slot creature-count  accessors generate)
+  (slot position        getter generate)
+  
+  
+  (method override (initialize sector coordinates time-since-last time-for-spawn creature-count position)
+    (set! sector~self sector)
+    (set! coordinates~self coordinates)
+    (set! time-since-last~self time-since-last)
+    (set! time-for-spawn~self time-for-spawn)
+    (set! creature-count~self creature-count)
+    (set! position~self position)))
+
+
+;;;
+;;;; Burnout
+;;;
+
+
+@code-to-implement-redstone-torch-burnout (
+(class Powerer extends Object
+  
+  
+  (slot i    getter generate)
+  (slot j    getter generate)
+  (slot time getter generate)
+  
+  
+  (method override (initialize i j time)
+    (set! i~self i)
+    (set! j~self j)
+    (set! time~self time)))
+
+
+(define burnout-delay
+  3)
+
+
+(define last-torches
+  (list #f))
+
+
+(define (add-torch powerer)
+  (set-cdr! last-torches (cons powerer (cdr last-torches))))
+
+
+(define (count-powerings i j time)
+  (define (powering? powerer)
+    (and (= (get-i~ powerer) i)
+         (= (get-j~ powerer) j)))
+  
+  (define (past-delay? powerer)
+    (> (- time (get-time~ powerer)) burnout-delay))
+  
+  (let (iter (scan last-torches) (count 0))
+    (let ((torches (cdr scan)))
+      (if (null? torches)
+          count
+        (let ((torch (car torches)))
+          (if (past-delay? torch)
+              (begin
+                (set-cdr! scan '())
+                count)
+            (iter (cdr scan) (if (powering? torch) (+ count 1) count))))))))
+
+
+(add-torch (new Powerer 1 2 10)) (debug 'add (length (cdr last-torches)))
+(count-powerings 1 2 10)         (debug 'count (length (cdr last-torches)))
+(add-torch (new Powerer 1 2 11)) (debug 'add (length (cdr last-torches)))
+(count-powerings 1 2 11)         (debug 'count (length (cdr last-torches)))
+(add-torch (new Powerer 1 2 14)) (debug 'add (length (cdr last-torches)))
+(count-powerings 1 2 14)         (debug 'count (length (cdr last-torches)))
+(count-powerings 1 2 20)         (debug 'count (length (cdr last-torches))))
+
+
+;;;
+;;;; Actions
+;;;
+
+
+(definition protected block-hook
+  #f)
+
+
+(definition public (register-block-hook hook)
+  (set! block-hook hook))
+
+
+(definition public (invoke-block-hook pos)
+  (when block-hook
+    (block-hook pos)))
+
+
+(definition protected block-actions
+  (make-table test: equal?))
+
+
+(definition public (registered-block-action pos)
+  (table-ref block-actions pos #f))
+
+
+(definition public (register-block-action pos action)
+  (if (pair? pos)
+      (for-each (lambda (pos)
+                  (table-set! block-actions pos action))
+                pos)
+    (table-set! block-actions pos action)))
+
+
+(definition public (invoke-block-action pos)
+  (let ((action (registered-block-action pos)))
+    (when action
+      (action)
+      #t)))
+
+
+;;;
+;;;; Add
+;;;
+
+
+(definition (make-quad-face what rendering <Rendering> texture-coordinates texture-depth quad l1 l2 l3 l4)
+  (case what
+    ((physical)
+     quad)
+    ((visual)
+     (new Quad-Template texture-coordinates texture-depth quad l1 l2 l3 l4))
+    (else
+     (new Quad-Face (get-entity-material~ rendering) texture-coordinates texture-depth quad l1 l2 l3 l4))))
+
+
+(definition (make-triangle-face what rendering <Rendering> texture-coordinates texture-depth triangle l1 l2 l3)
+  (case what
+    ((physical)
+     triangle)
+    ((visual)
+     (new Triangle-Template texture-coordinates texture-depth triangle l1 l2 l3))
+    (else
+     (new Triangle-Face (get-entity-material~ rendering) texture-coordinates texture-depth triangle l1 l2 l3))))
+
+
+(definition (make-block-quad v1 v2 v3 v4 block-id <fx> data-id <fx> x <fl> y <fl> z <fl>) <Quad>
+  (let ((quad <Quad> (make-quad #f v1 v2 v3 v4)))
+    (set-data1~ quad (cast <fl> (encode-id block-id data-id)))
+    (set-data2~ quad x)
+    (set-data3~ quad y)
+    (set-data4~ quad z)
+    quad))
+
+
+(definition (make-block-triangle v1 v2 v3 block-id <fx> data-id <fx> x <fl> y <fl> z <fl>) <Triangle>
+  (let ((triangle <Triangle> (make-triangle #f v1 v2 v3)))
+    (set-data1~ triangle (cast <fl> (encode-id block-id data-id)))
+    (set-data2~ triangle x)
+    (set-data3~ triangle y)
+    (set-data4~ triangle z)
+    triangle))
+
+
+(definition protected (generic-coordinates uv <f32vector>) <f32vector>
+  (let ((tl (uv-left uv))
+        (tt (uv-top uv))
+        (tr (uv-right uv))
+        (tb (uv-bottom uv)))
+    (f32vector tl tt tl tb tr tb tr tt)))
+
+
+;; 90 degrees to the left
+(definition protected (rotate-coordinates uv <f32vector>) <f32vector>
+  (let ((tl (uv-left uv))
+        (tt (uv-top uv))
+        (tr (uv-right uv))
+        (tb (uv-bottom uv)))
+    (f32vector tl tb tr tb tr tt tl tt)))
+
+
+;; 90 degrees to the right
+(definition protected (rotate-inverse-coordinates uv <f32vector>) <f32vector>
+  (let ((tl (uv-left uv))
+        (tt (uv-top uv))
+        (tr (uv-right uv))
+        (tb (uv-bottom uv)))
+    (f32vector tr tt tl tt tl tb tr tb)))
+
+
+(definition protected (rotate-other-coordinates uv <f32vector>) <f32vector>
+  (let ((tl (uv-left uv))
+        (tt (uv-top uv))
+        (tr (uv-right uv))
+        (tb (uv-bottom uv)))
+    (f32vector tr tb tr tt tl tt tl tb)))
+
+
+(definition protected (transpose-coordinates uv <f32vector>) <f32vector>
+  (let ((tl (uv-left uv))
+        (tt (uv-top uv))
+        (tr (uv-right uv))
+        (tb (uv-bottom uv)))
+    (f32vector tr tt tr tb tl tb tl tt)))
+
+
+(definition (generic-quad what i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> v1 <f64vector> v2 <f64vector> v3 <f64vector> v4 <f64vector> uv <f32vector> uv-coordinates lighting shade rendering block-id data-id matrix)
+  (let ((v1 (matrix-transform-3x4 matrix v1))
+        (v2 (matrix-transform-3x4 matrix v2))
+        (v3 (matrix-transform-3x4 matrix v3))
+        (v4 (matrix-transform-3x4 matrix v4)))
+    (let ((quad (make-block-quad (vertex+xyz v1 x y z)
+                                 (vertex+xyz v2 x y z)
+                                 (vertex+xyz v3 x y z)
+                                 (vertex+xyz v4 x y z)
+                                 block-id
+                                 data-id
+                                 x
+                                 y
+                                 z)))
+      (let ((normal (get-normal~ quad)))
+        (make-quad-face what
+                        rendering
+                        (uv-coordinates uv)
+                        (uv-depth uv)
+                        quad
+                        (generic-lighting i j k v1 normal lighting shade)
+                        (generic-lighting i j k v2 normal lighting shade)
+                        (generic-lighting i j k v3 normal lighting shade)
+                        (generic-lighting i j k v4 normal lighting shade))))))
+
+
+(definition (generic-triangle what i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> v1 <f64vector> v2 <f64vector> v3 <f64vector> uv <f32vector> uv-coordinates lighting shade rendering block-id data-id matrix)
+  (let ((v1 (matrix-transform-3x4 matrix v1))
+        (v2 (matrix-transform-3x4 matrix v2))
+        (v3 (matrix-transform-3x4 matrix v3)))
+    (let ((triangle (make-block-triangle (vertex+xyz v1 x y z)
+                                         (vertex+xyz v2 x y z)
+                                         (vertex+xyz v3 x y z)
+                                         block-id
+                                         data-id
+                                         x
+                                         y
+                                         z)))
+      (let ((normal (get-normal~ triangle)))
+        (make-triangle-face what
+                            rendering
+                            (uv-coordinates uv)
+                            (uv-depth uv)
+                            triangle
+                            (generic-lighting i j k v1 normal lighting shade)
+                            (generic-lighting i j k v2 normal lighting shade)
+                            (generic-lighting i j k v3 normal lighting shade))))))
+
+
+(constant inline 1/SQRT2 <fl>
+  (/ 1. (sqrt 2.)))
+
+;; minimal value for door to clear itself
+(constant inline ambient-forward <fl>
+  .3)
+
+;; minimal value for stair top to clear itself and fence to be uniform
+(constant inline ambient-angled <fl>
+  .9)
+
+
+@debugging
+(definition protected (get-ambient-forward/angled)
+  (values ambient-forward ambient-angled))
+
+@debugging
+(definition protected (set-ambient-forward/angled forward angled)
+  (set! ambient-forward forward)
+  (set! ambient-angled angled))
+
+
+(definition protected (generic-lighting i <fx> j <fx> k <fx> vert <f64vector> normal <f64vector> lighting shade)
+  (if (u8vector? lighting)
+      lighting
+    ;; the .5 is because the shape is centered at 0 0 0
+    (let ((adjusted (vertex+& (vertex+& vert (vertex& .5 .5 .5)) (vertex-scalar*& normal ambient-forward)))
+          (r1 (make-vertex&))
+          (r2 (make-vertex&))
+          (r3 (make-vertex&))
+          (r4 (make-vertex&)))
+      (define (ambient-rays!)
+        (let ((up (roll-free-up& normal)))
+          (let ((right (cross-product& normal up)))
+            (let ((advance (vertex-scalar*& normal 1/SQRT2)))
+              (let ((up/+2 (vertex-scalar/& up  2.))
+                    (up/-2 (vertex-scalar/& up -2.))
+                    (right/+2 (vertex-scalar/& right  2.))
+                    (right/-2 (vertex-scalar/& right -2.)))
+                (vertex+! r1 adjusted (vertex-scalar*& (vertex+& advance (vertex+& up/+2 right/+2)) ambient-angled))
+                (vertex+! r2 adjusted (vertex-scalar*& (vertex+& advance (vertex+& up/+2 right/-2)) ambient-angled))
+                (vertex+! r3 adjusted (vertex-scalar*& (vertex+& advance (vertex+& up/-2 right/-2)) ambient-angled))
+                (vertex+! r4 adjusted (vertex-scalar*& (vertex+& advance (vertex+& up/-2 right/+2)) ambient-angled)))))))
+      
+      (ambient-rays!)
+      (lighting shade i j k
+        (fxfloor (vertex-x r1)) (fxfloor (vertex-y r1)) (fxfloor (vertex-z r1))
+        (fxfloor (vertex-x r2)) (fxfloor (vertex-y r2)) (fxfloor (vertex-z r2))
+        (fxfloor (vertex-x r3)) (fxfloor (vertex-y r3)) (fxfloor (vertex-z r3))
+        (fxfloor (vertex-x r4)) (fxfloor (vertex-y r4)) (fxfloor (vertex-z r4))))))
+
+
+(constant inline no-shade     <fl> 1.)
+(constant inline top-shade    <fl> 1.)
+(constant inline bottom-shade <fl> .5)
+(constant inline left-shade   <fl> .6)
+(constant inline right-shade  <fl> .6)
+(constant inline back-shade   <fl> .8)
+(constant inline front-shade  <fl> .8)
+
+
+(definition public (left-side what i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> uv <f32vector> lighting rendering block-id data-id)
+  (let ((left (fl& (- x block-radius)))
+        (right (fl& (+ x block-radius)))
+        (bottom (fl& (- y block-radius)))
+        (top (fl& (+ y block-radius)))
+        (back (fl& (- z block-radius)))
+        (front (fl& (+ z block-radius))))
+    (left-face what i j k x y z left right bottom top back front uv generic-coordinates lighting rendering block-id data-id)))
+
+
+(definition public (left-face what i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> left <fl> right <fl> bottom <fl> top <fl> back <fl> front <fl> uv <f32vector> uv-coordinates lighting rendering block-id data-id)
+  (make-quad-face what
+                  rendering
+                  (uv-coordinates uv)
+                  (uv-depth uv)
+                  (make-block-quad (vertex left top back) (vertex left bottom back) (vertex left bottom front) (vertex left top front) block-id data-id x y z)
+                  (lighting left-shade i j k -1  0 -1 -1  0  0 -1  1 -1 -1  1  0)
+                  (lighting left-shade i j k -1 -1 -1 -1 -1  0 -1  0 -1 -1  0  0)
+                  (lighting left-shade i j k -1 -1  0 -1 -1  1 -1  0  0 -1  0  1)
+                  (lighting left-shade i j k -1  0  0 -1  0  1 -1  1  0 -1  1  1)))
+
+
+;; simple solution for shapes that don't work well with ambient vectors
+(definition (uniform-lighting i <fx> j <fx> k <fx> lighting)
+  (lighting no-shade i j k 0 0 1 0 0 -1 1 0 0 -1 0 0))
+
+
+(definition public (left-generic what i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> left <fl> right <fl> bottom <fl> top <fl> back <fl> front <fl> uv <f32vector> uv-coordinates lighting rendering block-id data-id matrix)
+  (let ((v1 (vertex left top back))
+        (v2 (vertex left bottom back))
+        (v3 (vertex left bottom front))
+        (v4 (vertex left top front)))
+    (generic-quad what i j k x y z v1 v2 v3 v4 uv uv-coordinates lighting left-shade rendering block-id data-id matrix)))
+
+
+(definition public (left-generic-quad what i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> left <fl> right <fl> bottom <fl> top <f64vector> back <fl> front <fl> uv <f32vector> uv-coordinates lighting rendering block-id data-id)
+  (let ((v1 (vertex left (first top) back))
+        (v2 (vertex left bottom back))
+        (v3 (vertex left bottom front))
+        (v4 (vertex left (second top) front)))
+    (generic-quad what i j k x y z v1 v2 v3 v4 uv uv-coordinates lighting left-shade rendering block-id data-id (make-identity-matrix))))
+
+
+(definition public (right-side what i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> uv <f32vector> lighting rendering block-id data-id)
+  (let ((left (fl& (- x block-radius)))
+        (right (fl& (+ x block-radius)))
+        (bottom (fl& (- y block-radius)))
+        (top (fl& (+ y block-radius)))
+        (back (fl& (- z block-radius)))
+        (front (fl& (+ z block-radius))))
+    (right-face what i j k x y z left right bottom top back front uv generic-coordinates lighting rendering block-id data-id)))
+
+
+(definition public (right-face what i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> left <fl> right <fl> bottom <fl> top <fl> back <fl> front <fl> uv <f32vector> uv-coordinates lighting rendering block-id data-id)
+  (make-quad-face what
+                  rendering
+                  (uv-coordinates uv)
+                  (uv-depth uv)
+                  (make-block-quad (vertex right top front) (vertex right bottom front) (vertex right bottom back) (vertex right top back) block-id data-id x y z)
+                  (lighting right-shade i j k  1  0  0  1  0  1  1  1  0  1  1  1)
+                  (lighting right-shade i j k  1 -1  0  1 -1  1  1  0  0  1  0  1)
+                  (lighting right-shade i j k  1 -1 -1  1 -1  0  1  0 -1  1  0  0)
+                  (lighting right-shade i j k  1  0 -1  1  0  0  1  1 -1  1  1  0)))
+
+
+(definition public (right-generic what i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> left <fl> right <fl> bottom <fl> top <fl> back <fl> front <fl> uv <f32vector> uv-coordinates lighting rendering block-id data-id matrix)
+  (let ((v1 (vertex right top front))
+        (v2 (vertex right bottom front))
+        (v3 (vertex right bottom back))
+        (v4 (vertex right top back)))
+    (generic-quad what i j k x y z v1 v2 v3 v4 uv uv-coordinates lighting right-shade rendering block-id data-id matrix)))
+
+
+(definition public (right-generic-quad what i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> left <fl> right <fl> bottom <fl> top <f64vector> back <fl> front <fl> uv <f32vector> uv-coordinates lighting rendering block-id data-id)
+  (let ((v1 (vertex right (first top) front))
+        (v2 (vertex right bottom front))
+        (v3 (vertex right bottom back))
+        (v4 (vertex right (second top) back)))
+    (generic-quad what i j k x y z v1 v2 v3 v4 uv uv-coordinates lighting right-shade rendering block-id data-id (make-identity-matrix))))
+
+
+(definition public (bottom-side what i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> uv <f32vector> lighting rendering block-id data-id)
+  (let ((left (fl& (- x block-radius)))
+        (right (fl& (+ x block-radius)))
+        (bottom (fl& (- y block-radius)))
+        (top (fl& (+ y block-radius)))
+        (back (fl& (- z block-radius)))
+        (front (fl& (+ z block-radius))))
+    (bottom-face what i j k x y z left right bottom top back front uv generic-coordinates lighting rendering block-id data-id)))
+
+
+(definition public (bottom-face what i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> left <fl> right <fl> bottom <fl> top <fl> back <fl> front <fl> uv <f32vector> uv-coordinates lighting rendering block-id data-id)
+  (make-quad-face what
+                  rendering
+                  (uv-coordinates uv)
+                  (uv-depth uv)
+                  (make-block-quad (vertex left bottom front) (vertex left bottom back) (vertex right bottom back) (vertex right bottom front) block-id data-id x y z)
+                  (lighting bottom-shade i j k -1 -1  0 -1 -1  1  0 -1  0  0 -1  1)
+                  (lighting bottom-shade i j k -1 -1 -1 -1 -1  0  0 -1 -1  0 -1  0)
+                  (lighting bottom-shade i j k  0 -1 -1  0 -1  0  1 -1 -1  1 -1  0)
+                  (lighting bottom-shade i j k  0 -1  0  0 -1  1  1 -1  0  1 -1  1)))
+
+
+(definition public (bottom-generic what i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> left <fl> right <fl> bottom <fl> top <fl> back <fl> front <fl> uv <f32vector> uv-coordinates lighting rendering block-id data-id matrix)
+  (let ((v1 (vertex left bottom front))
+        (v2 (vertex left bottom back))
+        (v3 (vertex right bottom back))
+        (v4 (vertex right bottom front)))
+    (generic-quad what i j k x y z v1 v2 v3 v4 uv uv-coordinates lighting bottom-shade rendering block-id data-id matrix)))
+
+
+(definition public (top-side what i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> uv <f32vector> lighting rendering block-id data-id)
+  (let ((left (fl& (- x block-radius)))
+        (right (fl& (+ x block-radius)))
+        (bottom (fl& (- y block-radius)))
+        (top (fl& (+ y block-radius)))
+        (back (fl& (- z block-radius)))
+        (front (fl& (+ z block-radius))))
+    (top-face what i j k x y z left right bottom top back front uv generic-coordinates lighting rendering block-id data-id)))
+
+
+(definition public (top-face what i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> left <fl> right <fl> bottom <fl> top <fl> back <fl> front <fl> uv <f32vector> uv-coordinates lighting rendering block-id data-id)
+  (make-quad-face what
+                  rendering
+                  (uv-coordinates uv)
+                  (uv-depth uv)
+                  (make-block-quad (vertex left top back) (vertex left top front) (vertex right top front) (vertex right top back) block-id data-id x y z)
+                  (lighting top-shade i j k -1  1 -1 -1  1  0  0  1 -1  0  1  0)
+                  (lighting top-shade i j k -1  1  0 -1  1  1  0  1  0  0  1  1)
+                  (lighting top-shade i j k  0  1  0  0  1  1  1  1  0  1  1  1)
+                  (lighting top-shade i j k  0  1 -1  0  1  0  1  1 -1  1  1  0)))
+
+(definition public (top-generic what i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> left <fl> right <fl> bottom <fl> top <fl> back <fl> front <fl> uv <f32vector> uv-coordinates lighting rendering block-id data-id matrix)
+  (let ((v1 (vertex left top back))
+        (v2 (vertex left top front))
+        (v3 (vertex right top front))
+        (v4 (vertex right top back)))
+    (generic-quad what i j k x y z v1 v2 v3 v4 uv uv-coordinates lighting top-shade rendering block-id data-id matrix)))
+
+
+(definition public (top-sloped what i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> left <fl> right <fl> bottom <fl> top <f64vector> back <fl> front <fl> uv <f32vector> uv-coordinates lighting rendering block-id data-id)
+  (let ((v1 (vertex left (first top) back))
+        (v2 (vertex left (second top) front))
+        (v3 (vertex right (third top) front))
+        (v4 (vertex right (fourth top) back))
+        (matrix (make-identity-matrix)))
+    (define (needs-triangles?)
+      (/= (/ (+ (vertex-y v1) (vertex-y v3)) 2.) (/ (+ (vertex-y v2) (vertex-y v4)) 2.)))
+    
+    (if (needs-triangles?)
+        (list
+          (generic-triangle what i j k x y z v1 v2 v4 uv uv-coordinates lighting top-shade rendering block-id data-id matrix)
+          (generic-triangle what i j k x y z v3 v4 v2 uv uv-coordinates lighting top-shade rendering block-id data-id matrix))
+      (list
+        (generic-quad what i j k x y z v1 v2 v3 v4 uv uv-coordinates lighting top-shade rendering block-id data-id matrix)))))
+
+
+(definition public (back-side what i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> uv <f32vector> lighting rendering block-id data-id)
+  (let ((left (fl& (- x block-radius)))
+        (right (fl& (+ x block-radius)))
+        (bottom (fl& (- y block-radius)))
+        (top (fl& (+ y block-radius)))
+        (back (fl& (- z block-radius)))
+        (front (fl& (+ z block-radius))))
+    (back-face what i j k x y z left right bottom top back front uv generic-coordinates lighting rendering block-id data-id)))
+
+
+(definition public (back-face what i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> left <fl> right <fl> bottom <fl> top <fl> back <fl> front <fl> uv <f32vector> uv-coordinates lighting rendering block-id data-id)
+  (make-quad-face what
+                  rendering
+                  (uv-coordinates uv)
+                  (uv-depth uv)
+                  (make-block-quad (vertex right top back) (vertex right bottom back) (vertex left bottom back) (vertex left top back) block-id data-id x y z)
+                  (lighting back-shade i j k  0  0 -1  0  1 -1  1  0 -1  1  1 -1)
+                  (lighting back-shade i j k  0 -1 -1  0  0 -1  1 -1 -1  1  0 -1)
+                  (lighting back-shade i j k -1 -1 -1 -1  0 -1  0 -1 -1  0  0 -1)
+                  (lighting back-shade i j k -1  0 -1 -1  1 -1  0  0 -1  0  1 -1)))
+
+
+(definition public (back-generic what i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> left <fl> right <fl> bottom <fl> top <fl> back <fl> front <fl> uv <f32vector> uv-coordinates lighting rendering block-id data-id matrix)
+  (let ((v1 (vertex right top back))
+        (v2 (vertex right bottom back))
+        (v3 (vertex left bottom back))
+        (v4 (vertex left top back)))
+    (generic-quad what i j k x y z v1 v2 v3 v4 uv uv-coordinates lighting back-shade rendering block-id data-id matrix)))
+
+
+(definition public (back-generic-quad what i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> left <fl> right <fl> bottom <fl> top <f64vector> back <fl> front <fl> uv <f32vector> uv-coordinates lighting rendering block-id data-id)
+  (let ((v1 (vertex right (first top) back))
+        (v2 (vertex right bottom back))
+        (v3 (vertex left bottom back))
+        (v4 (vertex left (second top) back)))
+    (generic-quad what i j k x y z v1 v2 v3 v4 uv uv-coordinates lighting back-shade rendering block-id data-id (make-identity-matrix))))
+
+
+(definition public (front-side what i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> uv <f32vector> lighting rendering block-id data-id)
+  (let ((left (fl& (- x block-radius)))
+        (right (fl& (+ x block-radius)))
+        (bottom (fl& (- y block-radius)))
+        (top (fl& (+ y block-radius)))
+        (back (fl& (- z block-radius)))
+        (front (fl& (+ z block-radius))))
+    (front-face what i j k x y z left right bottom top back front uv generic-coordinates lighting rendering block-id data-id)))
+
+
+(definition public (front-face what i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> left <fl> right <fl> bottom <fl> top <fl> back <fl> front <fl> uv <f32vector> uv-coordinates lighting rendering block-id data-id)
+  (make-quad-face what
+                  rendering
+                  (uv-coordinates uv)
+                  (uv-depth uv)
+                  (make-block-quad (vertex left top front) (vertex left bottom front) (vertex right bottom front) (vertex right top front) block-id data-id x y z)
+                  (lighting front-shade i j k -1  0  1 -1  1  1  0  0  1  0  1  1)
+                  (lighting front-shade i j k -1 -1  1 -1  0  1  0 -1  1  0  0  1)
+                  (lighting front-shade i j k  0 -1  1  0  0  1  1 -1  1  1  0  1)
+                  (lighting front-shade i j k  0  0  1  0  1  1  1  0  1  1  1  1)))
+
+
+(definition public (front-generic what i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> left <fl> right <fl> bottom <fl> top <fl> back <fl> front <fl> uv <f32vector> uv-coordinates lighting rendering block-id data-id matrix)
+  (let ((v1 (vertex left top front))
+        (v2 (vertex left bottom front))
+        (v3 (vertex right bottom front))
+        (v4 (vertex right top front)))
+    (generic-quad what i j k x y z v1 v2 v3 v4 uv uv-coordinates lighting front-shade rendering block-id data-id matrix)))
+
+
+(definition public (front-generic-quad what i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> left <fl> right <fl> bottom <fl> top <f64vector> back <fl> front <fl> uv <f32vector> uv-coordinates lighting rendering block-id data-id)
+  (let ((v1 (vertex left (first top) front))
+        (v2 (vertex left bottom front))
+        (v3 (vertex right bottom front))
+        (v4 (vertex right (second top) front)))
+    (generic-quad what i j k x y z v1 v2 v3 v4 uv uv-coordinates lighting front-shade rendering block-id data-id (make-identity-matrix))))
+
+
+(definition public (add-cuboid-generic what i j k x y z left right bottom top back front uv lighting rendering category block-id data-id matrix add-face)
+  (add-face (left-generic   what i j k x y z left right bottom top back front uv generic-coordinates lighting rendering block-id data-id matrix) rendering category)
+  (add-face (right-generic  what i j k x y z left right bottom top back front uv generic-coordinates lighting rendering block-id data-id matrix) rendering category)
+  (add-face (bottom-generic what i j k x y z left right bottom top back front uv generic-coordinates lighting rendering block-id data-id matrix) rendering category)
+  (add-face (top-generic    what i j k x y z left right bottom top back front uv generic-coordinates lighting rendering block-id data-id matrix) rendering category)
+  (add-face (back-generic   what i j k x y z left right bottom top back front uv generic-coordinates lighting rendering block-id data-id matrix) rendering category)
+  (add-face (front-generic  what i j k x y z left right bottom top back front uv generic-coordinates lighting rendering block-id data-id matrix) rendering category))
+
+
+(definition public (add-cube-faces what i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> uv <f32vector> lighting rendering category block-id data-id add-face)
+  (let ((left (fl& (- x block-radius)))
+        (right (fl& (+ x block-radius)))
+        (bottom (fl& (- y block-radius)))
+        (top (fl& (+ y block-radius)))
+        (back (fl& (- z block-radius)))
+        (front (fl& (+ z block-radius))))
+    (add-face (left-face   what i j k x y z left right bottom top back front uv generic-coordinates lighting rendering block-id data-id) rendering category)
+    (add-face (right-face  what i j k x y z left right bottom top back front uv generic-coordinates lighting rendering block-id data-id) rendering category)
+    (add-face (bottom-face what i j k x y z left right bottom top back front uv generic-coordinates lighting rendering block-id data-id) rendering category)
+    (add-face (top-face    what i j k x y z left right bottom top back front uv generic-coordinates lighting rendering block-id data-id) rendering category)
+    (add-face (back-face   what i j k x y z left right bottom top back front uv generic-coordinates lighting rendering block-id data-id) rendering category)
+    (add-face (front-face  what i j k x y z left right bottom top back front uv generic-coordinates lighting rendering block-id data-id) rendering category)))
+
+
+(definition public (add-cross-faces what i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> uv <f32vector> lighting rendering category block-id data-id add-face)
+  (let ((left (fl& (- x block-radius)))
+        (right (fl& (+ x block-radius)))
+        (bottom (fl& (- y block-radius)))
+        (top (fl& (+ y block-radius)))
+        (back (fl& (- z block-radius)))
+        (front (fl& (+ z block-radius)))
+        (tl (uv-left uv))
+        (tt (uv-top uv))
+        (tr (uv-right uv))
+        (tb (uv-bottom uv))
+        (texture-depth (uv-depth uv))
+        (lighting (uniform-lighting i j k lighting)))
+    (add-face (make-quad-face what
+                              rendering
+                              (f32vector tl tt tl tb tr tb tr tt)
+                              texture-depth
+                              (make-block-quad (vertex right top back) (vertex right bottom back) (vertex left bottom front) (vertex left top front) block-id data-id x y z)
+                              lighting lighting lighting lighting)
+              rendering
+              category)
+    (add-face (make-quad-face what
+                              rendering
+                              (f32vector tl tt tl tb tr tb tr tt)
+                              texture-depth
+                              (make-block-quad (vertex right top front) (vertex right bottom front) (vertex left bottom back) (vertex left top back) block-id data-id x y z)
+                              lighting lighting lighting lighting)
+              rendering
+              category)))
+
+
+(definition protected (add-torch what block-id data-id i j k x y z uv lighting rendering category add-face add-opaque-cube block-ref data-ref top-texture bottom-texture)
+  (define (position-torch proc)
+    (let ((margin .32))
+      (ecase data-id
+        ((1) (proc (- margin) 0.))
+        ((2) (proc margin 0.))
+        ((3) (proc 0. (- margin)))
+        ((4) (proc 0. margin))
+        (else (proc 0. 0.)))))
+  
+  (position-torch
+    (lambda (dx dz)
+      (let ((margin 1m)
+            (left (- x block-radius))
+            (right (+ x block-radius))
+            (bottom (- y block-radius))
+            (top (+ y block-radius))
+            (back (- z block-radius))
+            (front (+ z block-radius))
+            (top-uv (get-coordinates top-texture))
+            (bottom-uv (get-coordinates bottom-texture)))
+        (add-face (top-face    what i j k x y z (+ dx (- x margin)) (+ dx (+ x margin)) bottom (+ y (* 2 margin)) (+ dz (- z margin)) (+ dz (+ z margin)) top-uv generic-coordinates lighting rendering block-id data-id) rendering category)
+        (add-face (bottom-face what i j k x y z (+ dx (- x margin)) (+ dx (+ x margin)) bottom (+ y (* 2 margin)) (+ dz (- z margin)) (+ dz (+ z margin)) bottom-uv generic-coordinates lighting rendering block-id data-id) rendering category)
+        (add-face (left-face   what i j k x y z (+ dx (- x margin)) (+ dx right) bottom top (+ dz back) (+ dz front) uv generic-coordinates lighting rendering block-id data-id) rendering category)
+        (add-face (right-face  what i j k x y z (+ dx left) (+ dx (+ x margin)) bottom top (+ dz back) (+ dz front) uv generic-coordinates lighting rendering block-id data-id) rendering category)
+        (add-face (back-face   what i j k x y z (+ dx left) (+ dx right) bottom top (+ dz (- z margin)) (+ dz front) uv generic-coordinates lighting rendering block-id data-id) rendering category)
+        (add-face (front-face  what i j k x y z (+ dx left) (+ dx right) bottom top (+ dz back) (+ dz (+ z margin)) uv generic-coordinates lighting rendering block-id data-id) rendering category)))))
+
+
+(definition protected (add-button what block-id data-id i j k x y z uv lighting rendering category add-face add-opaque-cube block-ref data-ref)
+  (define (position-button proc)
+    (let ((orientation (bitwise-and data-id #b111))
+          (depth (if (bit-set? 3 data-id) 1m 2m))
+          (margin 3m)
+          (thick 2m)
+          (thin 1m))
+      (ecase orientation
+        ((0) (proc (- x margin) (+ x margin) (- (+ y block-radius) depth) (+ y block-radius) (- z thick) (+ z thick)))
+        ((1) (proc (- x block-radius) (+ (- x block-radius) depth) (- y thick) (+ y thick) (- z margin) (+ z margin)))
+        ((2) (proc (- (+ x block-radius) depth) (+ x block-radius) (- y thick) (+ y thick) (- z margin) (+ z margin)))
+        ((3) (proc (- x margin) (+ x margin) (- y thick) (+ y thick) (- z block-radius) (+ (- z block-radius) depth)))
+        ((4) (proc (- x margin) (+ x margin) (- y thick) (+ y thick) (- (+ z block-radius) depth) (+ z block-radius)))
+        ((5) (proc (- x margin) (+ x margin) (- y block-radius) (+ (- y block-radius) depth) (- z thick) (+ z thick))))))
+  
+  (position-button
+    (lambda (left right bottom top back front)
+      (add-face (left-face   what i j k x y z left right bottom top back front uv generic-coordinates lighting rendering block-id data-id) rendering category)
+      (add-face (right-face  what i j k x y z left right bottom top back front uv generic-coordinates lighting rendering block-id data-id) rendering category)
+      (add-face (bottom-face what i j k x y z left right bottom top back front uv generic-coordinates lighting rendering block-id data-id) rendering category)
+      (add-face (top-face    what i j k x y z left right bottom top back front uv generic-coordinates lighting rendering block-id data-id) rendering category)
+      (add-face (back-face   what i j k x y z left right bottom top back front uv generic-coordinates lighting rendering block-id data-id) rendering category)
+      (add-face (front-face  what i j k x y z left right bottom top back front uv generic-coordinates lighting rendering block-id data-id) rendering category))))
+
+
+(definition protected (add-json-model what filename block-id data-id i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> uv lighting rendering category add-face add-opaque-cube block-ref data-ref y-rotation x-rotation)
+  (define (read-json-model proc (file #f) (previous-textures #f))
+    (let ((models (load-block-model (or file filename))))
+      (let ((has-parent? (table-ref models "parent" #f))
+            (textures (or (table-ref models "textures" #f) previous-textures)))
+        (when (and previous-textures (table-ref models "textures" #f))
+          (iterate-table-safe textures
+            (lambda (key value)
+              (table-set! textures key (or (table-ref previous-textures (string-trailer value #\#) #f) value))))
+          (iterate-table previous-textures
+            (lambda (key value)
+              (unless (table-ref textures key #f)
+                (table-set! textures key value)))))
+        (if has-parent?
+            (read-json-model proc (string-append (string-trailer has-parent? #\/) ".json") textures)
+          (iterate-table-safe textures
+            (lambda (key value)
+              (table-set! textures key (string-trailer value #\/))))
+          (proc (table-ref models "elements") textures)))))
+  
+  (define (load-block-model filename)
+    (set-current-directory (new-directory~ {Directory Yownu-World "assets" "minecraft" "models"} texture-dir))
+    (load-json (new-file~ {Directory Yownu-World "assets" "minecraft" "models"} (if (file-exists? filename) (list texture-dir filename) (list "minecraft" filename)))))
+
+  (read-json-model
+    (lambda (elements textures)
+      (let ((matrix (matrix-multiply (make-y-rotation-matrix (degree->radian (cast <fl> y-rotation)))
+                                     (make-x-rotation-matrix (degree->radian (cast <fl> x-rotation))))))
+        (for-each
+          (lambda (element)
+            (define (get-file-texture face-name)
+              (let ((face (table-ref (table-ref element "faces") face-name #f)))
+                (when face
+                  (if (/= block-id 55)
+                      (let ((texture (get-coordinates (table-ref textures (string-trailer (table-ref face "texture") #\#)))))
+                        (bind (l t r b) (map (lambda (x) (/ (cast <fl> x) 16.)) (table-ref face "uv" '(0 0 16 16)))
+                          (uv-rect texture l t r b)))
+                    (let ((texture-name (string-trailer (table-ref face "texture") #\#)))
+                      (unless (ends-with? texture-name "overlay")
+                        (let ((texture (get-coordinates (string-append (table-ref textures texture-name) "_" (->string data-id)))))
+                          (bind (l t r b) (map (lambda (x) (/ (cast <fl> x) 16.)) (table-ref face "uv"))
+                            (uv-rect texture l t r b)))))))))
+            
+            (define (get-texture-rotation face-name)
+              (let ((face (table-ref (table-ref element "faces") face-name #f)))
+                (when face
+                  (let ((rot (or (table-ref face "rotation" #f) 0)))
+                    (case rot
+                      ((0)   generic-coordinates)
+                      ((90)  rotate-inverse-coordinates)
+                      ((180) rotate-other-coordinates)
+                      ((270) rotate-coordinates))))))
+            
+            (define (get-element-matrix)
+              (let ((rotation (table-ref element "rotation" #f)))
+                (if rotation
+                    (bind (x y z) (map (lambda (r) (/ (cast <fl> r) 16.)) (table-ref rotation "origin"))
+                      (let ((origin (vertex (- .5 x) (- .5 y) (- .5 z)))
+                            (rotation-matrix (case (string->symbol (table-ref rotation "axis"))
+                                               ((x) (make-x-rotation-matrix (degree->radian (cast <fl> (table-ref rotation "angle")))))
+                                               ((y) (make-y-rotation-matrix (- (degree->radian (cast <fl> (table-ref rotation "angle"))))))
+                                               ((z) (make-z-rotation-matrix (- (degree->radian (cast <fl> (table-ref rotation "angle")))))))))
+                        (matrix-multiply (make-translation-matrix (vertex-negate origin))
+                                         (matrix-multiply rotation-matrix (make-translation-matrix origin)))))
+                  (make-identity-matrix))))
+            
+            (bind (a b c) (map (lambda (x) (/ (cast <fl> x) 16.)) (table-ref element "from"))
+              (bind (d e f) (map (lambda (x) (/ (cast <fl> x) 16.)) (table-ref element "to"))
+                (unless (and (= a d) (= b e) (= c f))
+                  (let ((left (- a .5))
+                        (right (- d .5))
+                        (bottom (- b .5))
+                        (top (- e .5))
+                        (back (- c .5))
+                        (front (- f .5))
+                        (left-uv (get-file-texture "west"))
+                        (right-uv (get-file-texture "east"))
+                        (bottom-uv (get-file-texture "down"))
+                        (top-uv (get-file-texture "up"))
+                        (back-uv (get-file-texture "north"))
+                        (front-uv (get-file-texture "south"))
+                        (left-rotation (get-texture-rotation "west"))
+                        (right-rotation (get-texture-rotation "east"))
+                        (bottom-rotation (get-texture-rotation "down"))
+                        (top-rotation (get-texture-rotation "up"))
+                        (back-rotation (get-texture-rotation "north"))
+                        (front-rotation (get-texture-rotation "south"))
+                        (matrix (matrix-multiply matrix (get-element-matrix))))
+                    (when left-uv   (add-face (left-generic   what i j k x y z left right bottom top back front left-uv left-rotation lighting rendering block-id data-id matrix) rendering category))
+                    (when right-uv  (add-face (right-generic  what i j k x y z left right bottom top back front right-uv right-rotation lighting rendering block-id data-id matrix) rendering category))
+                    (when bottom-uv (add-face (bottom-generic what i j k x y z left right bottom top back front bottom-uv bottom-rotation lighting rendering block-id data-id matrix) rendering category))
+                    (when top-uv    (add-face (top-generic    what i j k x y z left right bottom top back front top-uv top-rotation lighting rendering block-id data-id matrix) rendering category))
+                    (when back-uv   (add-face (back-generic   what i j k x y z left right bottom top back front back-uv back-rotation lighting rendering block-id data-id matrix) rendering category))
+                    (when front-uv  (add-face (front-generic  what i j k x y z left right bottom top back front front-uv front-rotation lighting rendering block-id data-id matrix) rendering category)))))))
+          elements)))))
+
+
+;; unused
+(definition protected (add-stairs what data-id <fx> i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> uv lighting rendering category block-id add-face)
+  (let ((matrix (make-lookat-matrix& (horizon-lookat&^ (case (bitwise-and data-id #b11)
+                                                         ((3) (vertex&  0. 0. -1.))
+                                                         ((2) (vertex&  0. 0.  1.))
+                                                         ((1) (vertex& -1. 0.  0.))
+                                                         ((0) (vertex&  1. 0.  0.)))))))
+    ;; bottom
+    (let ((left (fl& (- block-radius)))
+          (right (fl& (+ block-radius)))
+          (bottom (fl& (- block-radius)))
+          (top 0.)
+          (back (fl& (- block-radius)))
+          (front (fl& (+ block-radius))))
+      (add-cuboid-generic what i j k x y z left right bottom top back front uv lighting rendering category block-id data-id matrix add-face))
+    ;; top
+    (let ((left (fl& (- block-radius)))
+          (right (fl& (+ block-radius)))
+          (bottom 0.)
+          (top (fl& (+ block-radius)))
+          (back 0.)
+          (front (fl& (+ block-radius))))
+      (add-cuboid-generic what i j k x y z left right bottom top back front uv lighting rendering category block-id data-id matrix add-face))))
+
+
+(definition protected (fence-configuration i <fx> j <fx> k <fx> block-ref connects)
+  (define (connect? block-id <fx>)
+    (memv? block-id connects))
+  
+  (bitwise-ior
+    ;; left
+    (if (connect? (block-ref (+ i 1) j k)) 1 0)
+    ;; right
+    (if (connect? (block-ref (- i 1) j k)) 2 0)
+    ;; back
+    (if (connect? (block-ref i j (+ k 1))) 4 0)
+    ;; front
+    (if (connect? (block-ref i j (- k 1))) 8 0)))
+
+
+(definition protected (add-fence what data-id <fx> config-data <fx> i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> uv <f32vector+> lighting rendering category block-id add-face block-ref)
+  (let ((matrix (make-lookat-matrix& (horizon-lookat&^ (vertex&  0. 0.  1.))))
+        (depth .075))
+    (define (add-trunk)
+      (let ((left (- .1))
+            (right (+ .1))
+            (bottom (- block-radius))
+            (top (+ block-radius))
+            (back (- .1))
+            (front (+ .1)))
+        (add-cuboid-generic what i j k x y z left right bottom top back front uv lighting rendering category block-id data-id matrix add-face)))
+    
+    (define (add-branches left <fl> right <fl> back <fl> front <fl>)
+      ;; upper
+      (let ((bottom (- .35 .075))
+            (top (+ .35 .075)))
+        (add-cuboid-generic what i j k x y z left right bottom top back front uv lighting rendering category block-id data-id matrix add-face))
+      ;; lower
+      (let ((bottom (- .075))
+            (top (+ .075)))
+        (add-cuboid-generic what i j k x y z left right bottom top back front uv lighting rendering category block-id data-id matrix add-face)))
+    
+    ;; trunk
+    (add-trunk)
+    ;; left
+    (when (bit-set? 0 config-data)
+      (add-branches .1 (+ block-radius) (- depth) depth))
+    ;; right
+    (when (bit-set? 1 config-data)
+      (add-branches (- block-radius) -.1 (- depth) depth))
+    ;; back
+    (when (bit-set? 2 config-data)
+      (add-branches (- depth) depth .1 (+ block-radius)))
+    ;; front
+    (when (bit-set? 3 config-data)
+      (add-branches (- depth) depth (- block-radius) -.1))))
+
+
+(definition protected (add-slab what i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> uv side-uv lighting rendering category block-id data-id add-face)
+  (let ((left (fl& (- x block-radius)))
+        (right (fl& (+ x block-radius)))
+        (bottom (fl& (- y block-radius)))
+        (top y)
+        (back (fl& (- z block-radius)))
+        (front (fl& (+ z block-radius))))
+    (add-face (left-face   what i j k x y z left right bottom top back front side-uv generic-coordinates lighting rendering block-id data-id) rendering category)
+    (add-face (right-face  what i j k x y z left right bottom top back front side-uv generic-coordinates lighting rendering block-id data-id) rendering category)
+    (add-face (bottom-face what i j k x y z left right bottom top back front uv generic-coordinates lighting rendering block-id data-id) rendering category)
+    (add-face (top-face    what i j k x y z left right bottom top back front uv generic-coordinates lighting rendering block-id data-id) rendering category)
+    (add-face (back-face   what i j k x y z left right bottom top back front side-uv generic-coordinates lighting rendering block-id data-id) rendering category)
+    (add-face (front-face  what i j k x y z left right bottom top back front side-uv generic-coordinates lighting rendering block-id data-id) rendering category)))
+
+
+(definition protected (add-sloped what i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> uv lighting rendering category block-id data-id add-face horizon)
+  (let ((left (fl& (- block-radius)))
+        (right (fl& (+ block-radius)))
+        (bottom (fl& (- block-radius)))
+        (top (fl& (+ block-radius)))
+        (back (fl& (- block-radius)))
+        (front (fl& (+ block-radius))))
+    (let ((v1 (vertex left top back))
+          (v2 (vertex left bottom front))
+          (v3 (vertex right bottom front))
+          (v4 (vertex right top back))
+          (matrix (make-lookat-matrix& (horizon-lookat&^ horizon))))
+      (add-face (generic-quad what i j k x y z v1 v2 v3 v4 uv generic-coordinates lighting no-shade rendering block-id data-id matrix) rendering category))))
+
+
+(definition protected (add-rail what data-id <fx> i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> uv lighting rendering category block-id add-face)
+  (case data-id
+    ((0) (add-bottom what i j k x y z uv generic-coordinates lighting rendering category block-id data-id add-face))
+    ((1) (add-bottom what i j k x y z uv rotate-coordinates lighting rendering category block-id data-id add-face))
+    ((2) (add-sloped what i j k x y z uv lighting rendering category block-id data-id add-face (vertex& -1. 0.  0.)))
+    ((3) (add-sloped what i j k x y z uv lighting rendering category block-id data-id add-face (vertex&  1. 0.  0.)))
+    ((4) (add-sloped what i j k x y z uv lighting rendering category block-id data-id add-face (vertex&  0. 0.  1.)))
+    ((5) (add-sloped what i j k x y z uv lighting rendering category block-id data-id add-face (vertex&  0. 0. -1.)))
+    ((6) (add-bottom what i j k x y z (get-coordinates "rail_normal_turned") generic-coordinates lighting rendering category block-id data-id add-face))
+    ((7) (add-bottom what i j k x y z (get-coordinates "rail_normal_turned") rotate-coordinates lighting rendering category block-id data-id add-face))
+    ((8) (add-bottom what i j k x y z (get-coordinates "rail_normal_turned") rotate-other-coordinates lighting rendering category block-id data-id add-face))
+    ((9) (add-bottom what i j k x y z (get-coordinates "rail_normal_turned") rotate-inverse-coordinates lighting rendering category block-id data-id add-face))))
+
+
+(definition protected (add-rail-gadget what data-id <fx> i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> uv uv-powered lighting rendering category block-id add-face)
+  (let ((powered? (bit-set? 3 data-id)))
+    (let ((uv (if powered? uv-powered uv)))
+      (case (bitwise-and data-id #b111)
+        ((0) (add-bottom what i j k x y z uv generic-coordinates lighting rendering category block-id data-id add-face))
+        ((1) (add-bottom what i j k x y z uv rotate-coordinates lighting rendering category block-id data-id add-face))
+        ((2) (add-sloped what i j k x y z uv lighting rendering category block-id data-id add-face (vertex& -1. 0.  0.)))
+        ((3) (add-sloped what i j k x y z uv lighting rendering category block-id data-id add-face (vertex&  1. 0.  0.)))
+        ((4) (add-sloped what i j k x y z uv lighting rendering category block-id data-id add-face (vertex&  0. 0.  1.)))
+        ((5) (add-sloped what i j k x y z uv lighting rendering category block-id data-id add-face (vertex&  0. 0. -1.)))))))
+
+
+(definition protected add-epsilon <fl>
+  .01)
+
+
+(definition protected (add-left what i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> uv uv-coordinates lighting rendering category block-id data-id add-face)
+  (let ((left (fl& (- x block-radius)))
+        (right (fl& (+ x block-radius)))
+        (bottom (fl& (- y block-radius)))
+        (top (fl& (+ y block-radius)))
+        (back (fl& (- z block-radius)))
+        (front (fl& (+ z block-radius))))
+    (add-face (right-face what i j k x y z left (+ left add-epsilon) bottom top back front uv uv-coordinates lighting rendering block-id data-id) rendering category)))
+
+
+(definition protected (add-right what i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> uv uv-coordinates lighting rendering category block-id data-id add-face)
+  (let ((left (fl& (- x block-radius)))
+        (right (fl& (+ x block-radius)))
+        (bottom (fl& (- y block-radius)))
+        (top (fl& (+ y block-radius)))
+        (back (fl& (- z block-radius)))
+        (front (fl& (+ z block-radius))))
+    (add-face (left-face what i j k x y z (- right add-epsilon) right bottom top back front uv uv-coordinates lighting rendering block-id data-id) rendering category)))
+
+
+(definition protected (add-bottom what i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> uv uv-coordinates lighting rendering category block-id data-id add-face)
+  (let ((left (fl& (- x block-radius)))
+        (right (fl& (+ x block-radius)))
+        (bottom (fl& (- y block-radius)))
+        (top (fl& (+ y block-radius)))
+        (back (fl& (- z block-radius)))
+        (front (fl& (+ z block-radius))))
+    (add-face (top-face what i j k x y z left right bottom (+ bottom add-epsilon) back front uv uv-coordinates lighting rendering block-id data-id) rendering category)))
+
+
+(definition protected (add-top what i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> uv uv-coordinates lighting rendering category block-id data-id add-face)
+  (let ((left (fl& (- x block-radius)))
+        (right (fl& (+ x block-radius)))
+        (bottom (fl& (- y block-radius)))
+        (top (fl& (+ y block-radius)))
+        (back (fl& (- z block-radius)))
+        (front (fl& (+ z block-radius))))
+    (add-face (bottom-face what i j k x y z left right (- top add-epsilon) top back front uv uv-coordinates lighting rendering block-id data-id) rendering category)))
+
+
+(definition protected (add-back what i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> uv uv-coordinates lighting rendering category block-id data-id add-face)
+  (let ((left (fl& (- x block-radius)))
+        (right (fl& (+ x block-radius)))
+        (bottom (fl& (- y block-radius)))
+        (top (fl& (+ y block-radius)))
+        (back (fl& (- z block-radius)))
+        (front (fl& (+ z block-radius))))
+    (add-face (front-face what i j k x y z left right bottom top back (+ back add-epsilon) uv uv-coordinates lighting rendering block-id data-id) rendering category)))
+
+
+(definition protected (add-front what i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> uv uv-coordinates lighting rendering category block-id data-id add-face)
+  (let ((left (fl& (- x block-radius)))
+        (right (fl& (+ x block-radius)))
+        (bottom (fl& (- y block-radius)))
+        (top (fl& (+ y block-radius)))
+        (back (fl& (- z block-radius)))
+        (front (fl& (+ z block-radius))))
+    (add-face (back-face what i j k x y z left right bottom top (- front add-epsilon) front uv uv-coordinates lighting rendering block-id data-id) rendering category)))
+
+
+(definition protected (add-transparent what data-id left right back front i j k x <fl> y <fl> z <fl> uv lighting rendering category block-id add-face)
+  (ecase data-id
+    ((left)  (add-left  what i j k x y z uv generic-coordinates lighting rendering category block-id data-id add-face))
+    ((right) (add-right what i j k x y z uv generic-coordinates lighting rendering category block-id data-id add-face))
+    ((back)  (add-back  what i j k x y z uv generic-coordinates lighting rendering category block-id data-id add-face))
+    (else    (add-front what i j k x y z uv generic-coordinates lighting rendering category block-id data-id add-face))))
+
+
+;;;
+;;;; Models
+;;;
+
+
+;; hacks to try out blocks rendered with ambient lighting
+
+
+(definition protected (generate-model what name block-id <fx> data-id <fx> i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> uv uv-coordinates lighting rendering category add-face)
+  (let ((world (current-world)))
+    (let ((model (find-model~ world name))
+          (center (vertex& x y z)))
+      (let ((matrix (make-translation-matrix& center)))
+        (let ((polygons (block-polygons-extract #f (get-polygons~ model) matrix block-id data-id x y z)))
+          (for-each (lambda (poly)
+                      (let ((normal (get-normal~ poly)))
+                        (let ((shade (determine-shade normal)))
+                          (define (triangle)
+                            (make-triangle-face what rendering (uv-coordinates uv) (uv-depth uv) poly
+                              (generic-lighting i j k (vertex-& (get-v1~ poly) center) normal lighting shade)
+                              (generic-lighting i j k (vertex-& (get-v2~ poly) center) normal lighting shade)
+                              (generic-lighting i j k (vertex-& (get-v3~ poly) center) normal lighting shade)))
+                          
+                          (define (quad)
+                            (make-quad-face what rendering (uv-coordinates uv) (uv-depth uv) poly
+                              (generic-lighting i j k (vertex-& (get-v1~ poly) center) normal lighting shade)
+                              (generic-lighting i j k (vertex-& (get-v2~ poly) center) normal lighting shade)
+                              (generic-lighting i j k (vertex-& (get-v3~ poly) center) normal lighting shade)
+                              (generic-lighting i j k (vertex-& (get-v4~ poly) center) normal lighting shade)))
+                          
+                          (add-face (if (is? poly Triangle)
+                                        (triangle)
+                                      (quad))
+                                    rendering
+                                    category))))
+                    polygons))))))
+
+
+(definition (determine-shade normal)
+  (cond ((vertex=? normal (vertex&  0.  1.  0.)) top-shade)
+        ((vertex=? normal (vertex&  0. -1.  0.)) bottom-shade)
+        ((vertex=? normal (vertex&  1.  0.  0.)) left-shade)
+        ((vertex=? normal (vertex& -1.  0.  0.)) right-shade)
+        ((vertex=? normal (vertex&  0.  0.  1.)) back-shade)
+        ((vertex=? normal (vertex&  0.  0. -1.)) front-shade)
+        (else no-shade))))
