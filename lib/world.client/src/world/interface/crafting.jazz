@@ -52,6 +52,20 @@
           (<Push-Button>          name: up title: "down" position: {Point 247 264} size: {Dimension 50 30} action-handler: {Event-Handler :form on-recipes-down})))))
   
   
+  (method override (set-visible? flag <bool>)
+    (when flag
+      (invalidate-recipes))
+    (nextmethod flag))
+  
+  
+  (method (invalidate-recipes)
+    (when visible?
+      (iterate-table recipes
+        (lambda (index recipe)
+          (set-verified?~ recipe #f)))
+      (verify-recipes~ (locate 'library) #t)))
+  
+  
   (method (on-recipes-up evt)
     (selection-up~ (locate 'library)))
   
@@ -105,7 +119,7 @@
   (method (set-recipe new-recipe)
     (if new-recipe
         (let ((block/item (name->block/item (car (get-output~ new-recipe)))))
-          (set! id (get-id~ block/item))
+          (set! id (if (is? block/item Block) (get-id~ block/item) (get-id~ block/item)))
           (set! durability (if (is? block/item Block) (get-variant-id~ block/item) (get-durability~ block/item)))
           (when recipe
             (reset-inventory-block self)))
@@ -123,44 +137,37 @@
   
   
   (method (verify-crafting)
-    (let ((interface (current-interface)))
-      (let ((bag (child~ interface 'bag))
-            (belt (child~ interface 'belt))
-            (input-slots (make-table))
-            (inputs (get-inputs~ recipe)))
-        (define (inventory-contains-all-inputs?)
-          (let ((reqs (list->table (get-inputs~ recipe))))
-            (define (test-done?)
-              (every? (lambda (x) (<= (cdr x) 0)) (table->list reqs)))
-            
-            (define (contains? pane)
-              (for-each (lambda (slot)
-                          (let ((id (get-id~ slot)))
-                            (when id
-                              (let ((name (if (< id 256) (get-name~ (id/durability->block id (get-durability~ slot))) (get-name~ (id->item id)))))
-                                (let ((remaining (table-ref reqs name #f)))
-                                  (when (and remaining (> remaining 0))
-                                    (table-set! input-slots slot remaining)
-                                    (table-set! reqs name (- remaining (get-count~ slot)))))))))
-                        (get-children~ pane))
-              #f)
-            
-            (or (test-done?)
-                (contains? belt)
-                (test-done?)
-                (contains? bag)
-                (test-done?))))
-        
-        (when (inventory-contains-all-inputs?)
-          (process-crafting bag belt input-slots)))))
+    (when (get-craftable?~ recipe)
+      (let ((interface (current-interface)))
+        (let ((belt (child~ interface 'belt))
+              (bag (child~ interface 'bag))
+              (items (get-inventory-items~ parent))
+              (input-slots (make-table)))
+          (define (rank->inventory-slot rank)
+            (if (< rank 9)
+                (rank->slot~ belt rank)
+              (rank->slot~ bag rank)))
+          
+          (for-each (lambda (input)
+                      (let ((amount (cdr input)))
+                        (let ((slot-ranks (get-indexes~ (table-ref items (car input)))))
+                          (let (iter (index 0))
+                            (let ((slot (rank->inventory-slot (list-ref slot-ranks index))))
+                              (table-set! input-slots slot amount)
+                              (decrease! amount (get-count~ slot)))
+                            (unless (<= amount 0)
+                              (iter (+ index 1)))))))
+                    (get-inputs~ recipe))
+          (process-crafting input-slots)))))
   
   
-  (method (process-crafting bag belt input-slots)
+  (method (process-crafting input-slots)
     (iterate-table input-slots
       (lambda (slot amount)
         (decrease-count~ slot amount)))
-    (deposit-inventory (name->block/item (car (get-output~ recipe))) count: (cdr (get-output~ recipe)))
-    (save-inventory))
+    (deposit-inventory (name->block/item (car (get-output~ recipe))) count: (cdr (get-output~ recipe)) notify-changed?: #f)
+    (save-inventory)
+    (inventory-changed))
   
   
   (method override (current-drop drag-drop pos)
@@ -172,7 +179,7 @@
       (define (present-item item)
         `(<paragraph>
            (<text> "   ")
-           (<text> color: World-Yellow ,(->string (car item)))
+           (<text> color: ,(if (memq? (car item) (get-missing-items~ recipe)) 'World-Red 'World-Green) ,(->string (car item)))
            (<text> " x ")
            (<text> ,(->string (cdr item)))))
       
@@ -206,6 +213,7 @@
   
   (slot slot-index      <fx>    initialize 0            getter explicit)
   (slot selection-index <fx>    initialize 0            getter explicit)
+  (slot inventory-items <table> initialize (make-table) getter generate)
   
   
   (method override (conclude initargs)
@@ -227,13 +235,15 @@
   (method (selection-up)
     (when (> selection-index 0)
       (decrease! selection-index)
-      (change-slots))
+      (change-slots)
+      (verify-recipes #f))
     (invalidate-view))
   
   (method (selection-down)
     (when (< (* (+ selection-index 1) 9) (table-length recipes))
       (increase! selection-index)
-      (change-slots))
+      (change-slots)
+      (verify-recipes #f))
     (invalidate-view))
   
   
@@ -248,12 +258,73 @@
         (set-recipe~ slot (table-ref recipes (+ index (* selection-index 9)) #f)))))
   
   
+  (method (collect-inventory)
+    (let ((items (make-table))
+          (interface (current-interface)))
+      (let ((bag (child~ interface 'bag))
+            (belt (child~ interface 'belt)))
+        (define (collect-pane pane)
+          (for-each (lambda (slot)
+                      (let ((id (get-id~ slot)))
+                        (when id
+                          (let ((name (if (< id 256) (get-name~ (id/durability->block id (get-durability~ slot))) (get-name~ (id->item id)))))
+                            (let ((indexer (table-ref items name #f)))
+                              (if (not indexer)
+                                  (table-set! items name (new Item-Indexer (get-count~ slot) (get-rank~ slot)))
+                                (increase-count~ indexer (get-count~ slot))
+                                (add-slot-index~ indexer (get-rank~ slot))))))))
+                    (get-children~ pane)))
+        
+        (collect-pane belt)
+        (collect-pane bag)
+        (set! inventory-items items))))
+  
+  
+  (method (verify-recipes collect?)
+    (when collect?
+      (collect-inventory))
+    (iterate-table slot-table
+      (lambda (index slot)
+        (let ((recipe (get-recipe~ slot)))
+          (when recipe
+            (verify-recipe~ recipe inventory-items))))))
+  
+  
   (method override (draw surface context)
     ))
 
 
 (definition protected (name->block/item name)
   (or (name->block name) (name->item name)))
+
+
+;;;
+;;;; Indexer
+;;;
+
+
+(class Item-Indexer extends Object
+  
+  
+  (slot count   <fx>    initialize 0           getter generate)
+  (slot indexes         initialize (new-queue) getter explicit)
+  
+  
+  (method override (initialize count index)
+    (set! count~self count)
+    (enqueue indexes index))
+  
+  
+  (method (add-slot-index index)
+    (enqueue indexes index))
+  
+  
+  (method (get-indexes)
+    (queue-list indexes))
+  
+  
+  (method (increase-count delta)
+    (increase! count delta)))
 
 
 ;;;
@@ -264,13 +335,33 @@
 (class Crafting-Recipe extends Object
   
   
-  (slot inputs  <list> initialize '() getter generate)
-  (slot output  <pair> initialize '() getter generate)
+  (slot inputs        <list> initialize '() getter generate)
+  (slot output        <pair> initialize '() getter generate)
+  (slot missing-items <list> initialize '() getter generate)
+  (slot craftable?    <bool> initialize #f  getter generate)
+  (slot verified?     <bool> initialize #f  accessors generate)
   
   
   (method override (initialize inputs output)
     (set! inputs~self inputs)
-    (set! output~self output)))
+    (set! output~self output))
+  
+  
+  (method (set-missing-items missing)
+    (set! missing-items missing)
+    (set! craftable? (null? missing-items)))
+  
+  
+  (method (verify-recipe items)
+    (unless verified?
+      (let ((missing (new-queue)))
+        (for-each (lambda (input)
+                    (let ((indexer (table-ref items (car input) #f)))
+                      (when (or (not indexer) (< (get-count~ indexer) (cdr input)))
+                        (enqueue missing (car input)))))
+                  inputs)
+        (set-missing-items (queue-list missing))
+        (set! verified? #t)))))
 
 
 ;;;
@@ -303,5 +394,5 @@
 (define-crafting-recipe '((BirchWood . 1)) '(IronBlock . 1))
 (define-crafting-recipe '((JungleWood . 15)) '(EmeraldBlock . 42))
 (define-crafting-recipe '((Cobblestone . 4) (OakWood . 3) (RedstoneWire . 1) (IronDoorBlock . 1)) '(Piston . 1))
-(define-crafting-recipe '((Diamond . 2) (Stick . 1)) '(GoldOre . 1))
+(define-crafting-recipe '() '(GoldOre . 1))
 (define-crafting-recipe '((Sand . 1) (Cobblestone . 1)) '(Diamond . 1)))
