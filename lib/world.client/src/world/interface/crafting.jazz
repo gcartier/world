@@ -98,7 +98,37 @@
   
   (method override (conclude initargs)
     (loop (for x from 0 below 3)
-          (table-set! slot-table x (new Inventory-Slot name: x parent: self position: (new Point (+ 180 (* x 70)) 16) rank: (+ 60 x))))))
+          (table-set! slot-table x (new Filter-Slot name: x parent: self position: (new Point (+ 180 (* x 70)) 16) rank: (+ 60 x) count: 1))))
+  
+  
+  (method (update-filter)
+    (let ((filters (new-queue)))
+      (define (add-filter name)
+        (unless (memq? name (queue-list filters))
+          (enqueue filters name)))
+      
+      (iterate-table slot-table
+        (lambda (index slot)
+          (let ((id (get-id~ slot)))
+            (when id
+              (add-filter (if (< id 256)
+                                   (get-name~ (id/durability->block id (get-durability~ slot)))
+                                 (get-name~ (id->item id))))))))
+      (filter-slots~ (locate~ (find-ascendant Crafting-Pane) 'library) (queue-list filters)))))
+              
+
+
+(class Filter-Slot extends Inventory-Slot
+  
+  
+  (method override (set-count value <fx>)
+    )
+  
+  
+  (method override (double-click evt)
+    (set! id #f)
+    (set! durability #f)
+    (update-filter~ parent)))
 
 
 ;;;
@@ -113,7 +143,7 @@
   
   
   (form
-    (<install>   size: {Dimension 48 48} tooltip?: #t draggable?: #f))
+    (<install>   size: {Dimension 48 48} background: {Color Black alpha: 0.} tooltip?: #t draggable?: #f))
   
   
   (method (set-recipe new-recipe)
@@ -121,6 +151,7 @@
         (let ((block/item (name->block/item (car (get-output~ new-recipe)))))
           (set! id (if (is? block/item Block) (get-id~ block/item) (get-id~ block/item)))
           (set! durability (if (is? block/item Block) (get-variant-id~ block/item) (get-durability~ block/item)))
+          (set! count (cdr (get-output~ new-recipe)))
           (when recipe
             (reset-inventory-block self)))
       (set! id #f)
@@ -213,9 +244,10 @@
 (class Crafting-Library extends Inventory-Pane
   
   
-  (slot slot-index      <fx>    initialize 0            getter explicit)
-  (slot selection-index <fx>    initialize 0            getter explicit)
-  (slot inventory-items <table> initialize (make-table) getter generate)
+  (slot slot-index       <fx>     initialize 0            getter explicit)
+  (slot selection-index  <fx>     initialize 0            getter explicit)
+  (slot inventory-items  <table>  initialize (make-table) getter generate)
+  (slot filtered-recipes <table+> initialize #f           getter explicit)
   
   
   (method override (conclude initargs)
@@ -257,7 +289,39 @@
   (method (change-slots)
     (iterate-table slot-table
       (lambda (index slot)
-        (set-recipe~ slot (table-ref recipes (+ index (* selection-index 9)) #f)))))
+        (set-recipe~ slot (table-ref (or filtered-recipes recipes) (+ index (* selection-index 9)) #f))))
+    (invalidate-view))
+  
+  
+  (method (filter-slots filters)
+    (set! selection-index 0)
+    (if (null? filters)
+        (set! filtered-recipes #f)
+      (let ((filtered-recipes (make-table)))
+        (define (sorted-recipes)
+          (let ((indexed (make-table))
+                (sorted (sort nu<? (table->list filtered-recipes) key: (lambda (element)
+                                                                         (let ((recipe (cdr element))
+                                                                               (no (length filters)))
+                                                                           (let ((output (car (get-output~ recipe))))
+                                                                             (list
+                                                                               (if (eq? (car filters) output) 0 1)
+                                                                               (if (and (> no 1) (eq? (cadr filters) output)) 0 1)
+                                                                               (if (and (> no 2) (eq? (caddr filters) output)) 0 1)
+                                                                               (car element))))))))
+            (loop (for x from 0 below (length sorted))
+                  (table-set! indexed x (cdr (list-ref sorted x))))
+            indexed))
+        
+        (define (recipe-filter recipe-names)
+          (every? (lambda (name) (memq? name recipe-names)) filters))
+        
+        (iterate-table recipes
+          (lambda (index recipe)
+            (when (recipe-filter (get-collected-names~ recipe))
+              (table-set! filtered-recipes index recipe))))
+        (set! filtered-recipes~self (sorted-recipes))))
+    (change-slots))
   
   
   (method (collect-inventory)
@@ -337,16 +401,27 @@
 (class Crafting-Recipe extends Object
   
   
-  (slot inputs        <list> initialize '() getter generate)
-  (slot output        <pair> initialize '() getter generate)
-  (slot missing-items <list> initialize '() getter generate)
-  (slot craftable?    <bool> initialize #f  getter generate)
-  (slot verified?     <bool> initialize #f  accessors generate)
+  (slot inputs          <list> initialize '() getter generate)
+  (slot output          <pair> initialize '() getter generate)
+  (slot collected-names <list> initialize '() getter generate)
+  (slot missing-items   <list> initialize '() getter generate)
+  (slot craftable?      <bool> initialize #f  getter generate)
+  (slot verified?       <bool> initialize #f  accessors generate)
   
   
   (method override (initialize inputs output)
     (set! inputs~self inputs)
-    (set! output~self output))
+    (set! output~self output)
+    (collect-names))
+  
+  
+  (method (collect-names)
+    (let ((names (new-queue)))
+      (for-each (lambda (input)
+                  (enqueue names (car input)))
+                inputs)
+      (enqueue names (car output))
+      (set! collected-names (queue-list names))))
   
   
   (method (set-missing-items missing)
@@ -387,14 +462,14 @@
   (add-recipe (new Crafting-Recipe inputs output)))
 
 
-(define-crafting-recipe '((OakWood . 1)) '(Torch . 4))
 (define-crafting-recipe '((SpruceWood . 1)) '(SprucePlank . 4))
 (define-crafting-recipe '((BirchWood . 1)) '(BirchPlank . 4))
 (define-crafting-recipe '((JungleWood . 1)) '(JunglePlank . 4))
-(define-crafting-recipe '((OakWood . 2)) '(DiamondBlock . 4))
-(define-crafting-recipe '((SpruceWood . 3)) '(GoldBlock . 5))
-(define-crafting-recipe '((BirchWood . 1)) '(IronBlock . 1))
-(define-crafting-recipe '((JungleWood . 15)) '(EmeraldBlock . 42))
-(define-crafting-recipe '((Cobblestone . 4) (OakWood . 3) (RedstoneWire . 1) (IronDoorBlock . 1)) '(Piston . 1))
-(define-crafting-recipe '() '(GoldOre . 1))
-(define-crafting-recipe '((Sand . 1) (Cobblestone . 1)) '(Diamond . 1)))
+(define-crafting-recipe '((OakWood . 2)) '(OakPlank . 4))
+(define-crafting-recipe '((OakPlank . 1)) '(Torch . 3))
+(define-crafting-recipe '((IronIngot . 10)) '(IronBlock . 1))
+(define-crafting-recipe '((GoldIngot . 10)) '(GoldBlock . 1))
+(define-crafting-recipe '((Cobblestone . 4) (OakWood . 3) (RedstoneDust . 1) (IronIngot . 1)) '(Piston . 1))
+(define-crafting-recipe '() '(OakWood . 1))
+(define-crafting-recipe '((Coal . 1) (Cobblestone . 1)) '(Diamond . 1))
+(define-crafting-recipe '((GoldBlock . 1)) '(GoldIngot . 10)))
