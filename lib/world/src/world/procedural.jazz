@@ -20,7 +20,8 @@
         (world.biome)
         (world.foreign.noise)
         (world.generation)
-        (world.generation.building))
+        (world.generation.building)
+        (world.geometry))
 
 
 (proclaim (warn optimizations))
@@ -47,8 +48,7 @@
   
   (method protected virtual (generate-chunk chunk block-ref block-set! data-set!)
     (let ((region (get-region~ chunk)))
-      (set-heightmap~ chunk (generate-heightmap (get-x~ chunk) (get-z~ chunk) (get-x~ region) (get-z~ region)))
-      (generate-blocks~ chunk block-ref block-set! data-set!)))
+      (generate-blocks~ chunk block-ref block-set! data-set! (generate-heightmap (get-x~ chunk) (get-z~ chunk) (get-x~ region) (get-z~ region)))))
   
   
   (method protected virtual (generate-heightmap chunk-x chunk-z region-x region-z)
@@ -90,11 +90,11 @@
 
 
 ;;;
-;;;; Simplex
+;;;; Old Simplex
 ;;;
 
 
-(class Simplex-Generator extends Generator
+(class Simplex-Generator-Old extends Generator
   
   
   (slot simplex initialize #f getter generate)
@@ -132,6 +132,287 @@
               (set! amplitude (* amplitude gain))
               (set! frequency (* frequency lacunarity))))
       heights)))
+
+
+;;;
+;;;; Simplex
+;;;
+
+
+(definition coordinate-scale <fl>
+  684.412) ;; 684.412
+
+
+(definition height-scale <fl>
+  684.412) ;; 684.412
+
+
+(definition depth-noise-scale-x <fl>
+  200.) ;; 200.
+
+(definition depth-noise-scale-z <fl>
+  200.) ;; 200.
+
+
+(definition main-noise-scale-x <fl>
+  80.) ;; 80.
+
+(definition main-noise-scale-y <fl>
+  160.) ;; 160.
+
+(definition main-noise-scale-z <fl>
+  80.) ;; 80.
+
+
+(definition base-size <fl>
+  8.5) ;; 8.5
+
+
+(definition lower-limit-scale <fl>
+  512.) ;; 512.
+
+(definition upper-limit-scale <fl>
+  512.) ;; 512.
+
+
+(definition default-base-height <fl>
+  .125)
+
+(definition default-height-variation <fl>
+  .05)
+
+
+(definition stretch-y <fl>
+  24.) ;; 12.
+
+
+(definition biome-depth-weight <fl>
+  1.) ;; 1.
+
+(definition biome-depth-offset <fl>
+  0.) ;; 0.
+
+(definition biome-scale-weight <fl>
+  1.) ;; 1.
+
+(definition biome-scale-offset <fl>
+  0.) ;; 0.
+
+
+(class Perlin-Attributes extends Object
+  
+  
+  (slot permutations initialize (make-vector 512) getter generate)
+  (slot x-coord      initialize 0.                getter generate)
+  (slot y-coord      initialize 0.                getter generate)
+  (slot z-coord      initialize 0.                getter generate)
+  
+  
+  (method override (initialize)
+    (set! x-coord (* (random-real) 256.))
+    (set! y-coord (* (random-real) 256.))
+    (set! z-coord (* (random-real) 256.))
+    (loop (for i from 0 below 256)
+          (vector-set! permutations i i))
+    (loop (for j from 0 below 256)
+          (let ((rnd (random-integer-between j 256))
+                (temp (vector-ref permutations j)))
+            (vector-set! permutations j (vector-ref permutations rnd))
+            (vector-set! permutations rnd temp)
+            (vector-set! permutations (+ j 256) (vector-ref permutations j))))))
+
+
+(class Simplex-Generator extends Generator
+  
+  
+  (slot biome-weights     initialize (make-vector 25 0.) getter generate)
+  (slot main-attributes   initialize (make-vector 8  (new Perlin-Attributes)) getter generate)
+  (slot min-attributes    initialize (make-vector 16 (new Perlin-Attributes)) getter generate)
+  (slot max-attributes    initialize (make-vector 16 (new Perlin-Attributes)) getter generate)
+  (slot depth-attributes  initialize (make-vector 16 (new Perlin-Attributes)) getter generate)
+  
+  
+  (method override (prepare rest)
+    (nextmethod rest)
+    (loop (for i from -2 below 3)
+          (loop (for j from -2 below 3)
+                (vector-set! biome-weights (+ i 2 (* (+ j 2) 5)) (/ 10. (sqrt (+ (* i i) (* j j) .2)))))))
+  
+  
+  (method override (generate-heightmap chunk-x <fx> chunk-z <fx> region-x <fx> region-z <fx>)
+    (let ((chunk-offset-x <fl> (cast <fl> (* (+ chunk-x (* 32. region-x)) 4.)))
+          (chunk-offset-z <fl> (cast <fl> (* (+ chunk-z (* 32. region-z)) 4.))))
+      (let ((depth-region (generate-perlin-noise depth-attributes chunk-offset-x 10. chunk-offset-z 5 1 5 depth-noise-scale-x 1. depth-noise-scale-z 16))
+            (main-noise (generate-perlin-noise main-attributes chunk-offset-x 0. chunk-offset-z 5 33 5 (/ coordinate-scale main-noise-scale-x) (/ height-scale main-noise-scale-y) (/ coordinate-scale main-noise-scale-z) 8))
+            (min-limit-region (generate-perlin-noise min-attributes chunk-offset-x 0. chunk-offset-z 5 33 5 coordinate-scale height-scale coordinate-scale 16))
+            (max-limit-region (generate-perlin-noise max-attributes chunk-offset-x 0. chunk-offset-z 5 33 5 coordinate-scale height-scale coordinate-scale 16))
+            (heightmap (make-vector 825 0.))
+            (heightmaps-index 0)
+            (depth-index 0))
+        (define (clamp a <fl> b <fl> w <fl>) <fl>
+          (cond ((< w 0.) a)
+                ((> w 1.) b)
+                (else (+ a (* (- b a) w)))))
+        
+        (loop (for x from 0 below 5)
+              (loop (for z from 0 below 5)
+                    (let ((total-height-var <fl> 0.)
+                          (total-height <fl> 0.)
+                          (total-weight <fl> 0.))
+                      (loop (for biome-x from -2 to 2)
+                            (loop (for biome-z from -2 to 2)
+                                  (let ((base-height <fl> (+ biome-depth-offset (* default-base-height biome-depth-weight)))
+                                        (height-variation <fl> (+ biome-scale-offset (* default-height-variation biome-scale-weight))))
+                                    (let ((weight <fl> (/ (vector-ref biome-weights (+ biome-x 2 (* (+ biome-z 2) 5))) (+ base-height 2.))))
+                                      (increase! total-height-var (* height-variation weight))
+                                      (increase! total-height (* base-height weight))
+                                      (increase! total-weight weight)))))
+                      (set! total-height-var (+ (* (/ total-height-var total-weight) .9) .1))
+                      (set! total-height (/ (- (* (/ total-height total-weight) 4.) 1) 8.))
+                      (let ((depth-factor <fl> (/ (vector-ref depth-region depth-index) 8000.)))
+                        (if (< depth-factor 0.)
+                            (set! depth-factor (- (* depth-factor -0.9) 2.))
+                          (set! depth-factor (- (* depth-factor 3.) 2.)))
+                        (if (< depth-factor 0.)
+                            (if (< depth-factor -2.)
+                                (set! depth-factor (/ -5. 14.))
+                              (divide! depth-factor 5.6))
+                          (if (> depth-factor 1.)
+                              (set! depth-factor 1.)
+                            (divide! depth-factor 8.)))
+                        (increase! depth-index)
+                        (set! total-height (* (+ total-height (* depth-factor .2)) (/ base-size 8.)))
+                        (let ((height-factor <fl> (+ base-size (* total-height 4.))))
+                          (loop (for y from 0 below 33)
+                                (let ((min-height <fl> (* (- y height-factor) (/ stretch-y 2. total-height-var))))
+                                  (when (< min-height 0.)
+                                    (multiply! min-height 4.))
+                                  (let ((min-limit <fl> (/ (vector-ref min-limit-region heightmaps-index) lower-limit-scale))
+                                        (max-limit <fl> (/ (vector-ref max-limit-region heightmaps-index) upper-limit-scale))
+                                        (main-height <fl> (/ (+ (/ (vector-ref main-noise heightmaps-index) 10.) 1.) 2.)))
+                                    (let ((normalized-height <fl> (- (clamp min-limit max-limit main-height) min-height)))
+                                      (when (> y 29)
+                                        (let ((d6 (/ (- y 29) 3.)))
+                                          (set! normalized-height (+ (* normalized-height (- 1. d6)) (* -10. d6)))))
+                                      (vector-set! heightmap heightmaps-index normalized-height)
+                                      (increase! heightmaps-index))))))))))
+        heightmap)))
+  
+  
+  (method (generate-perlin-noise attributes <vector> x-offset <fl> y-offset <fl> z-offset <fl> x-size <fx> y-size <fx> z-size <fx> x-scale <fl> y-scale <fl> z-scale <fl> octaves <fx>)
+    (let (iter (i <fx> 0)
+               (noise <vector> (make-vector (* x-size y-size z-size) 0.))
+               (scaling <fl> 1.))
+      (if (< i octaves)
+          (let ((scaled-x-offset <fl> (* scaling x-offset x-scale))
+                (scaled-y-offset <fl> (* scaling y-offset y-scale))
+                (scaled-z-offset <fl> (* scaling z-offset z-scale)))
+              (generate-noise-octave noise (vector-ref attributes i) (flmodulo scaled-x-offset 16777216.) scaled-y-offset (flmodulo scaled-z-offset 16777216.) x-size y-size z-size (* x-scale scaling) (* y-scale scaling) (* z-scale scaling) scaling
+                (lambda (noise)
+                  (iter (+ i 1) noise (/ scaling 2.)))))
+        noise)))
+  
+  
+  (method (generate-noise-octave noise <vector> attributes <Perlin-Attributes> x-offset <fl> y-offset <fl> z-offset <fl> x-size <fx> y-size <fx> z-size <fx> x-scale <fl> y-scale <fl> z-scale <fl> scaling <fl> proc)
+    (define (smooth/floor offset <fl> proc)
+      (let ((x <fx> (fxfloor offset)))
+        (proc (bitwise-and x 255) (- offset x) (smooth (- offset x)))))
+    
+    (define (permute x <fx>) <fx>
+      (vector-ref (get-permutations~ attributes) x))
+    
+    (if (= y-size 1)
+        (let ((j <fx> 0)
+              (i5 <fx> 0)
+              (j5 <fx> 0)
+              (k5 <fx> 0)
+              (d14 <fl> 0.)
+              (d15 <fl> 0.)
+              (d21 <fl> 0.)
+              (index <fx> 0))
+          (loop (for x from 0 below x-size)
+                (smooth/floor (+ x-offset (* x x-scale) (get-x-coord~ attributes))
+                  (lambda (k2 d17 d18)
+                    (loop (for z from 0 below z-size)
+                          (smooth/floor (+ z-offset (* z z-scale) (get-z-coord~ attributes))
+                            (lambda (l6 d19 d20)
+                              (set! i5 (permute k2))
+                              (set! j5 (+ (permute i5) l6))
+                              (set! j (permute (+ k2 1)))
+                              (set! k5 (+ (permute j) l6))
+                              (set! d14 (lerp (grad-2d (permute j5) d17 d19) (grad-2d (permute k5) (- d17 1) d19) d18))
+                              (set! d15 (lerp (grad-2d (permute (+ j5 1)) d17 (- d19 1)) (grad-2d (permute (+ k5 1)) (- d17 1) (- d19 1)) d18))
+                              (set! d21 (lerp d14 d15 d20))
+                              (vector-set! noise index (+ (vector-ref noise index) (/ d21 scaling)))
+                              (increase! index))))))))
+      (let ((k <fx> -1)
+            (l <fx> 0)
+            (i1 <fx> 0)
+            (j1 <fx> 0)
+            (k1 <fx> 0)
+            (l1 <fx> 0)
+            (i2 <fx> 0)
+            (d1 <fl> 0.)
+            (d2 <fl> 0.)
+            (d3 <fl> 0.)
+            (d4 <fl> 0.)
+            (d11 <fl> 0.)
+            (d12 <fl> 0.)
+            (d13 <fl> 0.)
+            (index <fx> 0))
+        (loop (for x from 0 below x-size)
+              (smooth/floor (+ x-offset (* x x-scale) (get-x-coord~ attributes))
+                (lambda (j3 d5 d6)
+                  (loop (for z from 0 below z-size)
+                        (smooth/floor (+ z-offset (* z z-scale) (get-z-coord~ attributes))
+                          (lambda (i4 d7 d8)
+                            (loop (for y from 0 below y-size)
+                                  (smooth/floor (+ y-offset (* y y-scale) (get-y-coord~ attributes))
+                                    (lambda (l4 d9 d10)
+                                      (when (or (= y 0) (/= l4 k))
+                                        (set! k l4)
+                                        (set! l (+ (permute j3) l4))
+                                        (set! i1 (+ (permute l) i4))
+                                        (set! j1 (+ (permute (+ l 1)) i4))
+                                        (set! k1 (+ (permute (+ j3 1)) l4))
+                                        (set! l1 (+ (permute k1) i4))
+                                        (set! i2 (+ (permute (+ k1 1)) i4))
+                                        (set! d1 (lerp (grad (permute i1) d5 d9 d7) (grad (permute l1) (- d5 1) d9 d7) d6))
+                                        (set! d2 (lerp (grad (permute j1) d5 (- d9 1) d7) (grad (permute i2) (- d5 1) (- d9 1) d7) d6))
+                                        (set! d3 (lerp (grad (permute (+ i1 1)) d5 d9 (- d7 1)) (grad (permute (+ l1 1)) (- d5 1) d9 (- d7 1)) d6))
+                                        (set! d4 (lerp (grad (permute (+ j1 1)) d5 (- d9 1) (- d7 1)) (grad (permute (+ i2 1)) (- d5 1) (- d9 1) (- d7 1)) d6)))
+                                      (set! d11 (lerp d1 d2 d10))
+                                      (set! d12 (lerp d3 d4 d10))
+                                      (set! d13 (lerp d11 d12 d8))
+                                      (vector-set! noise index (+ (vector-ref noise index) (/ d13 scaling)))
+                                      (increase! index))))))))))))
+    (proc noise)))
+                            
+
+(definition inline (smooth x <fl>) <fl>
+  (* x x x (+ (* x (- (* x 6.) 15.)) 10.)))
+
+
+(definition grad-x
+  #(1. -1. 1. -1. 1. -1. 1. -1. 0. 0. 0. 0. 1. 0. -1. 0.))
+
+(definition grad-y
+  #(1. 1. -1. -1. 0. 0. 0. 0. 1. -1. 1. -1. 1. -1. 1. -1.))
+
+(definition grad-z
+  #(0. 0. 0. 0. 1. 1. -1. -1. 1. 1. -1. -1. 0. 1. 0. -1.))
+
+(definition (grad index <fx> x <fl> y <fl> z <fl>) <fl>
+  (let ((i (bitwise-and index #b1111)))
+    (+ (* (vector-ref grad-x i) x) (* (vector-ref grad-y i) y) (* (vector-ref grad-z i) z))))
+
+(definition (grad-2d index <fx> x <fl> z <fl>) <fl>
+  (let ((i (bitwise-and index #b1111)))
+    (+ (* (vector-ref grad-x i) x) (* (vector-ref grad-z i) z))))
+
+
+(definition (lerp a <fl> b <fl> w <fl>) <fl>
+  (+ a (* w (- b a))))
 
 
 ;;;
