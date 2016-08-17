@@ -15,6 +15,7 @@
 
 
 (import (jazz.geometry)
+        (jazz.syntax (phase syntax))
         (world)
         (world.autoload)
         (world.biome)
@@ -89,8 +90,8 @@
   (slot raw                                           accessors generate)
   (slot region                                        getter generate)
   (slot tag                                           getter generate)
-  (slot biomes                                        accessors generate)
-  (slot heightmap             <vector+>               accessors generate)
+  (slot biomes                <u8vector>              accessors generate)
+  (slot heightmap             <vector>                accessors generate)
   (slot entities                                      getter generate)
   (slot block-entities                                getter generate)
   (slot block-entities-index  <table+>                getter generate)
@@ -233,34 +234,46 @@
   
   
   (method (generate register-chunk)
+    (declare (proper-tail-calls))
+    (declare (optimize-dead-local-variables))
+    (declare (inline))
+    (declare (inlining-limit 1000))
     (let ((zone (current-zone)))
-      (define (local-index i <fx> j <fx> k <fx>) <fx>
-        (+ (* j 256) (* k 16) i))
-      
-      (define (block-ref section i <fx> j <fx> k <fx>) <fx>
-        (u8vector-ref (get-blocks~ section) (local-index i j k)))
-      
-      (define (block-set! section i <fx> j <fx> k <fx> block-id <fx> (replace? <bool> #t))
-        (when (or replace? (= (block-ref section i j k) 0))
-          (u8vector-set! (get-blocks~ section) (local-index i j k) block-id)))
-      
-      (define (data-set! section i <fx> j <fx> k <fx> data-id <fx> (check-id <bool> #f))
-        (when (or (not check-id) (= (block-ref section i j k) check-id))
-          (u4vector-set! (get-data~ section) (local-index i j k) data-id)))
-      
-      (define (u4vector-set! field <u8vector> index <fx> value <fx>)
-        (let ((offset (quotient index 2)))
-          (let ((byte (u8vector-ref field offset)))
-            (u8vector-set! field offset
-              (if (even? index)
-                  (bitwise-ior value (bitwise-and byte #xF0))
-                (bitwise-ior (bitwise-and byte #x0F) (arithmetic-shift value 4)))))))
-      
-      (unless (welcome?~ zone)
-        (let ((generator (get-generator~ zone)))
-          (generate-chunk~ generator self block-ref block-set! data-set! register-chunk)))
-      (generate-complete)
-      (modified)))
+      (let ((sections (make-vector 16 #f)))
+        (define (cache-section j <fx>)
+          (let ((y (fxfloor/ j 16)))
+            (or (vector-ref sections y)
+                (let ((section (get-section y)))
+                  (vector-set! sections y section)
+                  section))))
+        
+        (define (local-index i <fx> j <fx> k <fx>) <fx>
+          (+ (* j 256) (* k 16) i))
+        
+        (define (block-ref section <World-Section> i <fx> j <fx> k <fx>) <fx>
+          (u8vector-ref (get-blocks~ section) (local-index i j k)))
+        
+        (define (block-set! section <World-Section> i <fx> j <fx> k <fx> block-id <fx> (replace? <bool> #t))
+          (when (or replace? (= (block-ref section i j k) 0))
+            (u8vector-set! (get-blocks~ section) (local-index i j k) block-id)))
+        
+        (define (data-set! section <World-Section> i <fx> j <fx> k <fx> data-id <fx> (check-id <bool> #f))
+          (when (or (not check-id) (= (block-ref section i j k) check-id))
+            (u4vector-set! (get-data~ section) (local-index i j k) data-id)))
+        
+        (define (u4vector-set! field <u8vector> index <fx> value <fx>)
+          (let ((offset (quotient index 2)))
+            (let ((byte (u8vector-ref field offset)))
+              (u8vector-set! field offset
+                (if (even? index)
+                    (bitwise-ior value (bitwise-and byte #xF0))
+                  (bitwise-ior (bitwise-and byte #x0F) (arithmetic-shift value 4)))))))
+        
+        (unless (welcome?~ zone)
+          (let ((generator (get-generator~ zone)))
+            (generate-chunk~ generator self cache-section block-ref block-set! data-set! register-chunk)))
+        (generate-complete)
+        (modified))))
   
   
   (definition rand-seed
@@ -281,8 +294,12 @@
   
   
   (method (generate-blocks block-ref block-set! data-set! heightmap <f64vector>)
-    (let ((sections (make-vector 16 #f))
-          (heightmap-check (make-vector 256 #t))
+    (declare (proper-tail-calls))
+    (declare (optimize-dead-local-variables))
+    (declare (inline))
+    (declare (inlining-limit 1000))
+    (site (blocks on?: #t parent: generate)
+    (let ((heightmap-check (make-vector 256 #t))
           (zone (current-zone)))
       
       (define (with-tons-of-variables i l i2 j2 k2 l2 proc)
@@ -337,7 +354,37 @@
                                           (increase! d1 d5)
                                           (increase! d2 d6)
                                           (increase! d3 d7)
-                                          (increase! d4 d8)))))))))))))
+                                          (increase! d4 d8))))))))))))))
+
+
+  (method (replace-biome-blocks get-section block-ref block-set! data-set!)
+    (declare (proper-tail-calls))
+    (declare (optimize-dead-local-variables))
+    (declare (inline))
+    (declare (inlining-limit 1000))
+    (site (replace on?: #t parent: generate)
+    (loop (for x from 0 below 16)
+          (loop (for z from 0 below 16)
+                (let ((biome <Biome> (id->biome (u8vector-ref biomes (+ x (* z 16)))))
+                      (replace-amount -1))
+                  (let (iter (height 255))
+                    (let ((section (get-section height))
+                          (y (modulo height 16)))
+                      (if (<= height (randomInt rand 5))
+                          (block-set! section x y z 7)
+                        (let ((block-id <fx> (block-ref section x y z)))
+                          (if (= block-id 0)
+                              (set! replace-amount -1)
+                            (when (= block-id 1)
+                              (if (= replace-amount -1)
+                                  (begin
+                                    (block-set! section x y z (get-top~ biome))
+                                    (set! replace-amount (randomIntBetween rand 3 5)))
+                                (when (> replace-amount 0)
+                                  (block-set! section x y z (get-fill~ biome))
+                                  (decrease! replace-amount))))))))
+                    (when (> height 0)
+                      (iter (- height 1)))))))))
   
   
   (method (generate-caves block-ref block-set! data-set!)
@@ -345,6 +392,7 @@
     (declare (optimize-dead-local-variables))
     (declare (inline))
     (declare (inlining-limit 1000))
+    (site (caves on?: #t parent: generate)
     (let ((range 8)
           (br block-ref)
           (bs block-set!)
@@ -353,8 +401,7 @@
           (Stone 1)
           (Water 8)
           (StationaryWater 9)
-          (Lava 10)
-          (LapisBlock 22)) ;; quicky
+          (Lava 10))
       (define (block-ref i <fx> j <fx> k <fx>) <fx>
         (br (get-section (fxfloor/ j 16)) i (modulo j 16) k))
       
@@ -368,158 +415,162 @@
         (add-tunnel seed chunkX chunkZ rx ry rz (+ 1.0 (* (randomFloat rand) 6.0)) 0.0 0.0 -1 -1 0.5))
       
       (define (add-tunnel seed chunkX <fx> chunkZ <fx> rx <fl> ry <fl> rz <fl> p_180702_12_ <fl> p_180702_13_ <fl> p_180702_14_ <fl> p_180702_15_ <fx> p_180702_16_ <fx> p_180702_17_ <fl>)
-        (let ((d0 (+ (* (cast <fl> chunkX) 16.) 8.))
-              (d1 (+ (* (cast <fl> chunkZ) 16.) 8.))
-              (f0 0.)
-              (f1 0.))
-          (let ((random (newRandom seed)))
-            (when (<= p_180702_16_ 0)
-              (let ((i (- (* range 16) 16)))
-                (set! p_180702_16_ (- i (randomInt random (/ i 4))))))
-            (let ((flag2 #f))
-              (when (= p_180702_15_ -1)
-                (set! p_180702_15_ (fxfloor/ p_180702_16_ 2)) ;; was /
-                (set! flag2 #t))
-              (let ((j (+ (randomInt random (fxfloor/ p_180702_16_ 2)) (fxfloor/ p_180702_16_ 4))) ;; was /
-                    (flag (= (randomInt random 6) 0)))
-                (continuation-capture
-                  (lambda (continue)
-                    (loop (for p_180702_15_ from p_180702_15_ below p_180702_16_)
-                          (let ((d2
-                                  (+ 1.5
-                                     (* (sin
-                                          (/ (* (cast <fl> p_180702_15_) PI)
-                                             (cast <fl> p_180702_16_)))
-                                        p_180702_12_))))
-                            (let ((d3 (* d2 p_180702_17_)))
-                              (let ((f2 (cos p_180702_14_)))
-                                (let ((f3 (sin p_180702_14_)))
-                                  (increase! rx (* (cos p_180702_13_) f2))
-                                  (increase! ry f3)
-                                  (increase! rz (* (sin p_180702_13_) f2))
-                                  (if flag
-                                      (set! p_180702_14_ (* p_180702_14_ .92))
-                                    (set! p_180702_14_ (* p_180702_14_ .7)))
-                                  (set! p_180702_14_ (+ p_180702_14_ (* f1 .1)))
-                                  (increase! p_180702_13_ (* f0 .1))
-                                  (set! f1 (* f1 .9))
-                                  (set! f0 (* f0 .75))
-                                  (set! f1 (+ f1 (* (- (randomFloat random) (randomFloat random)) (randomFloat random) 2.)))
-                                  (set! f0 (+ f0 (* (- (randomFloat random) (randomFloat random)) (randomFloat random) 4.)))
-                                  (when (and (not flag2)
-                                             (= p_180702_15_ j)
-                                             (> p_180702_12_ 1.)
-                                             (> p_180702_16_ 0))
-                                    (add-tunnel (randomLong random) chunkX chunkZ rx ry rz (+ (* (randomFloat random) .5) .5) (- p_180702_13_ (/ PI 2.)) (/ p_180702_14_ 3.) p_180702_15_ p_180702_16_ 1.)
-                                    (add-tunnel (randomLong random) chunkX chunkZ rx ry rz (+ (* (randomFloat random) .5) .5) (+ p_180702_13_ (/ PI 2.)) (/ p_180702_14_ 3.) p_180702_15_ p_180702_16_ 1.))
-                                  (when (or flag2 (/= (randomInt random 4) 0))
-                                    (let ((d4 (- rx d0)))
-                                      (let ((d5 (- rz d1)))
-                                        (let ((d6 (- p_180702_16_ p_180702_15_)))
-                                          (let ((d7 (+ p_180702_12_ 2. 16.)))
-                                            (when (> (- (+ (* d4 d4) (* d5 d5))
-                                                        (* d6 d6))
-                                                     (* d7 d7)))
-                                            (when (and (>= rx (- (- d0 16.) (* d2 2.)))
-                                                       (>= rz (- (- d1 16.) (* d2 2.)))
-                                                       (<= rx (+ d0 16. (* d2 2.)))
-                                                       (<= rz (+ d1 16. (* d2 2.))))
-                                              (let ((k2 (- (- (fxfloor (- rx d2)) (* chunkX 16)) 1))
-                                                    (k (+ (- (fxfloor (+ rx d2)) (* chunkX 16)) 1))
-                                                    (l2 (- (fxfloor (- ry d3)) 1))
-                                                    (l (+ (fxfloor (+ ry d3)) 1))
-                                                    (i3 (- (- (fxfloor (- rz d2)) (* chunkZ 16)) 1))
-                                                    (i1 (+ (- (fxfloor (+ rz d2)) (* chunkZ 16)) 1)))
-                                                (when (< k2 0) (set! k2 0))
-                                                (when (> k 16) (set! k 16))
-                                                (when (< l2 1) (set! l2 1))
-                                                (when (> l 248) (set! l 248))
-                                                (when (< i3 0) (set! i3 0))
-                                                (when (> i1 16) (set! i1 16))
-                                                (let ((flag3 #f))
-                                                  @wait
-                                                  (loop (for j1 init k2 test (and (not flag3) (< j1 k)) iter (+ j1 1))
-                                                        (loop (for k1 init i3 test (and (not flag3) (< k1 i1)) iter (+ k1 1))
-                                                              (loop (for l1 init (+ l 1) test (and (not flag3) (>= l1 (- l2 1))) iter (- l1 1))
-                                                                    (when (and (>= l1 0) (< l1 256))
-                                                                      (let ((block (block-ref j1 l1 k1)))
-                                                                        (when (or (= block Water)
-                                                                                  (= block StationaryWater))
-                                                                          (set! flag3 #t))
-                                                                        (when (and (/= l1 (- l2 1))
-                                                                                   (/= j1 k2)
-                                                                                   (/= j1 (- k 1))
-                                                                                   (/= k1 i3)
-                                                                                   (/= k1 (- i1 1)))
-                                                                          (set! l1 l2)))))))
-                                                  (when #t @wait (not flag3)
-                                                    (let ((mutableblockpos #f @wait (new MutableBlockPos)))
-                                                      (loop (for j3 init k2 test (< j3 k) iter (+ j3 1))
-                                                            (let ((d10 (/ (- (+ j3 (* chunkX 16) .5) rx) d2)))
-                                                              (loop (for i2 init i3 test (< i2 i1) iter (+ i2 1))
-                                                                    (let ((d8 (/ (- (+ i2 (* chunkZ 16) .5) rz) d2)))
-                                                                      (let ((flag1 #f))
-                                                                        (when (< (+ (* d10 d10) (* d8 d8)) 1.)
-                                                                          (loop (for j2 init l test (> j2 l2) iter (- j2 1))
-                                                                                (let ((d9 (/ (- (+ (- j2 1) .5) ry) d3)))
-                                                                                  (when (and (> d9 (- .7))
-                                                                                             (< (+ (* d10 d10) (* d9 d9) (* d8 d8)) 1.))
-                                                                                    (let () @wait ((iblockstate1
-                                                                                                     (getBlockState~ chunkPrimerIn j3 j2 i2))
-                                                                                                   (iblockstate2
-                                                                                                     (firstNonNull~
-                                                                                                       Objects
-                                                                                                       (getBlockState~ chunkPrimerIn j3 (+ j2 1) i2)
-                                                                                                       BLK_AIR)))
-                                                                                      @wait
-                                                                                      (when (or (= (getBlock~ iblockstate1) (GRASS~ Blocks))
-                                                                                                (= (getBlock~ iblockstate1) (MYCELIUM~ Blocks)))
-                                                                                        (set! flag1 #t))
-                                                                                      ;; quick try
-                                                                                      (block-set! j3 j2 i2 Stone)
-                                                                                      @wait
-                                                                                      (when (can-replace-block? iblockstate1 iblockstate2)
-                                                                                        (if (< (- j2 1) 10)
-                                                                                            (block-set! j3 j2 i2 Lava)
-                                                                                          (begin
-                                                                                            (block-set! j3 j2 i2 Air)
-                                                                                            @wait
-                                                                                            (when (= (getBlock~ iblockstate2)
-                                                                                                     (SAND~ Blocks))
-                                                                                              ;; CONVERT
-                                                                                              ;; chunkPrimerIn.setBlockState(j3, j2 + 1, i2, iblockstate2.getValue(BlockSand.VARIANT) == BlockSand.EnumType.RED_SAND ? BLK_RED_SANDSTONE : BLK_SANDSTONE)
-                                                                                              )
-                                                                                            @wait
-                                                                                            (when (and flag1
-                                                                                                       (= (getBlock~
-                                                                                                            (getBlockState~
-                                                                                                              chunkPrimerIn
-                                                                                                              j3
-                                                                                                              (- j2 1)
-                                                                                                              i2))
-                                                                                                          (DIRT~ Blocks)))
-                                                                                              (set~ mutableblockpos
-                                                                                                (+ j3 (* chunkX 16))
-                                                                                                0
-                                                                                                (+ i2 (* chunkZ 16)))
-                                                                                              (block-set!
-                                                                                                j3
-                                                                                                (- j2 1)
-                                                                                                i2
-                                                                                                (getDefaultState~
-                                                                                                  (getBlock~
-                                                                                                    (topBlock~
-                                                                                                      (getBiomeGenForCoords~
-                                                                                                        worldObj
-                                                                                                        mutableblockpos)))))))))))))))))))
-                                                      (when flag2
-                                                        (continuation-return continue #f))))))))))))))))))))))))
+        (continuation-capture
+          (lambda (return)
+            (let ((d0 (+ (* (cast <fl> chunkX) 16.) 8.))
+                  (d1 (+ (* (cast <fl> chunkZ) 16.) 8.))
+                  (f0 0.)
+                  (f1 0.))
+              (let ((random (newRandom seed)))
+                (when (<= p_180702_16_ 0)
+                  (let ((i (- (* range 16) 16)))
+                    (set! p_180702_16_ (- i (randomInt random (/ i 4))))))
+                (let ((flag2 #f))
+                  (when (= p_180702_15_ -1)
+                    (set! p_180702_15_ (fxfloor/ p_180702_16_ 2))
+                    (set! flag2 #t))
+                  (let ((j (+ (randomInt random (fxfloor/ p_180702_16_ 2)) (fxfloor/ p_180702_16_ 4)))
+                        (flag (= (randomInt random 6) 0)))
+                    (continuation-capture
+                      (lambda (continue)
+                        (loop (for p_180702_15_ from p_180702_15_ below p_180702_16_)
+                              (let ((d2
+                                      (+ 1.5
+                                         (* (sin
+                                              (/ (* (cast <fl> p_180702_15_) PI)
+                                                 (cast <fl> p_180702_16_)))
+                                            p_180702_12_))))
+                                (let ((d3 (* d2 p_180702_17_)))
+                                  (let ((f2 (cos p_180702_14_)))
+                                    (let ((f3 (sin p_180702_14_)))
+                                      (increase! rx (* (cos p_180702_13_) f2))
+                                      (increase! ry f3)
+                                      (increase! rz (* (sin p_180702_13_) f2))
+                                      (if flag
+                                          (set! p_180702_14_ (* p_180702_14_ .92))
+                                        (set! p_180702_14_ (* p_180702_14_ .7)))
+                                      (set! p_180702_14_ (+ p_180702_14_ (* f1 .1)))
+                                      (increase! p_180702_13_ (* f0 .1))
+                                      (set! f1 (* f1 .9))
+                                      (set! f0 (* f0 .75))
+                                      (set! f1 (+ f1 (* (- (randomFloat random) (randomFloat random)) (randomFloat random) 2.)))
+                                      (set! f0 (+ f0 (* (- (randomFloat random) (randomFloat random)) (randomFloat random) 4.)))
+                                      (when (and (not flag2)
+                                                 (= p_180702_15_ j)
+                                                 (> p_180702_12_ 1.)
+                                                 (> p_180702_16_ 0))
+                                        (add-tunnel (randomLong random) chunkX chunkZ rx ry rz (+ (* (randomFloat random) .5) .5) (- p_180702_13_ (/ PI 2.)) (/ p_180702_14_ 3.) p_180702_15_ p_180702_16_ 1.)
+                                        (add-tunnel (randomLong random) chunkX chunkZ rx ry rz (+ (* (randomFloat random) .5) .5) (+ p_180702_13_ (/ PI 2.)) (/ p_180702_14_ 3.) p_180702_15_ p_180702_16_ 1.)
+                                        (continuation-return return #f))
+                                      (when (or flag2 (/= (randomInt random 4) 0))
+                                        (let ((d4 (- rx d0)))
+                                          (let ((d5 (- rz d1)))
+                                            (let ((d6 (- (cast <fl> p_180702_16_) (cast <fl> p_180702_15_))))
+                                              (let ((d7 (+ p_180702_12_ 2. 16.)))
+                                                (when (> (- (+ (* d4 d4) (* d5 d5))
+                                                            (* d6 d6))
+                                                         (* d7 d7))
+                                                  (continuation-return return #f))
+                                                (when (and (>= rx (- (- d0 16.) (* d2 2.)))
+                                                           (>= rz (- (- d1 16.) (* d2 2.)))
+                                                           (<= rx (+ d0 16. (* d2 2.)))
+                                                           (<= rz (+ d1 16. (* d2 2.))))
+                                                  (let ((k2 (- (- (fxfloor (- rx d2)) (* chunkX 16)) 1))
+                                                        (k (+ (- (fxfloor (+ rx d2)) (* chunkX 16)) 1))
+                                                        (l2 (- (fxfloor (- ry d3)) 1))
+                                                        (l (+ (fxfloor (+ ry d3)) 1))
+                                                        (i3 (- (- (fxfloor (- rz d2)) (* chunkZ 16)) 1))
+                                                        (i1 (+ (- (fxfloor (+ rz d2)) (* chunkZ 16)) 1)))
+                                                    (when (< k2 0) (set! k2 0))
+                                                    (when (> k 16) (set! k 16))
+                                                    (when (< l2 1) (set! l2 1))
+                                                    (when (> l 248) (set! l 248))
+                                                    (when (< i3 0) (set! i3 0))
+                                                    (when (> i1 16) (set! i1 16))
+                                                    (let ((flag3 #f))
+                                                      @wait
+                                                      (loop (for j1 <fx> init k2 test (and (not flag3) (< j1 k)) iter (+ j1 1))
+                                                            (loop (for k1 <fx> init i3 test (and (not flag3) (< k1 i1)) iter (+ k1 1))
+                                                                  (loop (for l1 <fx> init (+ l 1) test (and (not flag3) (>= l1 (- l2 1))) iter (- l1 1))
+                                                                        (when (and (>= l1 0) (< l1 256))
+                                                                          (let ((block (block-ref j1 l1 k1)))
+                                                                            (when (or (= block Water)
+                                                                                      (= block StationaryWater))
+                                                                              (set! flag3 #t))
+                                                                            (when (and (/= l1 (- l2 1))
+                                                                                       (/= j1 k2)
+                                                                                       (/= j1 (- k 1))
+                                                                                       (/= k1 i3)
+                                                                                       (/= k1 (- i1 1)))
+                                                                              (set! l1 l2)))))))
+                                                      (when #t @wait (not flag3)
+                                                        (let ((mutableblockpos #f @wait (new MutableBlockPos)))
+                                                          (loop (for j3 <fx> init k2 test (< j3 k) iter (+ j3 1))
+                                                                (let ((d10 (/ (- (+ (cast <fl> j3) (* (cast <fl> chunkX) 16.) .5) rx) d2)))
+                                                                  (loop (for i2 <fx> init i3 test (< i2 i1) iter (+ i2 1))
+                                                                        (let ((d8 (/ (- (+ (cast <fl> i2) (* (cast <fl> chunkZ) 16.) .5) rz) d2)))
+                                                                          (let ((flag1 #f))
+                                                                            (when (< (+ (* d10 d10) (* d8 d8)) 1.)
+                                                                              (loop (for j2 <fx> init l test (> j2 l2) iter (- j2 1))
+                                                                                    (let ((d9 (/ (- (+ (- (cast <fl> j2) 1.) .5) ry) d3)))
+                                                                                      (when (and (> d9 -.7)
+                                                                                                 (< (+ (* d10 d10) (* d9 d9) (* d8 d8)) 1.))
+                                                                                        (let () @wait ((iblockstate1
+                                                                                                         (getBlockState~ chunkPrimerIn j3 j2 i2))
+                                                                                                       (iblockstate2
+                                                                                                         (firstNonNull~
+                                                                                                           Objects
+                                                                                                           (getBlockState~ chunkPrimerIn j3 (+ j2 1) i2)
+                                                                                                           BLK_AIR)))
+                                                                                          @wait
+                                                                                          (when (or (= (getBlock~ iblockstate1) (GRASS~ Blocks))
+                                                                                                    (= (getBlock~ iblockstate1) (MYCELIUM~ Blocks)))
+                                                                                            (set! flag1 #t))
+                                                                                          ;; quick try
+                                                                                          (block-set! j3 j2 i2 Air)
+                                                                                          @wait
+                                                                                          (when (can-replace-block? iblockstate1 iblockstate2)
+                                                                                            (if (< (- j2 1) 10)
+                                                                                                (block-set! j3 j2 i2 Lava)
+                                                                                              (begin
+                                                                                                (block-set! j3 j2 i2 Air)
+                                                                                                @wait
+                                                                                                (when (= (getBlock~ iblockstate2)
+                                                                                                         (SAND~ Blocks))
+                                                                                                  ;; CONVERT
+                                                                                                  ;; chunkPrimerIn.setBlockState(j3, j2 + 1, i2, iblockstate2.getValue(BlockSand.VARIANT) == BlockSand.EnumType.RED_SAND ? BLK_RED_SANDSTONE : BLK_SANDSTONE)
+                                                                                                  )
+                                                                                                @wait
+                                                                                                (when (and flag1
+                                                                                                           (= (getBlock~
+                                                                                                                (getBlockState~
+                                                                                                                  chunkPrimerIn
+                                                                                                                  j3
+                                                                                                                  (- j2 1)
+                                                                                                                  i2))
+                                                                                                              (DIRT~ Blocks)))
+                                                                                                  (set~ mutableblockpos
+                                                                                                    (+ j3 (* chunkX 16))
+                                                                                                    0
+                                                                                                    (+ i2 (* chunkZ 16)))
+                                                                                                  (block-set!
+                                                                                                    j3
+                                                                                                    (- j2 1)
+                                                                                                    i2
+                                                                                                    (getDefaultState~
+                                                                                                      (getBlock~
+                                                                                                        (topBlock~
+                                                                                                          (getBiomeGenForCoords~
+                                                                                                            worldObj
+                                                                                                            mutableblockpos)))))))))))))))))))
+                                                          (when flag2
+                                                            (continuation-return continue #f))))))))))))))))))))))))))
       
       (define (can-replace-block? block1 block2)
         ;; return block1 == Blocks.STONE ? #t : (block1 == Blocks.DIRT ? #t : (block1 == Blocks.GRASS ? #t : (block1 == Blocks.HARDENED_CLAY ? #t : (block1 == Blocks.STAINED_HARDENED_CLAY ? #t : (block1 == Blocks.SANDSTONE ? #t : (block1 == Blocks.RED_SANDSTONE ? #t : (block1 == Blocks.MYCELIUM ? #t : (block1 == Blocks.SNOW_LAYER ? #t : (block1 == Blocks.SAND || block1 == Blocks.GRAVEL) && block2.getMaterial() != Material.WATER))))))));
         #t)
       
-      (define (recursive-generate p q chunkX chunkZ)
+      (define (recursive-generate p <fx> q <fx> chunkX <fx> chunkZ <fx>)
         (let ((i (randomInt rand (+ (randomInt rand (+ (randomInt rand 15) 1)) 1))))
           (when (/= (randomInt rand 7) 0)
             (set! i 0))
@@ -544,41 +595,21 @@
         (setSeed rand worldSeed)
         (let ((j (randomLong rand))
               (k (randomLong rand)))
-          (loop (for p init (- x i) test (<= p (+ x i)) iter (+ p 1))
-                (loop (for q init (- z i) test (<= q (+ z i)) iter (+ q 1))
+          (loop (for p <fx> init (- x i) test (<= p (+ x i)) iter (+ p 1))
+                (loop (for q <fx> init (- z i) test (<= q (+ z i)) iter (+ q 1))
                       (setSeedAux rand p q j k worldSeed)
-                      (recursive-generate p q x z)))))))
-
-
-  (method (replace-biome-blocks block-ref block-set! data-set!)
-    (loop (for x from 0 below 16)
-          (loop (for z from 0 below 16)
-                (let ((biome <Biome> (id->biome (u8vector-ref biomes (+ x (* z 16)))))
-                      (replace-amount -1))
-                  (let (iter (height 255))
-                    (let ((section (get-section (fxfloor/ height 16)))
-                          (y (modulo height 16)))
-                      (if (<= height (randomInt rand 5))
-                          (block-set! section x y z 7)
-                        (let ((block-id (block-ref section x y z)))
-                          (if (= block-id 0)
-                              (set! replace-amount -1)
-                            (when (= block-id 1)
-                              (if (= replace-amount -1)
-                                  (begin
-                                    (block-set! section x y z (get-top~ biome))
-                                    (set! replace-amount (randomIntBetween rand 3 5)))
-                                (when (> replace-amount 0)
-                                  (block-set! section x y z (get-fill~ biome))
-                                  (decrease! replace-amount))))))))
-                    (when (> height 0)
-                      (iter (- height 1))))))))
+                      (recursive-generate p q x z))))))))
   
   
   (method (populate-chunks block-ref block-set! data-set!)
+    (declare (proper-tail-calls))
+    (declare (optimize-dead-local-variables))
+    (declare (inline))
+    (declare (inlining-limit 1000))
+    (site (populate on?: #t parent: generate)
     (let ((zone (current-zone)))
       (define (get-chunk chunk-x chunk-z)
-        (let ((region (get-loaded-region~ zone (+ (get-x~ region~self) (fxfloor/ chunk-x 32)) (+ (get-z~ region~self) (fxfloor/ chunk-z 32)))))
+        (let ((region (get-loaded-region~ zone (+ (get-x~ region) (fxfloor/ chunk-x 32)) (+ (get-z~ region) (fxfloor/ chunk-z 32)))))
           (and region (get-loaded-chunk~ region (modulo chunk-x 32) (modulo chunk-z 32)))))
       
       (let ((chunk1 (get-chunk x (- z 1)))
@@ -600,49 +631,59 @@
         (when (and chunk1 chunk2)
           (let ((corner (get-chunk (- x 1) (- z 1))))
             (when corner
-              (populate-chunk~ corner block-ref block-set! data-set! chunk2 self chunk1)))))))
+              (populate-chunk~ corner block-ref block-set! data-set! chunk2 self chunk1))))))))
   
   
   (method (populate-chunk block-ref block-set! data-set! chunk1 chunk2 chunk3)
-    (define (get-chunk x <fx> z <fx>) <World-Chunk>
-      (if (< x 16)
+    (declare (proper-tail-calls))
+    (declare (optimize-dead-local-variables))
+    (declare (inline))
+    (declare (inlining-limit 1000))
+    (let ()
+      (define (get-chunk x <fx> z <fx>) <World-Chunk>
+        (if (< x 16)
+            (if (< z 16)
+                self
+              chunk1)
           (if (< z 16)
-              self
-            chunk1)
-        (if (< z 16)
-            chunk3
-          chunk2)))
-    
-    (define (with-position x <fx> z <fx> proc)
-      (let ((chunk (get-chunk x z))
-            (index (heightmap-index (modulo x 16) (modulo z 16))))
-        (proc (vector-ref (get-heightmap~ chunk) index) (id->biome (u8vector-ref (get-biomes~ chunk) index)))))
-    
-    (define (heightmap-index x <fx> z <fx>) <fx>
-      (+ x (* z 16)))
-    
-    (unless populated?
-      (loop (for x from 8 below 24)
-            (loop (for z from 8 below 24)
-                  (with-position x z
-                    (lambda (height biome)
-                      (when (and (> height sea-level) (< (random-integer 100) (get-trees~ biome)))
-                        (generate-structure (get-structure biome) x (+ height 1) z block-set! data-set! get-chunk))))))))
+              chunk3
+            chunk2)))
+      
+      (define (with-position x <fx> z <fx> proc)
+        (let ((chunk (get-chunk x z))
+              (index (heightmap-index (modulo x 16) (modulo z 16))))
+          (proc (vector-ref (get-heightmap~ chunk) index) (id->biome (u8vector-ref (get-biomes~ chunk) index)))))
+      
+      (define (heightmap-index x <fx> z <fx>) <fx>
+        (+ x (* z 16)))
+      
+      (unless populated?
+        (loop (for x from 8 below 24)
+              (loop (for z from 8 below 24)
+                    (with-position x z
+                      (lambda (height biome)
+                        (when (and (> height sea-level) (< (random-integer 100) (get-trees~ biome)))
+                          (generate-structure (get-structure biome) x (+ height 1) z block-set! data-set! get-chunk)))))))))
   
   
   (method (generate-structure structure x y z block-set! data-set! get-chunk)
-    (define (with-field x <fx> y <fx> z <fx> proc)
-      (proc (get-section~ (get-chunk x z) (fxfloor/ y 16)) (modulo x 16) (modulo y 16) (modulo z 16)))
-    
-    (for-each (lambda (element)
-                (for-each (lambda (loc)
-                            (bind (a b c) loc
-                              (with-field (+ x a) (+ y b) (+ z c)
-                                (lambda (section x y z)
-                                  (block-set! section x y z (cadr element) #f)
-                                  (data-set! section x y z (cddr element) (cadr element))))))
-                          (car element)))
-              structure))
+    (declare (proper-tail-calls))
+    (declare (optimize-dead-local-variables))
+    (declare (inline))
+    (declare (inlining-limit 1000))
+    (let ()
+      (define (with-field x <fx> y <fx> z <fx> proc)
+        (proc (get-section~ (get-chunk x z) (fxfloor/ y 16)) (modulo x 16) (modulo y 16) (modulo z 16)))
+      
+      (for-each (lambda (element)
+                  (for-each (lambda (loc)
+                              (bind (a b c) loc
+                                (with-field (+ x a) (+ y b) (+ z c)
+                                  (lambda (section x y z)
+                                    (block-set! section x y z (cadr element) #f)
+                                    (data-set! section x y z (cddr element) (cadr element))))))
+                            (car element)))
+                structure)))
   
   
   (method (get-corner index)
