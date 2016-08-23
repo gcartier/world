@@ -1,0 +1,491 @@
+;;;===============
+;;;  WorldScheme
+;;;===============
+;;;
+;;;; World Generation Rendering
+;;;
+;;;  The Initial Developer of the Original Code is Guillaume Cartier.
+;;;  Portions created by the Initial Developer are Copyright (C) 2012-2016
+;;;  the Initial Developer. All Rights Reserved.
+;;;
+;;;  Contributor(s):
+;;;    Edouard Hebert
+
+
+(module world.generation.rendering jazz
+
+
+(import (jazz.cairo)
+        (jazz.geometry)
+        (jazz.graphic)
+        (jazz.opengl.glew)
+        (world)
+        (world.autoload)
+        (world.atlas)
+        (world.face)
+        (world.foreign)
+        (world.generate)
+        (world.generation.base)
+        (world.material)
+        (world.quad)
+        (world.renderers)
+        (world.settings)
+        (world.syntax (phase syntax))
+        (world.texture)
+        (world.triangle))
+
+
+(definition protected tile-resolution <fx>
+  (world-setting 'world.tile-resolution 128))
+
+(definition protected tile-size <fl>
+  (cast <fl> tile-resolution))
+
+(definition protected tile-period <fx>
+  16)
+
+(definition protected texture-size <fl>
+  (* tile-size (cast <fl> tile-period)))
+
+(definition protected texture-dir
+  (format "{a}x{a}" tile-resolution tile-resolution))
+
+(definition protected texture-mipmap?
+  #f)
+
+
+;;;
+;;;; Atlas
+;;;
+
+
+(definition protected (cache-atlas) <Atlas>
+  (let ((world (current-world)))
+    (get-block-atlas~ world)))
+
+
+(definition protected (cache-texture) <Image-Texture>
+  (let ((world (current-world)))
+    (get-block-texture~ world)))
+
+
+(definition protected (cache-texture-repeat) <Image-Texture>
+  (let ((world (current-world)))
+    (get-block-texture-repeat~ world)))
+
+
+(definition protected (create-block-atlas) <Atlas>
+  (define (find-assets)
+    (let ((world (current-world)))
+      (find-if (lambda (assets)
+                 (and (eq? (get-where~ assets) 'world)
+                      (equal? (get-spine~ assets) '("minecraft"))))
+               (get-world-assets~ world))))
+  
+  (let ((atlas (new Atlas uniform-size: (new Dimension tile-resolution tile-resolution)))
+        (assets (find-assets))
+        (path (list "textures" texture-dir)))
+    (add-assets-directory~ atlas assets (append path '("blocks")))
+    (add-assets-directory~ atlas assets (append path '("blocks_alt_static")))
+    (add-assets-directory~ atlas assets (append path '("generated")))
+    (generate-textures atlas assets path)
+    atlas))
+
+
+(definition protected (create-texture atlas (min-filter: min-filter #f) (mag-filter: mag-filter #f) (wrap: wrap #f)) <Image-Texture>
+  (let ((mipmap? (world-setting 'world.generate-mipmap? 32))
+        (min-filter (world-setting 'world.min-filter (or min-filter 'nearest)))
+        (mag-filter (world-setting 'world.mag-filter (or mag-filter 'linear))))
+    (let ((effective-mipmap? (if (integer? mipmap?) (>= tile-resolution (cast <fx> mipmap?)) mipmap?)))
+      (let ((min-filter (if (not effective-mipmap?)
+                            (case min-filter
+                              ((nearest) GL_NEAREST)
+                              ((linear) GL_LINEAR))
+                          (case min-filter
+                            ((nearest) GL_NEAREST_MIPMAP_LINEAR)
+                            ((linear) GL_LINEAR_MIPMAP_LINEAR))))
+            (mag-filter (case mag-filter
+                          ((nearest) GL_NEAREST)
+                          ((linear) GL_LINEAR))))
+        (extract-texture~ atlas min-filter: min-filter mag-filter: mag-filter wrap: wrap mipmap?: effective-mipmap?)))))
+
+
+;;;
+;;;; Textures
+;;;
+
+
+(definition textures-subuvs
+  '())
+
+(definition (add-textures-subuv name subuv)
+  (set! textures-subuvs (cons (cons name subuv) textures-subuvs)))
+
+(definition protected (update-textures-subuvs atlas)
+  (for-each (lambda (info)
+              (bind (name . subuv) info
+                (update-coordinates~ atlas name subuv)))
+            textures-subuvs)
+  (set! textures-subuvs '()))
+
+
+(definition protected generated-textures
+  (make-table test: equal?))
+
+(definition protected (get-generated-texture name)
+  (table-ref generated-textures name #f))
+
+
+(definition (generate-textures atlas assets path)
+  (let ((blocks-dir (make-directory~ assets (append path '("blocks"))))
+        (templates-dir (make-directory~ assets (append path '("templates")))))
+    (define (add-colored base suffix color (overlay: overlay #f) (preserve?: preserve? #f))
+      (let ((gray (new-file~ templates-dir (add-extension (or overlay base) "png")))
+            (overlaid (and overlay (new-file~ blocks-dir (add-extension base "png"))))
+            (name (format "{a}_{a}" base suffix)))
+        (define (preserve-texture surface width height)
+          (when preserve?
+            (let ((copy (new Image-Surface #f (new Dimension width height))))
+              (blit-surface~ copy surface)
+              (table-set! generated-textures name (list width height copy)))))
+        
+        (assert (exists?~ gray))
+        (apply-operator CAIRO_OPERATOR_MULTIPLY gray color
+          (lambda (surface width height)
+            (if (not overlay)
+                (begin
+                  (preserve-texture surface width height)
+                  (add-surface~ atlas name surface width height))
+              (bind-values (width height overlaid) (cairo-surface-from-png overlaid)
+                (let ((overlaid (new Surface overlaid)))
+                  (blit-surface~ overlaid surface)
+                  (close~ surface)
+                  (preserve-texture overlaid width height)
+                  (add-surface~ atlas name overlaid width height))))))))
+
+    (define (apply-operator operator gray color proc)
+      (bind-values (width height msk) (cairo-surface-from-png gray)
+        (bind-values (width height dst) (cairo-surface-from-png gray)
+          (let ((size (new Dimension width height))
+                (mask (new Surface msk))
+                (dest (new Surface dst)))
+            (set-operator~ dest operator)
+            (set-color~ dest color)
+            (draw-rectangle~ dest (size-rect size))
+            (set-mask-surface~ dest mask)
+            (close~ mask)
+            (proc dest width height)))))
+    
+    (define (redstone-dust base)
+      (let ((off .35)
+            (on 1.))
+        (loop (for n from 0 to 15)
+              (add-colored base (->string n) (new Color red: (+ off (* (- on off) (/ (cast <fl> n) 15.)))) preserve?: (= n 12)))))
+    
+    (define (mirror-pad name left top right bottom (save-to #f))
+      (bind (surface width height depth) (get-image~ atlas name)
+        (let ((cairo-surface
+                (when (u8vector? surface)
+                  (let ((cairo-format CAIRO_FORMAT_ARGB32))
+                    (let ((stride (cairo_format_stride_for_width cairo-format width)))
+                      (new Surface (cairo_image_surface_create_for_data (still-u8vector-body surface) CAIRO_FORMAT_ARGB32 width height stride)))))))
+          (let ((surface (or cairo-surface surface))
+                (l (* left width))
+                (t (* top height))
+                (r (* right width))
+                (b (* bottom height)))
+            (let ((w (- r l))
+                  (h (- b t)))
+              (let ((subimage (new Image-Surface surface (new Dimension (fxround w) (fxround h))))
+                    (pattern (cairo_pattern_create_for_surface (get-handle~ surface))))
+                (let ((surface (if (not save-to) surface (new Image-Surface surface (new Dimension width height)))))
+                  (let ((cr (get-context~ subimage))
+                        (matrix (cairo_matrix_t-make)))
+                    (cairo_set_source cr pattern)
+                    (cairo_matrix_init_translate matrix l t)
+                    (cairo_pattern_set_matrix pattern matrix)
+                    (cairo_rectangle cr 0. 0. (fl w) (fl h))
+                    (cairo_fill cr)
+                    (cairo_matrix_t-free matrix)
+                    (cairo_pattern_destroy pattern)
+                    (loop (for i from -1 to 1)
+                          (loop (for j from -1 to 1)
+                                (let ((sx (if (= i 0) 1 -1))
+                                      (sy (if (= j 0) 1 -1)))
+                                  (let ((l (if (= sx 1) l (+ l w)))
+                                        (t (if (= sy 1) t (+ t h))))
+                                    (let ((tx (+ l (* i w)))
+                                          (ty (+ t (* j h))))
+                                      (cairo_identity_matrix (get-context~ surface))
+                                      (translate~ surface tx ty)
+                                      (scale~ surface sx sy)
+                                      (blit-surface~ surface subimage))))))
+                    (close~ subimage)
+                    (when cairo-surface
+                      (close~ cairo-surface))
+                    (if (not save-to)
+                        (add-textures-subuv name (uv left top right bottom (cast <fl> depth)))
+                      (add-surface~ atlas save-to surface width height)
+                      (bind (surface width height depth) (get-image~ atlas save-to)
+                        (add-textures-subuv save-to (uv left top right bottom (cast <fl> depth)))))))))))))
+    
+    (add-colored "tallgrass" "green" {Color red: .403 green: .577 blue: .336} preserve?: #t) ;; autumn leaves 255 147 86
+    (add-colored "leaves_oak" "green" {Color red: 0 green: 125 blue: 0}) ;; 103 147 86
+    (add-colored "leaves_spruce" "green" {Color red: 58 green: 105 blue: 58})
+    (add-colored "leaves_birch" "green" {Color red: 99 green: 156 blue: 78})
+    (add-colored "leaves_jungle" "green" {Color red: .270 green: .416 blue: .286})
+    (add-colored "leaves_big_oak" "green" {Color red: .275 green: .435 blue: .157})
+    (add-colored "leaves_acacia" "green" {Color red: .275 green: .435 blue: .157})
+    (add-colored "double_plant_grass_top" "green" {Color red: .329 green: .482 blue: .153} preserve?: #t)
+    (add-colored "double_plant_grass_bottom" "green" {Color red: .329 green: .482 blue: .153} preserve?: #t)
+    (add-colored "double_plant_fern_top" "green" {Color red: .329 green: .482 blue: .153} preserve?: #t)
+    (add-colored "double_plant_fern_bottom" "green" {Color red: .329 green: .482 blue: .153} preserve?: #t)
+    (add-colored "melon_stem_disconnected" "ochre" {Color red: .747 green: .563 blue: .004} preserve?: #t)
+    (add-colored "pumpkin_stem_disconnected" "ochre" {Color red: .747 green: .563 blue: .004} preserve?: #t)
+    (add-colored "vine" "green" {Color red: .160 green: .619 blue: .160} preserve?: #t)
+    (add-colored "waterlily" "green" {Color red: .003 green: .619 blue: .003})
+    (add-colored "grass_top" "green" {Color red: .403 green: .577 blue: .336})
+    (add-colored "grass_side" "green" {Color red: .403 green: .577 blue: .336} overlay: "grass_side_overlay")
+    
+    (redstone-dust "redstone_dust_cross")
+    (redstone-dust "redstone_dust_line")
+    
+    (mirror-pad "cake_side"             1m 8m 15m 16m)
+    (mirror-pad "cake_top"              1m 1m 15m 15m)
+    (mirror-pad "cake_bottom"           1m 1m 15m 15m)
+    (mirror-pad "chest_side"            1m 2m 15m 16m)
+    (mirror-pad "chest_front"           1m 2m 15m 16m)
+    (mirror-pad "chest_back"            1m 2m 15m 16m)
+    (mirror-pad "chest_bottom"          1m 1m 15m 15m)
+    (mirror-pad "chest_top"             1m 1m 15m 15m)
+    (mirror-pad "bed_head_side"         0m 7m 16m 16m)
+    (mirror-pad "bed_head_end"          0m 7m 16m 16m)
+    (mirror-pad "bed_feet_side"         0m 7m 16m 16m)
+    (mirror-pad "bed_feet_end"          0m 7m 16m 16m)
+    (mirror-pad "enchanting_table_side" 0m 4m 16m 16m)
+    (mirror-pad "endframe_side"         0m 3m 16m 16m)
+    (mirror-pad "endframe_eye"          4m 0m 12m 4m "endframe_eye_side")
+    (mirror-pad "endframe_eye"          4m 4m 12m 12m)))
+
+
+;;;
+;;;; Face
+;;;
+
+
+(class Lighted-Face extends Face
+  
+  
+  (method protected virtual (iterate-lighting proc)
+    ))
+
+
+(class Triangle-Face extends Lighted-Face
+  
+  
+  (slot l1 accessors generate)
+  (slot l2 accessors generate)
+  (slot l3 accessors generate)
+  
+  
+  (method override (initialize material texture-coordinates <f32vector> texture-depth triangle <Triangle> l1 <f32vector> l2 <f32vector> l3 <f32vector>)
+    (nextmethod material texture-coordinates texture-depth triangle)
+    (set! l1~self l1)
+    (set! l2~self l2)
+    (set! l3~self l3))
+  
+  
+  (method override (iterate-lighting proc)
+    (proc l1 l2 l3)))
+
+
+(class Quad-Face extends Lighted-Face
+  
+  
+  (slot l1 accessors generate)
+  (slot l2 accessors generate)
+  (slot l3 accessors generate)
+  (slot l4 accessors generate)
+  
+  
+  (method override (initialize material texture-coordinates <f32vector> texture-depth quad <Quad> l1 <f32vector> l2 <f32vector> l3 <f32vector> l4 <f32vector>)
+    (nextmethod material texture-coordinates texture-depth quad)
+    (set! l1~self l1)
+    (set! l2~self l2)
+    (set! l3~self l3)
+    (set! l4~self l4))
+  
+  
+  (method override (iterate-lighting proc)
+    (proc l1 l2 l3)
+    (proc l3 l4 l1)))
+
+
+;;;
+;;;; Mesher
+;;;
+
+
+(class Lighted-Mesher extends Mesher
+  
+  
+  (method (add-lighting template l1 l2 l3 l4 inverse?)
+    (iterate-lighting~ template self l1 l2 l3 l4 inverse?
+      ;; lambda-lift
+      (lambda (mesher <Lighted-Mesher> l1 l2 l3)
+        (let ((lightmap (get-lightmap~ mesher)))
+          (define (blocklight! offset <fx> lighting <f32vector>) <void>
+            (f32vector-set! lightmap offset (f32vector-ref lighting 0)))
+          
+          (define (skylight! offset <fx> lighting <f32vector>) <void>
+            (f32vector-set! lightmap offset (f32vector-ref lighting 1)))
+          
+          (define (ambience! offset <fx> lighting <f32vector>) <void>
+            (f32vector-set! lightmap offset (/ (f32vector-ref lighting 2) 4.)))
+          
+          (let ((li (get-li~ mesher)))
+            (blocklight!    li    l1)
+            (skylight!   (+ li 1) l1)
+            (ambience!   (+ li 2) l1)
+            (blocklight! (+ li 3) l2)
+            (skylight!   (+ li 4) l2)
+            (ambience!   (+ li 5) l2)
+            (blocklight! (+ li 6) l3)
+            (skylight!   (+ li 7) l3)
+            (ambience!   (+ li 8) l3)
+            (increase-li!~ mesher 9)))))))
+
+
+;;;
+;;;; Rendering
+;;;
+
+
+(class Rendering extends Object
+  
+  
+  (slot material        <Material> getter generate)
+  (slot entity-material <Material> getter generate)
+  (slot mesher          <Mesher>   getter generate)
+  
+  
+  (method override (initialize initial-reserved material entity-material)
+    (set! material~self material)
+    (set! entity-material~self entity-material)
+    (set! mesher~self (new Lighted-Mesher initial-reserved 0 material: material)))
+  
+  
+  (method (reset-mesher)
+    (reset~ mesher)))
+
+
+(definition package (make-rendering initial-reserved material-name atlas texture renderer entity-renderer)
+  (let ((material (new Material name: material-name atlas: atlas texture: texture renderer: renderer))
+        (entity-material (new Material name: material-name atlas: atlas texture: texture renderer: entity-renderer)))
+    (new Rendering initial-reserved material entity-material)))
+
+
+(definition package opaque-rendering
+  (let ((rendering #f))
+    (lambda ()
+      (or rendering
+          (let ((atlas (cache-atlas))
+                (texture (cache-texture)))
+            (let ((rend (make-rendering 8192 'opaque atlas texture (get-opaque-terrain-renderer) (get-opaque-renderer))))
+              (set! rendering rend)
+              rend))))))
+
+
+(definition package transparent-rendering
+  (let ((rendering #f))
+    (lambda ()
+      (or rendering
+          (let ((atlas (cache-atlas))
+                (texture (cache-texture)))
+            (let ((rend (make-rendering 20480 'transparent atlas texture (get-transparent-terrain-renderer) (get-transparent-renderer))))
+              (set! rendering rend)
+              rend))))))
+
+
+(definition package coverage-rendering
+  (let ((rendering #f))
+    (lambda ()
+      (or rendering
+          (let ((atlas (cache-atlas))
+                (texture (cache-texture)))
+            (let ((rend (make-rendering 2048 'coverage atlas texture (get-coverage-terrain-renderer) (get-coverage-renderer))))
+              (set! rendering rend)
+              rend))))))
+
+
+(definition package water-rendering
+  (let ((rendering #f))
+    (lambda ()
+      (or rendering
+          (let ((atlas (cache-atlas))
+                (texture (cache-texture-repeat)))
+            (let ((rend (make-rendering 2048 'water atlas texture (get-water-terrain-renderer) (get-water-renderer))))
+              (set! rendering rend)
+              rend))))))
+
+
+(definition package wet-rendering
+  (let ((rendering #f))
+    (lambda ()
+      (or rendering
+          (let ((atlas (cache-atlas))
+                (texture (cache-texture)))
+            (let ((rend (make-rendering 2048 'wet atlas texture (get-wet-terrain-renderer) #f)))
+              (set! rendering rend)
+              rend))))))
+
+
+(definition package multitexture-rendering
+  (let ((rendering #f))
+    (lambda ()
+      (or rendering
+          (let ((atlas (cache-atlas))
+                (texture (cache-texture-repeat)))
+            (let ((rend (make-rendering 2048 'multitexture atlas texture (get-multitexture-terrain-renderer) (get-multitexture-renderer))))
+              (set! rendering rend)
+              rend))))))
+
+
+(definition package redstone-rendering
+  (let ((rendering #f))
+    (lambda ()
+      (or rendering
+          (let ((atlas (cache-atlas))
+                (texture (cache-texture)))
+            (let ((rend (make-rendering 20480 'redstone atlas texture (get-transparent-terrain-renderer) (get-transparent-renderer))))
+              (set! rendering rend)
+              rend))))))
+
+
+(definition package other-renderings
+  (let ((renderings #f))
+    (lambda ()
+      (or renderings
+          (let ((lst
+                  (list
+                    (transparent-rendering)
+                    (coverage-rendering)
+                    (water-rendering)
+                    (wet-rendering)
+                    (multitexture-rendering))))
+            (set! renderings lst)
+            lst)))))
+
+
+(definition package (dr)
+  (define (d rendering <Rendering>)
+    (let ((mesher (get-mesher~ rendering)))
+      (list (get-used~ mesher) (get-reserved~ mesher))))
+
+  (list (d (opaque-rendering))
+        (d (transparent-rendering))
+        (d (coverage-rendering))
+        (d (water-rendering))
+        (d (wet-rendering))
+        (d (multitexture-rendering))
+        (d (redstone-rendering)))))
