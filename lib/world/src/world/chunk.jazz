@@ -38,9 +38,9 @@
 
 
 (c-enumeration ChunkState
-  (Created   0)   ;; created by another's populate
-  (Populated 1)   ;; populated by another's generate
-  (Generated 2))  ;; fully generated
+  (Generated 0)
+  (Populated 1)
+  (Loaded    2))
 
 
 (class World-Chunk extends Object
@@ -62,8 +62,6 @@
   (slot sections                                      getter generate)
   (slot sections-table        <table+>  initialize #f getter generate)
   (slot generator-revision    <fx>      initialize -1 accessors generate)
-  (slot generated?            <bool>    initialize #f accessors generate)
-  (slot populated?            <bool>    initialize #f accessors generate)
   (slot modified?             <bool>    initialize #f accessors generate)
   
   
@@ -231,18 +229,10 @@
   
   (method (regenerate)
     (set! sections-table #f)
-    (generate (lambda ()
-                )))
+    (generate))
   
   
-  (method (generate register-chunk)
-    (cond-expand
-      (release
-       (declare (proper-tail-calls))
-       (declare (optimize-dead-local-variables))
-       (declare (inline))
-       (declare (inlining-limit 1000)))
-      (else))
+  (method (generate)
     (let ((zone (current-zone)))
       (let ((sections (make-vector 16 #f)))
         (define (cache-section j <fx>) <World-Section>
@@ -281,12 +271,16 @@
         (define (skylight-set! i <fx> j <fx> k <fx> value <fx>)
           (u4vector-set! (get-skylight~ (cache-section j)) (local-index i (modulo j 16) k) value))
         
-        (if (welcome?~ zone)
-            (register-chunk)
+        (unless (welcome?~ zone)
           (let ((generator (get-generator~ zone)))
-            (generate-chunk~ generator self block-ref block-set! data-set! blockstate-set! skylight-set! register-chunk)))
-        (generate-complete)
+            (generate-chunk~ generator self block-ref block-set! data-set! blockstate-set! skylight-set!)))
+        (generated)
         (modified))))
+  
+  
+  (method (generated)
+    (let ((zone (current-zone)))
+      (set! generator-revision (get-revision~ (get-generator~ zone)))))
   
   
   (definition rand-seed
@@ -296,21 +290,11 @@
     (newRandom rand-seed))
   
   
-  (method (generate-complete)
-    (let ((zone (current-zone)))
-      (set! generator-revision (get-revision~ (get-generator~ zone)))
-      (set! generated? #t)))
-  
-  
   (definition sea-level <fx>
     63)
   
   
   (method (generate-blocks block-ref block-set! data-set! heightmap <f64vector>)
-    (declare (proper-tail-calls))
-    (declare (optimize-dead-local-variables))
-    (declare (inline))
-    (declare (inlining-limit 1000))
     (site (blocks on?: #t parent: generate)
       (let ((zone (current-zone)))
         
@@ -357,10 +341,6 @@
 
 
   (method (replace-biome-blocks block-ref block-set! blockstate-set!)
-    (declare (proper-tail-calls))
-    (declare (optimize-dead-local-variables))
-    (declare (inline))
-    (declare (inlining-limit 1000))
     (site (replace on?: #t parent: generate)
       (loop (for x from 0 below 16)
             (loop (for z from 0 below 16)
@@ -369,10 +349,6 @@
   
   
   (method (generate-caves block-ref block-set! data-set!)
-    (declare (proper-tail-calls))
-    (declare (optimize-dead-local-variables))
-    (declare (inline))
-    (declare (inlining-limit 1000))
     (site (caves on?: #t parent: generate)
     (let ((range 8)
           (br block-ref)
@@ -551,104 +527,36 @@
                           (iter (- y 1) light)))))))))
   
   
-  (method (populate-chunks)
-    (declare (proper-tail-calls))
-    (declare (optimize-dead-local-variables))
-    (declare (inline))
-    (declare (inlining-limit 1000))
-    (site (populate on?: #t parent: generate)
-    (let ((zone (current-zone)))
-      (let ((region-x (get-x~ region))
-            (region-z (get-z~ region)))
-        (define (loaded-chunk chunk-x <fx> chunk-z <fx>) <World-Chunk+>
-          (let ((region (get-loaded-region~ zone (+ region-x (fxfloor/ chunk-x 32)) (+ region-z (fxfloor/ chunk-z 32)))))
-            (and region (get-loaded-chunk~ region (modulo chunk-x 32) (modulo chunk-z 32)))))
-        
-        (define (local-index i <fx> j <fx> k <fx>) <fx>
-          (+ (* j 256) (* k 16) i))
-        
-        (define (block-ref section <World-Section> i <fx> j <fx> k <fx>) <fx>
-          (u8vector-ref (get-blocks~ section) (local-index i (modulo j 16) k)))
-        
-        (define (block-set! section <World-Section> i <fx> j <fx> k <fx> block-id <fx>)
-          (u8vector-set! (get-blocks~ section) (local-index i (modulo j 16) k) block-id))
-        
-        (define (data-set! section <World-Section> i <fx> j <fx> k <fx> data-id <fx>)
-          (u4vector-set! (get-data~ section) (local-index i (modulo j 16) k) data-id))
-        
-        (define (u4vector-set! field <u8vector> index <fx> value <fx>)
-          (let ((offset (quotient index 2)))
-            (let ((byte (u8vector-ref field offset)))
-              (u8vector-set! field offset
-                (if (even? index)
-                    (bitwise-ior value (bitwise-and byte #xF0))
-                  (bitwise-ior (bitwise-and byte #x0F) (arithmetic-shift value 4)))))))
-        
-        (define (blockstate-set! section <World-Section> i <fx> j <fx> k <fx> id <fx>)
-          (bind-values (block-id <fx> data-id <fx>) (decode-fxid/variant-id id)
-            (block-set! section i j k block-id)
-            (when (>= data-id 0)
-              (data-set! section i j k data-id))))
-        
-        (let ((back (loaded-chunk x (- z 1)))
-              (right (loaded-chunk (+ x 1) z))
-              (front (loaded-chunk x (+ z 1)))
-              (left (loaded-chunk (- x 1) z)))
-          (when (and right front)
-            (let ((corner (loaded-chunk (+ x 1) (+ z 1))))
-              (when corner
-                (populate-chunk block-ref block-set! blockstate-set! front corner right))))
-          (when (and left front)
-            (let ((corner (loaded-chunk (- x 1) (+ z 1))))
-              (when corner
-                (populate-chunk~ left block-ref block-set! blockstate-set! corner front self))))
-          (when (and back right)
-            (let ((corner (loaded-chunk (+ x 1) (- z 1))))
-              (when corner
-                (populate-chunk~ back block-ref block-set! blockstate-set! self right corner))))
-          (when (and back left)
-            (let ((corner (loaded-chunk (- x 1) (- z 1))))
-              (when corner
-                (populate-chunk~ corner block-ref block-set! blockstate-set! left self back)))))))))
-  
-  
-  (method (populate-chunk block-ref block-set! blockstate-set! front corner right)
-    (declare (proper-tail-calls))
-    (declare (optimize-dead-local-variables))
-    (declare (inline))
-    (declare (inlining-limit 1000))
-    (unless populated?
-      (let ()
-        (define (neighbor-chunk x <fx> z <fx>) <World-Chunk>
-          (if (< x 16)
-              (if (< z 16)
-                  self
-                front)
-            (if (< z 16)
-                right
-              corner)))
-        
-        (define (get-height x <fx> z <fx>) <fx>
-          (get-chunk-height~ (neighbor-chunk x z) (modulo x 16) (modulo z 16)))
-        
-        (define (get-biome x <fx> z <fx>) <Biome>
-          (id->biome (u8vector-ref (get-biomes~ (neighbor-chunk x z)) (heightmap-index (modulo x 16) (modulo z 16)))))
-        
-        (define (heightmap-index x <fx> z <fx>) <fx>
-          (+ x (* z 16)))
-        
-        (define (chunk-block-ref x <fx> y <fx> z <fx>) <fx>
-          (block-ref (get-section~ (neighbor-chunk x z) (fxfloor/ y 16)) (modulo x 16) (modulo y 16) (modulo z 16)))
-        
-        (define (chunk-block-set! x <fx> y <fx> z <fx> block-id <fx>)
-          (block-set! (get-section~ (neighbor-chunk x z) (fxfloor/ y 16)) (modulo x 16) (modulo y 16) (modulo z 16) block-id))
-        
-        (define (chunk-blockstate-set! x <fx> y <fx> z <fx> id <fx>)
-          (blockstate-set! (get-section~ (neighbor-chunk x z) (fxfloor/ y 16)) (modulo x 16) (modulo y 16) (modulo z 16) id))
-        
-        (let ((biome (get-biome 16 16)))
-          (decorate-biome~ biome rand chunk-block-ref chunk-block-set! chunk-blockstate-set! get-height)
-          (set! populated? #t)))))
+  (method (populate block-ref block-set! blockstate-set! front corner right)
+    (define (neighbor-chunk x <fx> z <fx>) <World-Chunk>
+      (if (< x 16)
+          (if (< z 16)
+              self
+            front)
+        (if (< z 16)
+            right
+          corner)))
+    
+    (define (get-height x <fx> z <fx>) <fx>
+      (get-chunk-height~ (neighbor-chunk x z) (modulo x 16) (modulo z 16)))
+    
+    (define (get-biome x <fx> z <fx>) <Biome>
+      (id->biome (u8vector-ref (get-biomes~ (neighbor-chunk x z)) (heightmap-index (modulo x 16) (modulo z 16)))))
+    
+    (define (heightmap-index x <fx> z <fx>) <fx>
+      (+ x (* z 16)))
+    
+    (define (chunk-block-ref x <fx> y <fx> z <fx>) <fx>
+      (block-ref (get-section~ (neighbor-chunk x z) (fxfloor/ y 16)) (modulo x 16) (modulo y 16) (modulo z 16)))
+    
+    (define (chunk-block-set! x <fx> y <fx> z <fx> block-id <fx>)
+      (block-set! (get-section~ (neighbor-chunk x z) (fxfloor/ y 16)) (modulo x 16) (modulo y 16) (modulo z 16) block-id))
+    
+    (define (chunk-blockstate-set! x <fx> y <fx> z <fx> id <fx>)
+      (blockstate-set! (get-section~ (neighbor-chunk x z) (fxfloor/ y 16)) (modulo x 16) (modulo y 16) (modulo z 16) id))
+    
+    (let ((biome (get-biome 16 16)))
+      (decorate-biome~ biome rand chunk-block-ref chunk-block-set! chunk-blockstate-set! get-height)))
   
   
   (method protected (reset-modified)

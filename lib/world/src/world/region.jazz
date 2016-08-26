@@ -22,6 +22,7 @@
         (world.autoload)
         (world.binary)
         (world.chunk)
+        (world.generation.block)
         (world.geometry)
         (world.homogeneous)
         (world.index)
@@ -140,34 +141,113 @@
       (mutex-unlock! chunks-mutex)))
   
   
-  (method (load-sector-chunk sector-x <fx> sector-z <fx>) <World-Chunk>
-    (load-chunk (sector->chunk sector-x) (sector->chunk sector-z)))
+  (method (create-chunk chunk-x <fx> chunk-z <fx>) <World-Chunk>
+    (let ((chunk-index (planar-index& chunk-x chunk-z)))
+      (define (make-chunk)
+        (let ((biomes (make-tag "Biomes" TAG_Byte_Array (generate-u8biomes x z chunk-x chunk-z)))
+              (heightmap (make-tag "HeightMap" TAG_Int_Array (make-vector 256 0)))
+              (entities (make-tag "Entities" TAG_List (make-list-payload 0 '())))
+              (block-entities (make-tag "TileEntities" TAG_List (make-list-payload 0 '())))
+              (sections (make-tag "Sections" TAG_List (make-list-payload TAG_Compound '()))))
+          (let ((tag (make-tag "" TAG_Compound
+                       (list
+                         (make-tag "Level" TAG_Compound
+                           (list
+                             biomes heightmap entities block-entities sections))))))
+            (let ((chunk (new World-Chunk Generated #f #f self tag (tag-value biomes) (tag-value heightmap) (tag-value entities) (tag-value block-entities) (tag-value sections) chunk-index)))
+              (generate~ chunk)
+              (modified~ chunk)
+              chunk))))
+      
+      (let ((chunk (table-ref chunks chunk-index #f)))
+        (if chunk
+            (let ((generator (get-generator~ (current-zone))))
+              (when (< (get-generator-revision~ chunk) (get-revision~ generator))
+                (regenerate~ chunk))
+              chunk)
+          (let ((chunk (or (read-chunk chunk-index) (make-chunk))))
+            (refcount-increase)
+            (table-set! chunks (copy-planar-index chunk-index) chunk)
+            (save-region)
+            chunk)))))
+  
+  
+  (method (populate-chunk chunk-x <fx> chunk-z <fx>) <World-Chunk>
+    (let ((zone (current-zone)))
+      (let ((chunk (create-chunk chunk-x chunk-z)))
+        (if (>= (get-state~ chunk) Populated)
+            chunk
+          (let ((region-x x)
+                (region-z z))
+            (define (create x <fx> z <fx>) <World-Chunk>
+              (let ((region (load-region~ zone (+ region-x (fxfloor/ x 32)) (+ region-z (fxfloor/ z 32)))))
+                (create-chunk~ region (modulo x 32) (modulo z 32))))
+            
+            (define (local-index i <fx> j <fx> k <fx>) <fx>
+              (+ (* j 256) (* k 16) i))
+            
+            (define (block-ref section <World-Section> i <fx> j <fx> k <fx>) <fx>
+              (u8vector-ref (get-blocks~ section) (local-index i (modulo j 16) k)))
+            
+            (define (block-set! section <World-Section> i <fx> j <fx> k <fx> block-id <fx>)
+              (u8vector-set! (get-blocks~ section) (local-index i (modulo j 16) k) block-id))
+            
+            (define (data-set! section <World-Section> i <fx> j <fx> k <fx> data-id <fx>)
+              (u4vector-set! (get-data~ section) (local-index i (modulo j 16) k) data-id))
+            
+            (define (u4vector-set! field <u8vector> index <fx> value <fx>)
+              (let ((offset (quotient index 2)))
+                (let ((byte (u8vector-ref field offset)))
+                  (u8vector-set! field offset
+                    (if (even? index)
+                        (bitwise-ior value (bitwise-and byte #xF0))
+                      (bitwise-ior (bitwise-and byte #x0F) (arithmetic-shift value 4)))))))
+            
+            (define (blockstate-set! section <World-Section> i <fx> j <fx> k <fx> id <fx>)
+              (bind-values (block-id <fx> data-id <fx>) (decode-fxid/variant-id id)
+                (block-set! section i j k block-id)
+                (when (>= data-id 0)
+                  (data-set! section i j k data-id))))
+            
+            (let ((right (create (+ chunk-x 1) chunk-z))
+                  (front (create chunk-x (+ chunk-z 1)))
+                  (corner (create (+ chunk-x 1) (+ chunk-z 1))))
+              (populate~ chunk block-ref block-set! blockstate-set! front corner right)
+              (change-state~ chunk Populated)
+              (modified~ chunk)
+              (save-region)
+              chunk))))))
   
   
   (method (load-chunk chunk-x <fx> chunk-z <fx>) <World-Chunk>
     (with-chunks-mutex
       (lambda ()
-        (let ((chunk-index (planar-index& chunk-x chunk-z)))
-          (let ((chunk (table-ref chunks chunk-index #f)))
-            (if chunk
-                (let ((generator (get-generator~ (current-zone))))
-                  (when (< (get-generator-revision~ chunk) (get-revision~ generator))
-                    (regenerate~ chunk))
-                  chunk)
-              (let ((chunk (read-chunk chunk-index)))
-                (define (register-chunk)
-                  (table-set! chunks (copy-planar-index chunk-index) chunk))
+        (let ((zone (current-zone)))
+          (let ((chunk (populate-chunk chunk-x chunk-z)))
+            (if (>= (get-state~ chunk) Loaded)
+                chunk
+              (let ((region-x x)
+                    (region-z z))
+                (define (populate x <fx> z <fx>) <World-Chunk>
+                  (let ((region (load-region~ zone (+ region-x (fxfloor/ x 32)) (+ region-z (fxfloor/ z 32)))))
+                    (populate-chunk~ region (modulo x 32) (modulo z 32))))
                 
-                (refcount-increase)
-                (if (get-generated?~ chunk)
-                    (register-chunk)
-                  (generate~ chunk register-chunk)
-                  (save-region))
+                (populate (- chunk-x 1) chunk-z)
+                (populate chunk-x (- chunk-z 1))
+                (populate (- chunk-x 1) (- chunk-z 1))
+                (change-state~ chunk Loaded)
+                (modified~ chunk)
+                (save-region)
                 chunk)))))))
   
+  @reintegrate
+  (let ((generator (get-generator~ (current-zone))))
+    (when (< (get-generator-revision~ chunk) (get-revision~ generator))
+      (regenerate~ chunk)))
+
   
-  (method (get-loaded-chunk chunk-x <fx> chunk-z <fx>) <World-Chunk+>
-    (table-ref chunks (planar-index& chunk-x chunk-z) #f))
+  (method (load-sector-chunk sector-x <fx> sector-z <fx>) <World-Chunk>
+    (load-chunk (sector->chunk sector-x) (sector->chunk sector-z)))
   
   
   (method (find-chunk sector-x <fx> sector-z <fx>) <World-Chunk+>
@@ -221,7 +301,7 @@
       (u8vector-set! header (+ header-offset 3) count)))
   
   
-  (method (read-chunk chunk-index <pair>) <World-Chunk>
+  (method (read-chunk chunk-index <pair>) <World-Chunk+>
     (with-region-mutex
       (lambda ()
         (let ((chunk-x (planar-index-x chunk-index))
@@ -240,19 +320,7 @@
                       (if server-chunk-raw
                           (let ((digest (object->u8vector (digest-u8vector server-chunk-raw 'SHA-1))))
                             (deserialize-chunk 2 chunk-x chunk-z digest server-chunk-raw))
-                        (let ((biomes (make-tag "Biomes" TAG_Byte_Array (generate-u8biomes x z chunk-x chunk-z)))
-                              (heightmap (make-tag "HeightMap" TAG_Int_Array (make-vector 256 0)))
-                              (entities (make-tag "Entities" TAG_List (make-list-payload 0 '())))
-                              (block-entities (make-tag "TileEntities" TAG_List (make-list-payload 0 '())))
-                              (sections (make-tag "Sections" TAG_List (make-list-payload TAG_Compound '()))))
-                          (let ((tag (make-tag "" TAG_Compound
-                                       (list
-                                         (make-tag "Level" TAG_Compound
-                                           (list
-                                             biomes heightmap entities block-entities sections))))))
-                            (let ((chunk (new World-Chunk Created #f #f self tag (tag-value biomes) (tag-value heightmap) (tag-value entities) (tag-value block-entities) (tag-value sections) chunk-index)))
-                              (modified~ chunk)
-                              chunk)))))
+                        #f))
                   (input-port-byte-position port offset)
                   (let ((chunk-header (u8vector 0 0 0 0 0)))
                     (read-subu8vector chunk-header 0 5 port)
@@ -285,7 +353,7 @@
         (with ((reader <NBT-Reader> (new NBT-Reader chunk-data compressed?: #f)))
           (let ((tag (read-tag~ reader)))
             (let ((compound (tag-assoc "Level" (tag-value tag))))
-              (let ((state (or (tag-assoc "State" compound) Generated))
+              (let ((state (or (tag-assoc "State" compound) Loaded))
                     (biomes (tag-assoc "Biomes" compound))
                     (heightmap (tag-assoc "HeightMap" compound))
                     (entities (tag-assoc "Entities" compound))
@@ -304,7 +372,7 @@
                                               (>= yPos (cast <fx> truncate-y)))
                                       (register-section~ chunk yPos (new World-Section chunk blocks data blocklight skylight)))))
                                 (list-payload-content sections))))
-                  (generate-complete~ chunk)
+                  (generated~ chunk)
                   chunk))))))))
   
   
