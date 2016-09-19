@@ -44,12 +44,26 @@
 #define ___S32BODYSET(x, y, z) ___CAST(___S32*, ___BODY(x))[y] = (z)
 #define ___F64BODYREF(x, y) ___CAST(___F64*, ___BODY(x))[y]
 #define ___F64BODYSET(x, y, z) ___CAST(___F64*, ___BODY(x))[y] = (z)
+
+inline int even(int x)
+{
+    return (x % 2) == 0;
+}
+
+inline int odd(int x)
+{
+    return (x % 2) != 0;
+}
 //#)
 
 
-(defoptimize inline (shaping-section shapings <vector> shapings-touched <vector> j <fx>) <World-Section>
+;; ADD CORRECT BOOLEAN SUPPORT FOR shapings-touched and generate-skylight
+
+
+;; TO THINK IS IT OK TO TOUCH EVEN WHEN REFING?????
+(defoptimize inline (shaping-section shapings <vector> shapings-touched <u8vector> j <fx>) <World-Section>
   (let ((y (fxfloor (/ (cast <fl> j) 16.))))
-    (vector-set! shapings-touched y #t)
+    (u8vector-set! shapings-touched y 1)
     (vector-ref shapings y)))
 
 
@@ -57,8 +71,40 @@
   (+ (* j 256) (* k 16) i))
 
 
-(defoptimize inline (block-set! shapings <vector> shapings-touched <vector> i <fx> j <fx> k <fx> block-id <fx>) <void>
-  (u8vector-set! (get-blocks~ (shaping-section shapings shapings-touched j)) (local-index i (modulo j 16) k) block-id))
+@w
+(defoptimize inline (u4vector-set! field <u8vector> index <fx> value <fx>) <void>
+  (let ((offset (quotient index 2)))
+    (let ((byte (u8vector-ref field offset)))
+      (u8vector-set! field offset
+        (if (even? index)
+            (bitwise-ior value (bitwise-and byte #xF0))
+          (bitwise-ior (bitwise-and byte #x0F) (arithmetic-shift-left value 4)))))))
+
+
+;; QUICK HACK AROUND DUPLICATION THAT NEEDS LINKING LOGIC
+(defoptimize inline (shaping-blocks shapings <vector> shapings-touched <u8vector> j <fx>) <u8vector>
+  (get-blocks~ (shaping-section shapings shapings-touched j)))
+
+
+(defoptimize inline (block-ref shapings <vector> shapings-touched <u8vector> i <fx> j <fx> k <fx>) <fx>
+  (u8vector-ref (shaping-blocks shapings shapings-touched j) (local-index i (modulo j 16) k)))
+
+
+(defoptimize inline (block-set! shapings <vector> shapings-touched <u8vector> i <fx> j <fx> k <fx> block-id <fx>) <void>
+  (u8vector-set! (shaping-blocks shapings shapings-touched j) (local-index i (modulo j 16) k) block-id))
+
+@w
+(defoptimize inline (skylight-set! shapings <vector> shapings-touched <u8vector> i <fx> j <fx> k <fx> value <fx>) <void>
+  (u4vector-set! (get-skylight~ (shaping-section shapings shapings-touched j)) (local-index i (modulo j 16) k) value))
+
+
+(defoptimize inline (touched-top-y shapings-touched <u8vector>) <fx>
+  (continuation-capture
+    (lambda (return)
+      (for (y 15 (>= y 0) (decrease! y))
+           (when (= (u8vector-ref shapings-touched y) 1)
+             (continuation-return return (* y 16))))
+      -1)))
 
 
 ;;;
@@ -91,40 +137,34 @@
   (method protected virtual (generate-variations chunk-x chunk-z region-x region-z)
     )
   
-  
-  (method (generate-skylight chunk <World-Chunk> shapings <vector> shapings-touched <vector> block-ref skylight-set!)
-    (declare (proper-tail-calls))
-    (declare (optimize-dead-local-variables))
-    (declare (inline))
-    (declare (inlining-limit 1000))
+
+  (method (generate-skylight chunk <World-Chunk> shapings <vector> shapings-touched <u8vector>)
+    @w
     (site (skylight on?: #t parent: generate)
-      (define (get-top-y) <fx>
-        (let (iter (y 15))
-          (if (vector-ref shapings-touched y)
-              (* y 16)
-            (iter (- y 1)))))
-      
-      (define (get-opacity x y z) <fx>
-        (get-opacity~ (id->block (block-ref x y z))))
-      
-      (let ((top-y (get-top-y)))
-        (for (x 0 (< x 16) (increase! x))
-             (for (z 0 (< z 16) (increase! z))
-                  (let ((heightmap-set? #f))
-                    (let (iter (y (+ top-y 15)) (light 15))
-                      (let ((opacity (get-opacity x y z)))
-                        (unless heightmap-set?
-                          (when (/= opacity 0)
-                            (set-height!~ chunk x z (+ y 1))
-                            (set! heightmap-set? #t)))
-                        (let ((opacity (if (and (= opacity 0) (/= light 15))
-                                           1
-                                         opacity)))
-                          (let ((next-light (- light opacity)))
-                            (when (> next-light 0)
-                              (skylight-set! x y z next-light))
-                            (unless (or (<= y 0) (<= next-light 0))
-                              (iter (- y 1) next-light))))))))))))
+      (begin;optimize
+        (let ((top-y (touched-top-y shapings-touched))
+              (heightmap (get-heightmap~ chunk)))
+          (for (x 0 (< x 16) (increase! x))
+               (for (z 0 (< z 16) (increase! z))
+                    (let ((heightmap-set? #f))
+                      (continuation-capture
+                        (lambda (break)
+                          (let ((y (+ top-y 15)) (light 15))
+                            (for ()
+                                 (let ((opacity (get-opacity~ (cast <Block> (vector-ref blockids (* (block-ref shapings shapings-touched x y z) block-variants)))))
+                                       @optimize (opacity (get-opacity~ (id->block (block-ref shapings shapings-touched x y z)))))
+                                   (unless heightmap-set?
+                                     (when (/= opacity 0)
+                                       (vector-set! heightmap (+ x (* z 16)) (+ y 1))
+                                       (set! heightmap-set? #t)))
+                                   (when (and (= opacity 0) (/= light 15))
+                                     (set! opacity 1))
+                                   (decrease! light opacity)
+                                   (when (> light 0)
+                                     (skylight-set! shapings shapings-touched x y z light))
+                                   (if (or (<= y 0) (<= light 0))
+                                       (continuation-return break)
+                                     (decrease! y))))))))))))))
   
   
   (method protected virtual (populate-chunk block-ref block-set! blockstate-set! skylight-set! chunk front corner right)
@@ -154,7 +194,7 @@
                 (block-set! i 1 k Dirt)
                 (block-set! i 2 k Dirt)
                 (block-set! i 3 k Grass)))
-    (generate-skylight chunk shapings shapings-touched block-ref skylight-set!)))
+    (generate-skylight chunk shapings shapings-touched)))
 
 
 ;;;
@@ -350,10 +390,10 @@
   (method override (shape-chunk chunk <World-Chunk> shapings shapings-touched block-ref block-set! data-set! blockstate-set! skylight-set!)
     (let ((region <World-Region> (get-region~ chunk)))
       (setSeed rand rand-seed)
-      (generate-blocks chunk shapings shapings-touched block-ref block-set! data-set! (generate-variations (get-x~ region) (get-z~ region) (get-x~ chunk) (get-z~ chunk)))
+      (generate-blocks shapings shapings-touched (generate-variations (get-x~ region) (get-z~ region) (get-x~ chunk) (get-z~ chunk)))
       (replace-biome-blocks chunk block-ref block-set! blockstate-set!)
       (generate-caverns chunk block-ref block-set! data-set!)
-      (generate-skylight chunk shapings shapings-touched block-ref skylight-set!)))
+      (generate-skylight chunk shapings shapings-touched)))
   
   
   (method override (generate-variations region-x <fx> region-z <fx> chunk-x <fx> chunk-z <fx>) <f64vector>
@@ -429,7 +469,7 @@
     63)
 
   
-  (method (generate-blocks chunk <World-Chunk> shapings <vector> shapings-touched <vector> block-ref <fx^fx^fx:fx> zzzblock-set! <fx^fx^fx^fx:void> data-set! <fx^fx^fx^fx:void> variations <f64vector>)
+  (method (generate-blocks shapings <vector> shapings-touched <u8vector> variations <f64vector>)
     ;; optimize test
     (define (call-randomInt n <fx>) <fx>
       (randomInt rand n))
