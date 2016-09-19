@@ -37,6 +37,187 @@
 (proclaim (warn optimizations))
 
 
+;;;
+;;;; Random
+;;;
+
+
+;; PUT CODE HERE TO TEST UNTIL WE HAVE LINKING
+
+
+(c-include "<stdlib.h>")
+
+
+(c-declare world.foreign
+  #/C/
+    ___S64 multiplier = 0x5DEECE66D;
+    ___S64 addend = 0xB;
+    ___S64 mask = ((___S64) 1 << 48) - 1;
+    ___S64 seedUniquifier = 8682522807148012;
+    
+    void setSeed(___S64* rand, ___S64 seed)
+    {
+        seed = ((seed) ^ multiplier) & mask;
+        *rand = seed;
+    }
+
+    ___S32 next(___S64* rand, ___S32 bits)
+    {
+        ___S64 oldseed, nextseed;
+        oldseed = *rand;
+        nextseed = (oldseed * multiplier + addend) & mask;
+        *rand = nextseed;
+        return (___S32)((___U64) nextseed >> (48 - bits));
+    }
+    
+    ___S32 randomInt(___S64* rand, ___S32 n)
+    {
+        if ((n & -n) == n)
+            return (___S32)((n * (___S64)next(rand, 31)) >> 31);
+        else
+        {
+            ___S32 bits, val;
+            do {
+                bits = next(rand, 31);
+                val = bits % n;
+            } while (bits - val + (n-1) < 0);
+            
+            return val;
+        }
+    }
+//#)
+
+
+(defoptimize inline (_initRandom rand <s64vector> seed <s64vector>) <void>
+  (inline
+    #/C/
+      *rand = 0;
+      setSeed(rand, *seed);
+//#))
+
+
+(definition (_newRandom seed) <s64vector>
+  (let ((rand (make-s64vector 1))
+        (seed (s64vector seed)))
+    (optimize
+      (_initRandom rand seed)
+      ;; quicky
+      0)
+    rand))
+
+
+(c-external (_setSeed int64* int64) void
+  #/C/
+    setSeed(___arg1, ___arg2);
+//#)
+
+
+(c-external (_setSeedAux int64* int32 int32 int64 int64 int64) void
+  #/C/
+    ___S64 j1 = (___S64)___arg2 * ___arg4;
+    ___S64 k1 = (___S64)___arg3 * ___arg5;
+    setSeed(___arg1, j1 ^ k1 ^ ___arg6);
+//#)
+
+
+(defoptimize inline (_randomLong rand <s64vector>) <s64>
+  (inline
+    #/C/
+      return ((___S64)(next(rand, 32)) << 32) + next(rand, 32);
+//#))
+
+
+(defoptimize inline (_randomInt rand <s64vector> n <fx>) <fx>
+  (inline
+    #/C/
+      return randomInt(rand, n);
+//#))
+
+
+(definition public (_randomIntBetween rand min <fx> max <fx>) <fx>
+  (+ min (_randomInt rand (+ (- max min) 1))))
+
+
+(definition public (_randomBool rand) <bool>
+  (= (_randomInt rand 2) 1))
+
+
+(defoptimize inline (_randomFloat rand <s64vector>) <fl>
+  (inline
+    #/C/
+      return next(rand, 24) / ((float)((___S64) 1 << 24));
+//#))
+
+
+;;;
+;;;; Generation
+;;;
+
+
+(c-declare world.foreign
+  #/C/
+    ___S64 worldSeed;
+    ___S64 chunkSeed;
+    
+    void initChunkSeed(___S64 arg1, ___S64 arg2)
+    {
+        chunkSeed = worldSeed;
+        chunkSeed *= chunkSeed * 6364136223846793005 + 1442695040888963407;
+        chunkSeed += arg1;
+        chunkSeed *= chunkSeed * 6364136223846793005 + 1442695040888963407;
+        chunkSeed += arg2;
+        chunkSeed *= chunkSeed * 6364136223846793005 + 1442695040888963407;
+        chunkSeed += arg1;
+        chunkSeed *= chunkSeed * 6364136223846793005 + 1442695040888963407;
+        chunkSeed += arg2;
+    }
+    
+    ___S32 nextInt(___S32 n)
+    {
+        ___S32 i = (___S32)((chunkSeed >> 24) % (___S64) n);
+    
+        if (i < 0)
+        {
+            i += n;
+        }
+    
+        chunkSeed *= chunkSeed * 6364136223846793005 + 1442695040888963407;
+        chunkSeed += worldSeed;
+        
+        return i;
+    }
+//#)
+
+
+(c-external (_worldSeed) int64
+  #/C/
+    ___result = worldSeed;
+//#)
+
+
+(c-external (_initWorldSeed int64) void
+  #/C/
+    worldSeed = ___arg1;
+//#)
+
+
+(c-external (_initChunkSeed int64 int64) void
+  #/C/
+    initChunkSeed(___arg1, ___arg2);
+//#)
+
+
+(c-external (_nextInt int32) int32 <fx>
+  #/C/
+    ___result = nextInt(___arg1);
+//#)
+
+
+;;;
+;;;; Optimize
+;;;
+
+
 ;; for optimize tests
 (c-declare world.procedural #/C/
 #define ___BODYREF(x, y) ___CAST(___SCMOBJ*, ___BODY(x))[y]
@@ -97,15 +278,6 @@ inline int odd(int x)
   (u4vector-set! (get-skylight~ (shaping-section shapings shapings-touched j)) (local-index i (modulo j 16) k) value))
 
 
-(defoptimize inline (touched-top-y shapings-touched <u8vector>) <fx>
-  (continuation-capture
-    (lambda (return)
-      (for (y 15 (>= y 0) (decrease! y))
-           (when (= (u8vector-ref shapings-touched y) 1)
-             (continuation-return return (* y 16))))
-      -1)))
-
-
 ;;;
 ;;;; Generator
 ;;;
@@ -136,6 +308,15 @@ inline int odd(int x)
   (method protected virtual (generate-variations chunk-x chunk-z region-x region-z)
     )
   
+  
+  (defoptimize inline (touched-top-y shapings-touched <u8vector>) <fx>
+    (continuation-capture
+      (lambda (return)
+        (for (y 15 (>= y 0) (decrease! y))
+             (when (= (u8vector-ref shapings-touched y) 1)
+               (continuation-return return (* y 16))))
+        -1)))
+
 
   (method (generate-skylight chunk <World-Chunk> shapings <vector> shapings-touched <u8vector>)
     (site (skylight on?: #t parent: generate)
@@ -309,7 +490,11 @@ inline int odd(int x)
   42)
 
 (definition rand
-  (newRandom 42))
+  (newRandom rand-seed))
+
+
+(definition _rand <s64vector>
+  (_newRandom rand-seed))
 
 
 (defoptimize inline (clamp a <fl> b <fl> w <fl>) <fl>
@@ -456,22 +641,11 @@ inline int odd(int x)
           variations))))
   
   
-  (definition rand-seed
-    23)
-  
-  (definition rand
-    (newRandom rand-seed))
-  
-  
   (definition sea-level <fx>
     63)
 
   
   (method (generate-blocks shapings <vector> shapings-touched <u8vector> variations <f64vector>)
-    ;; optimize test
-    (define (call-randomInt n <fx>) <fx>
-      (randomInt rand n))
-    
     (site (blocks on?: #t parent: generate)
       (optimize
         (for (i 0 (< i 4) (increase! i))
@@ -503,7 +677,7 @@ inline int odd(int x)
                                                (let ((lvt-45-1 d9))
                                                  (for (l2 0 (< l2 4) (increase! l2))
                                                       (let ((z (+ l2 (* l 4))))
-                                                        (if (<= y 2 @w (call-randomInt 5))
+                                                        (if (<= y (_randomInt _rand 5))
                                                             (block-set! shapings shapings-touched x y z 7)
                                                           (if (> lvt-45-1 0.)
                                                               (block-set! shapings shapings-touched x y z 1)
