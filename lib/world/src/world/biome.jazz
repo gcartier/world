@@ -8,14 +8,17 @@
 ;;;  Portions created by the Initial Developer are Copyright (C) 2012-2016
 ;;;  the Initial Developer. All Rights Reserved.
 ;;;
-;;;  Contributor(s): Édouard Hébert
+;;;  Contributor(s): Edouard Hebert
 
 
 (module world.biome jazz
 
 
-(import (jazz.geometry)
+(import (jazz.foreign)
+        (jazz.geometry)
         (jazz.graphic)
+        (jazz.optimize (phase syntax))
+        (jazz.platform (phase syntax))
         (world)
         (world.autoload)
         (world.foreign)
@@ -23,10 +26,296 @@
         (world.geometry)
         (world.geometry.syntax (phase syntax))
         (world.homogeneous)
+        (world.section)
         (world.syntax (phase syntax)))
 
 
 (proclaim (warn optimizations))
+
+
+;;;
+;;;; Random
+;;;
+
+
+;; PUT CODE HERE TO TEST UNTIL WE HAVE LINKING
+
+
+(c-include "<stdlib.h>")
+
+
+(c-declare world.foreign
+  #/C/
+    ___S64 multiplier = 0x5DEECE66D;
+    ___S64 addend = 0xB;
+    ___S64 mask = ((___S64) 1 << 48) - 1;
+    ___S64 seedUniquifier = 8682522807148012;
+    
+    void setSeed(___S64* rand, ___S64 seed)
+    {
+        seed = ((seed) ^ multiplier) & mask;
+        *rand = seed;
+    }
+
+    ___S32 next(___S64* rand, ___S32 bits)
+    {
+        ___S64 oldseed, nextseed;
+        oldseed = *rand;
+        nextseed = (oldseed * multiplier + addend) & mask;
+        *rand = nextseed;
+        return (___S32)((___U64) nextseed >> (48 - bits));
+    }
+    
+    ___S32 randomInt(___S64* rand, ___S32 n)
+    {
+        if ((n & -n) == n)
+            return (___S32)((n * (___S64)next(rand, 31)) >> 31);
+        else
+        {
+            ___S32 bits, val;
+            do {
+                bits = next(rand, 31);
+                val = bits % n;
+            } while (bits - val + (n-1) < 0);
+            
+            return val;
+        }
+    }
+//#)
+
+
+(defoptimize inline (__initRandom rand <s64vector> seed <s64vector>) <void>
+  (inline
+  #/C/
+    *rand = 0;
+    setSeed(rand, *seed);
+//#))
+
+
+(definition (__newRandom seed) <s64vector>
+  (let ((rand (make-s64vector 1))
+        (seed (s64vector seed)))
+    (optimize
+      (__initRandom rand seed)
+      ;; quicky
+      0)
+    rand))
+
+
+(defoptimize inline (__getSeed rand <s64vector>) <s64>
+  (inline
+  #/C/
+    return *rand;
+//#))
+
+
+(defoptimize inline (__setSeed rand <s64vector> seed <s64>) <void>
+  (inline
+  #/C/
+    setSeed(rand, seed);
+//#))
+
+
+(defoptimize inline (__setSeedAux rand <s64vector> p <fx> q <fx> j <s64> k <s64> seed <s64>) <void>
+  (inline
+  #/C/
+    ___S64 j1 = (___S64)p * j;
+    ___S64 k1 = (___S64)q * k;
+    setSeed(rand, j1 ^ k1 ^ seed);
+//#))
+
+
+(defoptimize inline (__randomLong rand <s64vector>) <s64>
+  (inline
+  #/C/
+    return ((___S64)(next(rand, 32)) << 32) + next(rand, 32);
+//#))
+
+
+(defoptimize inline (__randomInt rand <s64vector> n <fx>) <fx>
+  (inline
+  #/C/
+    return randomInt(rand, n);
+//#))
+
+
+(defoptimize inline (__randomIntBetween rand <s64vector> min <fx> max <fx>) <fx>
+  (+ min (__randomInt rand (+ (- max min) 1))))
+
+
+(defoptimize inline (__randomBool rand <s64vector>) <fx>
+  (if (= (__randomInt rand 2) 1)
+      1
+    0))
+
+
+(defoptimize inline (__randomFloat rand <s64vector>) <fl>
+  (inline
+  #/C/
+    return next(rand, 24) / ((float)((___S64) 1 << 24));
+//#))
+
+
+;;;
+;;;; Generation
+;;;
+
+
+(c-declare world.foreign
+  #/C/
+    ___S64 worldSeed;
+    ___S64 chunkSeed;
+    
+    void initChunkSeed(___S64 arg1, ___S64 arg2)
+    {
+        chunkSeed = worldSeed;
+        chunkSeed *= chunkSeed * 6364136223846793005 + 1442695040888963407;
+        chunkSeed += arg1;
+        chunkSeed *= chunkSeed * 6364136223846793005 + 1442695040888963407;
+        chunkSeed += arg2;
+        chunkSeed *= chunkSeed * 6364136223846793005 + 1442695040888963407;
+        chunkSeed += arg1;
+        chunkSeed *= chunkSeed * 6364136223846793005 + 1442695040888963407;
+        chunkSeed += arg2;
+    }
+    
+    ___S32 nextInt(___S32 n)
+    {
+        ___S32 i = (___S32)((chunkSeed >> 24) % (___S64) n);
+    
+        if (i < 0)
+        {
+            i += n;
+        }
+    
+        chunkSeed *= chunkSeed * 6364136223846793005 + 1442695040888963407;
+        chunkSeed += worldSeed;
+        
+        return i;
+    }
+//#)
+
+
+(defoptimize inline (__worldSeed) <s64>
+  (inline
+  #/C/
+    return worldSeed;
+//#))
+
+
+(c-external (__initWorldSeed int64) void
+  #/C/
+    worldSeed = ___arg1;
+//#)
+
+
+(c-external (__initChunkSeed int64 int64) void
+  #/C/
+    initChunkSeed(___arg1, ___arg2);
+//#)
+
+
+(c-external (__nextInt int32) int32 <fx>
+  #/C/
+    ___result = nextInt(___arg1);
+//#)
+
+
+;;;
+;;;; Optimize
+;;;
+
+
+;; for optimize tests
+(c-declare world.procedural #/C/
+#define ___BODYREF(x, y) ___CAST(___SCMOBJ*, ___BODY(x))[y]
+#define ___S32BODYREF(x, y) ___CAST(___S32*, ___BODY(x))[y]
+#define ___S32BODYSET(x, y, z) ___CAST(___S32*, ___BODY(x))[y] = (z)
+#define ___F64BODYREF(x, y) ___CAST(___F64*, ___BODY(x))[y]
+#define ___F64BODYSET(x, y, z) ___CAST(___F64*, ___BODY(x))[y] = (z)
+
+#define MAX(x,y)(((x)<(y))?(y):(x))
+#define MIN(x,y)(((x)<(y))?(x):(y))
+
+inline int even(int x)
+{
+    return (x % 2) == 0;
+}
+
+inline int odd(int x)
+{
+    return (x % 2) != 0;
+}
+
+inline int floor_divide(int n, int d)
+{
+    return floor((double) n / (double) d);
+}
+//#)
+
+
+;; ADD CORRECT BOOLEAN SUPPORT FOR shapings-touched and generate-skylight
+
+
+;; TO THINK IS IT OK TO TOUCH EVEN WHEN REFING?????
+(defoptimize inline (shaping-section shapings <vector> shapings-touched <u8vector> j <fx>) <World-Section>
+  (let ((y (fxfloor (/ (cast <fl> j) 16.))))
+    (u8vector-set! shapings-touched y 1)
+    (vector-ref shapings y)))
+
+
+(defoptimize inline (local-index i <fx> j <fx> k <fx>) <fx>
+  (+ (* j 256) (* k 16) i))
+
+
+(defoptimize inline (u4vector-set! field <u8vector> index <fx> value <fx>) <void>
+  (let ((offset (quotient index 2)))
+    (let ((byte (u8vector-ref field offset)))
+      (u8vector-set! field offset
+        (if (even? index)
+            (bitwise-ior value (bitwise-and byte #xF0))
+          (bitwise-ior (bitwise-and byte #x0F) (arithmetic-shift-left value 4)))))))
+
+
+;; QUICK HACK AROUND DUPLICATION THAT NEEDS LINKING LOGIC
+(defoptimize inline (shaping-blocks shapings <vector> shapings-touched <u8vector> j <fx>) <u8vector>
+  (get-blocks~ (shaping-section shapings shapings-touched j)))
+
+
+(defoptimize inline (block-ref shapings <vector> shapings-touched <u8vector> i <fx> j <fx> k <fx>) <fx>
+  (u8vector-ref (shaping-blocks shapings shapings-touched j) (local-index i (modulo j 16) k)))
+
+
+(defoptimize inline (block-set! shapings <vector> shapings-touched <u8vector> i <fx> j <fx> k <fx> block-id <fx>) <void>
+  (u8vector-set! (shaping-blocks shapings shapings-touched j) (local-index i (modulo j 16) k) block-id))
+
+
+(defoptimize inline (data-set! shapings <vector> shapings-touched <u8vector> i <fx> j <fx> k <fx> data-id <fx>) <void>
+  (u4vector-set! (get-data~ (shaping-section shapings shapings-touched j)) (local-index i (modulo j 16) k) data-id))
+
+
+(defoptimize inline (skylight-set! shapings <vector> shapings-touched <u8vector> i <fx> j <fx> k <fx> value <fx>) <void>
+  (u4vector-set! (get-skylight~ (shaping-section shapings shapings-touched j)) (local-index i (modulo j 16) k) value))
+
+
+;; TEMP COPIED
+;; QUICK HACK AROUND DUPLICATION THAT NEEDS LINKING LOGIC
+(defoptimize inline (get-block-variants) <fx>
+  block-variants)
+
+(defoptimize inline (decode-fxid id <fx>) <fx>
+  (fxfloor/ id (get-block-variants)))
+
+(defoptimize inline (decode-variant-id id <fx>) <fx>
+  (- (modulo id (get-block-variants)) 1))
+
+
+(defoptimize inline (blockstate-set! shapings <vector> shapings-touched <u8vector> i <fx> j <fx> k <fx> id <fx>) <void>
+  (let ((block-id (decode-fxid id))
+        (data-id (decode-variant-id id)))
+    (block-set! shapings shapings-touched i j k block-id)
+    (when (> data-id 0)
+      (data-set! shapings shapings-touched i j k data-id))))
 
 
 ;;;
@@ -40,8 +329,8 @@
   (slot name                 getter generate)
   (slot title                getter generate)
   (slot id          <fx>     getter generate)
-  (slot top                  accessors generate)
-  (slot fill                 accessors generate)
+  (slot top         <fx>     accessors generate)
+  (slot fill        <fx>     accessors generate)
   (slot color       <Color>  getter generate)
   (slot base        <fl>     getter generate)
   (slot variation   <fl>     getter generate)
@@ -89,22 +378,21 @@
     (if (= (randomInt rand 10) 0) 0 1))
   
   
-  (method virtual (replace-blocks x z rand block-ref block-set! blockstate-set!)
-    (let ((replace-amount -1))
-      (let (iter (y 255))
-        (let ((block-id <fx> (block-ref x y z)))
-          (if (= block-id 0)
-              (set! replace-amount -1)
-            (when (= block-id 1)
-              (if (= replace-amount -1)
-                  (begin
-                    (blockstate-set! x y z top)
-                    (set! replace-amount (randomIntBetween rand 3 5)))
-                (when (> replace-amount 0)
-                  (blockstate-set! x y z fill)
-                  (decrease! replace-amount))))))
-        (when (> y 0)
-          (iter (- y 1))))))
+  (method virtual (replace-blocks x <fx> z <fx> rand <s64vector> shapings <vector> shapings-touched <u8vector>)
+    (optimize
+      (let ((replace-amount -1))
+        (for (y 255 (>= y 0) (decrease! y))
+             (let ((block-id (block-ref shapings shapings-touched x y z)))
+               (if (= block-id 0)
+                   (set! replace-amount -1)
+                 (when (= block-id 1)
+                   (if (= replace-amount -1)
+                       (begin
+                         (blockstate-set! shapings shapings-touched x y z top)
+                         (set! replace-amount (__randomIntBetween rand 3 5)))
+                     (when (> replace-amount 0)
+                       (blockstate-set! shapings shapings-touched  x y z fill)
+                       (decrease! replace-amount))))))))))
   
   
   (method (decorate-biome rand block-ref block-set! blockstate-set! skylight-set! get-sector get-height)
@@ -441,4 +729,419 @@
   (table-ref biome-names name #f))
 
 (definition public (id->biome id <fx>) <Biome>
-  (vector-ref biome-ids id)))
+  (vector-ref biome-ids id))
+
+
+;;;
+;;;; Mesa
+;;;
+
+
+(class BiomeMesa extends Biome
+  
+  
+  (slot white-stained-clay  <fx>        initialize 2704 getter explicit)
+  (slot orange-stained-clay <fx>        initialize 2705 getter explicit)
+  (slot yellow-stained-clay <fx>        initialize 2708 getter explicit)
+  (slot silver-stained-clay <fx>        initialize 2712 getter explicit)
+  (slot brown-stained-clay  <fx>        initialize 2716 getter explicit)
+  (slot red-stained-clay    <fx>        initialize 2718 getter explicit)
+  (slot hardened-clay       <fx>        initialize 2924 getter explicit)
+  (slot bands               <s32vector> initialize (generate-bands) getter generate)
+  
+  
+  (method (generate-bands)
+    (let ((rand (newRandom (worldSeed)))
+          (bands (make-s32vector 64 hardened-clay)))
+      (let ((i2 (+ (randomInt rand 4) 2))
+            (j2 (+ (randomInt rand 4) 2))
+            (l2 (+ (randomInt rand 4) 2))
+            (k3 (+ (randomInt rand 3) 3))
+            (j4 0))
+        (loop (for l1 <fx> from 0 below 64)
+              (increase! l1 (+ (randomInt rand 5) 1))
+              (when (< l1 64)
+                (s32vector-set! bands l1 orange-stained-clay)))
+        (loop (for i <fx> from 0 below i2)
+              (let ((j (+ (randomInt rand 3) 1))
+                    (k (randomInt rand 64)))
+                (loop (for l <fx> init 0 test (and (< (+ k l) 64) (< l j)) iter (+ l 1))
+                      (s32vector-set! bands (+ k l) yellow-stained-clay))))
+        (loop (for k2 <fx> from 0 below j2)
+              (let ((i3 (+ (randomInt rand 3) 2))
+                    (l3 (randomInt rand 64)))
+                (loop (for i1 <fx> init 0 test (and (< (+ l3 i1) 64) (< i1 i3)) iter (+ i1 1))
+                      (s32vector-set! bands (+ l3 i1) brown-stained-clay))))
+        (loop (for j3 <fx> from 0 below l2)
+              (let ((i4 (+ (randomInt rand 3) 1))
+                    (k4 (randomInt rand 64)))
+                (loop (for j1 <fx> init 0 test (and (< (+ k4 j1) 64) (< j1 i4)) iter (+ j1 1))
+                      (s32vector-set! bands (+ k4 j1) red-stained-clay))))
+        (loop (for l4 from 0 below k3)
+              (do
+                    (increase! j4 (+ (randomInt rand 16) 4))
+                  (when (< j4 64)
+                    (s32vector-set! bands j4 white-stained-clay)
+                    (when (and (> j4 1) (randomBool rand))
+                      (s32vector-set! bands (- j4 1) silver-stained-clay))
+                    (when (and (< j4 63) (randomBool rand))
+                      (s32vector-set! bands (+ j4 1) silver-stained-clay))))))
+      bands))
+  
+  
+  (method override (replace-blocks x <fx> z <fx> rand <s64vector> shapings <vector> shapings-touched <u8vector>)
+    (optimize
+      (let ((l -1)
+            (flag #f))
+        (for (y 255 (>= y 0) (decrease! y))
+             (let ((iblockstate1 (block-ref shapings shapings-touched x y z)))
+               (if (= iblockstate1 0)
+                   (set! l -1)
+                 (when (= iblockstate1 1)
+                   (if (= l -1) ;; i. e. there is air above this stone block
+                       (begin
+                         (set! flag #f)
+                         (set! l (+ 3 (max 0 (- y 63))))
+                         (cond ((< y 62)
+                                (blockstate-set! shapings shapings-touched x y z orange-stained-clay))
+                               ((<= y 69)
+                                (blockstate-set! shapings shapings-touched x y z top)
+                                (set! flag #t))
+                               (else
+                                (let ((iblockstate2 orange-stained-clay))
+                                  (when (and (>= y 64) (<= y 127))
+                                    (set! iblockstate2 (if #f hardened-clay (vector-ref bands (modulo y 64)))))
+                                  (blockstate-set! shapings shapings-touched x y z iblockstate2)))))
+                     (when (> l 0)
+                       (decrease! l)
+                       (blockstate-set! shapings shapings-touched x y z (if flag orange-stained-clay (vector-ref bands (modulo y 64))))))))))))))
+
+
+;;;
+;;;; Taiga
+;;;
+
+
+(class BiomeTaiga extends Biome
+  
+  
+  (method override (setup-decorator)
+    (set-trees-per-chunk~ decorator 10))
+  
+  
+  (method override (get-tree-generation rand) <fx>
+    2)
+  
+  
+  (method override (replace-blocks x <fx> z <fx> rand <s64vector> shapings <vector> shapings-touched <u8vector>)
+    (optimize
+      (let ((replace-amount -1))
+        (for (y 255 (>= y 0) (decrease! y))
+             (let ((block-id (block-ref shapings shapings-touched x y z)))
+               (if (= block-id 0)
+                   (set! replace-amount -1)
+                 (when (= block-id 1)
+                   (if (= replace-amount -1)
+                       (begin
+                         (when (and (< y 255) (< temperature 0.) (= (block-ref shapings shapings-touched x (+ y 1) z) 0))
+                           (blockstate-set! shapings shapings-touched x (+ y 1) z 1327))
+                         (blockstate-set! shapings shapings-touched x y z top)
+                         (set! replace-amount (__randomIntBetween rand 3 5)))
+                     (when (> replace-amount 0)
+                       (blockstate-set! shapings shapings-touched x y z fill)
+                       (decrease! replace-amount)))))))))))
+
+
+;;;
+;;;; Plains
+;;;
+
+
+(class BiomePlains extends Biome
+  
+  
+  (method override (setup-decorator)
+    (set-grass-per-chunk~ decorator 10)))
+
+
+;;;
+;;;; Forest
+;;;
+
+
+(class BiomeForest extends Biome
+  
+  
+  (method override (setup-decorator)
+    (set-trees-per-chunk~ decorator 10)
+    (set-grass-per-chunk~ decorator 2))
+  
+  
+  (method override (get-tree-generation rand) <fx>
+    (if (and (neq? type 'birch) (/= (randomInt rand 5) 0))
+        (if (= (randomInt rand 10) 0)
+            1
+          0)
+      3)))
+
+
+;;;
+;;;; Hills
+;;;
+
+
+(class BiomeHills extends Biome
+  
+  
+  (method override (setup-decorator)
+    (set-trees-per-chunk~ decorator 1)))
+
+
+;;;
+;;;; Desert
+;;;
+
+
+(class BiomeDesert extends Biome
+  
+  
+  (method override (setup-decorator)
+    (set-water-lakes?~ decorator #f)))
+
+
+;;;
+;;;; Ocean
+;;;
+
+
+(class BiomeOcean extends Biome
+  )
+
+
+;;;
+;;;; Swamp
+;;;
+
+
+(class BiomeSwamp extends Biome
+  )
+
+
+;;;
+;;;; River
+;;;
+
+
+(class BiomeRiver extends Biome
+  )
+
+
+;;;
+;;;; Hell
+;;;
+
+
+(class BiomeHell extends Biome
+  
+  
+  (method override (setup-decorator)
+    (set-water-lakes?~ decorator #f)))
+
+
+;;;
+;;;; End
+;;;
+
+
+(class BiomeEnd extends Biome
+  
+  
+  (method override (setup-decorator)
+    (set-water-lakes?~ decorator #f)))
+
+
+;;;
+;;;; Snow
+;;;
+
+
+(class BiomeSnow extends Biome
+  
+  
+  (method override (replace-blocks x <fx> z <fx> rand <s64vector> shapings <vector> shapings-touched <u8vector>)
+    (optimize
+      (let ((replace-amount -1))
+        (for (y 255 (>= y 0) (decrease! y))
+             (let ((block-id (block-ref shapings shapings-touched x y z)))
+               (if (= block-id 0)
+                   (set! replace-amount -1)
+                 (when (= block-id 1)
+                   (if (= replace-amount -1)
+                       (begin
+                         (when (and (< y 255) (= (block-ref shapings shapings-touched x (+ y 1) z) 0))
+                           (blockstate-set! shapings shapings-touched x (+ y 1) z 1327))
+                         (blockstate-set! shapings shapings-touched x y z top)
+                         (set! replace-amount (__randomIntBetween rand 3 5)))
+                     (when (> replace-amount 0)
+                       (blockstate-set! shapings shapings-touched x y z fill)
+                       (decrease! replace-amount)))))))))))
+
+
+;;;
+;;;; MushroomIsland
+;;;
+
+
+(class BiomeMushroomIsland extends Biome
+  )
+
+
+;;;
+;;;; Jungle
+;;;
+
+
+(class BiomeJungle extends Biome
+  )
+
+
+;;;
+;;;; Beach
+;;;
+
+
+(class BiomeBeach extends Biome
+  )
+
+
+;;;
+;;;; StoneBeach
+;;;
+
+
+(class BiomeStoneBeach extends Biome
+  )
+
+
+;;;
+;;;; Savanna
+;;;
+
+
+(class BiomeSavanna extends Biome
+  )
+
+
+;;;
+;;;; ForestMutated
+;;;
+
+
+(class BiomeForestMutated extends Biome
+  )
+
+
+;;;
+;;;; SavannaMutated
+;;;
+
+
+(class BiomeSavannaMutated extends Biome
+  )
+
+
+;;;
+;;;; Void
+;;;
+
+
+@not-necessary-for-now
+(class BiomeVoid extends Biome
+  )
+
+
+;;;
+;;;; Biomes
+;;;
+
+
+(define-biome Ocean                BiomeOcean          "Ocean"                        0  Gravel       Gravel            (0 0 112) base: -1.0 variation: 0.1)
+(define-biome Plains               BiomePlains         "Plains"                       1  Grass        Dirt              (141 179 96) base: 0.125 variation: 0.05 temperature: 0.8 rain: 0.4)
+(define-biome Desert               BiomeDesert         "Desert"                       2  Sand         Sand              (250 148 24) base: 0.125 variation: 0.05 temperature: 2.0 rain: 0.0)
+(define-biome ExtremeHills         BiomeHills          "Extreme Hills"                3  Grass        Dirt              (96 96 96) base: 1.0 variation: 0.5 temperature: 0.2 rain: 0.3)
+(define-biome Forest               BiomeForest         "Forest"                       4  Grass        Dirt              (5 102 33) temperature: 0.7 rain: 0.8)
+(define-biome Taiga                BiomeTaiga          "Taiga"                        5  Grass        Dirt              (11 102 89) base: 0.2 variation: 0.2 temperature: -0.25 rain: 0.8)
+(define-biome Swampland            BiomeSwamp          "Swampland"                    6  Grass        Dirt              (7 249 178) base: -0.2 variation: 0.1 temperature: 0.8 rain: 0.9)
+(define-biome River                BiomeRiver          "River"                        7  Sand         Sand              (0 0 255) base: -0.5 variation: 0.0)
+(define-biome Hell                 BiomeHell           "Hell"                         8  Grass        Dirt              (255 0 0) temperature: 2.0 rain: 0.0)
+(define-biome Sky                  BiomeEnd            "End"                          9  Grass        Dirt              (128 128 255))
+(define-biome FrozenOcean          BiomeOcean          "Frozen Ocean"                10  Gravel       Gravel            (144 144 160) base: -1.0 variation: 0.1 temperature: 0.0 rain: 0.5)
+(define-biome FrozenRiver          BiomeRiver          "Frozen River"                11  Grass        Dirt              (160 160 255) base: -0.5 variation: 0.0 temperature: 0.0 rain: 0.5)
+(define-biome IcePlains            BiomeSnow           "Ice Plains"                  12  Grass        Dirt              (255 255 255) base: 0.125 variation: 0.05 temperature: 0.0 rain: 0.5)
+(define-biome IceMountains         BiomeSnow           "Ice Mountains"               13  Grass        Dirt              (160 160 160) base: 0.45 variation: 0.3 temperature: 0.0 rain: 0.5)
+(define-biome MushroomIsland       BiomeMushroomIsland "Mushroom Island"             14  Mycelium     Dirt              (255 0 255) base: 0.2 variation: 0.3 temperature: 0.9 rain: 1.0)
+(define-biome MushroomIslandShore  BiomeMushroomIsland "Mushroom Island Shore"       15  Mycelium     Dirt              (160 0 255) base: 0.0 variation: 0.025 temperature: 0.9 rain: 1.0)
+(define-biome Beach                BiomeBeach          "Beach"                       16  Sand         Sand              (250 222 85) base: 0.0 variation: 0.025 temperature: 0.8 rain: 0.4)
+(define-biome DesertHills          BiomeDesert         "Desert Hills"                17  Sand         Sand              (210 95 18) base: 0.45 variation: 0.3 temperature: 2.0 rain: 0.0)
+(define-biome ForestHills          BiomeForest         "Forest Hills"                18  Grass        Dirt              (34 85 28) base: 0.45 variation: 0.3 temperature: 0.7 rain: 0.8)
+(define-biome TaigaHills           BiomeTaiga          "Taiga Hills"                 19  Grass        Dirt              (22 57 51) temperature: 0.25 rain: 0.8 base: 0.45 variation: 0.3)
+(define-biome ExtremeHillsEdge     BiomeHills          "Extreme Hills Edge"          20  Grass        Dirt              (114 120 154) base: 0.8 variation: 0.3 temperature: 0.2 rain: 0.3)
+(define-biome Jungle               BiomeJungle         "Jungle"                      21  Grass        Dirt              (83 123 9) temperature: 0.95 rain: 0.9)
+(define-biome JungleHills          BiomeJungle         "Jungle Hills"                22  Grass        Dirt              (44 66 5) base: 0.45 variation: 0.3 temperature: 0.95 rain: 0.9)
+(define-biome JungleEdge           BiomeJungle         "Jungle Edge"                 23  Grass        Dirt              (98 139 23) temperature: 0.95 rain: 0.8)
+(define-biome DeepOcean            BiomeOcean          "Deep Ocean"                  24  Gravel       Gravel            (0 0 48) base: -1.8 variation: 0.1)
+(define-biome StoneBeach           BiomeStoneBeach     "Stone Beach"                 25  Stone        Stone             (162 162 132) base: 0.1 variation: 0.8 temperature: 0.2 rain: 0.3)
+(define-biome ColdBeach            BiomeBeach          "Cold Beach"                  26  Sand         Sand              (250 240 192) base: 0.0 variation: 0.025 temperature: 0.05 rain: 0.3)
+(define-biome BirchForest          BiomeForest         "Birch Forest"                27  Grass        Dirt              (48 116 68) temperature: 0.6 rain: 0.6)
+(define-biome BirchForestHills     BiomeForest         "Birch Forest Hills"          28  Grass        Dirt              (31 95 50) base: 0.45 variation: 0.3 temperature: 0.6 rain: 0.6)
+(define-biome RoofedForest         BiomeForest         "Roofed Forest"               29  Grass        Dirt              (64 81 26) temperature: 0.7 rain: 0.8)
+(define-biome ColdTaiga            BiomeTaiga          "Cold Taiga"                  30  Grass        Dirt              (49 85 74) base: 0.2 variation: 0.2 temperature: -0.5 rain: 0.4)
+(define-biome ColdTaigaHills       BiomeTaiga          "Cold Taiga Hills"            31  Grass        Dirt              (36 63 54) base: 0.45 variation: 0.3 temperature: -0.5 rain: 0.4)
+(define-biome MegaTaiga            BiomeTaiga          "Mega Taiga"                  32  Grass        Dirt              (89 102 81) temperature: 0.3 rain: 0.8 base: 0.2 variation: 0.2)
+(define-biome MegaTaigaHills       BiomeTaiga          "Mega Taiga Hills"            33  Grass        Dirt              (69 79 62) base: 0.45 variation: 0.3 temperature: 0.3 rain: 0.8)
+(define-biome ExtremeHillsPlus     BiomeHills          "Extreme Hills+"              34  Grass        Dirt              (80 112 80) base: 1.0 variation: 0.5 temperature: 0.2 rain: 0.3)
+(define-biome Savanna              BiomeSavanna        "Savanna"                     35  Grass        Dirt              (189 178 95) base: 0.125 variation: 0.05 temperature: 1.2 rain: 0.0)
+(define-biome SavannaPlateau       BiomeSavanna        "Savanna Plateau"             36  Grass        Dirt              (167 157 100) base: 1.5 variation: 0.025 temperature: 1.0 rain: 0.0)
+(define-biome Mesa                 BiomeMesa           "Mesa"                        37  RedSand      OrangeStainedClay (217 69 21) temperature: 2.0 rain: 0.0)
+(define-biome MesaPlateauF         BiomeMesa           "Mesa Plateau F"              38  HardenedClay HardenedClay      (176 151 101) base: 1.5 variation: 0.025 temperature: 2.0 rain: 0.0)
+(define-biome MesaPlateau          BiomeMesa           "Mesa Plateau"                39  HardenedClay HardenedClay      (202 140 101) base: 1.5 variation: 0.025 temperature: 2.0 rain: 0.0)
+@w(define-biome Void               BiomeVoid           "Void"                       127  Grass        Dirt              (0 0 0))
+(define-biome SunflowerPlains      BiomePlains         "Sunflower Plains"           129  Grass        Dirt              (141 179 96) base: 0.125 variation: 0.05 temperature: 0.8 rain: 0.4)
+(define-biome DesertM              BiomeDesert         "Desert M"                   130  Sand         Sand              (250 148 24) base: 0.225 variation: 0.25 temperature: 2.0 rain: 0.0)
+(define-biome ExtremeHillsM        BiomeHills          "Extreme Hills M"            131  Grass        Dirt              (96 96 96) base: 1.0 variation: 0.5 temperature: 0.2 rain: 0.3)
+(define-biome FlowerForest         BiomeForest         "Flower Forest"              132  Grass        Dirt              (5 102 33) variation: 0.4 temperature: 0.7 rain: 0.8)
+(define-biome TaigaM               BiomeTaiga          "Taiga M"                    133  Grass        Dirt              (11 102 89) base: 0.3 variation: 0.4 temperature: 0.25 rain: 0.8)
+(define-biome SwamplandM           BiomeSwamp          "Swampland M"                134  Grass        Dirt              (7 249 178) base: -0.1 variation: 0.3 temperature: 0.8 rain: 0.9)
+(define-biome IcePlainsSpikes      BiomeSnow           "Ice Plains Spikes"          140  Snow         Dirt              (140 180 180) base: 0.425 variation: 0.45 temperature: 0.0 rain: 0.5)
+(define-biome JungleM              BiomeJungle         "Jungle M"                   149  Grass        Dirt              (83 123 9) base: 0.2 variation: 0.4 temperature: 0.95 rain: 0.9)
+(define-biome JungleEdgeM          BiomeJungle         "Jungle Edge M"              151  Grass        Dirt              (98 139 23) base: 0.2 variation: 0.4 temperature: 0.95 rain: 0.8)
+(define-biome BirchForestM         BiomeForestMutated  "Birch Forest M"             155  Grass        Dirt              (48 116 68) base: 0.2 variation: 0.4 temperature: 0.6 rain: 0.6)
+(define-biome BirchForestHillsM    BiomeForestMutated  "Birch Forest Hills M"       156  Grass        Dirt              (31 95 50) base: 0.55 variation: 0.5 temperature: 0.6 rain: 0.6)
+(define-biome RoofedForestM        BiomeForest         "Roofed Forest M"            157  Grass        Dirt              (64 81 26) base: 0.2 variation: 0.4 temperature: 0.7 rain: 0.8)
+(define-biome ColdTaigaM           BiomeTaiga          "Cold Taiga M"               158  Grass        Dirt              (49 85 74) base: 0.3 variation: 0.4 temperature: -0.5 rain: 0.4)
+(define-biome MegaSpruceTaiga      BiomeTaiga          "Mega Spruce Taiga"          160  Grass        Dirt              (89 102 81) base: 0.2 variation: 0.2 temperature: 0.25 rain: 0.8)
+(define-biome MegaSpurceTaigaHills BiomeTaiga          "Mega Spruce Taiga (Hills)"  161  Grass        Dirt              (69 79 62) base: 0.2 variation: 0.2 temperature: 0.25 rain: 0.8)
+(define-biome ExtremeHillsPlusM    BiomeHills          "Extreme Hills+ M"           162  Grass        Dirt              (80 112 80) base: 1.0 variation: 0.5 temperature: 0.2 rain: 0.3)
+(define-biome SavannaM             BiomeSavannaMutated "Savanna M"                  163  Grass        Dirt              (189 178 95) base: 0.3625 variation: 1.225 temperature: 1.1 rain: 0.0)
+(define-biome SavannaPlateauM      BiomeSavannaMutated "Savanna Plateau M"          164  Grass        Dirt              (167 157 100) base: 1.05 variation: 1.2125001 temperature: 1.0 rain: 0.0)
+(define-biome MesaBryce            BiomeMesa           "Mesa (Bryce)"               165  HardenedClay HardenedClay      (217 69 21) temperature: 2.0 rain: 0.0)
+(define-biome MesaPlateauFM        BiomeMesa           "Mesa Plateau F M"           166  HardenedClay HardenedClay      (176 151 101) base: 0.45 variation: 0.3 temperature: 2.0 rain: 0.0)
+(define-biome MesaPlateauM         BiomeMesa           "Mesa Plateau M"             167  HardenedClay HardenedClay      (202 140 101) base: 0.45 variation: 0.3 temperature: 2.0 rain: 0.0)
+
+
+;;;
+;;;; Regions
+;;;
+
+
+(definition public Warm-Biomes <vector>
+  (vector Desert Desert Desert Savanna Savanna Plains))
+
+(definition public Medium-Biomes <vector>
+  (vector Forest RoofedForest ExtremeHills Plains BirchForest Swampland))
+
+(definition public Cold-Biomes <vector>
+  (vector Forest ExtremeHills Taiga Plains))
+
+(definition public Ice-Biomes <vector>
+  (vector IcePlains IcePlains IcePlains ColdTaiga)))
