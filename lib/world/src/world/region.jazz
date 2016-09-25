@@ -67,6 +67,51 @@
   (modulo x/z 32))
 
 
+;;;
+;;;; Pool
+;;;
+
+
+(constant sections-size <fx>
+  (* 5 16))
+
+(definition protected sections-pool <vector>
+  (make-vector sections-size #f))
+
+(definition protected sections-allocated <fx>
+  0)
+
+(definition protected sections-available <fx>
+  0)
+
+
+(definition protected (make-section$ sector-y) <World-Section>
+  (if (= sections-available 0)
+      (assert (< sections-allocated sections-size)
+        (increase! sections-allocated)
+        (make-section sector-y))
+    (decrease! sections-available)
+    (let ((section (vector-ref sections-pool sections-available)))
+      (vector-set! sections-pool sections-available #f)
+      section)))
+
+
+(definition protected (free-section$ section <World-Section>) <void>
+  (assert (< sections-available sections-size))
+  (vector-set! sections-pool sections-available section)
+  (increase! sections-available))
+
+
+(definition protected (keep-section$ section)
+  (assert (> sections-allocated 0))
+  (decrease! sections-allocated))
+
+
+;;;
+;;;; Region
+;;;
+
+
 (class World-Region extends Object
   
   
@@ -142,22 +187,25 @@
   
   
   (definition shapings <vector>
-    (make-vector 16 #f))
+    (make-vector 17 #f))
   
   
-  (method (setup-shapings chunk <World-Chunk>)
+  (method (setup-shapings shapings <vector> chunk <World-Chunk>)
     (loop (for y from 0 below 16)
           (let ((section <World-Section+> (vector-ref shapings y)))
             (if section
                 (set-touched~ section 0)
-              (vector-set! shapings y (make-section~ chunk y))))))
+              (vector-set! shapings y (make-section y)))))
+    (vector-set! shapings 16 chunk))
   
   
-  (method (extract-shapings chunk <World-Chunk>)
+  (method (extract-shapings shapings <vector> chunk <World-Chunk>)
     (loop (for y from 0 below 16)
           (let ((section <World-Section> (vector-ref shapings y)))
             (when (= (get-touched~ section) 1)
-              (setup-section~ chunk section)
+              (if (get-chunk~ section)
+                  (modified~ section)
+                (setup-section~ chunk section))
               (vector-set! shapings y #f)))))
   
   
@@ -176,10 +224,10 @@
                              (list
                                biomes heightmap entities block-entities sections))))))
               (let ((chunk (new World-Chunk Shaped #f #f self tag (tag-value biomes) (tag-value heightmap) (tag-value entities) (tag-value block-entities) (tag-value sections) chunk-index)))
-                (setup-shapings chunk)
+                (setup-shapings shapings chunk)
                 (let ((generator (get-generator~ zone)))
                   (shape~ generator chunk shapings))
-                (extract-shapings chunk)
+                (extract-shapings shapings chunk)
                 (generated~ chunk)
                 (modified~ chunk)
                 chunk))))
@@ -197,6 +245,19 @@
                 chunk)))))))
   
   
+  (definition chunk-shapings <vector>
+    (make-vector 17 #f))
+  
+  (definition front-shapings <vector>
+    (make-vector 17 #f))
+  
+  (definition corner-shapings <vector>
+    (make-vector 17 #f))
+  
+  (definition right-shapings <vector>
+    (make-vector 17 #f))
+  
+  
   (method (populate-chunk chunk-x <fx> chunk-z <fx>) <World-Chunk>
     (let ((zone (current-zone)))
       (let ((chunk (shape-chunk chunk-x chunk-z)))
@@ -208,40 +269,19 @@
               (let ((region (load-region~ zone (+ region-x (fxfloor/ x 32)) (+ region-z (fxfloor/ z 32)))))
                 (shape-chunk~ region (modulo x 32) (modulo z 32))))
             
-            (define (local-index i <fx> j <fx> k <fx>) <fx>
-              (+ (* j 256) (* k 16) i))
-            
-            (define (block-ref section <World-Section> i <fx> j <fx> k <fx>) <fx>
-              (u8vector-ref (get-blocks~ section) (local-index i (modulo j 16) k)))
-            
-            (define (block-set! section <World-Section> i <fx> j <fx> k <fx> block-id <fx>)
-              (u8vector-set! (get-blocks~ section) (local-index i (modulo j 16) k) block-id))
-            
-            (define (data-set! section <World-Section> i <fx> j <fx> k <fx> data-id <fx>)
-              (u4vector-set! (get-data~ section) (local-index i (modulo j 16) k) data-id))
-            
-            (define (u4vector-set! field <u8vector> index <fx> value <fx>)
-              (let ((offset (quotient index 2)))
-                (let ((byte (u8vector-ref field offset)))
-                  (u8vector-set! field offset
-                    (if (even? index)
-                        (bitwise-ior value (bitwise-and byte #xF0))
-                      (bitwise-ior (bitwise-and byte #x0F) (arithmetic-shift value 4)))))))
-            
-            (define (blockstate-set! section <World-Section> i <fx> j <fx> k <fx> id <fx>)
-              (bind-values (block-id <fx> data-id <fx>) (decode-fxid/variant-id id)
-                (block-set! section i j k block-id)
-                (when (>= data-id 0)
-                  (data-set! section i j k data-id))))
-            
-            (define (skylight-set! section <World-Section> i <fx> j <fx> k <fx> value <fx>)
-              (u4vector-set! (get-skylight~ section) (local-index i (modulo j 16) k) value))
-            
-            (let ((right (shape (+ chunk-x 1) chunk-z))
-                  (front (shape chunk-x (+ chunk-z 1)))
+            (let ((front (shape chunk-x (+ chunk-z 1)))
                   (corner (shape (+ chunk-x 1) (+ chunk-z 1)))
-                  (generator (get-generator~ zone)))
-              (populate~ generator block-ref block-set! blockstate-set! skylight-set! chunk front corner right)
+                  (right (shape (+ chunk-x 1) chunk-z)))
+              (setup-shapings chunk-shapings chunk)
+              (setup-shapings front-shapings front)
+              (setup-shapings corner-shapings corner)
+              (setup-shapings right-shapings right)
+              (let ((generator (get-generator~ zone)))
+                (populate~ generator chunk-shapings front-shapings corner-shapings right-shapings))
+              (extract-shapings chunk-shapings chunk)
+              (extract-shapings front-shapings front)
+              (extract-shapings corner-shapings corner)
+              (extract-shapings right-shapings right)
               (change-state~ chunk Populated)
               (modified~ chunk)
               chunk))))))
