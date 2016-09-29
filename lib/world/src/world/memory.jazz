@@ -478,7 +478,7 @@
 ;;;
 
 
-(definition public (analyse-regions (members?: members? #f) (orphans?: orphans? #f) (feedback?: feedback? #t))
+(definition public (analyse-regions (members?: members? #f) (orphans?: orphans? #f) (feedback?: feedback? #t) (output: output :terminal))
   (let ((world (current-world))
         (zone (current-zone))
         (kind MOVABLE0)
@@ -511,18 +511,18 @@
         (* 2 (domain-bytes-copied domain)))
       
       (define (report-memory)
-        (format :terminal "{%}live : {a}m ({a} + {a}){%}" (meg last-gc-live) (meg last-gc-movable) (meg last-gc-nonmovable)))
+        (format output "{%}live : {a}m ({a} + {a}){%}" (meg last-gc-live) (meg last-gc-movable) (meg last-gc-nonmovable)))
       
       (define (report-regions regions)
         (let ((total (apply + (map second regions))))
-          (format :terminal "{%}total : {a}m (- {a}m){%}" (meg total) (meg (- last-gc-live total))))
+          (format output "{%}total : {a}m (- {a}m){%}" (meg total) (meg (- last-gc-live total))))
         (for-each (lambda (info)
                     (bind (region bytes members) info
-                      (format :terminal "{%}{a} : {a}m" region (meg bytes))
+                      (format output "{%}{a} : {a}m" region (meg bytes))
                       (when members
                         (for-each (lambda (info)
                                     (bind (class . count) info
-                                      (format :terminal "{%}  {a} : {a}" (category-name class) count)))
+                                      (format output "{%}  {a} : {a}" (category-name class) count)))
                                   (sort > (table->list members) key: cdr)))))
                   regions))
       
@@ -530,7 +530,7 @@
         (fxround (/ (cast <fl> bytes) 1024. 1024.)))
       
       (define (analyse-orphans regions)
-        (format :terminal "{%}{%}")
+        (format output "{%}{%}")
         (walk-object!
           (lambda (container i obj)
             walk-continue)
@@ -542,10 +542,10 @@
                     (table-set! orphans class (+ (table-ref orphans class 0) 1))))))
             obj)
           feedback?: feedback?)
-        (format :terminal "{%}")
+        (format output "{%}")
         (for-each (lambda (info)
                     (bind (class . count) info
-                      (format :terminal "{%}{a} : {a}" (category-name class) count)))
+                      (format output "{%}{a} : {a}" (category-name class) count)))
                   (sort > (table->list orphans) key: cdr)))
       
       (report-memory)
@@ -559,9 +559,9 @@
       (let ((regions (queue-list regions)))
         (report-regions regions)
         (when orphans?
-          (format :terminal "{%}{%}")
+          (format output "{%}{%}")
           (analyse-types ignore: (domain-copies domain))))
-      (format :terminal "{%}"))))
+      (format output "{%}"))))
 
 
 ;;;
@@ -569,18 +569,24 @@
 ;;;
 
 
-(definition public (analyse-types (ignore: ignore #f) (sample: sample #f) (threshold: threshold #f) (feedback?: feedback? #t))
+(definition public (analyse-types (ignore: ignore #f) (sample: sample #f) (threshold: threshold #f) (feedback?: feedback? #t) (output: output :terminal))
   (let ((seen (new-register))
-        (movable (make-table test: eq?))
-        (still (make-table test: eq?))
-        (perm (make-table test: eq?))
+        (movable-sizes (make-table test: eq?))
+        (movable-counts (make-table test: eq?))
+        (still-sizes (make-table test: eq?))
+        (still-counts (make-table test: eq?))
+        (perm-sizes (make-table test: eq?))
+        (perm-counts (make-table test: eq?))
         (samples '())
+        (samples-size 0)
         (threshold (* (or threshold 100) 1024)))
     (bind-values (last-gc-heap-size last-gc-alloc last-gc-live last-gc-movable last-gc-nonmovable) (process-memory)
-      (define (add-size table obj class size)
-        (when (eq? sample class)
-          (set! samples (cons obj samples)))
-        (table-set! table class (+ (table-ref table class 0) size)))
+      (define (add-size sizes counts obj class size)
+        (when (and (eq? sample class) (< samples-size 100))
+          (set! samples (cons obj samples))
+          (increase! samples-size))
+        (table-set! sizes class (+ (table-ref sizes class 0) size))
+        (table-set! counts class (+ (table-ref counts class 0) 1)))
       
       (define (kb bytes)
         (fxround (/ (cast <fl> bytes) 1024.)))
@@ -594,25 +600,26 @@
           (format "{a}k" (kb bytes))))
       
       (define (report-memory)
-        (format :terminal "Live : {a}m ({a} + {a}){%}{%}" (meg last-gc-live) (meg last-gc-movable) (meg last-gc-nonmovable)))
+        (format output "Live : {a}m ({a} + {a}){%}{%}" (meg last-gc-live) (meg last-gc-movable) (meg last-gc-nonmovable)))
       
-      (define (report-region name region (factor 1))
+      (define (report-region name sizes counts (factor 1))
         (let ((live (case name
                       ((MOVA) last-gc-movable)
                       ((STIL) last-gc-nonmovable)
                       (else #f)))
-              (total (apply + (map (lambda (info) (* factor (cdr info))) region))))
+              (total (apply + (map (lambda (info) (* factor (cdr info))) sizes))))
           (let ((missing (and live (- live total))))
-            (format :terminal "{a}: {a}{? (- {a})~}{%}" name (mem total) (and (not ignore) missing (mem missing))))))
+            (format output "{a}: {a}{? (- {a})~}{%}" name (mem total) (and (not ignore) missing (mem missing))))))
       
-      (define (report-content name region (factor 1))
-        (format :terminal "{%}{a}{%}" name)
+      (define (report-content name sizes counts (factor 1))
+        (format output "{%}{a}{%}" name)
         (for-each (lambda (info)
                     (let ((class (car info))
                           (size (* factor (cdr info))))
                       (when (>= size threshold)
-                        (format :terminal "{a} {a}{%}" class (mem size)))))
-                  (sort > region key: cdr)))
+                        (let ((count (table-ref counts class)))
+                          (format output "{a} {a} ({a}){%}" class (mem size) count)))))
+                  (sort > sizes key: cdr)))
       
       (walk-object!
         (lambda (container i obj)
@@ -620,45 +627,50 @@
         (lambda (container i obj)
           (unless (register-ref seen obj #f)
             (unless (and ignore (register-ref ignore obj #f))
-              (let ((table (and (mem-allocated? obj)
+              (let ((sizes (and (mem-allocated? obj)
                                 (case (mem-allocated-kind obj)
-                                  ((PERM) perm)
-                                  ((STILL) still)
-                                  (else movable)))))
-                (when table
+                                  ((PERM) perm-sizes)
+                                  ((STILL) still-sizes)
+                                  (else movable-sizes))))
+                    (counts (and (mem-allocated? obj)
+                                 (case (mem-allocated-kind obj)
+                                   ((PERM) perm-counts)
+                                   ((STILL) still-counts)
+                                   (else movable-counts)))))
+                (when sizes
                   (cond ((pair? obj)
-                         (add-size table obj 'Pair 12))
+                         (add-size sizes counts obj 'Pair 12))
                         ((symbol? obj)
-                         (add-size table obj 'Symbol 16))
+                         (add-size sizes counts obj 'Symbol 16))
                         ((source? obj)
-                         (add-size table obj 'Source (mem-allocated-size obj)))
+                         (add-size sizes counts obj 'Source (mem-allocated-size obj)))
                         ((or (table? obj)
                              (gc-hash-table? obj))
-                         (add-size table obj 'Table (mem-allocated-size obj)))
+                         (add-size sizes counts obj 'Table (mem-allocated-size obj)))
                         (else
-                         (add-size table obj (category-name (class-of obj)) (mem-allocated-size obj)))))))
+                         (add-size sizes counts obj (category-name (class-of obj)) (mem-allocated-size obj)))))))
             (register-set! seen obj #t))
           obj)
         feedback?: feedback?)
       (when feedback?
-        (format :terminal "{%}{%}"))
+        (format output "{%}{%}"))
       (unless ignore
         (report-memory))
-      (let ((movable (table->list movable))
-            (still (table->list still))
-            (perm (table->list perm)))
-        (report-region 'MOVA movable 2)
-        (report-region 'STIL still)
+      (let ((movable-sizes (table->list movable-sizes))
+            (still-sizes (table->list still-sizes))
+            (perm-sizes (table->list perm-sizes)))
+        (report-region 'MOVA movable-sizes movable-counts 2)
+        (report-region 'STIL still-sizes still-counts)
         (unless ignore
-          (report-region 'PERM perm))
-        (report-content 'MOVA movable 2)
-        (report-content 'STIL still)
+          (report-region 'PERM perm-sizes perm-counts))
+        (report-content 'MOVA movable-sizes movable-counts 2)
+        (report-content 'STIL still-sizes still-counts)
         (unless ignore
-          (report-content 'PERM perm))
+          (report-content 'PERM perm-sizes perm-counts))
         (when sample
-          (format :terminal "{%}{%}")
-          (terminal (subseq samples 0 (min (length samples) 1000)))
+          (format output "{%}{%}")
+          (terminal samples)
           (set-%a samples))
-        (set-%m movable)
-        (set-%s still)
-        (set-%p perm))))))
+        (set-%m movable-sizes)
+        (set-%s still-sizes)
+        (set-%p perm-sizes))))))
