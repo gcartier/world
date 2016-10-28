@@ -28,6 +28,7 @@
         (world.audio)
         (world.autoload)
         (world.camera)
+        (world.chunk)
         (world.client.tier)
         (world.configure)
         (world.creature)
@@ -51,6 +52,7 @@
         (world.homogeneous)
         (world.index)
         (world.info)
+        (world.instantiate)
         (world.interface.bars)
         (world.interface.documents)
         (world.interface.inventory)
@@ -152,14 +154,13 @@
   (slot regions-dir                 <Directory>  initialize #f                        getter explicit)
   (slot regions-mutex               <object>     initialize (make-mutex 'regions)     getter generate)
   (slot regions                     <table>      initialize (make-table test: equal?) getter generate)
-  (slot sectors                     <table>      initialize #f                        getter generate)
   (slot sector-size                 <fx>         initialize 16                        getter generate)
   (slot sector-radius               <fl>         initialize #f                        getter generate)
   (slot sector-diameter             <fl>         initialize #f                        getter generate)
   (slot sector/area-ratio           <fx>         initialize #f                        getter generate)
   (slot sectors-generating          <fx>         initialize 0                         getter generate)
   (slot sectors-mutex               <object>     initialize #f                        getter generate)
-  (slot debug-sectors?              <bool>       initialize #f                        accessors generate)
+  (slot debug-sections?             <bool>       initialize #f                        accessors generate)
   (slot areas                       <table>      initialize #f                        getter generate)
   (slot area-size                   <fx>         initialize 2                         getter generate)
   (slot debug-areas?                <bool>       initialize #f                        accessors generate)
@@ -243,6 +244,7 @@
     (set! draw-procedure-names (make-table test: eq?))
     (when (window?)
       (register-task 'generate generate-task)
+      (register-task 'instantiate instantiate-task)
       (register-task 'render render-task))
     (when (current-me+)
       (register-task 'player player-task))
@@ -332,11 +334,22 @@
     )
   
   
+  ;; for backward compatibility
   (method protected virtual (setup-children)
-    (for-each (lambda (obj)
-                (when (is? obj Element)
-                  (add-element obj)))
-              children))
+    (let ((touched? #f))
+      (for-each (lambda (obj)
+                  (when (is? obj Element)
+                    (add-element obj)
+                    (when (component-in-descendants?~ designer obj)
+                      (with-designer obj
+                        (lambda (des container)
+                          (remove-child~ designer obj)
+                          (add-child~ des obj container form: (get-form~ obj))
+                          (set! touched? #t)))
+                      (run-scriptable obj))))
+                children)
+      (when touched?
+        (save~ designer))))
   
   
   (method protected virtual (enter-tier)
@@ -382,13 +395,13 @@
             (instantiate-visual sector))))))
   
   
-  (method protected virtual (generate-physical sector revision-update?)
+  (method protected virtual (generate-physical area revision-update?)
     (site (physical on?: #t)
       (with-generate-mutex
         (lambda ()
           ;; is this still necessary?
           (when (eq? self (current-zone))
-            (instantiate-physical sector revision-update?))))))
+            (instantiate-physical area revision-update?))))))
   
   
   (method protected virtual (zone-ready)
@@ -452,7 +465,6 @@
                 destroy-hooks)
       (free-generator)
       (free-eye-sectors)
-      (free-sectors)
       (free-regions)
       (when (window?)
         (stop-ambience)
@@ -555,6 +567,7 @@
   (method (start-tasks)
     (when (window?)
       (start-task 'generate)
+      (start-task 'instantiate)
       (start-task 'render))
     (when (current-me+)
       (start-task 'player))
@@ -575,6 +588,7 @@
       (start-task 'alive))
     (when (window?)
       (thread-base-priority-set! (task-thread 'generate) generate-priority)
+      (thread-base-priority-set! (task-thread 'instantiate) instantiate-priority)
       (thread-base-priority-set! (task-thread 'render) render-priority))
     (when (current-me+)
       (thread-base-priority-set! (task-thread 'player) player-priority))
@@ -629,6 +643,7 @@
         (set-render-thread~ world #f))
       (reset-content)
       (when (window?)
+        (stop-task 'instantiate)
         (stop-task 'generate stop-generate))))
   
   
@@ -649,12 +664,18 @@
   
   
   (method (run-scripts)
-    (for-each (lambda (element)
-                (when (is? element Scriptable)
-                  (let ((script (get-script~ element)))
-                    (when script
-                      (evaluate-script~ script)))))
-              children))
+    (run-scriptables children))
+  
+  
+  (method (run-scriptables children)
+    (for-each run-scriptable children))
+  
+  
+  (method (run-scriptable element)
+    (when (is? element Scriptable)
+      (let ((script (get-script~ element)))
+        (when script
+          (evaluate-script~ script)))))
   
   
   ;;;
@@ -680,20 +701,20 @@
   
   (method (target-update target poly vert)
     (define (center-info title center (poly #f))
-      (let ((sector (position-sector center))
+      (let ((section (position-section center))
             (x (fxfloor (vertex-x center)))
             (y (fxfloor (vertex-y center)))
             (z (fxfloor (vertex-z center))))
         (let ((block (vector x y z))
-              (sector-index (get-index~ sector)))
-          (let ((sector-x (index-x sector-index))
-                (sector-y (index-y sector-index))
-                (sector-z (index-z sector-index)))
-            (let ((region (sector-region sector-x sector-y sector-z)))
-              (let ((section (load-section~ region 'physical sector-x sector-y sector-z))
+              (section-index (get-index~ section)))
+          (let ((section-x (index-x section-index))
+                (section-y (index-y section-index))
+                (section-z (index-z section-index)))
+            (let ((region (section-region section-x section-y section-z)))
+              (let ((section (load-section~ region 'physical section-x section-y section-z))
                     (cache-uninitialized 65535))
                 (when section
-                  (let ((bottom-section? (= sector-y (cast <fx> (or truncate-y 0))))
+                  (let ((bottom-section? (= section-y (cast <fx> (or truncate-y 0))))
                         (sections <vector> (make-vector 27 #t))
                         (cache <u16vector> (initialize-block-cache cache-uninitialized))
                         (blocks (get-blocks~ section))
@@ -709,10 +730,10 @@
                           (let ((section (vector-ref sections index)))
                             (if (neq? section #t)
                                 section
-                              (let ((x (+ sector-x a))
-                                    (y (+ sector-y b))
-                                    (z (+ sector-z c)))
-                                (let ((region (sector-region x y z)))
+                              (let ((x (+ section-x a))
+                                    (y (+ section-y b))
+                                    (z (+ section-z c)))
+                                (let ((region (section-region x y z)))
                                   (let ((section (and region (load-section~ (cast <World-Region> region) 'physical x y z))))
                                     (vector-set! sections index section)
                                     section))))))))
@@ -810,7 +831,7 @@
                                         (cons "block light" blocklight)
                                         (cons "sky light" skylight))
                                   (if (and poly (programmer?))
-                                      (list (cons "sector" (format "{a} {a} {a}" sector-x sector-y sector-z))
+                                      (list (cons "section" (format "{a} {a} {a}" section-x section-y section-z))
                                             (cons "coordinates" (format "{a} {a} {a}" i j k))
                                             (cons "location" (present-location (position->location (vertex (get-data2~ poly) (get-data3~ poly) (get-data4~ poly)))))
                                             (cons "ambient" (ambient-light i j k vert)))
@@ -822,9 +843,9 @@
                               (vector-ref loc 1)
                               (vector-ref loc 2)))
                     
-                    (let ((i (- x (* sector-x 16)))
-                          (j (- y (* sector-y 16)))
-                          (k (- z (* sector-z 16))))
+                    (let ((i (- x (* section-x 16)))
+                          (j (- y (* section-y 16)))
+                          (k (- z (* section-z 16))))
                       (block-info i j k))))))))))
     
     (define (update-info)
@@ -900,7 +921,30 @@
   
   
   (method (write-element element property value)
-    (set-property~ designer element property value))
+    (with-designer element
+      (lambda (designer container)
+        (set-property~ designer element property value))))
+  
+  
+  (method (with-designer element proc)
+    (define (toplevel elem)
+      (let ((parent (get-parent~ elem)))
+        (if (or (not parent) (eq? parent self) (is? parent Chunk-Container))
+            elem
+          (toplevel parent))))
+    
+    (let ((top (toplevel element)))
+      (with-section-designer (or (get-section~ top) (element-section top))
+        proc)))
+  
+  
+  (method (with-section-designer section proc)
+    (let ((chunk (get-chunk~ section)))
+      (let ((designer (cache-designer~ chunk)))
+        (prog1 (proc designer (get-reference~ designer))
+          (save-designer~ chunk)
+          (modified~ chunk)
+          (save-region~ (get-region~ chunk))))))
   
   
   ;;;
@@ -1107,8 +1151,7 @@
       ((Light) (add-light))
       ((Gadget) (add-gadget))
       ((Entity) (add-entity)))
-    (area-add-element (element-area obj) obj)
-    (sector-add-element (element-sector obj) obj)
+    (section-add-element (element-section obj) obj)
     (when (is? obj Creature)
       (add-creature obj))
     obj)
@@ -1151,28 +1194,29 @@
       ((Light) (remove-light))
       ((Gadget) (remove-gadget))
       ((Entity) (remove-entity)))
-    (area-remove-element (element-area obj) obj)
-    (sector-remove-element (element-sector obj) obj)
+    (section-remove-element (element-section obj) obj)
     (close~ obj))
   
   
   (method (update-element element old-position)
-    (when areas
-      (let ((old-index (position-area-index old-position))
-            (new-index (element-area-index element)))
+    ;; for setup-children backward compatibility
+    (when level-dir
+      (let ((old-index (position-section-index old-position))
+            (new-index (element-section-index element)))
         (unless (equal? old-index new-index)
-          (let ((old-area (index-area old-index))
-                (new-area (index-area new-index)))
-            (area-remove-element old-area element)
-            (area-add-element new-area element)))))
-    (when sectors
-      (let ((old-index (position-sector-index old-position))
-            (new-index (element-sector-index element)))
-        (unless (equal? old-index new-index)
-          (let ((old-sector (index-sector old-index))
-                (new-sector (index-sector new-index)))
-            (sector-remove-element old-sector element)
-            (sector-add-element new-sector element))))))
+          (let ((old-section (index-section old-index))
+                (new-section (index-section new-index)))
+            (section-remove-element old-section element)
+            (when (and (is? (get-parent~ element) Chunk-Container)
+                       (get-chunk~ (get-parent~ element)))
+              (with-section-designer old-section
+                (lambda (designer container)
+                  (remove-child~ designer element)))
+              (with-section-designer new-section
+                (lambda (designer container)
+                  (set-parent~ element container)
+                  (add-child~ designer element container form: (get-form~ element)))))
+            (section-add-element new-section element))))))
   
   
   (method (find-element predicate)
@@ -1221,6 +1265,8 @@
   
   
   (method (element-at vert)
+    #f
+    @convert^^^
     (continuation-capture
       (lambda (return)
         (let ((area (index-area (position-area-index vert))))
@@ -1233,6 +1279,8 @@
   
   
   (method (element-near vert)
+    #f
+    @convert^^^
     (let ((x (vertex-x vert))
           (y (vertex-y vert))
           (z (vertex-z vert))
@@ -1246,21 +1294,25 @@
             (front (+ z radius)))
         (continuation-capture
           (lambda (return)
-            (iterate-position-neighbor-areas vert 1 #f
-              (lambda (area)
-                (iterate-area-elements area
-                  (lambda (obj)
-                    (when (and (get-visible?~ obj)
-                               (let ((x (get-x~ obj))
-                                     (y (get-y~ obj))
-                                     (z (get-z~ obj)))
-                                 (and (>= x left)
-                                      (>= y bottom)
-                                      (>= z back)
-                                      (<  x right)
-                                      (<  y top)
-                                      (<  z front))))
-                      (continuation-return return obj))))))
+            (with-area-retainer
+              (lambda (retain)
+                (iterate-position-neighbor-areas vert 1 #f
+                  (lambda (area index retain?)
+                    (when retain?
+                      (retain area))
+                    (iterate-area-elements area
+                      (lambda (obj)
+                        (when (and (get-visible?~ obj)
+                                   (let ((x (get-x~ obj))
+                                         (y (get-y~ obj))
+                                         (z (get-z~ obj)))
+                                     (and (>= x left)
+                                          (>= y bottom)
+                                          (>= z back)
+                                          (<  x right)
+                                          (<  y top)
+                                          (<  z front))))
+                          (continuation-return return obj))))))))
             #f)))))
   
   
@@ -1374,10 +1426,11 @@
       (lambda (file <File>)
         (when (extension=? (get-extension~ file) "mca")
           (let ((base <string> (get-base~ file)))
-            (bind (x z) (split (substring base 2 (string-length base)) ".")
+            (bind (x z y . rest) (split (substring base 2 (string-length base)) ".")
               (let ((x (string->number x))
-                    (z (string->number z)))
-                (proc file x z))))))))
+                    (z (string->number z))
+                    (y (if (null? rest) 0 (string->number y))))
+                (proc file x y z))))))))
   
   
   (method public (change-dimension)
@@ -1389,19 +1442,18 @@
                           ((end) 'over)))
         (set! regions-dir #f)
         (set! regions (make-table test: equal?))
-        (set! sectors (make-table test: equal?))
         (set! areas (make-table test: equal?)))))
   
   
   ;; for exploration
   (method (preload-regions)
     (iterate-regions-dir
-      (lambda (file x z)
-        (let ((region (load-region x z)))
-          (loop (for sector-x from 0 below 32)
-                (loop (for sector-z from 0 below 32)
-                      (loop (for sector-y from 0 below 16)
-                            (load-section~ region 'physical sector-x sector-y sector-z))))))))
+      (lambda (file x y z)
+        (let ((region (load-region x y z)))
+          (loop (for section-x from 0 below 32)
+                (loop (for section-z from 0 below 32)
+                      (loop (for section-y from 0 below 16)
+                            (load-section~ region 'physical section-x section-y section-z))))))))
 
 
   ;; for exploration
@@ -1423,7 +1475,7 @@
     
     (loop (for x from from to to)
           (loop (for z from from to to)
-                (explore (load-region x z)))))
+                (explore (load-region x 0 z)))))
   
   
   ;; exploration
@@ -1431,10 +1483,10 @@
     (preload-regions)
     (let ((items '()))
       (for-each (lambda (info)
-                  (bind (sector i j k) info
-                    (call-with-sector sector i j k
-                      (lambda (region sector block-id <fx> data-id <fx> i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!)
-                        (let ((data (block-entity-data region sector i j k)))
+                  (bind (section i j k) info
+                    (call-with-section section i j k
+                      (lambda (region section block-id <fx> data-id <fx> i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!)
+                        (let ((data (block-entity-data region section i j k)))
                           (let ((inventory (list-payload-content (tag-assoc "Items" data))))
                             (for-each (lambda (item)
                                         (let ((id (tag-assoc "id" item)))
@@ -1448,9 +1500,11 @@
       (sort nu<? items key: ->string)))
   
   
-  (method (load-region region-x <fx> region-z <fx>) <World-Region>
+  (method (load-region region-x <fx> region-y <fx> region-z <fx>) <World-Region>
     (define (region-name)
-      (format "r.{a}.{a}.mca" region-x region-z))
+      (if (= region-y 0)
+          (format "r.{a}.{a}.mca" region-x region-z)
+        (format "r.{a}.{a}.{a}.mca" region-x region-z region-y)))
     
     (define (create-region file)
       (create-directories~ file)
@@ -1462,26 +1516,27 @@
     
     (with-regions-mutex
       (lambda ()
-        (let ((region-index (planar-index& region-x region-z)))
+        (let ((region-index (index& region-x region-y region-z)))
           (or (table-ref regions region-index #f)
               (let ((dir (get-regions-dir))
                     (name (region-name)))
                 (let ((file (new-file~ dir name)))
                   (let ((region (if (exists?~ file)
-                                    (new World-Region region-x region-z file)
+                                    (new World-Region region-x region-y region-z file)
                                   (create-region file)
-                                  (new World-Region region-x region-z file))))
-                    (table-set! regions (cons region-x region-z) region)
+                                  (new World-Region region-x region-y region-z file))))
+                    (table-set! regions (copy-index region-index) region)
                     region))))))))
   
   
-  (method (get-loaded-region region-x <fx> region-z <fx>) <World-Region+>
-    (table-ref regions (planar-index& region-x region-z) #f))
+  (method (get-loaded-region region-x <fx> region-y <fx> region-z <fx>) <World-Region+>
+    (table-ref regions (index& region-x region-y region-z) #f))
   
   
-  (method (sector-region sector-x <fx> sector-y <fx> sector-z <fx>) <World-Region>
-    (load-region (fxfloor/ sector-x region-size)
-                 (fxfloor/ sector-z region-size)))
+  (method (section-region section-x <fx> section-y <fx> section-z <fx>) <World-Region>
+    (load-region (fxfloor/ section-x region-size)
+                 (fxfloor/ section-y region-size)
+                 (fxfloor/ section-z region-size)))
   
   
   (proclaim (not warn optimizations))
@@ -1533,7 +1588,6 @@
   
   (method (setup-sectors)
     (let ((world (current-world)))
-      (set! sectors (make-table test: equal?))
       (set! sector-radius (let ((half (/ sector-size 2.)))
                             (vertex-norm (vertex half half half))))
       (set! sector-diameter (* sector-radius 2))
@@ -1550,6 +1604,7 @@
   
   
   (method (update-view-distance old-distance distance)
+    @convert-coordinates-sector^^^
     (unless (= distance old-distance)
       (let ((diameter (+ distance 1 distance)))
         (let ((radius distance)
@@ -1598,11 +1653,11 @@
             (update-eye-neighbors distance))))))
   
   
-  (method (element-sector-index element <Element>) <vector>
-    (position-sector-index (get-position~ element)))
+  (method (element-section-index element <Element>) <vector>
+    (position-section-index (get-position~ element)))
   
   
-  (method (position-sector-index pos <vertex>) <vector>
+  (method (position-section-index pos <vertex>) <vector>
     (let ((size (cast <fl> sector-size)))
       (vector (fxfloor (/ (vertex-x pos) size))
               (fxfloor (/ (vertex-y pos) size))
@@ -1618,31 +1673,40 @@
               (fxfloor (fl& (/ (vertex-z pos) size))))))
   
   
-  (method (position-sector pos) <Sector>
-    (index-sector (position-sector-index pos)))
+  (method (position-section-index& pos <vertex>) <vector>
+    (let ((size (cast <fl> sector-size))
+          (index (make-index&)))
+      (index! index
+              (fxfloor (fl& (/ (vertex-x pos) size)))
+              (fxfloor (fl& (/ (vertex-y pos) size)))
+              (fxfloor (fl& (/ (vertex-z pos) size))))))
   
   
-  (method (element-sector element) <Sector>
-    (index-sector (element-sector-index element)))
+  (method (position-section pos) <World-Section>
+    (let ((index (position-section-index& pos)))
+      (let ((section-x (vector-ref index 0))
+            (section-y (vector-ref index 1))
+            (section-z (vector-ref index 2)))
+        (coordinates-section section-x section-y section-z))))
   
   
-  (method (index-sector index <vector>) <Sector>
-    (or (table-ref sectors index #f)
-        (let ((sector (new-sector index)))
-          (table-set! sectors index sector)
-          sector)))
+  (method (coordinates-section section-x section-y section-z)
+    (let ((region (section-region section-x section-y section-z)))
+      ;; quick first try
+      (load-section~ region 'physical section-x section-y section-z create?: #t)))
   
   
-  (method (coordinates-sector x y z) <Sector>
-    (let ((index (make-index&)))
-      (index-x-set! index x)
-      (index-y-set! index y)
-      (index-z-set! index z)
-      (or (table-ref sectors index #f)
-          (let ((index (vector x y z)))
-            (let ((sector (new-sector index)))
-              (table-set! sectors index sector)
-              sector)))))
+  (method (index-section index)
+    (coordinates-section (index-x index)
+                         (index-y index)
+                         (index-z index)))
+  
+  
+  (method (element-section element) <World-Section>
+    (let ((index (element-section-index element)))
+      (coordinates-section (index-x index)
+                           (index-y index)
+                           (index-z index))))
   
   
   (method (new-sector index <vector>) <Sector>
@@ -1658,121 +1722,56 @@
   (proclaim (not warn optimizations))
   
   
-  (method (free-sectors)
-    (iterate-table sectors
-      (lambda (index sector)
-        (close~ sector))))
-  
-  
-  (method (sector-add-element sector element)
+  (method (section-add-element section element)
     (define (add-entity)
-      (set-entities~ sector (cons element (get-entities~ sector))))
+      (retain~ section)
+      (set-section~ element section)
+      (set-entities~ section (cons element (get-entities~ section))))
     
-    (typecase element
-      ((Gadget))
-      ((Entity)
-       (add-entity)))
-    (invalidate-lightmaps element))
-  
-  
-  (method (sector-remove-element sector element)
+    ;; try $$$
+    (when section
+      (typecase element
+        ((Gadget))
+        ((Entity)
+         (add-entity)))
+      (invalidate-lightmaps element)))
+
+
+  (method (section-remove-element section element)
     (define (remove-entity)
-      (set-entities~ sector (remove! element (get-entities~ sector))))
+      (set-entities~ section (remove! element (get-entities~ section)))
+      (set-section~ element #f)
+      (release~ section))
     
-    (typecase element
-      ((Gadget))
-      ((Entity)
-       (remove-entity)))
-    (invalidate-lightmaps element))
+    ;; try $$$
+    (when section
+      (typecase element
+        ((Gadget))
+        ((Entity)
+         (remove-entity)))
+      (invalidate-lightmaps element)))
   
   
   (method (iterate-sectors proc)
-    (iterate-table sectors
-      proc))
-  
-  
-  (method (iterate-sector-areas sector <Sector> proc)
-    (let ((ratio sector/area-ratio)
-          (index (get-index~ sector)))
-      (let ((a (* (index-x index) ratio))
-            (b (* (index-y index) ratio))
-            (c (* (index-z index) ratio)))
-        (loop (for i from 0 below ratio)
-              (loop (for j from 0 below ratio)
-                    (loop (for k from 0 below ratio)
-                          (let ((area (existing-area (vector (+ a i)
-                                                             (+ b j)
-                                                             (+ c k)))))
-                            (when area
-                              (proc area)))))))))
-  
-  
-  (method (sector-areas-bounds sector <Sector>) <vector>
-    (let ((ratio sector/area-ratio)
-          (index (get-index~ sector)))
-      (let ((a (* (index-x index) ratio))
-            (b (* (index-y index) ratio))
-            (c (* (index-z index) ratio))
-            (limit (- ratio 1)))
-        (vector a b c (+ a limit) (+ b limit) (+ c limit)))))
+    (when eye-neighbors
+      (loop (for sector in-vector eye-neighbors)
+            (proc sector))))
   
   
   (proclaim (warn optimizations))
   
   
-  (method (iterate-sector-neighbors sector distance <fx> proc)
-    (let ((index (get-index~ sector)))
+  (method (iterate-section-neighbors section distance <fx> proc)
+    (let ((index (get-index~ section)))
       (let ((a (index-x index))
             (b (index-y index))
             (c (index-z index)))
         (loop (for i from (- distance) to distance)
               (loop (for j from (- distance) to distance)
-                    (loop (for k from (- distance) to distance)
-                          (proc (coordinates-sector (+ a i) (+ b j) (+ c k)))))))))
-  
-  
-  (method (iterate-position-neighbor-sectors pos distance <fx> proc)
-    (iterate-sector-neighbors (position-sector pos) distance proc))
-  
-  
-  (method (iterate-position-outward-neighbor-sectors pos distance <fx> proc)
-    (let ((index (position-sector-index pos)))
-      (proc (index-sector index))
-      (let ((a (index-x index))
-            (b (index-y index))
-            (c (index-z index)))
-        (loop (for radius from 1 to distance)
-              (let ((radius-1 (- radius 1)))
-                ;; left
-                (let ((i (- a radius)))
-                  (loop (for j from (- radius) to radius)
-                        (loop (for k from (- radius) to radius)
-                              (proc (coordinates-sector i (+ b j) (+ c k))))))
-                ;; right
-                (let ((i (+ a radius)))
-                  (loop (for j from (- radius) to radius)
-                        (loop (for k from (- radius) to radius)
-                              (proc (coordinates-sector i (+ b j) (+ c k))))))
-                ;; bottom
-                (let ((j (- b radius)))
-                  (loop (for i from (- radius-1) to radius-1)
-                        (loop (for k from (- radius) to radius)
-                              (proc (coordinates-sector (+ a i) j (+ c k))))))
-                ;; top
-                (let ((j (+ b radius)))
-                  (loop (for i from (- radius-1) to radius-1)
-                        (loop (for k from (- radius) to radius)
-                              (proc (coordinates-sector (+ a i) j (+ c k))))))
-                ;; back
-                (let ((k (- c radius)))
-                  (loop (for i from (- radius-1) to radius-1)
-                        (loop (for j from (- radius-1) to radius-1)
-                              (proc (coordinates-sector (+ a i) (+ b j) k)))))
-                ;; front
-                (let ((k (+ c radius)))
-                  (loop (for i from (- radius-1) to radius-1)
-                        (loop (for j from (- radius-1) to radius-1)
-                              (proc (coordinates-sector (+ a i) (+ b j) k))))))))))
+                    ;; $$$ try
+                    (do (when (and (>= j 0) (< j 16))
+                          (loop (for k from (- distance) to distance)
+                                (proc (coordinates-section (+ a i) (+ b j) (+ c k)))))))))))
     
   
   ;; index of the eye sector
@@ -1852,69 +1851,70 @@
   
   
   (method (eye-neighbor-sectors index <vector> distance <fx>) <vector>
-    (define (sector-new i j k)
-      ;; commented until cleanup finished
-      ;; (new-sector (vector i j k))
-      (coordinates-sector i j k))
-    
-    (define (sector-free sector)
-      ;; commented until cleanup finished
-      ;; (close~ sector)
-      )
-    
-    (if (and eye-index (index=? index eye-index))
-        eye-neighbors
-      ;; update sectors
-      (let ((sectors (get-eye-sectors))
-            (a <fx> (- (index-x index) eye-radius))
-            (b <fx> (- (index-y index) eye-radius))
-            (c <fx> (- (index-z index) eye-radius)))
-        (if (not eye-index)
-            (loop (for i from 0 below eye-diameter)
-                  (loop (for j from 0 below eye-diameter)
-                        (loop (for k from 0 below eye-diameter)
-                              (vector-set! sectors (sectors-index i j k)
-                                (sector-new (+ a i)
-                                            (+ b j)
-                                            (+ c k))))))
-          (let ((last (- eye-diameter 1))
-                (dx (- (index-x index) (index-x eye-index)))
-                (dy (- (index-y index) (index-y eye-index)))
-                (dz (- (index-z index) (index-z eye-index))))
-            (define (by delta <fx>)
-              (if (>= delta 0)
-                  1
-                -1))
-            
-            (loop (for x start 0 end last by (by dx))
-                  (let ((fx (+ x dx))
-                        (tx x))
-                    (loop (for y start 0 end last by (by dy))
-                          (let ((fy (+ y dy))
-                                (ty y))
-                            (loop (for z start 0 end last by (by dz))
-                                  (let ((fz (+ z dz))
-                                        (tz z))
-                                    (let ((fi (and (between? fx 0 last)
-                                                   (between? fy 0 last)
-                                                   (between? fz 0 last)
-                                                   (sectors-index fx fy fz)))
-                                          (ti (sectors-index tx ty tz)))
-                                      (let ((sector (vector-ref sectors ti)))
-                                        (when sector
-                                          ;; free
-                                          (sector-free sector)))
-                                      (if fi
-                                          (begin
-                                            ;; move
-                                            (vector-set! sectors ti (vector-ref sectors fi))
-                                            (vector-set! sectors fi #f))
-                                        ;; new
-                                        (vector-set! sectors ti (sector-new (+ a tx) (+ b ty) (+ c tz))))))))))))))
-      ;; update neighbors
-      (update-eye-neighbors distance)
-      (set! eye-index (copy-index index))
-      eye-neighbors))
+    (declare (proper-tail-calls))
+    (declare (optimize-dead-local-variables))
+    (declare (inline))
+    (declare (inlining-limit 1000))
+    (let ()
+      (define (sector-new i j k)
+        (new-sector (vector i j k)))
+      
+      (define (sector-free sector)
+        (close~ sector))
+      
+      (if (and eye-index (index=? index eye-index))
+          eye-neighbors
+        ;; update sectors
+        (let ((sectors (get-eye-sectors))
+              (a <fx> (- (index-x index) eye-radius))
+              (b <fx> (- (index-y index) eye-radius))
+              (c <fx> (- (index-z index) eye-radius)))
+          (if (not eye-index)
+              (loop (for i from 0 below eye-diameter)
+                    (loop (for j from 0 below eye-diameter)
+                          (loop (for k from 0 below eye-diameter)
+                                (vector-set! sectors (sectors-index i j k)
+                                  (sector-new (+ a i)
+                                              (+ b j)
+                                              (+ c k))))))
+            (let ((last (- eye-diameter 1))
+                  (dx (- (index-x index) (index-x eye-index)))
+                  (dy (- (index-y index) (index-y eye-index)))
+                  (dz (- (index-z index) (index-z eye-index))))
+              (define (by delta <fx>)
+                (if (>= delta 0)
+                    1
+                  -1))
+              
+              (loop (for x start 0 end last by (by dx))
+                    (let ((fx (+ x dx))
+                          (tx x))
+                      (loop (for y start 0 end last by (by dy))
+                            (let ((fy (+ y dy))
+                                  (ty y))
+                              (loop (for z start 0 end last by (by dz))
+                                    (let ((fz (+ z dz))
+                                          (tz z))
+                                      (let ((fi (and (between? fx 0 last)
+                                                     (between? fy 0 last)
+                                                     (between? fz 0 last)
+                                                     (sectors-index fx fy fz)))
+                                            (ti (sectors-index tx ty tz)))
+                                        (let ((sector (vector-ref sectors ti)))
+                                          (when sector
+                                            ;; free
+                                            (sector-free sector)))
+                                        (if fi
+                                            (begin
+                                              ;; move
+                                              (vector-set! sectors ti (vector-ref sectors fi))
+                                              (vector-set! sectors fi #f))
+                                          ;; new
+                                          (vector-set! sectors ti (sector-new (+ a tx) (+ b ty) (+ c tz))))))))))))))
+        ;; update neighbors
+        (update-eye-neighbors distance)
+        (set! eye-index (copy-index index))
+        eye-neighbors)))
   
   
   (method (update-eye-neighbors distance <fx>)
@@ -1964,16 +1964,6 @@
   (proclaim (not warn optimizations))
   
   
-  (method (iterate-element-neighbor-sectors element distance proc)
-    (iterate-position-neighbor-sectors (get-position~ element) distance proc))
-  
-  
-  (method (element-neighbor-sectors element distance)
-    (let ((queue (new-queue)))
-      (iterate-element-neighbor-sectors element distance (lambda (sector) (enqueue queue sector)))
-      (queue-list queue)))
-  
-  
   (method (increase-sectors-generating count <fx>)
     (mutex-lock! sectors-mutex)
     (when (= sectors-generating 0)
@@ -1992,8 +1982,8 @@
   
   (method (compute-floats)
     (let ((total 0))
-      (iterate-table sectors
-        (lambda (index sector)
+      (iterate-sectors
+        (lambda (sector)
           (let ((mesh (get-mesh~ sector)))
             (when mesh
               (let ((floats (count-floats~ mesh)))
@@ -2004,8 +1994,8 @@
   
   (method (count-non-empty-sectors)
     (let ((total 0))
-      (iterate-table sectors
-        (lambda (index sector)
+      (iterate-sectors
+        (lambda (sector)
           (let ((mesh (get-mesh~ sector)))
             (when mesh
               (increase! total)))))
@@ -2016,14 +2006,14 @@
     )
   
   
-  (method (toggle-debug-sectors)
+  (method (toggle-debug-sections)
     (let ((world (current-world)))
-      (set! debug-sectors? (not debug-sectors?))
-      (update-parameter~ world 'debug-sectors)))
+      (set! debug-sections? (not debug-sections?))
+      (update-parameter~ world 'debug-sections)))
   
   
-  (method (draw-debug-sectors)
-    (draw-3d-grid (element-sector-index (current-me)) sector-size))
+  (method (draw-debug-sections)
+    (draw-3d-grid (element-section-index (current-me)) sector-size))
   
   
   ;;;
@@ -2058,142 +2048,41 @@
               (fxfloor (fl& (/ (vertex-z pos) size))))))
   
   
-  (method (position-area pos) <Area>
-    (index-area (position-area-index pos)))
-  
-  
   (method (element-area element) <Area>
-    (index-area (element-area-index element)))
+    (let ((index (element-area-index element)))
+      (coordinates-area (index-x index)
+                        (index-y index)
+                        (index-z index))))
   
   
-  (method (index-area index <vector> (update? #t)) <Area>
-    (let ((area
-            (or (table-ref areas index #f)
-                (let ((sector (area-index-sector index)))
-                  (let ((area (new Area index sector)))
-                    (table-set! areas index area)
-                    area)))))
-    (when update?
-      (update-physical~ (get-sector~ area)))
-    area))
-  
-  
-  (method (area-sector area <Area>) <Sector>
-    (area-index-sector (get-index~ area)))
-  
-  
-  (method (area-index-sector index <vector>) <Sector>
-    (area-coordinates-sector (index-x index) (index-y index) (index-z index)))
-  
-  
-  (method (existing-area index <vector>) <Area+>
+  (method (find-area index) <Area>
     (table-ref areas index #f))
   
   
-  (method (coordinates-area x y z) <Area>
+  (method (coordinates-area x <fx> y <fx> z <fx>) <Area>
     (let ((index (make-index&)))
-      (index-x-set! index x)
-      (index-y-set! index y)
-      (index-z-set! index z)
+      (index-x-set! index (fxfloor/ (* x area-size) section-size))
+      (index-y-set! index (fxfloor/ (* y area-size) section-size))
+      (index-z-set! index (fxfloor/ (* z area-size) section-size))
       (let ((area
               (or (table-ref areas index #f)
-                  (let ((index (vector x y z)))
-                    (let ((sector (area-index-sector index)))
-                      (let ((area (new Area index sector)))
-                        (table-set! areas index area)
-                        area))))))
-        (update-physical~ (get-sector~ area))
+                  (let ((index (copy-index index)))
+                    (let ((area (new Area index)))
+                      (table-set! areas index area)
+                      area)))))
+        (update-physical~ area)
         area)))
   
   
-  (method (area-coordinates-sector x <fx> y <fx> z <fx>) <Sector>
-    (coordinates-sector (arithmetic-shift-right x 3)
-                        (arithmetic-shift-right y 3)
-                        (arithmetic-shift-right z 3)))
-  
-  
-  (method (area-index-sector-coordinates! index <vector> coord <vector>)
-    (index-x-set! coord (arithmetic-shift-right (index-x index) 3))
-    (index-y-set! coord (arithmetic-shift-right (index-y index) 3))
-    (index-z-set! coord (arithmetic-shift-right (index-z index) 3)))
+  (method (unlink-area index)
+    (table-clear areas index))
   
   
   (proclaim (not warn optimizations))
   
   
-  (method (unlink-area area)
-    @doesnt-work-as-is-because-hit-test-will-consult/create-the-27-adjacent-areas-even-if-they-are-empty
-    (table-clear areas (get-index~ area)))
-  
-  
-  (method (area-add-element area element)
-    (define (add-actor)
-      (set-actors~ area (cons element (get-actors~ area))))
-    
-    (define (add-gadget)
-      (set-gadgets~ area (cons element (get-gadgets~ area))))
-    
-    (define (add-entity)
-      (set-entities~ area (cons element (get-entities~ area)))
-      ;; need to optimize
-      (when (get-physical?~ element)
-        (let ((polygons (element-polygons~ element))
-              (table (make-table test: eq?)))
-          (for-each (lambda (polygon)
-                      (let ((area (position-area (get-origin~ polygon))))
-                        (table-add table area polygon)))
-                    polygons)
-          (iterate-table table
-            (lambda (area polygons)
-              (add-polygons~ area element polygons #f))))))
-    
-    (cond ((and (is? element Actor) (is-not? element Missile))
-           (add-actor))
-          ((is? element Gadget)
-           (add-gadget))
-          ((is? element Entity)
-           (add-entity))))
-  
-  
-  (method (area-remove-element area element)
-    (define (remove-actor)
-      (let ((actors (remove! element (get-actors~ area))))
-        (set-actors~ area actors)
-        (when (and (null? actors) (null? (get-gadgets~ area)))
-          (unlink-area area))))
-    
-    (define (remove-gadget)
-      (let ((gadgets (remove! element (get-gadgets~ area))))
-        (set-gadgets~ area gadgets)
-        (when (and (null? gadgets) (null? (get-actors~ area)))
-          (unlink-area area))))
-    
-    (define (remove-entity)
-      (let ((entities (remove! element (get-entities~ area))))
-        (set-entities~ area entities)
-        ;; need to optimize
-        (when (get-physical?~ element)
-          (let ((polygons (element-polygons~ element))
-                (table (make-table test: eq?)))
-            (for-each (lambda (polygon)
-                        (let ((area (position-area (get-origin~ polygon))))
-                          (table-set! table area #t)))
-                      polygons)
-            (iterate-table table
-              (lambda (area ignore)
-                (remove-polygons~ area element)))))
-        (when (and (null? gadgets) (null? (get-actors~ area)))
-          (unlink-area area))))
-    
-    (cond ((is? element Actor)
-           (remove-actor))
-          ((is? element Gadget)
-           (remove-gadget))
-          ((is? element Entity)
-           (remove-entity))))
-  
-  
   (method (iterate-areas proc)
+    @convert^^^
     (iterate-table areas
       proc))
   
@@ -2209,7 +2098,13 @@
           (loop (for i from (- distance) to distance)
                 (loop (for j from (- distance) to distance)
                       (loop (for k from (- distance) to distance)
-                            (proc (coordinates-area (+ a i) (+ b j) (+ c k))))))))))
+                            (let ((a (+ a i))
+                                  (b (+ b j))
+                                  (c (+ c k)))
+                              (let ((area (coordinates-area a b c)))
+                                (proc area
+                                      (coordinates-index~ area a b c)
+                                      #t))))))))))
   
   
   (method (iterate-area-elements area proc)
@@ -2218,21 +2113,9 @@
     (for-each proc (get-gadgets~ area)))
   
   
-  (method (collect-area-elements)
-    (let ((queue (new-queue)))
-      (iterate-table areas
-        (lambda (index area)
-          (enqueue-list queue (get-actors~ area))
-          (enqueue-list queue (get-entities~ area))
-          (enqueue-list queue (get-gadgets~ area))))
-      (queue-list queue)))
-  
-  
-  (method (areas-count filter)
-    (count-if filter (collect-area-elements)))
-  
-  
   (method (count-polygons)
+    0
+    @convert^^^
     (let ((count 0))
       (iterate-table areas
         (lambda (index area)
@@ -2240,29 +2123,6 @@
             (when polygons
               (increase! count (fxround/ (f64vector-length polygons) polygon-float-size))))))
       count))
-  
-  
-  (method (validate-areas)
-    (let ((world (current-world)))
-      (let ((actors-count 0)
-            (gadgets-count 0))
-        (iterate-table areas
-          (lambda (index area)
-            (let ((area-actors (length (get-actors~ area)))
-                  (area-gadgets (length (get-gadgets~ area))))
-              (increase! actors-count area-actors)
-              (increase! gadgets-count area-gadgets))))
-        (if (and (= actors-count (length actors))
-                 (= gadgets-count (length gadgets)))
-            (begin
-              (unregister-info 'corrupted-areas)
-              #t)
-          (register-info 'corrupted-areas
-            (lambda (add-section add-info)
-              (let ((section (add-section "Corrupted areas")))
-                (add-info section "actors" (format "{s} {s}" actors-count (length actors)))
-                (add-info section "gadgets" (format "{s} {s}" gadgets-count (length gadgets))))))
-          #f))))
   
   
   (method (toggle-debug-areas)
@@ -2484,13 +2344,13 @@
   
   (method (blocks-fall elapse blocks)
     (let ((game (current-game)))
-      (updating-sectors~ (current-zone)
-        (lambda (add-sector)
+      (updating-sections~ (current-zone)
+        (lambda (add-section)
           (let (iter)
             (unless (queue-empty? blocks)
-              (bind (sector i j k) (dequeue blocks)
-                (call-with-sector sector i j k
-                  (lambda (region sector block <fx> data <fx> i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!)
+              (bind (section i j k) (dequeue blocks)
+                (call-with-section section i j k
+                  (lambda (region section block <fx> data <fx> i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!)
                     (define (effective-block-ref i j k)
                       (with-field i j k
                         (lambda (section index)
@@ -2503,12 +2363,12 @@
                         (with-field i j k
                           (lambda (section index)
                             @w(when (id? (block-ref section index) SandBlock Gravel)
-                              (normalize-sector/coordinates sector i j k with-field
-                                (lambda (sector i j k)
-                                  (add-fall-block~ game sector i j k))))
+                              (normalize-section/coordinates section i j k with-field
+                                (lambda (section i j k)
+                                  (add-fall-block~ game section i j k))))
                             ;; EH validate
                             (when section
-                              (add-sector (get-sector~ section))))))
+                              (add-section section)))))
                       
                       (add-neighbor (+ i 1) j k)
                       (add-neighbor (- i 1) j k)
@@ -2522,8 +2382,8 @@
                         (lambda (section index)
                           (block-set! section index 0)
                           (add-neighbors i j k)
-                          (inverse-propagate-light~ game i j k add-sector with-field block-ref blocklight-ref blocklight-set!)
-                          (redstone-update sector (list i j k block) add-sector with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set!)))))))
+                          (inverse-propagate-light~ game i j k add-section with-field block-ref blocklight-ref blocklight-set!)
+                          (redstone-update section (list i j k block) add-section with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set!)))))))
               (iter))))
         delay-update?: #t)))
   
@@ -2566,20 +2426,19 @@
             (creatures (get-aggroed-creatures~ me))
             (pos (get-position~ me)))
         (when chest
-          (bind (index i j k) chest
-            (let ((sector (table-ref (get-sectors~ zone) index)))
-              (let ((location (sector/coordinates->location sector i j k)))
-                (let ((dist (vertex-distance (vertex (+ (vector-ref location 0) .5)
-                                                     (+ (vector-ref location 1) .5)
-                                                     (+ (vector-ref location 2) .5))
-                                             pos)))
-                  (when (> dist (if (user?)
-                                    (world-setting 'world.interaction-distance 8.)
-                                  20.))
-                    (play-sound-file "sound/random/chestclosed" volume: .5)
-                    (hide-chest~ world)
-                    (hide-bag~ world)
-                    (set-opened-chest~ zone #f)))))))
+          (bind (section index i j k) chest
+            (let ((location (section/coordinates->location section i j k)))
+              (let ((dist (vertex-distance (vertex (+ (vector-ref location 0) .5)
+                                                   (+ (vector-ref location 1) .5)
+                                                   (+ (vector-ref location 2) .5))
+                                           pos)))
+                (when (> dist (if (user?)
+                                  (world-setting 'world.interaction-distance 8.)
+                                20.))
+                  (play-sound-file "sound/random/chestclosed" volume: .5)
+                  (hide-chest~ world)
+                  (hide-bag~ world)
+                  (set-opened-chest~ zone #f))))))
         (when creatures
           (for-each (lambda (creature)
                       (when (> (vertex-distance pos (get-position~ creature)) (get-aggro-radius~ creature))
@@ -2853,11 +2712,12 @@
   ;;;
   
   
+  @convert^^^
   (method (generate-heightmap-old sector <Sector> heightmap <f32vector> from-x <fx> width <fx> from-z <fx> depth <fx> what)
     (define (generate-done)
       (set-visual-uptodate?~ sector #t)
       (set-visual-revision~ sector (get-revision~ generator))
-      (set-generating?~ sector #f)
+      (set-visual-generating?~ sector #f)
       (decrease-sectors-generating 1))
     
     (declare (proper-tail-calls))
@@ -2921,7 +2781,7 @@
                 
                 (define (add-face face <Face>)
                   (let ((center (get-center~ (get-polygon~ face))))
-                    (let ((sector (index-sector (position-sector-index center))))
+                    (let ((sector #f @$$$ (index-sector (position-sector-index center))))
                       (table-add sectors sector face))
                     (when (eq? what 'physical)
                       (let ((area (index-area (position-area-index center) #f)))
@@ -3131,65 +2991,67 @@
   
   (method (explode-blocks tnts blocks)
     (play-sound-file "sound/random/explode" volume: .25)
-    (updating-sectors
-      (lambda (add-sector)
+    (updating-sections
+      (lambda (add-section)
         (for-each (lambda (tnt)
-                    (remove-block! tnt add-sector))
+                    (remove-block! tnt add-section))
                   tnts)
         (for-each (lambda (block)
-                    (remove-block! block add-sector)) blocks))
+                    (remove-block! block add-section)) blocks))
       delay-update?: #t))
   
   
   (method (reveal-chests command-block blocks)
-    (updating-sectors
-      (lambda (add-sector)
+    (updating-sections
+      (lambda (add-section)
         (loop (for x from 0 below (fxceiling (/ (length blocks) 6.)))
               (let ((pos (random-element blocks)))
                 (set! blocks (remove pos blocks test: equal?))
-                (place-block! pos RedstoneTorchOn add-sector)))
-        (remove-block (car command-block) add-sector))))
+                (place-block! pos RedstoneTorchOn add-section)))
+        (remove-block (car command-block) add-section))))
   
   
   (method (testfor-action command-block test action)
     (call-with-position (car test)
-      (lambda (region sector block-id <fx> data-id <fx> i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!)
+      (lambda (region section block-id <fx> data-id <fx> i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!)
         (when (= block-id (cdr test))
-          (updating-sectors
-            (lambda (add-sector)
+          (updating-sections
+            (lambda (add-section)
               (case (cdr action)
-                ((remove) (remove-block (car action) add-sector))
-                ((delete) (remove-block! (car action) add-sector))
-                ((add)    (place-block! (caar action) (cdar action) add-sector)))
-              (remove-block (car command-block) add-sector)))))))
+                ((remove) (remove-block (car action) add-section))
+                ((delete) (remove-block! (car action) add-section))
+                ((add)    (place-block! (caar action) (cdar action) add-section)))
+              (remove-block (car command-block) add-section)))))))
   
   
-  (method (remove-block pos add-sector)
+  (method (remove-block pos add-section)
     (call-with-position pos
-      (lambda (region sector block-id <fx> data-id <fx> i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!)
+      (lambda (region section block-id <fx> data-id <fx> i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!)
         (with-field i j k
           (lambda (section index)
-            (add-sector (get-sector~ section))
+            (add-section section)
             (block-set! section index 0)
             (data-set! section index 0))))))
   
   
-  (method (remove-block! pos add-sector)
+  (method (remove-block! pos add-section)
     (call-with-position pos
-      (lambda (region sector block-id <fx> data-id <fx> i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!)
-        (delete-block~ (current-game) #f region sector block-id data-id i j k x y z add-sector with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!))))
+      (lambda (region section block-id <fx> data-id <fx> i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!)
+        (delete-block~ (current-game) #f region section block-id data-id i j k x y z add-section with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!))))
   
   
-  (method (place-block! pos block add-sector)
+  (method (place-block! pos block add-section)
     (call-with-position pos
-      (lambda (region sector block-id <fx> data-id <fx> i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!)
-        (add-block~ (current-game) #f #f block region sector block-id data-id i j k x y z add-sector with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!))))
+      (lambda (region section block-id <fx> data-id <fx> i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!)
+        (add-block~ (current-game) #f #f block region section block-id data-id i j k x y z add-section with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!))))
   
   
   (method (on-toggle-glow evt)
-    (if (= player-glow -1.)
-        (set! player-glow 300.)
-      (set! player-glow -1.)))
+    (let ((world (current-world)))
+      (if (= player-glow -1.)
+          (set! player-glow 300.)
+        (set! player-glow -1.))
+      (update-parameter~ world 'glow)))
   
   
   ;;;
@@ -3201,176 +3063,165 @@
   
   
   (method (call-with-position pos <vertex> proc)
-    (let ((sector (position-sector pos))
+    (let ((section (position-section pos))
           (x (fxfloor (vertex-x pos)))
           (y (fxfloor (vertex-y pos)))
           (z (fxfloor (vertex-z pos))))
-      (let ((sector-index (get-index~ sector)))
-        (let ((sector-x (index-x sector-index))
-              (sector-y (index-y sector-index))
-              (sector-z (index-z sector-index)))
-          (let ((i (- x (* sector-x 16)))
-                (j (- y (* sector-y 16)))
-                (k (- z (* sector-z 16))))
-            (call-with-sector sector i j k proc))))))
+      (let ((section-index (get-index~ section)))
+        (let ((section-x (index-x section-index))
+              (section-y (index-y section-index))
+              (section-z (index-z section-index)))
+          (let ((i (- x (* section-x 16)))
+                (j (- y (* section-y 16)))
+                (k (- z (* section-z 16))))
+            (call-with-section section i j k proc))))))
   
   
-  (method (call-with-sector sector i <fx> j <fx> k <fx> proc)
-    (let ((sector-index (get-index~ sector)))
-      (let ((sector-x (index-x sector-index))
-            (sector-y (index-y sector-index))
-            (sector-z (index-z sector-index)))
-        (let ((region (sector-region sector-x sector-y sector-z)))
+  (method (call-with-section section i <fx> j <fx> k <fx> proc)
+    (with-index~ section
+      (lambda (section-x section-y section-z)
+        (let ((region (section-region section-x section-y section-z)))
           (let ((region-x (get-x~ region))
                 (region-z (get-z~ region))
-                (section (load-section~ region 'physical sector-x sector-y sector-z create?: #t))
-                (chunk-x (sector->chunk sector-x))
-                (chunk-z (sector->chunk sector-z)))
-            (when section
-              (let ((bottom-section? (= sector-y (cast <fx> (or truncate-y 0))))
-                    (section-x (+ (* region-x 32 16) (* chunk-x 16)))
-                    (section-y (* sector-y 16))
-                    (section-z (+ (* region-z 32 16) (* chunk-z 16)))
-                    (sections <vector> (make-vector 27 #t))
-                    (blocks (get-blocks~ section))
-                    (data (get-data~ section))
-                    (blocklight (get-blocklight~ section))
-                    (skylight (get-skylight~ section)))
-                (define (section-ref a <fx> b <fx> c <fx>) <World-Section+>
-                  (if (and (= a 0)
-                           (= b 0)
-                           (= c 0))
-                      section
-                    ;; quick hack for test
-                    (if (or (< a -1)
-                            (< b -1)
-                            (< c -1)
-                            (> a 1)
-                            (> b 1)
-                            (> c 1))
-                        (let ((x (+ sector-x a))
-                              (y (+ sector-y b))
-                              (z (+ sector-z c)))
-                          (let ((region (sector-region x y z)))
-                            (load-section~ (cast <World-Region> region) 'physical x y z)))
-                      (let ((index (section-index a b c)))
-                        (let ((section (vector-ref sections index)))
-                          (if (neq? section #t)
-                              section
-                            (let ((x (+ sector-x a))
-                                  (y (+ sector-y b))
-                                  (z (+ sector-z c)))
-                              (let ((region (sector-region x y z)))
-                                (let ((section (and region (load-section~ (cast <World-Region> region) 'physical x y z))))
-                                  (vector-set! sections index section)
-                                  section)))))))))
-                
-                (define (section-index a <fx> b <fx> c <fx>) <fx>
-                  (+ (* b 9) (* c 3) a 13))
-                
-                (define (local-index i <fx> j <fx> k <fx>) <fx>
-                  (+ (* j 256) (* k 16) i))
-                
-                (define (block-ref section local-index <fx>) <fx>
-                  (u8vector-ref (get-blocks~ section) local-index))
-                
-                (define (block-set! section local-index <fx> block-id <fx>)
-                  (u8vector-set! (get-blocks~ section) local-index block-id))
-                
-                (define (data-ref section local-index <fx>) <fx>
-                  (u4vector-ref (get-data~ section) local-index))
-                
-                (define (data-set! section local-index <fx> data-id <fx>)
-                  (u4vector-set! (get-data~ section) local-index data-id))
-                
-                (define (blocklight-ref section local-index <fx>) <fx>
-                  (u4vector-ref (get-blocklight~ section) local-index))
-                
-                (define (blocklight-set! section local-index <fx> blocklight <fx>)
-                  (u4vector-set! (get-blocklight~ section) local-index blocklight))
-                
-                (define (skylight-ref section local-index <fx>) <fx>
-                  (u4vector-ref (get-skylight~ section) local-index))
-                
-                (define (skylight-set! section local-index <fx> skylight <fx>)
-                  (u4vector-set! (get-skylight~ section) local-index skylight))
-                
-                (define (u4vector-ref field <u8vector> index <fx>) <fx>
-                  (let ((byte (u8vector-ref field (quotient index 2))))
-                    (if (even? index)
-                        (bitwise-and byte #x0F)
-                      (bitwise-and (arithmetic-shift-right byte 4) #x0F))))
-                
-                (define (u4vector-set! field <u8vector> index <fx> value <fx>)
-                  (let ((offset (quotient index 2)))
-                    (let ((byte (u8vector-ref field offset)))
-                      (u8vector-set! field offset
-                        (if (even? index)
-                            (bitwise-ior value (bitwise-and byte #xF0))
-                          (bitwise-ior (bitwise-and byte #x0F) (arithmetic-shift value 4)))))))
-                
-                (define (with-field i <fx> j <fx> k <fx> proc)
-                  (define (bind-i a <fx> i <fx>)
-                    (define (bind-j b <fx> j <fx>)
-                      (define (bind-k c <fx> k <fx>)
-                        (let ((section (section-ref a b c)))
-                          (proc section (local-index i j k))))
-                      
-                      (cond ((< k 0) (bind-k (- (quotient k 16) 1) (modulo k 16)))
-                            ((> k 15) (bind-k (quotient k 16) (modulo k 16)))
-                            (else (bind-k 0 k))))
+                (chunk-x (section->chunk section-x))
+                (chunk-z (section->chunk section-z)))
+            (let ((bottom-section? (= section-y (cast <fx> (or truncate-y 0))))
+                  (position-x (+ (* region-x 32 16) (* chunk-x 16) i))
+                  (position-y (+ (* section-y 16) j))
+                  (position-z (+ (* region-z 32 16) (* chunk-z 16) k))
+                  (sections <vector> (make-vector 27 #t))
+                  (blocks (get-blocks~ section))
+                  (data (get-data~ section))
+                  (blocklight (get-blocklight~ section))
+                  (skylight (get-skylight~ section)))
+              (define (section-ref a <fx> b <fx> c <fx>) <World-Section+>
+                (if (and (= a 0)
+                         (= b 0)
+                         (= c 0))
+                    section
+                  ;; quick hack for test
+                  (if (or (< a -1)
+                          (< b -1)
+                          (< c -1)
+                          (> a 1)
+                          (> b 1)
+                          (> c 1))
+                      (let ((x (+ section-x a))
+                            (y (+ section-y b))
+                            (z (+ section-z c)))
+                        (let ((region (section-region x y z)))
+                          (load-section~ (cast <World-Region> region) 'physical x y z)))
+                    (let ((index (section-index a b c)))
+                      (let ((section (vector-ref sections index)))
+                        (if (neq? section #t)
+                            section
+                          (let ((x (+ section-x a))
+                                (y (+ section-y b))
+                                (z (+ section-z c)))
+                            (let ((region (section-region x y z)))
+                              (let ((section (and region (load-section~ (cast <World-Region> region) 'physical x y z))))
+                                (vector-set! sections index section)
+                                section)))))))))
+              
+              (define (section-index a <fx> b <fx> c <fx>) <fx>
+                (+ (* b 9) (* c 3) a 13))
+              
+              (define (local-index i <fx> j <fx> k <fx>) <fx>
+                (+ (* j 256) (* k 16) i))
+              
+              (define (block-ref section local-index <fx>) <fx>
+                (u8vector-ref (get-blocks~ section) local-index))
+              
+              (define (block-set! section local-index <fx> block-id <fx>)
+                (u8vector-set! (get-blocks~ section) local-index block-id))
+              
+              (define (data-ref section local-index <fx>) <fx>
+                (u4vector-ref (get-data~ section) local-index))
+              
+              (define (data-set! section local-index <fx> data-id <fx>)
+                (u4vector-set! (get-data~ section) local-index data-id))
+              
+              (define (blocklight-ref section local-index <fx>) <fx>
+                (u4vector-ref (get-blocklight~ section) local-index))
+              
+              (define (blocklight-set! section local-index <fx> blocklight <fx>)
+                (u4vector-set! (get-blocklight~ section) local-index blocklight))
+              
+              (define (skylight-ref section local-index <fx>) <fx>
+                (u4vector-ref (get-skylight~ section) local-index))
+              
+              (define (skylight-set! section local-index <fx> skylight <fx>)
+                (u4vector-set! (get-skylight~ section) local-index skylight))
+              
+              (define (u4vector-ref field <u8vector> index <fx>) <fx>
+                (let ((byte (u8vector-ref field (quotient index 2))))
+                  (if (even? index)
+                      (bitwise-and byte #x0F)
+                    (bitwise-and (arithmetic-shift-right byte 4) #x0F))))
+              
+              (define (u4vector-set! field <u8vector> index <fx> value <fx>)
+                (let ((offset (quotient index 2)))
+                  (let ((byte (u8vector-ref field offset)))
+                    (u8vector-set! field offset
+                      (if (even? index)
+                          (bitwise-ior value (bitwise-and byte #xF0))
+                        (bitwise-ior (bitwise-and byte #x0F) (arithmetic-shift value 4)))))))
+              
+              (define (with-field i <fx> j <fx> k <fx> proc)
+                (define (bind-i a <fx> i <fx>)
+                  (define (bind-j b <fx> j <fx>)
+                    (define (bind-k c <fx> k <fx>)
+                      (let ((section (section-ref a b c)))
+                        (proc section (local-index i j k))))
                     
-                    (cond ((< j 0) (bind-j (- (quotient j 16) 1) (modulo j 16)))
-                          ((> j 15) (bind-j (quotient j 16) (modulo j 16)))
-                          (else (bind-j 0 j))))
+                    (cond ((< k 0) (bind-k (- (quotient k 16) 1) (modulo k 16)))
+                          ((> k 15) (bind-k (quotient k 16) (modulo k 16)))
+                          (else (bind-k 0 k))))
                   
-                  @debug-infinite-loop
-                  (continuation-capture
-                    (lambda (cont)
-                      (let ((max 1000))
-                        (when (>= (length (get-continuation-stack cont (+ max 10))) max)
-                          (break)))))
-                  (cond ((< i 0) (bind-i (- (quotient i 16) 1) (modulo i 16)))
-                        ((> i 15) (bind-i (quotient i 16) (modulo i 16)))
-                        (else (bind-i 0 i))))
+                  (cond ((< j 0) (bind-j (- (quotient j 16) 1) (modulo j 16)))
+                        ((> j 15) (bind-j (quotient j 16) (modulo j 16)))
+                        (else (bind-j 0 j))))
                 
-                ;; debugging
-                (assert (and (between? i 0 15)
-                             (between? j 0 15)
-                             (between? k 0 15)))
-                (let ((index (local-index i j k)))
-                  (let ((block-id (block-ref section index))
-                        (data-id (data-ref section index)))
-                    (let ((x (+ section-x i))
-                          (y (+ section-y j))
-                          (z (+ section-z k)))
-                      (let ((x (fl& (+ block-radius (cast <fl> x))))
-                            (y (fl& (+ block-radius (cast <fl> y))))
-                            (z (fl& (+ block-radius (cast <fl> z)))))
-                        (proc region sector block-id data-id i j k x y z with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!))))))))))))
+                @debug-infinite-loop
+                (continuation-capture
+                  (lambda (cont)
+                    (let ((max 1000))
+                      (when (>= (length (get-continuation-stack cont (+ max 10))) max)
+                        (break)))))
+                (cond ((< i 0) (bind-i (- (quotient i 16) 1) (modulo i 16)))
+                      ((> i 15) (bind-i (quotient i 16) (modulo i 16)))
+                      (else (bind-i 0 i))))
+              
+              ;; debugging
+              (assert (and (between? i 0 15)
+                           (between? j 0 15)
+                           (between? k 0 15)))
+              (let ((index (local-index i j k)))
+                (let ((block-id (block-ref section index))
+                      (data-id (data-ref section index)))
+                  (let ((x (fl& (+ block-radius (cast <fl> position-x))))
+                        (y (fl& (+ block-radius (cast <fl> position-y))))
+                        (z (fl& (+ block-radius (cast <fl> position-z)))))
+                    (proc region section block-id data-id i j k x y z with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!))))))))))
   
   
-  (method (updating-sectors proc (delay-update?: delay-update? #f))
-    (define (update-sectors sectors)
-      (for-each (lambda (sector)
-                  (iterate-sector-areas sector
-                    (lambda (area)
-                      (clear-polygons~ area)))
-                  (set-physical-uptodate?~ sector #f)
-                  ;; no need to generate the physical explicitly
-                  ;; (instantiate-physical sector)
-                  (let ((eye-sector (find-eye-sector (get-index~ sector))))
+  (method (updating-sections proc (delay-update?: delay-update? #f))
+    (define (update-sections sections)
+      (for-each (lambda (section)
+                  (let ((area (find-area (get-index~ section))))
+                    (when area
+                      (clear-polygons~ area)
+                      (set-physical-uptodate?~ area #f)))
+                  ;; should iterate over every camera
+                  (let ((eye-sector (find-eye-sector (get-index~ section))))
                     (when eye-sector
                       (set-visual-uptodate?~ eye-sector #f)
                       (unless (and delay-update? delay-updating?)
-                        (set-generating?~ sector #t)
+                        (set-visual-generating?~ eye-sector #t) ;; $$$ was sector. is this correct?
                         (increase-sectors-generating 1)
                         (instantiate-visual eye-sector))))
-                  ;; this test should not be necessary
-                  (let ((section (get-section~ sector)))
-                    (when section
-                      (modified~ (get-chunk~ section)))))
-                sectors))
+                  (modified~ (get-chunk~ section)))
+                sections))
     
     (define (save-regions)
       (with-regions-mutex
@@ -3380,22 +3231,22 @@
               (when region
                 (save-region~ region)))))))
     
-    (let ((sectors '()))
-      (define (add-sector sector)
-        (unless (memq? sector sectors)
-          (set! sectors (cons sector sectors))))
+    (let ((sections '()))
+      (define (add-section section)
+        (unless (memq? section sections)
+          (set! sections (cons section sections))))
       
       (let ((timer (new Timer)))
         (with-generate-mutex
           (lambda ()
-            (proc add-sector)
-            (update-sectors sectors)
+            (proc add-section)
+            (update-sections sections)
             (save-regions)))
         (when report-updating?
           (let ((world (current-world)))
-            (let ((count (length sectors))
+            (let ((count (length sections))
                   (duration (real-duration-in-milliseconds~ timer)))
-              (display-message~ world (format "Updated {a} sector{a} ({a}ms)" count (format-plural count) duration))))))))
+              (display-message~ world (format "Updated {a} section{a} ({a}ms)" count (format-plural count) duration))))))))
   
   
   ;;;
@@ -3410,13 +3261,15 @@
                         forms)))
       (cond ((not-null? ids)
              (reset-inventory-blocks)
-             (updating-sectors
-               (lambda (add-sector)
+             @$$$
+             (updating-sections
+               (lambda (add-section)
                  (finding-visual-blocks ids
-                   add-sector)
+                   add-section)
                  (finding-physical-blocks ids
                    (lambda (area)
-                     (add-sector (area-sector area)))))))
+                     (add-section (get-section~ area)))))))
+            @$$$
             ((search container "world/external/minecraft")
              (updating-sectors
                (lambda (add-sector)
@@ -3441,6 +3294,8 @@
   
   
   (method (find-visual-blocks ids)
+    '()
+    @$$$
     (let ((zone (current-zone))
           (queue (new-queue)))
       (iterate-sectors~ zone
@@ -3452,6 +3307,7 @@
   
   
   (method (finding-visual-blocks ids proc)
+    @$$$
     (let ((zone (current-zone)))
       (iterate-sectors~ zone
         (lambda (index sector)
@@ -3473,8 +3329,26 @@
       (let ((sector-x (index-x sector-index))
             (sector-y (index-y sector-index))
             (sector-z (index-z sector-index)))
-        (let ((region (sector-region sector-x sector-y sector-z)))
+        (let ((region (section-region sector-x sector-y sector-z)))
           (let ((section (load-section~ region 'physical sector-x sector-y sector-z)))
+            (when section
+              (let ((blocks (get-blocks~ section)))
+                (for-each (lambda (id)
+                            (let (iter (pos 0))
+                              (let ((found (u8vector-find id blocks (u8vector-length blocks) pos)))
+                                (when found
+                                  (proc found)
+                                  (iter (+ found 1))))))
+                          ids))))))))
+  
+  
+  (method (section-iterate-blocks section ids proc)
+    (let ((section-index (get-index~ section)))
+      (let ((section-x (index-x section-index))
+            (section-y (index-y section-index))
+            (section-z (index-z section-index)))
+        (let ((region (section-region section-x section-y section-z)))
+          (let ((section (load-section~ region 'physical section-x section-y section-z)))
             (when section
               (let ((blocks (get-blocks~ section)))
                 (for-each (lambda (id)
@@ -3491,7 +3365,7 @@
       (let ((sector-x (index-x sector-index))
             (sector-y (index-y sector-index))
             (sector-z (index-z sector-index)))
-        (let ((region (sector-region sector-x sector-y sector-z)))
+        (let ((region (section-region sector-x sector-y sector-z)))
           (let ((section (load-section~ region 'physical sector-x sector-y sector-z)))
             (if (not section)
                 0
@@ -3505,6 +3379,7 @@
   
   
   (method (finding-physical-blocks ids proc)
+    @convert^^^
     (let ((zone (current-zone)))
       (iterate-areas~ zone
         (lambda (index area)
@@ -3525,6 +3400,7 @@
 
 ;; Ideally, this would use a PRNG which we can seed with a given value.
 ;; That way the map can be persisted using just the seed and a list of changes.
+@convert^^^
 (class Procedural-Zone extends Zone
   
   

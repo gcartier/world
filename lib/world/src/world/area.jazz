@@ -16,6 +16,7 @@
 
 (import (world)
         (world.autoload)
+        (world.geometry)
         (world.index)
         (world.polygon)
         (world.syntax (phase syntax)))
@@ -27,6 +28,133 @@
 
 
 (class Area extends Object
+  
+  
+  (slot refcount           <fx>         initialize 0   getter generate)
+  (slot index              <vector>                    getter generate)
+  (slot header             <table>                     getter generate)
+  (slot polygons           <f64vector+> initialize #f  accessors generate)
+  (slot polygons-elements  <vector+>    initialize #f  accessors generate)
+  (slot physical-uptodate? <bool>       initialize #f  accessors generate)
+  (slot physical-revision  <fx>         initialize -1  accessors generate)
+  (slot visit              <table>                     getter generate)
+  
+  
+  (method override (initialize index)
+    (set! index~self index)
+    (set! header~self (make-table test: equal?))
+    (set! visit~self (make-table test: equal?)))
+  
+  
+  (method override (print output readably)
+    (print-unreadable self output
+      (lambda (output)
+        (format output "{a}, {a}, {a}" (index-x index) (index-y index) (index-z index)))))
+  
+  
+  (method (retain)
+    (increase! refcount))
+  
+  
+  (method (release)
+    (decrease! refcount)
+    (when (<= refcount 0)
+      (free)))
+  
+  
+  (method (free)
+    (let ((zone (current-zone)))
+      (unlink-area~ zone index)))
+  
+  
+  (method (visit-ref index)
+    (table-ref visit index -1))
+  
+  
+  (method (visit-set! index value)
+    (table-set! visit index value))
+  
+  
+  (method (get-position&) <vertex>
+    (vertex& (* (cast <fl> (index-x index)) 16.)
+             (* (cast <fl> (index-y index)) 16.)
+             (* (cast <fl> (index-z index)) 16.)))
+  
+  
+  (method (update-physical)
+    (let ((zone (current-zone)))
+      (let ((generator-revision (get-revision~ (get-generator~ zone))))
+        (when (or (not physical-uptodate?)
+                  (< physical-revision generator-revision))
+          (generate-physical~ zone self physical-uptodate?))
+        (set! physical-uptodate? #t)
+        (set! physical-revision generator-revision))))
+  
+  
+  (method (local-index i <fx> j <fx> k <fx>) <fx>
+    (+ (* j 64) (* k 8) i))
+  
+  
+  (method (index->coordinates index)
+    (let ((i (modulo index 8))
+          (k (modulo (quotient index 8) 8))
+          (j (modulo (quotient (quotient index 8) 8) 8)))
+      (vector i j k)))
+  
+  
+  (method (position-index pos <vertex>) <fx>
+    (let ((zone (current-zone)))
+      (let ((size (get-area-size~ zone))
+            (ratio (get-sector/area-ratio~ zone)))
+        (local-index (between-interval 0 (fxfloor (/ (vertex-x pos) size)) ratio)
+                     (between-interval 0 (fxfloor (/ (vertex-y pos) size)) ratio)
+                     (between-interval 0 (fxfloor (/ (vertex-z pos) size)) ratio)))))
+  
+  
+  (method (coordinates-index i <fx> j <fx> k <fx>) <fx>
+    (local-index (modulo i 8)
+                 (modulo j 8)
+                 (modulo k 8)))
+  
+  
+  (method (iterate-polygons env index proc)
+    (let ((polygons (table-ref header index #f)))
+      (when polygons
+        (loop (for i from 0 below (fxround/ (f64vector-length polygons) polygon-float-size))
+              (let ((offset (* i polygon-float-size)))
+                (proc env
+                      (and polygons-elements (vector-ref polygons-elements i))
+                      polygons
+                      offset))))))
+  
+  
+  (method (add-polygons element index lst matrix)
+    (define (add-at vect offset)
+      (for-each (lambda (poly)
+                  (polygon-move!~ poly vect offset matrix)
+                  (increase! offset polygon-float-size))
+                lst))
+    
+    (let ((count (length lst)))
+      (let ((add (* count polygon-float-size)))
+        (let ((vect (make-f64vector add)))
+          (add-at vect 0)
+          (table-set! header index vect)))))
+  
+  
+  (method (clear-polygons)
+    (set! header (make-table test: equal?))
+    (set! polygons #f)
+    (set! polygons-elements #f)))
+
+
+;;;
+;;;; Area Old
+;;;
+
+
+@old^^^
+(class Area-Old extends Object
   
   
   (slot index             <vector>                    getter generate)
@@ -47,6 +175,8 @@
   (method override (print output readably)
     (print-unreadable self output
       (lambda (output)
+        (format output "{a}, {a}, {a}" (index-x index) (index-y index) (index-z index))
+        @$$$-buggy
         (let ((polygons (if (not polygons) 0 (fxround/ (vector-length polygons) polygon-float-size)))
               (actors (length actors))
               (gadgets (length gadgets)))
@@ -143,6 +273,27 @@
 
 
 ;;;
+;;;; Area Retainer
+;;;
+
+
+(definition public (with-area-retainer proc)
+  (let ((queue #f))
+    (define (retain area)
+      (retain~ area)
+      (when (not queue)
+        (set! queue (new-queue)))
+      (enqueue queue area))
+    
+    (define (release)
+      (when queue
+        (for-each release~ (queue-list queue))))
+    
+    (unwind-protect (proc retain)
+      (release))))
+
+
+;;;
 ;;;; Area Cube
 ;;;
 
@@ -158,6 +309,7 @@
   (slot cube-diameter^2 <fx>     getter generate)
   (slot cube-diameter^3 <fx>     getter generate)
   (slot cube-areas      <vector> getter generate)
+  (slot cube-indexes    <vector> getter generate)
   (slot cube-index      <vector> getter generate)
   (slot cube-inited?    <bool>   getter generate)
   
@@ -168,6 +320,7 @@
     (set! cube-diameter^2 (expt cube-diameter 2))
     (set! cube-diameter^3 (expt cube-diameter 3))
     (set! cube-areas (make-vector cube-diameter^3 #f))
+    (set! cube-indexes (make-vector cube-diameter^3 #f))
     (set! cube-index (make-index))
     (set! cube-inited? #f))
   
@@ -176,39 +329,38 @@
     (+ (* j cube-diameter^2) (* k cube-diameter) i))
   
   
-  (method (get-areas pos) <vector>
+  (method (update-cube pos <vertex>) <void>
     (declare (proper-tail-calls))
     (declare (optimize-dead-local-variables))
     (declare (inline))
     (declare (inlining-limit 1000))
     (let ((zone (current-zone)))
       (let ((index (position-area-index&~ zone pos)))
-        (if (and cube-inited? (equal? index cube-index))
-            cube-areas
+        (unless (and cube-inited? (equal? index cube-index))
           ;; update areas
           (let ((areas cube-areas)
+                (indexes cube-indexes)
                 (a (- (index-x index) cube-radius))
                 (b (- (index-y index) cube-radius))
                 (c (- (index-z index) cube-radius)))
-            (define (area-new i j k)
-              ;; commented until cleanup finished
-              ;; (new-area (vector i j k))
-              (coordinates-area~ zone i j k))
+            (define (area-new index i j k)
+              (let ((area (coordinates-area~ zone i j k)))
+                (retain~ area)
+                (vector-set! areas index area)
+                (vector-set! indexes index (coordinates-index~ area i j k))))
             
             (define (area-free area)
-              ;; commented until cleanup finished
-              ;; (close~ area)
-              )
+              (release~ area))
             
             (if (not cube-inited?)
                 (begin
                   (loop (for i from 0 below cube-diameter)
                         (loop (for j from 0 below cube-diameter)
                               (loop (for k from 0 below cube-diameter)
-                                    (vector-set! areas (areas-index i j k)
-                                      (area-new (+ a i)
-                                                (+ b j)
-                                                (+ c k))))))
+                                    (area-new (areas-index i j k)
+                                              (+ a i)
+                                              (+ b j)
+                                              (+ c k)))))
                   (set! cube-inited? #t))
               (let ((last (- cube-diameter 1))
                     (dx (- (index-x index) (index-x cube-index)))
@@ -241,12 +393,13 @@
                                               (begin
                                                 ;; move
                                                 (vector-set! areas ti (vector-ref areas fi))
-                                                (vector-set! areas fi #f))
+                                                (vector-set! areas fi #f)
+                                                (vector-set! indexes ti (vector-ref indexes fi))
+                                                (vector-set! indexes fi #f))
                                             ;; new
-                                            (vector-set! areas ti (area-new (+ a tx) (+ b ty) (+ c tz))))))))))))))
-          ;; return areas
-          (index-copy! cube-index index)
-          cube-areas))))
+                                            (area-new ti (+ a tx) (+ b ty) (+ c tz)))))))))))))
+          ;; update index
+          (index-copy! cube-index index)))))
   
   
   (method (iterate-neighbor-areas pos distance <fx> proc)
@@ -268,10 +421,15 @@
                             (let ((a (+ i di))
                                   (b (+ j dj))
                                   (c (+ k dk)))
-                              (let ((area <Area> (if (and (between? a 0 last)
-                                                          (between? b 0 last)
-                                                          (between? c 0 last))
-                                                     (vector-ref cube-areas (areas-index a b c))
-                                                   (index-area~ zone index))))
-                                (update-physical~ (get-sector~ area))
-                                (proc area))))))))))))
+                              (let ((in? (and (between? a 0 last)
+                                              (between? b 0 last)
+                                              (between? c 0 last)))
+                                    (idx (areas-index a b c)))
+                                (let ((area (if in?
+                                                (vector-ref cube-areas idx)
+                                              (coordinates-area~ zone a b c))))
+                                  (let ((index (if in?
+                                                   (vector-ref cube-indexes idx)
+                                                 (coordinates-index~ area a b c))))
+                                    (update-physical~ area)
+                                    (proc area index (not in?)))))))))))))))

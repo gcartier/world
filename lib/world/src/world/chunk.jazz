@@ -14,8 +14,10 @@
 (module world.chunk jazz
 
 
-(import (jazz.foreign)
+(import (jazz.component)
+        (jazz.foreign)
         (jazz.geometry)
+        (jazz.jml)
         (jazz.syntax (phase syntax))
         (world)
         (world.autoload)
@@ -23,6 +25,7 @@
         (world.generation.block)
         (world.geometry.syntax (phase syntax))
         (world.homogeneous)
+        (world.instantiate)
         (world.section)
         (world.syntax (phase syntax))
         (world.tag))
@@ -60,11 +63,13 @@
   (slot block-entities-index  <table+>                getter generate)
   (slot sections                                      getter generate)
   (slot sections-table        <table+>  initialize #f getter generate)
+  (slot elements                                      getter generate)
+  (slot elements-designer               initialize #f accessors generate)
   (slot generator-revision    <fx>      initialize -1 accessors generate)
   (slot modified?             <bool>    initialize #f accessors generate)
   
   
-  (method override (initialize state digest raw region tag biomes heightmap entities block-entities sections chunk-index)
+  (method override (initialize state digest raw region tag biomes heightmap entities block-entities sections elements chunk-index)
     (set! state~self state)
     (set! digest~self digest)
     (set! raw~self raw)
@@ -76,6 +81,7 @@
     (set! block-entities~self block-entities)
     (set! block-entities-index~self (index-block-entities (list-payload-content block-entities)))
     (set! sections~self sections)
+    (set! elements~self elements)
     (set! x~self (car chunk-index))
     (set! z~self (cdr chunk-index)))
   
@@ -86,22 +92,22 @@
         (format output "{a} {a}" x z))))
   
   
-  (method (refcount-increase)
+  (method (retain)
     (increase! refcount)
     ;(debug self 'refcount refcount)
     )
   
   
-  (method (refcount-decrease)
+  (method (release)
     (decrease! refcount)
     ;(debug self 'refcount refcount)
     (when (<= refcount 0)
-      (release)))
+      (free)))
   
   
-  (method (release)
-    ;(debug 'release self)
-    (refcount-decrease~ region))
+  (method (free)
+    ;(debug 'free self)
+    (release~ region))
   
   
   (method (change-state s)
@@ -111,7 +117,8 @@
   
   
   (method (register-section y section)
-    (refcount-increase)
+    (assert (between? y 0 31))
+    (retain)
     (unless sections-table
       (set! sections-table (make-table test: eq?)))
     (allege sections-table
@@ -146,11 +153,9 @@
                                 (make-tag "y" TAG_Int y)
                                 (make-tag "z" TAG_Int z))))
         (when (not block-entities-index)
-          ;; when empty it contains ("TileEntities" 9 0)
-          (set-list-payload-type block-entities TAG_Compound)
           (set! block-entities-index (make-table test: equal?)))
         (allege block-entities-index
-          (set-list-payload-content block-entities (cons block-entity (list-payload-content block-entities)))
+          (set-list-payload-content block-entities TAG_Compound (cons block-entity (list-payload-content block-entities)))
           (table-set! block-entities-index index block-entity)
           block-entity))))
   
@@ -165,13 +170,12 @@
                               (make-tag "Text3" TAG_String (list-ref data 2))
                               (make-tag "Text4" TAG_String (list-ref data 3)))))
       (when (not block-entities-index)
-        (set-list-payload-type block-entities TAG_Compound)
         (set! block-entities-index (make-table test: equal?)))
       (allege block-entities-index
         (let ((old-sign (table-ref block-entities-index index #f)))
           (when old-sign
-            (set-list-payload-content block-entities (remove! old-sign (list-payload-content block-entities) test: equal?))))
-        (set-list-payload-content block-entities (cons block-entity (list-payload-content block-entities)))
+            (set-list-payload-content block-entities TAG_Compound (remove! old-sign (list-payload-content block-entities) test: equal?))))
+        (set-list-payload-content block-entities TAG_Compound (cons block-entity (list-payload-content block-entities)))
         (table-set! block-entities-index index block-entity)
         (modified)
         (save-region~ region)
@@ -179,36 +183,32 @@
   
   
   (method (setup-section section <World-Section>)
-    (let ((sector-y (get-y~ section))
+    (let ((section-y (get-y~ section))
           (blocks (get-blocks~ section))
           (data (get-data~ section))
           (blocklight (get-blocklight~ section))
           (skylight (get-skylight~ section)))
       (set-chunk~ section self)
-      (register-section sector-y section)
-      (modified)
+      (register-section section-y section)
       (let ((section-tag (list (make-tag "Blocks" TAG_Byte_Array blocks)
                                (make-tag "Data" TAG_Byte_Array data)
                                (make-tag "BlockLight" TAG_Byte_Array blocklight)
                                (make-tag "SkyLight" TAG_Byte_Array skylight)
-                               (make-tag "Y" TAG_Byte sector-y))))
-        (set-list-payload-content sections (cons section-tag (list-payload-content sections))))))
+                               (make-tag "Y" TAG_Byte section-y))))
+        (set-list-payload-content sections TAG_Compound (cons section-tag (list-payload-content sections))))
+      (modified)))
   
   
-  (method (add-section sector-y) <World-Section>
-    (let ((section (make-section sector-y)))
+  (method (create-section section-y) <World-Section>
+    (let ((section (make-section section-y)))
       (setup-section section)
       section))
   
   
   (method (get-section section-y <fx>) <World-Section>
-    (assert (< section-y 16))
+    (assert (between? section-y 0 31))
     (or (and sections-table (table-ref sections-table section-y #f))
-        (let ((section (add-section section-y)))
-          (let ((sector (index-sector~ (current-zone) (vector (+ (* (get-x~ region) 32) x) section-y (+ (* (get-z~ region) 32) z)))))
-            (set-sector~ section sector)
-            (set-section~ sector section))
-          section)))
+        (create-section section-y)))
   
   
   (method (get-chunk-height x <fx> z <fx>) <fx>
@@ -232,25 +232,60 @@
   
   (method protected (modified)
     (set! modified? #t)
-    (modified~ region)))
+    (modified~ region))
+  
+  
+  ;;;
+  ;;;; Designer
+  ;;;
+  
+  
+  (method (cache-designer)
+    (or elements-designer
+        (let ((units '(world.data)))
+          (let ((tag '(<Chunk-Container>))
+                (data (new Data zone-version 'jazz units #f)))
+            (let ((form (construct-form tag (imports-locator units) data))
+                  (container (new Chunk-Container)))
+              (set-chunk~ container self)
+              (let ((des (new Former form: form reference: container)))
+                (set! elements-designer des)
+                des))))))
+  
+  
+  (method (save-designer)
+    (when elements-designer
+      (let ((compound (tag-find "Level" (tag-value tag))))
+        (if (null? (get-children~ (get-form~ elements-designer)))
+            (begin
+              (tag-remove compound "Elements")
+              (set! elements #f)
+              (set! elements-designer #f))
+          (let ((port (open-output-string)))
+            ;; for now save as string
+            (save-to-port~ elements-designer port)
+            (let ((content (object->u8vector (get-output-string port))))
+              (tag-add compound "Elements" TAG_Byte_Array content)))))))
+  
+  
+  (method (instantiate-elements)
+    (when elements
+      (instantiate-enqueue (cons self elements))
+      (set! elements #f))))
 
 
 ;;;
-;;;; Data
+;;;; Container
 ;;;
 
 
-(class World-Data extends Object
+(class Chunk-Container extends Component
   
   
-  (slot blocks      getter generate)
-  (slot data        getter generate)
-  (slot blocklight  getter generate)
-  (slot skylight    getter generate)
+  (slot chunk initialize #f accessors generate)
   
   
-  (method override (initialize blocks data blocklight skylight)
-    (set! blocks~self blocks)
-    (set! data~self data)
-    (set! blocklight~self blocklight)
-    (set! skylight~self skylight))))
+  (method override (print output readably)
+    (print-unreadable self output
+      (lambda (output)
+        (format output "{a} {a}" (get-x~ chunk) (get-z~ chunk)))))))
