@@ -27,6 +27,7 @@
         (world.homogeneous)
         (world.index)
         (world.layer)
+        (world.retain)
         (world.section)
         (world.syntax (phase syntax))
         (world.tag))
@@ -65,6 +66,26 @@
 ;; looks like we don't need to adjust for negative values like stated on the wiki
 (definition protected inline (section->chunk x/z <fx>) <fx>
   (modulo x/z 32))
+
+
+(definition chunks-mutex
+  (make-mutex 'chunks))
+
+
+(definition (with-chunks-mutex thunk)
+  (mutex-lock! chunks-mutex)
+  (prog1 (thunk)
+    (mutex-unlock! chunks-mutex)))
+
+
+(definition region-mutex
+  (make-mutex 'region))
+
+
+(definition (with-region-mutex thunk)
+  (mutex-lock! region-mutex)
+  (prog1 (thunk)
+    (mutex-unlock! region-mutex)))
 
 
 ;;;
@@ -123,9 +144,7 @@
   (slot file         <File>                                          getter generate)
   (slot port         <port>                                          getter generate)
   (slot header       <u8vector>                                      getter generate)
-  (slot region-mutex <object>   initialize (make-mutex 'region)      getter generate)
-  (slot chunks-mutex <object>   initialize (make-mutex 'chunks)      getter generate)
-  (slot chunks       <table>    initialize (make-table test: equal?) getter generate)
+  (slot chunks       <table>    initialize (make-table test: equal? weak-values: #t) getter generate)
   (slot modified?    <bool>     initialize #f                        accessors generate)
   (slot compact?     <bool>     initialize #f                        accessors generate)
   
@@ -136,7 +155,10 @@
     (set! z~self z)
     (set! file~self file)
     (set! port~self (open-file (path-settings file)))
-    (set! header (read-header)))
+    (set! header (read-header))
+    (make-will self
+      (lambda (obj)
+        (close-port (get-port~ obj)))))
   
   
   (method override (print output readably)
@@ -150,12 +172,25 @@
     (nextmethod))
   
   
-  (method (retain)
-    (increase! refcount))
+  (method (get-index&)
+    (index& x y z))
   
   
-  (method (release)
+  (method (retain retainer)
+    (increase! refcount)
+    (when debug-retain?
+      (add-retainer self retainer)))
+  
+  
+  (method (transfer old-retainer new-retainer)
+    (when debug-retain?
+      (transfer-retainer self old-retainer new-retainer)))
+  
+  
+  (method (release retainer)
     (decrease! refcount)
+    (when debug-retain?
+      (remove-retainer self retainer))
     (when (<= refcount 0)
       (free)))
   
@@ -171,18 +206,6 @@
           (let ((content (make-u8vector size)))
             (read-subu8vector content 0 size port)
             content)))))
-  
-  
-  (method (with-region-mutex thunk)
-    (mutex-lock! region-mutex)
-    (prog1 (thunk)
-      (mutex-unlock! region-mutex)))
-  
-  
-  (method (with-chunks-mutex thunk)
-    (mutex-lock! chunks-mutex)
-    (prog1 (thunk)
-      (mutex-unlock! chunks-mutex)))
   
   
   (definition shapings <vector>
@@ -250,7 +273,6 @@
                 chunk)
             (let ((read-chunk (read-chunk chunk-index)))
               (let ((chunk (or read-chunk (make-chunk))))
-                (retain)
                 (table-set! chunks (copy-planar-index chunk-index) chunk)
                 chunk)))))))
   
@@ -278,7 +300,8 @@
                 (region-z z))
             (define (shape x <fx> z <fx>) <World-Chunk>
               (let ((region (load-region~ zone (+ region-x (fxfloor/ x 32)) region-y (+ region-z (fxfloor/ z 32)))))
-                (shape-chunk~ region (modulo x 32) (modulo z 32))))
+                (prog1 (shape-chunk~ region (modulo x 32) (modulo z 32))
+                  (release~ region 'load-region))))
             
             (let ((front (shape chunk-x (+ chunk-z 1)))
                   (corner (shape (+ chunk-x 1) (+ chunk-z 1)))
@@ -311,7 +334,8 @@
                     (region-z z))
                 (define (populate x <fx> z <fx>) <World-Chunk>
                   (let ((region (load-region~ zone (+ region-x (fxfloor/ x 32)) region-y (+ region-z (fxfloor/ z 32)))))
-                    (populate-chunk~ region (modulo x 32) (modulo z 32))))
+                    (prog1 (populate-chunk~ region (modulo x 32) (modulo z 32))
+                      (release~ region 'load-region))))
                 
                 (populate (- chunk-x 1) chunk-z)
                 (populate chunk-x (- chunk-z 1))
@@ -333,7 +357,9 @@
     (let ((chunk
             (with-chunks-mutex
               (lambda ()
-                (generate-chunk chunk-x chunk-z)))))
+                (let ((chunk (generate-chunk chunk-x chunk-z)))
+                  (retain~ chunk 'load-chunk)
+                  chunk)))))
       (instantiate-elements~ chunk)
       chunk))
   
@@ -344,7 +370,9 @@
 
   
   (method (load-section-chunk section-x <fx> section-z <fx>) <World-Chunk>
-    (load-chunk (section->chunk section-x) (section->chunk section-z)))
+    (let ((chunk (load-chunk (section->chunk section-x) (section->chunk section-z))))
+      (transfer~ chunk 'load-chunk 'load-section-chunk)
+      chunk))
   
   
   (method (find-chunk section-x <fx> section-z <fx>) <World-Chunk+>
@@ -475,14 +503,10 @@
   
   
   (method (load-section section-x <fx> section-y <fx> section-z <fx> (create?: create? #f)) <World-Section+>
-    (let ((zone (current-zone)))
-      (let ((chunk (load-section-chunk section-x section-z))
-            (y (modulo section-y 32)))
-        (let ((sections-table (get-sections-table~ chunk)))
-          (let ((section (and sections-table (table-ref sections-table y #f))))
-            (if (and (not section) create?)
-                (create-section~ chunk y)
-              section))))))
+    (let ((chunk (load-section-chunk section-x section-z)))
+      (let ((section (load-section~ chunk section-x section-y section-z create?: create?)))
+        (transfer~ chunk section)
+        section)))
   
   
   (method (save-header port)
