@@ -47,6 +47,94 @@
   (Generated 2))
 
 
+(definition protected debug-regenerated?
+  #f)
+
+
+(definition protected partial-chunks
+  (make-table test: eq?))
+
+(definition protected generated-chunks
+  (make-table test: equal?))
+
+
+(definition protected (iterate-chunks-neighbors chunk proc)
+  (let ((zone (current-zone)))
+    (let ((region (get-region~ chunk))
+          (region-size 32))
+      (let ((x (+ (* (get-x~ region) 32) (get-x~ chunk)))
+            (z (+ (* (get-z~ region) 32) (get-z~ chunk))))
+        (loop (for section-x from (- x 1) to (+ x 1))
+              (loop (for section-z from (- z 1) to (+ z 1))
+                    (if (and (= section-x x)
+                             (= section-z z))
+                        (proc chunk)
+                      (let ((region (load-region-if~ zone
+                                      (fxfloor/ section-x region-size)
+                                      0
+                                      (fxfloor/ section-z region-size)
+                                      create?: #f)))
+                        (when region
+                          (let ((neighbor (find-chunk~ region section-x section-z)))
+                            (when neighbor
+                              (proc neighbor))))))))))))
+
+
+(definition protected (register-partial chunk)
+  (let ((needed '()))
+    (iterate-chunks-neighbors chunk
+      (lambda (neighbor)
+        (set! needed (cons neighbor needed))))
+    (table-set! partial-chunks chunk needed)))
+
+
+(definition protected (register-generated chunk)
+  (define (generated-stack)
+    (let ((stack (execution-stack)))
+      (cond ((memq? 'world.spawn:find-spawners stack)
+             'find-spawners)
+            ((memq? 'world.actor:Actor:update-area-cube stack)
+             'update-area-cube)
+            ((memq? 'world.generation:instantiate-visual stack)
+             'instantiate-visual)
+            ((memq? 'world.element:Element:set-position stack)
+             'set-position)
+            (else
+             'unknown @w stack))))
+  
+  (table-clear partial-chunks chunk)
+  (when debug-regenerated?
+    (let ((region (get-region~ chunk)))
+      (let ((region-x (get-x~ region))
+            (region-z (get-z~ region))
+            (chunk-x (get-x~ chunk))
+            (chunk-z (get-z~ chunk)))
+        (let ((index (list region-x region-z chunk-x chunk-z))
+              (stack (generated-stack)))
+          (table-add generated-chunks index stack)
+          (let ((all (table-ref generated-chunks index)))
+            (when (> (length all) 1)
+              (terminal region-x region-z chunk-x chunk-z (reverse all)))))))))
+
+
+(definition protected (monitor-generated-throughput)
+  (thread-start!
+    (new-thread
+      (let ((zone (current-zone)))
+        (let ((last-time (current-seconds))
+              (last-generated (get-sectors-generated~ zone)))
+          (lambda ()
+            (let (iter)
+              (thread-sleep! 1.)
+              (let ((time (current-seconds))
+                    (generated (get-sectors-generated~ zone)))
+                (terminal (/ (cast <fl> (- generated last-generated)) (- time last-time)))
+                (set! last-time time)
+                (set! last-generated generated))
+              (iter)))))
+      'generated)))
+
+
 (class World-Chunk extends Object
   
   
@@ -84,7 +172,9 @@
     (set! sections~self sections)
     (set! elements~self elements)
     (set! x~self (planar-index-x chunk-index))
-    (set! z~self (planar-index-z chunk-index)))
+    (set! z~self (planar-index-z chunk-index))
+    (unless (= state Generated)
+      (register-partial self)))
   
   
   (method override (print output readably)
@@ -121,7 +211,10 @@
   (method (change-state s)
     (set! state s)
     (let ((compound (tag-find "Level" (tag-value tag))))
-      (tag-add compound "State" TAG_Byte state)))
+      (tag-add compound "State" TAG_Byte state))
+    (if (= s Generated)
+        (register-generated self)
+      (register-partial self)))
   
   
   (method (register-section y section)
