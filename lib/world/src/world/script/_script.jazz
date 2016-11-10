@@ -14,12 +14,14 @@
 (module world.script jazz
 
 
-(export (world)
+(export (jazz.optimize (phase syntax)) ;; for
+        (world)
         (world.audio)
         (world.autoload)
         (world.commands)
         (world.draw)
         (world.dyes)
+        (world.generation.building)
         (world.geometry)
         (world.mark)
         (world.scripting)
@@ -42,6 +44,7 @@
         (world.dyes)
         (world.entity)
         (world.generation)
+        (world.generation.block)
         (world.geometry)
         (world.mark)
         (world.homogeneous)
@@ -49,6 +52,7 @@
         (world.scripter)
         (world.scripting)
         (world.syntax (phase syntax))
+        (world.task)
         (world.travel))
 
 
@@ -91,6 +95,17 @@
         (when volume
           (set-volume~ sound volume))
         (play~ sound)))))
+
+
+;;;
+;;;; Script
+;;;
+
+
+(definition public (script-sleep period)
+  (let ((task (current-task))
+        (exit (current-exit)))
+    (task-sleep task period 0. exit)))
 
 
 ;;;
@@ -228,22 +243,14 @@
 (definition public (walk)
   (let ((actor (current-actor)))
     (let ((script (get-script~ actor)))
-      (add-objective~ script
-        (lambda ()
-          (lambda ()
-            (set! sprint? #f)
-            (set-motion (current-actor) 'walk)
-            (objective-done~ script)))))))
+      (set! sprint? #f)
+      (set-motion (current-actor) 'walk))))
 
 (definition public (run)
   (let ((actor (current-actor)))
     (let ((script (get-script~ actor)))
-      (add-objective~ script
-        (lambda ()
-          (lambda ()
-            (set! sprint? #f)
-            (set-motion (current-actor) 'run)
-            (objective-done~ script)))))))
+      (set! sprint? #f)
+      (set-motion (current-actor) 'run))))
 
 
 ;; hack
@@ -253,12 +260,8 @@
 (definition public (sprint)
   (let ((actor (current-actor)))
     (let ((script (get-script~ actor)))
-      (add-objective~ script
-        (lambda ()
-          (lambda ()
-            (set! sprint? #t)
-            (set-motion (current-actor) 'run)
-            (objective-done~ script)))))))
+      (set! sprint? #t)
+      (set-motion (current-actor) 'run))))
 
 
 (definition public (set-hover? actor flag)
@@ -275,7 +278,14 @@
 (definition public (set-interact-handler actor handler)
   (set-interact~ (get/create-script actor) handler))
 
+(definition public (set-double-click-handler actor handler)
+  (set-double-click~ (get/create-script actor) handler))
 
+(definition public (set-hit-handler actor handler)
+  (set-hit~ (get/create-script actor) handler))
+
+
+@old
 (definition public (perform commands (gravity?: gravity? #t))
   (assert (is? commands Commands))
   (let ((event (current-event)))
@@ -283,6 +293,16 @@
           (time (get-time~ event))
           (elapse (get-elapse~ event)))
       (tick-actor~ actor commands time elapse gravity? 'slide))))
+
+
+(definition public (perform commands (gravity?: gravity? #t))
+  (let ((actor (current-actor)))
+    (let ((script (get-script~ actor)))
+      (let ((last-tick (get-last-tick~ script)))
+        (let ((time (current-seconds)))
+          (let ((elapse (- time last-tick)))
+            (set-last-tick~ script time)
+            (tick-actor~ actor commands time elapse gravity? 'slide)))))))
 
 
 (definition public (set-billboard actor name)
@@ -328,93 +348,210 @@
 
 
 ;;;
-;;;; Objective
+;;;; Life
 ;;;
+
+
+;; for testing hit event
+(definition public (full-life)
+  (set-life~ (event-me) 100.))
+
+
+;;;
+;;;; Tick
+;;;
+
+
+(definition script-period
+  (/ 1. 30.))
+
+
+(definition (with-tick proc)
+  (let ((task (current-task))
+        (exit (current-exit))
+        (actor (current-actor)))
+    (let ((script (get-script~ actor)))
+      (let (iter)
+        (declare (proper-tail-calls))
+        (poll-script actor script)
+        (let ((last-tick (get-last-tick~ script)))
+          (if (not last-tick)
+              (begin
+                (set-last-tick~ script (current-seconds))
+                (task-sleep task script-period 0. exit)
+                (iter))
+            (let ((time (current-seconds)))
+              (let ((elapse (- time last-tick)))
+                (if (>= elapse script-period)
+                    (begin
+                      (set-last-tick~ script time)
+                      (animate~ actor elapse)
+                      (proc actor script time elapse iter))
+                  (task-sleep task (- script-period elapse) 0. exit)
+                  (iter))))))))))
+
+
+(definition (poll-script actor script)
+  (let ((event (dequeue-event~ script)))
+    (case event
+      ((interact)
+       (let ((handler (get-interact~ script)))
+         (parameterize ((current-event (new Interact-Event actor (current-seconds))))
+           (handler actor))))
+      ((double-click)
+       (let ((handler (get-double-click~ script)))
+         (parameterize ((current-event (new Double-Click-Event actor (current-seconds))))
+           (handler actor))))
+      ((hit)
+       (let ((handler (get-hit~ script)))
+         (parameterize ((current-event (new Double-Click-Event actor (current-seconds))))
+           (handler actor))))
+      ((toggle-paused)
+       (toggle-paused)))))
+
+
+;;;
+;;;; Move
+;;;
+
+
+(definition public (stay)
+  (declare (proper-tail-calls))
+  (with-tick
+    (lambda (actor script time elapse iter)
+      (tick-actor~ actor stay-commands time elapse #t 'slide)
+      (iter))))
 
 
 (definition public (move distance)
   (let ((distance (cast <fl> distance))
         (actor (current-actor)))
-    (let ((script (get-script~ actor)))
-      (add-objective~ script
-        (lambda ()
-          (let ((start (copy-vertex (get-position~ actor)))
-                (target (vertex+ (get-position~ actor) (vertex-scalar*& (get-sight~ actor) distance)))
-                (line #f))
-            (lambda ()
-              (perform-move)
-              (let ((traveled (vertex-distance& (get-position~ actor) start)))
-                (when (get-trail?~ script)
-                  (let ((end (copy-vertex (get-position~ actor))))
-                    (if (not line)
-                        (let ((l (list start end (get-trail-color~ script))))
-                          (trail-line actor l)
-                          (set! line l))
-                      (set-second! line end))))
-                (when (> traveled distance)
-                  (set-position~ actor target)
-                  (when line
-                    (set-second! line target))
-                  (when (objectiveless?~ script)
-                    (animate actor "Idle"))
-                  (objective-done~ script))))))))))
+    (let ((start (copy-vertex (get-position~ actor)))
+          (target (vertex+ (get-position~ actor) (vertex-scalar*& (get-sight~ actor) distance)))
+          (line #f))
+      (with-tick
+        (lambda (actor script time elapse iter)
+          (tick-actor~ actor (if sprint? sprint-commands move-commands) time elapse #t 'slide)
+          (let ((traveled (vertex-distance& (get-position~ actor) start)))
+            (when (get-trail?~ script)
+              (let ((end (copy-vertex (get-position~ actor))))
+                (if (not line)
+                    (let ((l (list start end (get-trail-color~ script))))
+                      (trail-line actor l)
+                      (set! line l))
+                  (set-second! line end))))
+            (if (< traveled distance)
+                (iter)
+              (set-position~ actor target)
+              (when line
+                (set-second! line target)))))))))
 
 
 (definition public (move-to . rest)
-  (let ((actor (current-actor))
-        (target (if (= (length rest) 1)
+  (let ((target (if (= (length rest) 1)
                     (car rest)
                   (bind (x y z) rest
-                    (vertex (cast <fl> x) (cast <fl> y) (cast <fl> z))))))
-    (let ((script (get-script~ actor)))
-      (add-objective~ script
-        (lambda ()
-          (let ((start (copy-vertex (get-position~ actor)))
-                (distance (vertex-distance (get-position~ actor) target))
-                (line #f))
-            (set-lookat actor (horizon-lookat (vertex-normalize& (vertex-& target (get-position~ actor)))))
-            (lambda ()
-              (perform-move)
-              (let ((traveled (vertex-distance& (get-position~ actor) start)))
-                (when (get-trail?~ script)
-                  (let ((end (copy-vertex (get-position~ actor))))
-                    (if (not line)
-                        (let ((l (list start end (get-trail-color~ script))))
-                          (trail-line actor l)
-                          (set! line l))
-                      (set-second! line end))))
-                (when (> traveled distance)
-                  (set-position~ actor target)
-                  (when line
-                    (set-second! line target))
-                  (when (objectiveless?~ script)
-                    (animate actor "Idle"))
-                  (objective-done~ script))))))))))
+                    (vertex (cast <fl> x) (cast <fl> y) (cast <fl> z)))))
+        (actor (current-actor)))
+    (let ((start (copy-vertex (get-position~ actor)))
+          (distance (vertex-distance (get-position~ actor) target))
+          (line #f))
+      (set-lookat actor (horizon-lookat (vertex-normalize& (vertex-& target (get-position~ actor)))))
+      (with-tick
+        (lambda (actor script time elapse iter)
+          (tick-actor~ actor (if sprint? sprint-commands move-commands) time elapse #t 'slide)
+          (let ((traveled (vertex-distance& (get-position~ actor) start)))
+            (when (get-trail?~ script)
+              (let ((end (copy-vertex (get-position~ actor))))
+                (if (not line)
+                    (let ((l (list start end (get-trail-color~ script))))
+                      (trail-line actor l)
+                      (set! line l))
+                  (set-second! line end))))
+            (if (< traveled distance)
+                (iter)
+              (set-position~ actor target)
+              (when line
+                (set-second! line target)))))))))
 
 
 (definition public (rotate angle)
   (let ((angle (degree->radian (cast <fl> angle)))
         (actor (current-actor)))
-    (let ((script (get-script~ actor)))
-      (unless (= angle 0.)
-        (add-objective~ script
-          (lambda ()
-            (let ((start (copy-vertex (get-sight~ actor)))
-                  (target (rotate-upon angle (vertex& 0. 1. 0.) (get-sight~ actor)))
-                  (perform (if (> angle 0.) perform-rotate-left perform-rotate-right))
-                  (test (if (> angle 0.) > <)))
-              (lambda ()
-                (set-lookat~ actor (horizon-lookat target))
-                (objective-done~ script)
-                @w
-                (perform)
-                @w
-                (let ((traveled (vector-signed-angle start (get-sight~ actor) (vertex& 0. 1. 0.))))
-                  (when (test traveled angle)
-                    (set-lookat~ actor (horizon-lookat target))
-                    (when (objectiveless?~ script)
-                      (animate actor "Idle"))
-                    (objective-done~ script)))))))))))
+    (unless (= angle 0.)
+      (let ((start (copy-vertex (get-sight~ actor)))
+            (target (rotate-upon angle (vertex& 0. 1. 0.) (get-sight~ actor)))
+            (commands (if (> angle 0.) rotate-left-commands rotate-right-commands))
+            (test (if (> angle 0.) > <)))
+        (with-tick
+          (lambda (actor script time elapse iter)
+            (tick-actor~ actor commands time elapse #t 'slide)
+            (let ((traveled (vector-signed-angle start (get-sight~ actor) (vertex& 0. 1. 0.))))
+              (if (not (test traveled angle))
+                  (iter)
+                (set-lookat~ actor (horizon-lookat target))))))))))
+
+
+;;;
+;;;; Block
+;;;
+
+
+@too-much-for-now-to-be-obstructed-by-blocks
+(definition public (with-script-interaction position proc)
+  (let ((world (current-world))
+        (game (current-game))
+        (actor (current-actor)))
+    (let ((max-distance (get-view-radius~ world))
+          (lens (lens-center~ actor)))
+      (let ((direction (vertex-normalize (vertex- position lens))))
+        (let ((closest (ray-closest-polygon lens direction max-distance ignore-non-physical?: #f ignore-entities?: #f ignore-players?: #t)))
+          (when closest
+            (let ((poly (car closest)))
+              (when poly
+                (with-polygon-interaction~ game poly
+                  (lambda (poly block fore)
+                    (proc poly fore)))))))))))
+
+
+(definition public (add-block position block-id)
+  (let ((game (current-game)))
+    (apply-add-block~ game position block-id 0)))
+
+
+(definition public (delete-block position)
+  )
+
+
+(definition public (change-block position block-id)
+  )
+
+
+;;;
+;;;; Pause
+;;;
+
+
+(definition public (paused?)
+  (boolean (find-restart 'unpause)))
+
+
+(definition public (pause)
+  (with-restart-catcher 'unpause "Unpause"
+    (lambda ()
+      (stay))))
+
+
+(definition public (unpause)
+  (let ((restart (find-restart 'unpause)))
+    (when restart
+      (invoke-restart restart))))
+
+
+(definition public (toggle-paused)
+  (if (paused?)
+      (unpause)
+    (pause)))
 
 
 ;;;
@@ -422,77 +559,62 @@
 ;;;
 
 
-@w (
-(clear-trail)
-(run)
-
-(define (plot function)
-  (untrail)
-  (loop (for x <fl> from -5. to 5. by .5)
-        (let ((y (function x)))
-          (move-to x 4. y)
-          (trail))))
-
-(plot (lambda (x) (* x x)))
-(plot sin))
-
-
 (definition public (trail (color #f))
   (let ((zone (current-zone)))
     (let ((actor (current-actor)))
       (let ((script (get-script~ actor)))
-        (add-objective~ script
+        (set-trail?~ script #t)
+        (when (not (get-trail~ script))
+          (set-trail~ script (new-queue)))
+        (when color
+          (set-trail-color~ script (case color
+                                     ((red) red-dye)
+                                     ((green) green-dye)
+                                     (else blue-dye))))
+        (register-draw~ zone actor
           (lambda ()
-            (lambda ()
-              (set-trail?~ script #t)
-              (when (not (get-trail~ script))
-                (set-trail~ script (new-queue)))
-              (when color
-                (set-trail-color~ script (case color
-                                           ((red) red-dye)
-                                           ((green) green-dye)
-                                           (else blue-dye))))
-              (register-draw~ zone actor
-                (lambda ()
-                  (draw-trail actor)))
-              (objective-done~ script))))))))
+            (draw-trail actor)))))))
 
 
 (definition public (untrail)
   (let ((zone (current-zone)))
     (let ((actor (current-actor)))
       (let ((script (get-script~ actor)))
-        (add-objective~ script
-          (lambda ()
-            (lambda ()
-              (set-trail?~ script #f)
-              @w
-              (unregister-draw~ zone actor)
-              (objective-done~ script))))))))
+        (set-trail?~ script #f)
+        @w
+        (unregister-draw~ zone actor)))))
 
 
 (definition public (trail-color color)
   (let ((zone (current-zone)))
     (let ((actor (current-actor)))
       (let ((script (get-script~ actor)))
-        (add-objective~ script
-          (lambda ()
-            (lambda ()
-              (set-trail-color~ script (case color
-                                         ((red) red-dye)
-                                         ((green) green-dye)
-                                         (else blue-dye)))
-              (objective-done~ script))))))))
+        (set-trail-color~ script (case color
+                                   ((red) red-dye)
+                                   ((green) green-dye)
+                                   (else blue-dye)))))))
 
 
 (definition public (clear-trail)
   (let ((actor (current-actor)))
     (let ((script (get-script~ actor)))
-      (add-objective~ script
-        (lambda ()
-          (lambda ()
-            (set-trail~ script (new-queue))
-            (objective-done~ script)))))))
+      (set-trail~ script (new-queue)))))
+
+
+(definition (trail-line actor line)
+  (let ((script (get-script~ actor)))
+    (enqueue (get-trail~ script) line)))
+
+
+(definition (draw-trail actor)
+  (let ((script (get-script~ actor)))
+    (for-each (lambda (line)
+                (bind (start end color) line
+                  (render-line start
+                               end
+                               .04
+                               (or color blue-dye))))
+              (queue-list (get-trail~ script)))))
 
 
 (definition public (plot-axes (dx 0) (dz 0))
@@ -511,22 +633,6 @@
   (move-to from)
   (trail color)
   (move-to to))
-
-
-(definition (trail-line actor line)
-  (let ((script (get-script~ actor)))
-    (enqueue (get-trail~ script) line)))
-
-
-(definition (draw-trail actor)
-  (let ((script (get-script~ actor)))
-    (for-each (lambda (line)
-                (bind (start end color) line
-                  (render-line start
-                               end
-                               .04
-                               (or color blue-dye))))
-              (queue-list (get-trail~ script)))))
 
 
 ;;;
@@ -726,17 +832,6 @@
   (set-animation-active~ actor animation))
 
 
-;; quick hack
-(definition public (refresh)
-  (let ((actor (current-actor)))
-    (let ((script (get-script~ actor)))
-      (add-objective~ script
-        (lambda ()
-          (lambda ()
-            (animate actor "Idle")
-            (objective-done~ script)))))))
-
-
 (definition public (creatures)
   (let ((zone (current-zone)))
     (get-creatures~ zone)))
@@ -757,138 +852,4 @@
             (with-field i j k
               (lambda (section index)
                 (data-set! section index data)
-                (add-section section)))))))))
-
-
-;;;
-;;;; Move
-;;;
-
-
-#/Jazz/
-(handle (tick)
-  (move))
-//#
-
-
-;;;
-;;;; Happy
-;;;
-
-
-#/Jazz/
-(define happy?
-  #f)
-
-(handle (tick)
-  (if (near-player? me)
-      (begin
-        (when (not happy?)
-          (sound bark volume: .25))
-        (lookat-player me)
-        (jump)
-        (set! happy? #t))
-    (move)
-    (set! happy? #f)))
-//#
-
-
-;;;
-;;;; Speed
-;;;
-
-
-#/Jazz/
-(when (get first-time? #t)
-  (set-position me (vertex 0. -60. 0.))
-  (set-lookat me (lookat-horizon (vertex 0. 0. 1.)))
-  (set first-time? #f))
-
-(set-motion me 'run)
-
-(handle (tick)
-  (let ((z (vertex-z (get-position me))))
-    (cond ((> z 20.)
-           (set-lookat me (lookat-horizon (vertex 0. 0. -1.))))
-          ((< z 0.)
-           (set-lookat me (lookat-horizon (vertex 0. 0. 1.))))))
-  (move))
-//#
-
-
-;;;
-;;;; Run
-;;;
-
-
-#/Jazz/
-(when (not (get stage))
-  (set stage 0))
-
-(set stage (+ (get stage) 1))
-
-(case (get stage)
-  ((1)
-   (set-all-motion 'walk))
-  ((2)
-   (set-all-motion 'run)
-   (sound "sound/Rocky"))
-  ((3)
-   (handle (tick)
-     (debug 'tick))))
-//#
-
-
-;;;
-;;;; Dialog
-;;;
-
-
-#/Jazz/
-(handle (tick)
-  (if fly
-      (my-people)
-    (lookat-player)
-    (if (near-player? self 3.)
-        (stay)
-      (move))
-    (let ((time (current-seconds)))
-      (let ((elapse (- time previous)))
-        (set! previous time)
-        (tick-msgs elapse)))))
-
-(definition self
-  (current-actor))
-
-(definition previous
-  0.)
-
-(definition timer
-  #f)
-
-(definition (stop)
-  (stay))
-
-(definition fly
-  #f)
-
-(definition msg-index
-  0)
-
-(definition msgs
-  (list (cons "Hi" 3.)
-        (cons "I am Groot" 3.)
-        (cons "My people need me!" 0.)))
-
-(definition (tick-msgs elapse)
-  (if (< msg-index (length msgs))
-      (begin
-        (when timer
-          (decrease! timer elapse))
-        (when (or (not timer) (< timer 0.))
-          (message (car (list-ref msgs msg-index)))
-          (set! timer (cdr (list-ref msgs msg-index)))
-          (increase! msg-index)))
-    (set! fly #t)))
-//#
-)
+                (add-section section))))))))))
