@@ -244,9 +244,9 @@
   (slot tick-no                <object>            initialize 0               getter generate)
   (slot commands               <object>            initialize #f              getter generate)
   (slot base-assets            <object>            initialize '()             getter generate)
+  (slot user-assets            <object>            initialize '()             getter generate)
   (slot world-assets           <object>            initialize '()             getter generate)
   (slot zone-assets            <object>            initialize '()             accessors generate)
-  (slot user-assets            <object>            initialize '()             getter generate)
   (slot textures               <object>            initialize #f              getter generate)
   (slot models                 <object>            initialize #f              getter generate)
   (slot gc-sound?              <bool>              initialize #f              getter generate)
@@ -449,50 +449,35 @@
   ;;;
   
   
-  (slot installed-repositories initialize (make-table test: equal?) getter generate)
-  
-  
   (method (prepare-assets)
     (set! base-assets (gather-assets 'base (new Directory (cons (world-alias) '("lib" "world.client" "assets")))))
-    (set! world-assets (gather-assets 'world (let ((dir (get-world-directory))) (and dir (new-directory~ dir "assets")))))
-    (set! user-assets (gather-assets 'user {Directory Settings "assets"})))
+    (set! user-assets (gather-assets 'user {Directory Settings "assets"}))
+    (set! world-assets (gather-assets 'world (let ((dir (get-world-directory))) (and dir (new-directory~ dir "assets"))))))
   
   
   (method (iterate-assets proc (include-zone?: include-zone? #t))
-    (for-each proc user-assets)
     (when include-zone?
       (for-each proc zone-assets))
     (for-each proc world-assets)
     (let ((tier (current-tier+)))
       (when tier
         (for-each proc (get-assets~ tier))))
+    (for-each proc user-assets)
     (for-each proc base-assets))
   
   
-  (method (prepare-modules instance)
-    (let ((queue (new-queue)))
-      (define (process-assets assets)
-        (let ((repository-dir (new-directory~ (get-directory~ assets) "module")))
-          (when (exists?~ repository-dir)
-            (enqueue queue (parse~ repository-dir)))))
-      
-      (define (template-modules)
-        (and instance (exists?~ instance)
-          (let ((instance (instantiate~ (read-form instance))))
-            (let ((template-dir (get-template~ instance)))
-              (new-directory~ template-dir '("assets" "module"))))))
-      
-      (if (not (programmer?))
-          (iterate-assets process-assets)
-        ;; enable direct edition of template code
-        (iterate-assets process-assets include-zone?: #f)
-        (let ((module-dir (template-modules)))
-          (if (and module-dir (exists?~ module-dir))
-              (enqueue queue (parse~ module-dir))
-            (for-each process-assets zone-assets))))
-      (let ((new (queue-list queue)))
-        (update-repositories installed-repositories new)
-        (set-world-repositories new))))
+  (method (partition-assets (include-zone?: include-zone? #t))
+    (list
+      (cons 'zone (if include-zone?
+                      zone-assets
+                    '()))
+      (cons 'world world-assets)
+      (cons 'tier (let ((tier (current-tier+)))
+                    (if tier
+                        (get-assets~ tier)
+                      '())))
+      (cons 'user user-assets)
+      (cons 'base base-assets)))
   
   
   (method (prepare-players)
@@ -525,6 +510,59 @@
     (set! block-materials (make-table test: eq?))
     (set! material-opaque (get-entity-material~ (opaque-rendering)))
     (set! material-transparent (get-entity-material~ (transparent-rendering))))
+
+  
+  ;;;
+  ;;;; Modules
+  ;;;
+  
+  
+  (slot installed-repositories initialize (make-table test: equal?) getter generate)
+  
+  
+  (method (prepare-modules instance)
+    (let ((queue (new-queue)))
+      (define (process-assets assets)
+        (let ((repository-dir (new-directory~ (get-directory~ assets) "module")))
+          (when (exists?~ repository-dir)
+            (enqueue queue (parse~ repository-dir)))))
+      
+      (define (template-modules)
+        (and instance (exists?~ instance)
+          (let ((instance (instantiate~ (read-form instance))))
+            (let ((template-dir (get-template~ instance)))
+              (new-directory~ template-dir '("assets" "module"))))))
+      
+      (if (not (programmer?))
+          (iterate-assets process-assets)
+        ;; enable direct edition of template code
+        (iterate-assets process-assets include-zone?: #f)
+        (let ((module-dir (template-modules)))
+          (if (and module-dir (exists?~ module-dir))
+              (enqueue queue (parse~ module-dir))
+            (for-each process-assets zone-assets))))
+      (let ((new (queue-list queue)))
+        (update-repositories installed-repositories new)
+        (set-world-repositories new))))
+  
+  
+  (method (collect-modules)
+    (let ((modules '()))
+      (for-each (lambda (path)
+                  (let ((repository (table-ref installed-repositories path)))
+                    (iterate-packages repository
+                      (lambda (package)
+                        (let ((dir (new Directory (tokenise-filename (package-directory package)))))
+                          (iterate-directory~ dir
+                            (lambda (path kind)
+                              (unless (member? (last path) '(".DS_Store") test: filename=?)
+                                (set! modules (cons (cons dir path) modules))))
+                            full?: #f
+                            files?: #t
+                            directories?: #f
+                            recursive?: #t))))))
+                (get-world-repositories))
+      modules))
 
   
   ;;;
@@ -3063,21 +3101,36 @@
   
   
   (method (collect-scripts (include-zone?: include-zone? #t))
-    (let ((scripts '()))
-      (iterate-assets
-        (lambda (assets)
-          (let ((scripts-dir (new-directory~ (get-directory~ assets) "script")))
-            (when (exists?~ scripts-dir)
-              (iterate-directory~ scripts-dir
-                (lambda (path kind)
-                  (unless (member? (last path) '(".DS_Store" "README") test: filename=?)
-                    (set! scripts (cons (cons scripts-dir path) scripts))))
-                full?: #f
-                files?: #t
-                directories?: #f
-                recursive?: #t))))
-        include-zone?: include-zone?)
-      (sort di<? scripts key: cdr)))
+    (let ((queue (new-queue)))
+      (for-each (lambda (partition)
+                  (bind (kind . assets) partition
+                    (let ((scripts '()))
+                      (for-each (lambda (assets)
+                                  (let ((scripts-dir (new-directory~ (get-directory~ assets) "script")))
+                                    (when (exists?~ scripts-dir)
+                                      (iterate-directory~ scripts-dir
+                                        (lambda (path kind)
+                                          (unless (member? (last path) '(".DS_Store" "README") test: filename=?)
+                                            (set! scripts (cons (cons scripts-dir path) scripts))))
+                                        full?: #f
+                                        files?: #t
+                                        directories?: #f
+                                        recursive?: #t))))
+                                assets)
+                      (for-each (lambda (script)
+                                  (enqueue queue script))
+                                (sort di<? scripts key: cdr)))))
+                  (partition-assets include-zone?: include-zone?))
+      (queue-list queue)))
+  
+  
+  (method (partition-scripts scripts)
+    (partition scripts key: (lambda (script)
+                              (bind (dir . path) script
+                                (if (> (length path) 1)
+                                    (car path)
+                                  "")))
+      test: filename=?))
   
   
   (method (find-script path)
@@ -3828,6 +3881,7 @@
         (target-update selection polygon vertex)
         (target-update~ zone selection polygon vertex)
         (invalidate-view~ interface)
+        (reset-edited-file)
         (update-color-pane)
         (update-target-pane)
         (update-script-pane)

@@ -20,6 +20,7 @@
         (jazz.editor.lisp)
         (jazz.handler)
         (jazz.ide)
+        (jazz.io)
         (jazz.jml)
         (jazz.graphic)
         (jazz.project)
@@ -44,15 +45,25 @@
         (world.window))
 
 
+(definition protected edited-file
+  #f)
+
+(definition protected (set-edited-file file)
+  (set! edited-file file))
+
+(definition protected (reset-edited-file)
+  (set! edited-file #f))
+
+
 (definition public (toggle-script)
   (interface-script (not interface-script?)))
 
 
-(definition (interface-script flag (update-debugger? #t))
+(definition (interface-script flag (update-debugger?: update-debugger? #t))
   (let ((window (current-world-window))
         (world (current-world)))
     (set-interface-script? flag)
-    (update-script-pane update-debugger?)
+    (update-script-pane update-debugger?: update-debugger?)
     (update-parameter~ world 'script)
     (update-window-cursor~ window)))
 
@@ -61,9 +72,16 @@
   (interface-script #t)
   (let ((interface (current-interface)))
     (let ((pane (child~ interface 'script)))
-      (update-workspace~ pane)
       (let ((splitter (locate~ pane 'workspace-splitter)))
-        (toggle-zoom~ splitter (locate~ pane 'horz-splitter))))))
+        (when (zoomed?~ splitter)
+          (update-workspace~ pane))
+        (toggle-zoom~ splitter (locate~ pane 'horz-splitter))
+        @wait
+        (if (zoomed?~ splitter)
+            (acquire-focus~ (locate~ pane '(script text)))
+          (let ((tree (locate~ pane '(scripts scripts))))
+            (set-single-selection~ tree 0)
+            (acquire-focus~ tree)))))))
 
 
 (definition public (view-script)
@@ -76,11 +94,12 @@
 
 
 (definition public (view-debugger)
-  (interface-script #t #f)
+  (interface-script #t update-debugger?: #f)
   (let ((interface (current-interface)))
     (let ((pane (child~ interface 'script)))
-      (update-debugger~ pane)
       (let ((splitter (locate~ pane 'console-splitter)))
+        (when (zoomed?~ splitter)
+          (update-debugger~ pane))
         (toggle-zoom~ splitter (locate~ pane 'console-border))))))
 
 
@@ -90,13 +109,13 @@
       (let ((interface (current-interface)))
         (let ((pane (child~ interface 'script)))
           (when (get-visible?~ pane)
-            (let ((entity (get-entity~ pane)))
-              (when (eq? entity target)
+            (let ((edited (get-edited~ pane)))
+              (when (eq? edited target)
                 (update-debugger~ pane)
                 (let ((splitter (locate~ pane 'console-splitter)))
-                  (if (and entity
-                           (get-script~ entity)
-                           (eq? (get-state~ (get-script~ entity)) 'run))
+                  (if (and edited
+                           (get-script~ edited)
+                           (eq? (get-state~ (get-script~ edited)) 'run))
                       (zoom~ splitter (locate~ pane 'console-border))
                     (unzoom~ splitter)))))))))))
 
@@ -120,7 +139,7 @@
             (evaluate-script~ entity script)))))))
 
 
-(definition public (update-script-pane (update-debugger? #t))
+(definition public (update-script-pane (update-debugger?: update-debugger? #t))
   (let ((interface (current-interface))
         (world (current-world))
         (zone (current-zone)))
@@ -128,60 +147,66 @@
           (pane (child~ interface 'script)))
       (define (hide-pane)
         (save-pane)
-        (set-entity~ pane #f)
+        (set-edited~ pane #f)
         (set-visible?~ pane #f)
         (reset-focus~ window))
       
-      (define (show-pane entity)
-        (set-entity~ pane entity)
+      (define (show-pane edited)
+        (set-edited~ pane edited)
         (set-visible?~ pane #t)
         (when update-debugger?
-          (update-debugger entity)))
+          (update-debugger edited)))
       
       (define (save-pane)
         (save-script~ pane))
       
       (if (not interface-script?)
           (hide-pane)
-        (let ((targ (first-target~ world)))
-          (unless (eq? targ (get-entity~ pane))
-            (cond ((and (is? targ Block-Entity) (eq? (get-model~ targ) 'CommandBlock))
-                   (save-pane)
-                   (let ((block-proxy (find-block-proxy~ targ)))
+        (if edited-file
+            (begin
+              (save-pane)
+              (let ((text (locate~ pane '(script text))))
+                (load-content~ text edited-file)
+                (show-pane #f)))
+          (let ((targ (first-target~ world)))
+            (unless (eq? targ (get-edited~ pane))
+              (cond ((and (is? targ Block-Entity) (eq? (get-model~ targ) 'CommandBlock))
+                     (save-pane)
+                     (let ((block-proxy (find-block-proxy~ targ)))
+                       (let ((text (locate~ pane '(script text)))
+                             (content (if block-proxy (get-text~ (get-script~ block-proxy)) "")))
+                         (set-string-content~ text (or content ""))
+                         (show-pane (or block-proxy targ)))))
+                    ((is? targ Block-Proxy)
+                     (save-pane)
                      (let ((text (locate~ pane '(script text)))
-                           (content (if block-proxy (get-text~ (get-script~ block-proxy)) "")))
-                       (set-string-content~ text (or content ""))
-                       (show-pane (or block-proxy targ)))))
-                  ((is? targ Block-Proxy)
-                   (save-pane)
-                   (let ((text (locate~ pane '(script text)))
-                         (script (get-script~ targ)))
-                     (set-string-content~ text (if script (get-text~ script) ""))
-                     (show-pane targ)))
-                  ((is? targ Actor)
-                   (save-pane)
-                   (let ((text (locate~ pane '(script text)))
-                         (script (get-script~ targ)))
-                     (set-string-content~ text (if script (get-text~ script) ""))
-                     (show-pane targ)))
-                  (else
-                   (let ((scriptable? (and targ (scriptable?~ targ))))
-                     (if (not scriptable?)
-                         (hide-pane)
-                       (let ((name (get-name~ targ)))
-                         (if (not name)
-                             (hide-pane)
-                           (if (not (get-cataloguer))
+                           (script (get-script~ targ)))
+                       (set-string-content~ text (if script (get-text~ script) ""))
+                       (show-pane targ)))
+                    ((is? targ Entity)
+                     (save-pane)
+                     (let ((text (locate~ pane '(script text)))
+                           (script (get-script~ targ)))
+                       (set-string-content~ text (if script (get-text~ script) ""))
+                       (show-pane targ)))
+                    (else
+                     (let ((scriptable? (and targ (scriptable?~ targ))))
+                       (if (not scriptable?)
+                           (hide-pane)
+                         (let ((name (get-name~ targ)))
+                           (if (not name)
                                (hide-pane)
-                             (let ((locator (compose-reference 'tutorial.objectives name)))
-                               (let ((entry (locator->entry locator)))
-                                 (if (not entry)
-                                     (hide-pane)
-                                   (save-pane)
-                                   (let ((text (locate~ pane '(script text))))
-                                     (set-moniker~ (get-document-controller~ text) (get-moniker~ entry))
-                                     (set-selection-safe~ text (get-range~ entry) reposition: 'vertical ensure-displayed?: #t)
-                                     (show-pane #f))))))))))))))))))
+                             (if (not (get-cataloguer))
+                                 (hide-pane)
+                               (let ((locator (compose-reference 'tutorial.objectives name)))
+                                 (let ((entry (locator->entry locator)))
+                                   (if (not entry)
+                                       (hide-pane)
+                                     (save-pane)
+                                     (let ((text (locate~ pane '(script text))))
+                                       (set-moniker~ (get-document-controller~ text) (get-moniker~ entry))
+                                       (set-selection-safe~ text (get-range~ entry) reposition: 'vertical ensure-displayed?: #t)
+                                       (show-pane #f)))))))))))))))))))
 
 
 (definition (need-script obj (create?: create? #t))
@@ -221,11 +246,16 @@
   
   (form
     (<install>                                                               size: {Dimension 420 639} background: {Color red: .000 green: .000 blue: .000 alpha: .450} layout-type: fill
-      (<Splitter-View>                              name: workspace-splitter location: first separator: none orientation: vert mode: absolute division: 200 state: zoom target: second
-        (<Border-View>                              name: workspace-border   location: first border-color: {Color Medium-Gray} border-type: edge style: entry
-          (<Pad-View>
-            (<Docked-Host>                                                   title: "Workspace" location: selection
-              (<Workspace-Guest>                    name: workspace))))
+      (<Splitter-View>                              name: workspace-splitter location: first separator: none orientation: vert mode: absolute division: 250 state: zoom target: second
+        (<Splitter-View>                            name: workspace-border   location: first separator: none orientation: horz mode: relative division: 50
+          (<Border-View>                                                     location: first border-color: {Color Medium-Gray} border-type: edge style: entry
+            (<Pad-View>
+              (<Docked-Host>                                                 title: "Scripts" location: selection
+                (<Scripts-Guest>                    name: scripts))))
+          (<Border-View>                                                     location: second border-color: {Color Medium-Gray} border-type: edge style: entry
+            (<Pad-View>
+              (<Docked-Host>                                                 title: "Modules" location: selection
+                (<Modules-Guest>                    name: modules)))))
         (<Splitter-View>                            name: horz-splitter      location: second separator: none orientation: horz mode: relative division: -30 state: zoom target: first
           (<Splitter-View>                          name: vert-splitter      location: first separator: none orientation: vert mode: absolute division: -17 state: zoom target: first
             (<Splitter-View>                        name: console-splitter   location: first separator: none orientation: vert mode: relative division: -27 state: zoom target: first
@@ -249,7 +279,7 @@
                         (<content~>                                          layout-type: fill
                           (<Tree-Header>                                     style: document shown?: #f
                             (<content~>
-                              (<Tree-View>          name: frames             portfolio: :images filled-column: frame background: #f double-click-handler: {Event-Handler :form on-double-click} return-press-handler: {Event-Handler :form on-return-press} escape-press-handler: {Event-Handler :form on-escape-press}
+                              (<Stack-Tree-View>    name: stack              portfolio: :images filled-column: frame background: #f double-click-handler: {Event-Handler :form on-double-click} return-press-handler: {Event-Handler :form on-return-press} escape-press-handler: {Event-Handler :form on-escape-press}
                                 (<Tree-Node-Column> name: frame              title: "Frame" width: 235 toplevel-controls?: #f display-images?: #f display-levels?: #f)))))))))))
             (<Minibuffer-Toolbar>))
           (<Border-View>                            name: toolbox-border     location: second border-color: {Color Medium-Gray} border-type: edge style: entry layout-type: fill
@@ -263,7 +293,7 @@
                           (<Tree-Node-Column>       name: contour            title: "Contour" width: 235 toplevel-controls?: #f display-images?: #f display-levels?: #f)))))))))))))
   
   
-  (slot entity initialize #f accessors generate)
+  (slot edited initialize #f accessors generate)
   
   
   (method override (finish initargs)
@@ -274,60 +304,156 @@
   
   
   (method (update-workspace)
-    (let ((tree (locate '(workspace monikers))))
-      (add-row~ tree
-        children: (list (new Tree-Node title: "Zone" font: {Font Label-User}))
-        user-data: 'zone)))
+    (update~ (locate 'scripts))
+    (update~ (locate 'modules)))
   
   
   (method (update-debugger)
-    (let ((text (locate 'exception-text)))
-      (if entity
-          (let ((script (get-script~ entity)))
-            (if script
-                (set-string-content~ text (or (get-reason~ script) ""))
-              (set-string-content~ text "")))
-        (set-string-content~ text "")))
-    (let ((tree (locate 'frames)))
-      (remove-every-row~ tree)
-      (when entity
-        (let ((script (get-script~ entity)))
-          (when script
-            (let ((stack (get-stack~ script)))
-              (when stack
-                (for-each (lambda (frame)
-                            (add-row~ tree
-                              children: (list (new Tree-Node title: (->string frame) font: {Font Label-User}))))
-                          stack))))))))
-        
+    (update~ (locate 'exception-text) edited)
+    (update~ (locate 'stack) edited))
   
   
   (method (save-script)
     (let ((zone (current-zone)))
-      (when entity
-        (let ((script (need-script entity create?: #f))
+      (when edited
+        (let ((script (need-script edited create?: #f))
               (text (locate '(script text))))
           (let ((content (get-string-content~ text)))
             (unless (equal? (if script (or (get-text~ script) "") "") content)
-              (let ((script (or script (need-script entity))))
+              (let ((script (or script (need-script edited))))
                 (write-element~ zone script 'text content)))))))))
 
 
 ;;;
-;;;; Workspace
+;;;; Scripts
 ;;;
 
 
-(class Workspace-Guest extends Scroller-View
+(class Scripts-Guest extends Scroller-View
   
   
   (form
-    (<install>                                   style: document hscroll?: #f vscroll?: #f
-      (<content~>                                layout-type: fill
-        (<Tree-Header>                           style: document shown?: #f
+    (<install>                                  style: document hscroll?: #f vscroll?: #f
+      (<content~>                               layout-type: fill
+        (<Tree-Header>                          style: document shown?: #f
           (<content~>
-            (<Tree-View>          name: monikers portfolio: :images filled-column: moniker background: #f double-click-handler: {Event-Handler :form on-double-click} return-press-handler: {Event-Handler :form on-return-press} escape-press-handler: {Event-Handler :form on-escape-press}
-              (<Tree-Node-Column> name: moniker  title: "Moniker" width: 235 toplevel-controls?: #f display-images?: #f display-levels?: #f))))))))
+            (<Scripts-Tree>       name: scripts portfolio: :images filled-column: script background: #f show-unfocused-selection?: #f double-click-handler: {Event-Handler :form on-double-click} return-press-handler: {Event-Handler :form on-return-press} escape-press-handler: {Event-Handler :form on-escape-press}
+              (<Tree-Node-Column> name: script  title: "Script" width: 235 toplevel-controls?: #f display-images?: #f display-levels?: #f)))))))
+  
+  
+  (method (update)
+    (let ((world (current-world)))
+      (let ((scripts (partition-scripts~ world (collect-scripts~ world)))
+            (tree (locate 'scripts)))
+        (remove-every-row~ tree)
+        (for-each (lambda (partition)
+                    (bind (title . children) partition
+                      (let ((father (add-row~ tree
+                                      state: 'expanded
+                                      children: (list (new Tree-Node title: title font: {Font Label-User} color: {Color red: 220 green: 0 blue: 0})))))
+                        (for-each (lambda (script)
+                                    (bind (dir . path) script
+                                      (let ((title (extract-spine (join (if (> (length path) 1) (cdr path) path) "."))))
+                                        (add-row~ tree
+                                          father: father
+                                          children: (list (new Tree-Node title: title font: {Font Label-User} color: {Color White}))
+                                          user-data: script))))
+                                  children))))
+                  scripts))))
+  
+  
+  (method (on-double-click evt)
+    (edit-script))
+  
+  
+  (method override (on-return-press evt)
+    (edit-script))
+  
+  
+  (method override (on-escape-press evt)
+    (view-workspace))
+  
+  
+  (method (edit-script)
+    (let ((pane (find-ascendant Script-Pane))
+          (tree (locate 'scripts)))
+      (let ((script (get-single-selected-data~ tree)))
+        (when script
+          (bind (dir . path) script
+            (let ((file (new-file~ dir path)))
+              (set-edited-file file)
+              (update-script-pane)
+              (toggle-zoom~ (locate~ pane 'workspace-splitter) (locate~ pane 'horz-splitter))
+              (acquire-focus~ (locate~ pane '(script text))))))))))
+
+
+(class Scripts-Tree extends Tree-View)
+
+
+;;;
+;;;; Modules
+;;;
+
+
+(class Modules-Guest extends Scroller-View
+  
+  
+  (form
+    (<install>                                  style: document hscroll?: #f vscroll?: #f
+      (<content~>                               layout-type: fill
+        (<Tree-Header>                          style: document shown?: #f
+          (<content~>
+            (<Modules-Tree>       name: modules portfolio: :images filled-column: module background: #f show-unfocused-selection?: #f double-click-handler: {Event-Handler :form on-double-click} return-press-handler: {Event-Handler :form on-return-press} escape-press-handler: {Event-Handler :form on-escape-press}
+              (<Tree-Node-Column> name: module  title: "Module" width: 235 toplevel-controls?: #f display-images?: #f display-levels?: #f)))))))
+  
+  
+  (method (update)
+    (let ((world (current-world)))
+      (let ((modules (collect-modules~ world))
+            (tree (locate 'modules)))
+        (define (present-path path)
+          (let ((last (last path)))
+            (if (and (starts-with? last "_")
+                     (ends-with? last ".jazz"))
+                (let ((len (string-length last)))
+                  (join (append (butlast (butlast path)) (list (substring last 1 (- len 5)))) "."))
+              (join path "."))))
+        
+        (remove-every-row~ tree)
+        (for-each (lambda (module)
+                    (bind (dir . path) module
+                      (let ((title (present-path path)))
+                        (add-row~ tree
+                          children: (list (new Tree-Node title: title font: {Font Label-User} color: {Color White}))
+                          user-data: module))))
+                  modules))))
+  
+  
+  (method (on-double-click evt)
+    (edit-module))
+  
+  
+  (method override (on-return-press evt)
+    (edit-module))
+  
+  
+  (method override (on-escape-press evt)
+    (view-workspace))
+  
+  
+  (method (edit-module)
+    (let ((pane (find-ascendant Script-Pane))
+          (tree (locate 'modules)))
+      (let ((module (get-single-selected-data~ tree)))
+        (bind (dir . path) module
+          (let ((file (new-file~ dir path)))
+            (set-edited-file file)
+            (update-script-pane)
+            (toggle-zoom~ (locate~ pane 'workspace-splitter) (locate~ pane 'horz-splitter))
+            (acquire-focus~ (locate~ pane '(script text)))))))))
+
+
+(class Modules-Tree extends Tree-View)
 
 
 ;;;
@@ -353,23 +479,25 @@
   
   (method (on-run evt)
     (let ((pane (find-ascendant Script-Pane)))
-      (let ((entity (get-entity~ pane)))
-        (let ((script (need-script entity)))
-          (save-script~ pane)
-          (evaluate-script~ entity script)))))
+      (let ((edited (get-edited~ pane)))
+        (when (is? edited Entity)
+          (let ((script (need-script edited)))
+            (save-script~ pane)
+            (evaluate-script~ edited script))))))
   
   
   (method (on-text-change evt)
     (when (world-setting 'world.live? #f)
       (let ((pane (find-ascendant Script-Pane)))
-        (let ((entity (get-entity~ pane)))
-          (let ((script (need-script entity)))
-            (save-script~ pane)
-            (evaluate-script~ entity script)))))))
+        (let ((edited (get-edited~ pane)))
+          (when (is? edited Entity)
+            (let ((script (need-script edited)))
+              (save-script~ pane)
+              (evaluate-script~ edited script))))))))
 
 
 ;;;
-;;;; Script Text
+;;;; Code
 ;;;
 
 
@@ -396,10 +524,11 @@
   
   (method override (evaluate-selection)
     (let ((pane (find-ascendant Script-Pane)))
-      (let ((entity (get-entity~ pane)))
-        (let ((script (need-script entity)))
-          (save-script~ pane)
-          (evaluate-script~ entity script)))))
+      (let ((edited (get-edited~ pane)))
+        (when (is? edited Entity)
+          (let ((script (need-script edited)))
+            (save-script~ pane)
+            (evaluate-script~ edited script))))))
 
 
   (method override (favorite-completions?)
@@ -505,7 +634,37 @@
   
   
   (method override (context-menu?)
-    #f))
+    #f)
+  
+  
+  (method (update edited)
+    (if edited
+        (let ((script (get-script~ edited)))
+          (if script
+              (set-string-content (or (get-reason~ script) ""))
+            (set-string-content "")))
+      (set-string-content ""))))
+
+
+;;;
+;;;; Stack
+;;;
+
+
+(class Stack-Tree-View extends Tree-View
+  
+  
+  (method (update edited)
+    (remove-every-row)
+    (when edited
+      (let ((script (get-script~ edited)))
+        (when script
+          (let ((stack (get-stack~ script)))
+            (when stack
+              (for-each (lambda (frame)
+                          (add-row
+                            children: (list (new Tree-Node title: (->string frame) font: {Font Label-User}))))
+                        stack))))))))
 
 
 ;;;
