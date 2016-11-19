@@ -19,6 +19,7 @@
         (world.audio)
         (world.autoload)
         (world.commands)
+        (world.configure)
         (world.draw)
         (world.dyes)
         (world.generation.base)
@@ -171,9 +172,47 @@
     (teleport~ zone position)))
 
 
-(definition public (%%jump actor (impulsion #f))
-  (set-jump?~ actor #t)
-  (set-jump-impulsion~ actor impulsion))
+;;;
+;;;; Actor
+;;;
+
+
+(definition public (%%current-actor)
+  (let ((entity (%%current-entity)))
+    (assert (is? entity Actor)
+      entity)))
+
+
+(definition public (%%fire actor)
+  (let ((x (random-in 1.))
+        (z (random-in 1.)))
+    (unless (and (= x 0.)
+                 (= z 0.))
+      (let ((dir (vertex-normalize (vertex x 0. z))))
+        (fire-missile~ actor dir 'bullet)))))
+
+
+(definition public (%%fire-at actor creature)
+  (let ((dir (vertex-normalize (vertex- (get-position~ creature) (get-position~ actor)))))
+    (%%set-lookat actor (%%lookat-horizon dir))
+    (fire-missile~ actor dir 'bullet)))
+
+
+(definition public (%%nearest-creature actor)
+  (let ((zone (current-zone)))
+    (let ((position (get-position~ actor))
+          (nearest #f)
+          (nearest-distance #f))
+      (for-each (lambda (creature)
+                  (unless (or (eq? creature actor)
+                              (equal? (get-model~ creature) "creature/chicken"))
+                    (let ((dist (vertex-distance position (get-position~ creature))))
+                      (when (or (not nearest)
+                                (< dist nearest-distance))
+                        (set! nearest creature)
+                        (set! nearest-distance dist)))))
+                (get-creatures~ zone))
+      nearest)))
 
 
 ;;;
@@ -278,6 +317,12 @@
     (move-forward~ commands)
     commands))
 
+(definition public move/jump-commands
+  (let ((commands (new Commands)))
+    (move-forward~ commands)
+    (jump~ commands)
+    commands))
+
 (definition public sprint-commands
   (let ((commands (new Commands)))
     (sprint-forward~ commands)
@@ -303,7 +348,10 @@
   (perform stay-commands))
 
 (definition public (perform-move)
-  (perform (if (get-sprint?~ (%%current-entity)) sprint-commands move-commands)))
+  (perform (if (get-sprint?~ (%%current-actor)) sprint-commands move-commands)))
+
+(definition public (perform-move/jump)
+  (perform move/jump-commands))
 
 (definition public (perform-rotate-left)
   (perform rotate-left-commands))
@@ -340,7 +388,12 @@
 (definition public (%%pause)
   (with-restart-catcher 'unpause "Unpause"
     (lambda ()
-      (%%stay))))
+      (declare (proper-tail-calls))
+      (with-tick
+        (lambda (entity script time elapse iter)
+          (when (is? entity Actor)
+            (perform-stay))
+          (iter))))))
 
 
 (definition public (%%unpause)
@@ -393,7 +446,7 @@
 
 (definition public (%%move distance)
   (declare (proper-tail-calls))
-  (let ((actor (%%current-entity)))
+  (let ((actor (%%current-actor)))
     (let ((start (copy-vertex (get-position~ actor)))
           (target (vertex+ (get-position~ actor) (vertex-scalar*& (get-sight~ actor) distance)))
           (line #f))
@@ -417,7 +470,7 @@
 
 (definition public (%%move-to target)
   (declare (proper-tail-calls))
-  (let ((actor (%%current-entity)))
+  (let ((actor (%%current-actor)))
     (let ((start (copy-vertex (get-position~ actor)))
           (distance (vertex-distance (get-position~ actor) target))
           (line #f))
@@ -444,7 +497,7 @@
 
 (definition public (%%rotate angle)
   (declare (proper-tail-calls))
-  (let ((actor (%%current-entity)))
+  (let ((actor (%%current-actor)))
     (unless (= angle 0.)
       (let ((start (copy-vertex (get-sight~ actor)))
             (target (rotate-upon angle (vertex& 0. 1. 0.) (get-sight~ actor)))
@@ -459,6 +512,84 @@
                 (%%set-lookat actor (horizon-lookat target))))))))))
 
 
+(definition public (%%jump actor (impulsion #f))
+  (set-jump?~ actor #t)
+  (set-jump-impulsion~ actor impulsion))
+
+
+(definition public (%%path actor)
+  (let ((world (current-world))
+        (history (current-history)))
+    (let ((tick-count -1)
+          (path-duration #f))
+      (define (prepare-pathing)
+        (set! path-duration (random-between 1. 3.)))
+      
+      (define (path-actor)
+        (cond ((< (random-real) .333)
+               (set-motion~ actor 'idle))
+              (else
+               (set-motion~ actor 'walk)
+               (update-lookat (vertex (random-in 1.) 0. (random-in 1.)))))
+        (prepare-pathing))
+      
+      (define (update-lookat dir)
+        (init-lookat~ actor
+          (vertex-normalize& dir)
+          (get-world-up~ world)))
+      
+      (declare (proper-tail-calls))
+      (prepare-pathing)
+      (with-tick
+        (lambda (ignore-actor script time elapse iter)
+          (unless (get-paused?~ history)
+            (set! tick-count (modulo (+ tick-count 1) creature-ticks))
+            (when (and path-duration (> path-duration 0.))
+              (decrease! path-duration elapse))
+            (%%move-actor actor time elapse)
+            (when (and (= (modulo tick-count aggro-ticks) 0)
+                       (<= path-duration 0.))
+              (path-actor)))
+          (iter))))))
+
+
+(definition (%%move-actor actor time elapse)
+  (define (random-jump?)
+    (let ((number .005 @w (random-jump)))
+      (and number (< (random-real) number))))
+  
+  (let ((gravity? #t)
+        (response 'slide)
+        (ignore-entities? #t)
+        (ignore-players? #f)
+        (ignore-me? #f))
+    (let ((idle? (eq? (get-motion~ actor) 'idle)))
+      (if (and (get-jump?~ actor) (not idle?))
+          (begin
+            (set-jump?~ actor #f)
+            (tick-actor~ actor move/jump-commands time elapse gravity? response ignore-entities?: ignore-entities? ignore-players?: ignore-players? ignore-me?: ignore-me? proportional-slide?: #f))
+        (let ((commands (if idle? stay-commands move-commands)))
+          (let ((info (tick-actor~ actor commands time elapse gravity? response ignore-entities?: ignore-entities? ignore-players?: ignore-players? ignore-me?: ignore-me? proportional-slide?: #f)))
+            (when (and info (or (not (get-jump-time~ actor)) (> time (+ (get-jump-time~ actor) (if #f @w aggro-target 1. 2.)))))
+              (bind-values (center slide-collisions fall-collisions) info
+                (when (or (not-null? slide-collisions) (random-jump?))
+                  (set-jump?~ actor #t))))))))))
+
+
+;;;
+;;;; Aggro
+;;;
+
+
+;; not correct should get info dynamically
+(definition protected creature-ticks <fx>
+  (fxround creature-rate))
+
+;; aggro 5 times per second
+(definition protected aggro-ticks <fx>
+  (fxround/ creature-ticks 5))
+
+
 ;;;
 ;;;; Block
 ;;;
@@ -468,7 +599,7 @@
 (definition public (with-script-interaction position proc)
   (let ((world (current-world))
         (game (current-game))
-        (actor (%%current-entity)))
+        (actor (%%current-actor)))
     (let ((max-distance (get-view-radius~ world))
           (lens (lens-center~ actor)))
       (let ((direction (vertex-normalize (vertex- position lens))))
@@ -539,7 +670,7 @@
 
 (definition public (%%trail (color #f))
   (let ((zone (current-zone)))
-    (let ((actor (%%current-entity)))
+    (let ((actor (%%current-actor)))
       (let ((script (get-script~ actor)))
         (set-trail?~ script #t)
         (when (not (get-trail~ script))
@@ -556,7 +687,7 @@
 
 (definition public (%%untrail)
   (let ((zone (current-zone)))
-    (let ((actor (%%current-entity)))
+    (let ((actor (%%current-actor)))
       (let ((script (get-script~ actor)))
         (set-trail?~ script #f)
         @w
@@ -565,7 +696,7 @@
 
 (definition public (%%trail-color color)
   (let ((zone (current-zone)))
-    (let ((actor (%%current-entity)))
+    (let ((actor (%%current-actor)))
       (let ((script (get-script~ actor)))
         (set-trail-color~ script (case color
                                    ((red) red-dye)
@@ -574,7 +705,7 @@
 
 
 (definition public (%%clear-trail)
-  (let ((actor (%%current-entity)))
+  (let ((actor (%%current-actor)))
     (let ((script (get-script~ actor)))
       (set-trail~ script (new-queue)))))
 
