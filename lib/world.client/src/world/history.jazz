@@ -85,7 +85,7 @@
 ;;;
 
 
-(definition stepping-history?
+(definition protected stepping-history?
   (make-parameter #f))
 
 
@@ -206,7 +206,7 @@
 
 
 (definition index-size <fx>
-  5)
+  6)
 
 (definition metadata-size <fx>
   1)
@@ -283,14 +283,17 @@
   (method (historical-change-id n)
     (u32vector-ref indexes (+ (historical-index n) 1)))
   
-  (method (historical-forward-index n)
+  (method (historical-action-index n)
     (u32vector-ref indexes (+ (historical-index n) 2)))
   
-  (method (historical-backward-index n)
+  (method (historical-forward-index n)
     (u32vector-ref indexes (+ (historical-index n) 3)))
   
-  (method (historical-metadata-index n)
+  (method (historical-backward-index n)
     (u32vector-ref indexes (+ (historical-index n) 4)))
+  
+  (method (historical-metadata-index n)
+    (u32vector-ref indexes (+ (historical-index n) 5)))
   
   
   (method (historical-metadata n)
@@ -311,22 +314,25 @@
     (set! metadatas-head (modulo (+ metadatas-head 1) metadatas-size)))
   
   
-  (method (add-change change-id forward backward metadata)
-    (let ((index (historical-index count)))
+  (method (add-change change-id action forward backward metadata)
+    (let ((index (historical-index now)))
       (assert client-no)
       (u32vector-set! indexes index client-no)
       (u32vector-set! indexes (+ index 1) change-id)
       (u32vector-set! indexes (+ index 2) changes-head)
-      (forward changes-push)
+      (action changes-push)
       (u32vector-set! indexes (+ index 3) changes-head)
+      (forward changes-push)
+      (u32vector-set! indexes (+ index 4) changes-head)
       (backward changes-push)
-      (u32vector-set! indexes (+ index 4) metadatas-head)
+      (u32vector-set! indexes (+ index 5) metadatas-head)
       (metadatas-push metadata)
-      (if (< count size)
-          (begin
-            (increase! count)
-            (increase! now))
-        (set! first (modulo (+ first index-size) indexes-size))))
+      (unless (stepping-history?)
+        (if (< count size)
+            (begin
+              (increase! count)
+              (increase! now))
+          (set! first (modulo (+ first index-size) indexes-size)))))
     (when (or (eq? tier-kind 'client)
               (and (eq? tier-kind 'server)
                    (not (admin?))))
@@ -348,33 +354,25 @@
 
   
   (method (goto-history n)
-    (let ((world (current-world)))
-      (let ((n (in-history n)))
-        (when (/= n now)
-          (cond ((> n now)
-                 (loop (for s from now below n)
-                       (let ((id (historical-change-id s))
-                             (forward-index (historical-forward-index s)))
-                         (forward-change id (lambda ()
-                                              (prog1 (f64vector-ref changes (modulo forward-index changes-size))
-                                                (increase! forward-index)))))))
-                (else
-                 (loop (for s from (- now 1) downto n)
-                       (let ((id (historical-change-id s))
-                             (backward-index (historical-backward-index s)))
-                         (backward-change id (lambda ()
-                                               (prog1 (f64vector-ref changes (modulo backward-index changes-size))
-                                                 (increase! backward-index))))))))
-          (set! now n)
-          (invalidate-slider)
-          (set-?n now)))))
-  
-  
-  (method (stepped-history)
-    (when (< now (history-end))
-      (increase! now)
-      (invalidate-slider)
-      (set-?n now)))
+    (let ((n (in-history n)))
+      (when (/= n now)
+        (cond ((> n now)
+               (loop (for s from now below n)
+                     (let ((id (historical-change-id s))
+                           (forward-index (historical-forward-index s)))
+                       (forward-change id (lambda ()
+                                            (prog1 (f64vector-ref changes (modulo forward-index changes-size))
+                                              (increase! forward-index)))))))
+              (else
+               (loop (for s from (- now 1) downto n)
+                     (let ((id (historical-change-id s))
+                           (backward-index (historical-backward-index s)))
+                       (backward-change id (lambda ()
+                                             (prog1 (f64vector-ref changes (modulo backward-index changes-size))
+                                               (increase! backward-index))))))))
+        (set! now n)
+        (invalidate-slider)
+        (set-?n now))))
   
   
   (method (invalidate-slider)
@@ -455,21 +453,39 @@
     (step-history))
   
   
+  ;; this is correct as we are redoing the same action so
+  ;; the space taken on the changes buffer will be the same
   (method (step-history)
-    @convert
-    (let ((world (current-world))
-          (me (current-me)))
-      (clear-logic)
-      (when (< now (history-end))
-        (let ((moment (historical-moment now)))
-          (when moment
-            (parameterize ((stepping-history? #t))
-              (let ((commands (get-commands~ moment))
-                    (time (get-time~ moment))
-                    (elapse (get-elapse~ moment)))
-                (tick-sliced~ world me commands time elapse)
-                (tick-actors~ world commands time elapse)))))
+    (clear-logic)
+    (when (< now (history-end))
+      (let ((id (historical-change-id now)))
+        (parameterize ((stepping-history? #t))
+          (action/forward-change id))
         (stepped-history))))
+  
+  
+  (method (action/forward-change id)
+    (let ((change (id->change id)))
+      (if (get-action-apply~ change)
+          (let ((action-index (historical-action-index now)))
+            (action-change id (lambda ()
+                                (prog1 (f64vector-ref changes (modulo action-index changes-size))
+                                  (increase! action-index)))))
+        (let ((forward-index (historical-forward-index now)))
+          (forward-change id (lambda ()
+                               (prog1 (f64vector-ref changes (modulo forward-index changes-size))
+                                 (increase! forward-index))))))))
+  
+  
+  (method (stepped-history)
+    (when (< now (history-end))
+      ;; we could let add-change advance the now but not
+      ;; at the moment because some changes have no action
+      (if (< count size)
+          (increase! now)
+        (set! first (modulo (+ first index-size) indexes-size)))
+      (invalidate-slider)
+      (set-?n now)))
   
   
   ;;;
@@ -477,6 +493,14 @@
   ;;;
   
   
-  ;; convert
+  ;; future can be recalculated in-place as we are redoing the same
+  ;; actions so the space taken on the changes buffer stays constant
   (method (recalculate-future)
-    )))
+    (let ((now now)
+          (end (history-end)))
+      (loop (for n from now below end)
+            (let ((id (historical-change-id n)))
+              (parameterize ((stepping-history? #t))
+                (action/forward-change id))
+              (stepped-history)))
+      (goto-history now)))))
