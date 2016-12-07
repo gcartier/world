@@ -1,0 +1,381 @@
+;;;===============
+;;;  WorldScheme
+;;;===============
+;;;
+;;;; World Chronology Pane
+;;;
+;;;  The Initial Developer of the Original Code is Guillaume Cartier.
+;;;  Portions created by the Initial Developer are Copyright (C) 2012-2016
+;;;  the Initial Developer. All Rights Reserved.
+;;;
+;;;  Contributor(s):
+
+
+(module world.interface.chronology jazz
+
+
+(import (jazz.cairo)
+        (jazz.event)
+        (jazz.graphic)
+        (jazz.syntax (phase syntax))
+        (profiler)
+        (world)
+        (world.autoload)
+        (world.biome)
+        (world.change)
+        (world.foreign)
+        (world.geometry)
+        (world.history)
+        (world.interface.pane)
+        (world.layer)
+        (world.player)
+        (world.profiling)
+        (world.syntax (phase syntax)))
+
+
+(proclaim (warn optimizations))
+
+
+;;;
+;;;; Player
+;;;
+
+
+(definition protected (draw-chronology)
+  (let ((world (current-world))
+        (interface (current-interface)))
+    (let ((view (child~ interface 'chronology))
+          (player (get-chronology-player~ world)))
+      (unless (get-uptodate?~ view)
+        (let ((texture (get-texture~ player)))
+          (let ((surface (get-surface~ texture))
+                (data (get-data~ texture)))
+            (draw-view~ view surface data)
+            (map-texture~ texture)
+            (set-uptodate?~ view #t))))
+      (let ((x (cast <fl> (get-left~ view)))
+            (y (cast <fl> (get-top~ view)))
+            (h (cast <fl> (get-height~ view))))
+        (let ((matrix (make-translation-matrix (vertex x (- (get-height~ world) y h) 0.))))
+          (render-player~ player matrix))))))
+
+
+(definition protected (update-chronology (force?: force? #f))
+  (let ((interface (current-interface+))
+        (history (current-history)))
+    (when interface
+      (let ((pane (child~ interface 'chronology)))
+        (unless (= (get-count~ chronology) 0)
+          (unless (and (get-from~ pane) (not force?))
+            (let ((f (chronological-time~ chronology (first~ chronology)))
+                  (l (chronological-time~ chronology (last~ chronology))))
+              (set-from~ pane (max f (- l 5.)))
+              (set-to~ pane l)))
+          (set-uptodate?~ pane #f))))))
+
+
+;;;
+;;;; Chronology
+;;;
+
+
+(class Chronology-Pane extends World-Pane
+  
+  
+  (slot scale        <fl> initialize 0  accessors generate)
+  (slot sampling     <fx> initialize 2  accessors generate)
+  (slot from         <fl> initialize #f accessors generate)
+  (slot to           <fl> initialize #f accessors generate)
+  (slot uptodate?         initialize #f accessors generate)
+  ;; scroll code is a copy/paste from showcase
+  (slot point             initialize #f getter generate)
+  (slot moved?            initialize #f getter generate)
+  (slot scrolled?         initialize #f getter generate)
+  (slot last-to           initialize #f getter generate)
+  (slot last-seconds      initialize #f getter generate)
+  (slot last-speed        initialize #f getter generate)
+  (slot pulse             initialize #f getter generate)
+  
+  
+  ;;;
+  ;;;; Mouse
+  ;;;
+  
+  
+  (method override (mouse-down evt)
+    (set! point (get-h~ evt))
+    (set! moved? #f)
+    (set! last-to to)
+    (set! last-seconds (current-seconds))
+    (set! last-speed #f)
+    (kill-autoscroll))
+  
+  
+  (method override (drag-move evt)
+    (let ((h (get-h~ evt)))
+      (when (and point (not (near? h point 2)) @w head @w tail)
+        (let ((span (- to from)))
+          (let ((delta (* (/ (cast <fl> (- h point)) (cast <fl> (get-width))) (- span)))
+                (head (chronological-time~ chronology (first~ chronology)))
+                (tail (chronological-time~ chronology (last~ chronology))))
+            (set! to (min (max (+ to delta) head) tail))
+            (set! from (- to span))
+            (set-uptodate? #f)
+            @w
+            (let ((position (get-position~ camera)))
+              (let ((new-z (+ (vertex-z position) delta)))
+                (vertex-z-set! position (min (max new-z head) tail))
+                (derive-target~ camera)
+                (camera-update~ camera))))
+          (set! point h)
+          (set! moved? #t)
+          (let ((new-to to)
+                (new-seconds (current-seconds))
+                (old-to last-to)
+                (old-seconds last-seconds))
+            (set! last-to new-to)
+            (set! last-seconds new-seconds)
+            (unless (= new-seconds old-seconds)
+              (let ((new-speed (/ (- new-to old-to) (- new-seconds old-seconds)))
+                    (p .9))
+                (set! last-speed (+ (* new-speed (- 1. p)) (* (or last-speed 0.) p))))))))))
+
+  
+  (method override (mouse-up evt)
+    (when (or (not moved?) (< (- (current-seconds) last-seconds) .1))
+      (if (and moved? @w head @w tail)
+          (begin
+            (set! scrolled? #f)
+            (start-autoscroll))
+        (set! point (get-h~ evt))
+        (set! moved? #f)
+        (set! scrolled? #f)
+        (set! last-speed #f)
+        (kill-autoscroll))))
+  
+  
+  (method override (double-click evt)
+    )
+  
+  
+  (method override (mouse-wheel pos delta)
+    (let ((d (get-v~ delta)))
+      (cond ((> d 0)
+             (zoom-in))
+            ((< d 0)
+             (zoom-out)))))
+  
+  
+  (method (zoom-in)
+    (let ((h (get-h~ (mouse-position)))
+          (width (get-width))
+          (span (- to from)))
+      (let ((proportion (/ (cast <fl> h) (cast <fl> width))))
+        (let ((when (+ from (* span proportion)))
+              (new-span (* span .75)))
+          (let ((new-from (- when (* new-span proportion)))
+                (new-to (+ when (* new-span (- 1. proportion)))))
+            (set! from new-from)
+            (set! to new-to)
+            (set-uptodate? #f))))))
+  
+  
+  (method (zoom-out)
+    (let ((h (get-h~ (mouse-position)))
+          (width (get-width))
+          (span (- to from)))
+      (let ((proportion (/ (cast <fl> h) (cast <fl> width))))
+        (let ((when (+ from (* span proportion)))
+              (new-span (/ span .75)))
+          (let ((new-from (- when (* new-span proportion)))
+                (new-to (+ when (* new-span (- 1. proportion)))))
+            (set! from new-from)
+            (set! to new-to)
+            (set-uptodate? #f))))))
+  
+  
+  (method (h->when span h)
+    (let ((width (get-width)))
+      (cond ((< h 0)
+             from)
+            ((> h width)
+             to)
+            (else
+             (+ from (* span (/ (cast <fl> h) (cast <fl> width))))))))
+  
+  
+  (method (when->h when)
+    (fxround (* (/ (- when from) (- to from)) (cast <fl> (get-width)))))
+  
+  
+  ;;;
+  ;;;; Autoscroll
+  ;;;
+  
+  
+  (method (start-autoscroll)
+    (set! pulse (new Pulse 'autoscroll 0.01 autoscroll-action delay: 0)))
+  
+  
+  (method (kill-autoscroll)
+    (when pulse
+      (close~ pulse)
+      (set! pulse #f)))
+  
+  
+  (method (autoscroll-action)
+    (execute-event
+      (lambda ()
+        (when last-speed
+          (let ((actual-to to))
+            (let ((scroll-to (+ actual-to (/ last-speed 100.))))
+              (let ((new-to scroll-to))
+                (when (/= new-to actual-to)
+                  (set! scrolled? #t)
+                  (let ((span (- to from)))
+                    (let ((new-from (- new-to span)))
+                    (set! to new-to)
+                    (set! from new-from)
+                    (set-uptodate? #f)
+                    (let ((head (chronological-time~ chronology (first~ chronology)))
+                          (tail (chronological-time~ chronology (last~ chronology))))
+                      (when (or (<= new-from head)
+                                (>= new-to tail))
+                        (set! scrolled? #f)
+                        (kill-autoscroll)))))))))))))
+  
+  
+  ;;;
+  ;;;; Update
+  ;;;
+  
+  
+  (method (update time <fl>)
+    (let ((half (/ (- to from) 2.)))
+      (set! from (- time half))
+      (set! to (+ time half))
+      (set-uptodate? #f)))
+  
+  
+  ;;;
+  ;;;; Drawing
+  ;;;
+
+
+  (method (draw-view surface <Surface> data)
+    (clear~ surface)
+    (fill-rect~ surface (new Rect 0 0 (get-width) (get-height)) {Color red: .000 green: .000 blue: .000 alpha: .350})
+    (draw-chronology surface)
+    (frame-rect~ surface (new Rect 0 0 (get-width) (get-height)) {Color Entry-Border}))
+  
+  
+  (method (draw-chronology surface <Surface>)
+    (when (and from to)
+      (plot-time surface)
+      (plot-history surface)
+      (plot-units surface)
+      (plot-chronology surface)))
+  
+  
+  (method (plot-time surface <Surface>)
+    (let ((width (cast <fl> (get-width)))
+          (height (cast <fl> (get-height)))
+          (v 15.))
+      (set-color~ surface {Color Medium-Gray})
+      (set-line-width~ surface 1)
+      (move-to~ surface 0 v)
+      (line-to~ surface width v)))
+  
+  
+  (method (plot-units surface <Surface>)
+    (let ((width (cast <fl> (get-width)))
+          (height (cast <fl> (get-height)))
+          (v 15.))
+      (set-color~ surface {Color Medium-Gray})
+      (set-line-width~ surface 1)
+      (loop (for s from (fxceiling from) to (fxfloor to))
+            (let ((h (when->h (cast <fl> s))))
+              (move-to~ surface h (- v 5.))
+              (line-to~ surface h (+ v 6.))))))
+  
+  
+  (method (plot-history surface <Surface>)
+    (let ((history (current-history)))
+      (let ((width (cast <fl> (get-width)))
+            (height (cast <fl> (get-height)))
+            (first (history-first~ history))
+            (last (history-last~ history))
+            (now (get-now~ history))
+            (changes (get-changes~ history))
+            (span (- to from))
+            (v 15))
+        (define (plot-change n)
+          (let ((time (historical-time~ history n)))
+            (when (between? time from to)
+              (let ((change (id->change (historical-change-id~ history n))))
+                (let ((h (fxround (* (/ (- time from) span) width)))
+                      (color (case (get-name~ change)
+                               ((move) {Color Purple})
+                               ((lookat) {Color Blue})
+                               ((animate) {Color Blue})
+                               ((edit-script update-script) {Color Ochre})
+                               ((fire) {Color Green})
+                               ((spawn) {Color Green})
+                               ((die) {Color Red})
+                               ((add-block delete-block add-entity remove-entity) {Color Green})
+                               ((action interact) {Color Green})
+                               (else {Color Light-Gray}))))
+                  (if (= n now)
+                      (fill-rect~ surface (new Rect (- h 2) (- v 5) (+ h 3) (+ v 6)) color)
+                    (fill-rect~ surface (new Rect (- h 2) (- v 2) (+ h 3) (+ v 3)) color)))))))
+        
+        (loop (for n from first to last)
+              (unless (= n now)
+                (plot-change n)))
+        (plot-change now))))
+  
+  
+  (method (plot-chronology surface <Surface>)
+    (plot-calls surface 'render {Color Blue} 50.)
+    (plot-calls surface 'player {Color Green} 30.)
+    (plot-calls surface 'network {Color Orange} 60.)
+    (plot-calls surface 'generate {Color Purple} 10.)
+    (plot-calls surface 'message {Color Purple} 40.)
+    (plot-calls surface 'gc {Color Red} 70.))
+  
+  
+  (method (plot-calls surface <Surface> name color bar-height <fl>)
+    (set-color~ surface color)
+    (set-line-width~ surface 1)
+    (let ((width (cast <fl> (get-width)))
+          (height (cast <fl> (get-height)))
+          (span (- to from))
+          (site (registered-site name)))
+      (let ((id (cast <fl> (cast <fx> (get-id~ site))))
+            (start #f))
+        (loop (for n from (first~ chronology) to (last~ chronology))
+              (when (= (chronological-id~ chronology n) id)
+                (let ((marker (chronological-marker~ chronology n)))
+                  (if (even? (flonum->fixnum marker))
+                      (set! start (chronological-time~ chronology n))
+                    (when start
+                      (let ((end (chronological-time~ chronology n)))
+                        (let ((f (* (/ (- start from) span) width))
+                              (t (* (/ (- end from) span) width))
+                              (bottom height)
+                              (top (- height bar-height)))
+                          (if (eq? name 'gc)
+                              (let ((mid (round (/ (+ f t) 2.))))
+                                (when (between? mid 0. width)
+                                  (move-to~ surface mid bottom)
+                                  (line-to~ surface mid top)))
+                            (when (or (between? f 0. width)
+                                      (between? t 0. width))
+                              (let ((left (round f))
+                                    (right (round t)))
+                                (move-to~ surface left bottom)
+                                (line-to~ surface left top)
+                                (move-to~ surface left top)
+                                (line-to~ surface right top)
+                                (move-to~ surface right top)
+                                (line-to~ surface right bottom))))))))))))))))
