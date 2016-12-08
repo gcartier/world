@@ -167,6 +167,7 @@
   (slot settings                    <object>     initialize #f                        getter generate)
   (slot regions-dir                 <Directory>  initialize #f                        getter explicit)
   (slot regions-mutex               <object>     initialize (make-mutex 'regions)     getter generate)
+  (slot region-access-mutexes       <table>      initialize (make-table test: equal?) getter generate)
   (slot regions                     <table>      initialize (make-table test: equal? weak-values: #t) getter generate)
   (slot debug-sections?             <bool>       initialize #f                        accessors generate)
   (slot sector-size                 <fx>         initialize 16                        getter generate)
@@ -1485,24 +1486,104 @@
   (proclaim (warn optimizations))
   
   
+  (method (setup-regions)
+    (with-regions-mutex
+      (lambda ()
+        (set! region-access-mutexes (make-table test: equal?))
+        (set! regions (make-table test: equal? weak-values: #t)))))
+  
+  
   (method (with-regions-mutex thunk)
     (mutex-lock! regions-mutex)
     (prog1 (thunk)
       (mutex-unlock! regions-mutex)))
   
   
-  (method (free-regions)
+  (method (with-region-access-mutex index thunk)
+    (define (cache-access-mutex index)
+      (with-regions-mutex
+        (lambda ()
+          (or (table-ref region-access-mutexes index #f)
+              (let ((mutex (make-mutex 'region-access)))
+                (table-set! region-access-mutexes index mutex)
+                mutex)))))
+    
+    (let ((mutex (cache-access-mutex index)))
+      (mutex-lock! mutex)
+      (prog1 (thunk)
+        (mutex-unlock! mutex))))
+  
+  
+  (method (iterate-regions proc)
     (with-regions-mutex
       (lambda ()
         (iterate-table regions
-          (lambda (index region <World-Region+>)
-            (when region
-              (close~ region))))
-        (empty-table regions))))
+          (lambda (index region)
+            (proc region))))))
+  
+  
+  (method (find-region index <index>) <World-Region+>
+    (with-regions-mutex
+      (lambda ()
+        (table-ref regions index #f))))
+  
+  
+  (method (load-region index <index>) <World-Region>
+    (or (find-region index)
+        (let ((region-x (index-x index))
+              (region-y (index-y index))
+              (region-z (index-z index)))
+          (define (region-name)
+            (if (= region-y 0)
+                (format "r.{a}.{a}.mca" region-x region-z)
+              (format "r.{a}.{a}.{a}.mca" region-x region-z region-y)))
+          
+          (define (create-file file)
+            (create-directories~ file)
+            (call-with-output-file (path-settings file)
+              (lambda (port)
+                (let ((locations/timestamps (make-u8vector 4096 0)))
+                  (write-subu8vector locations/timestamps 0 4096 port)
+                  (write-subu8vector locations/timestamps 0 4096 port)))))
+          
+          (define (create-region)
+            (let ((dir (get-regions-dir))
+                  (name (region-name)))
+              (let ((file (new-file~ dir name)))
+                (if (exists?~ file)
+                    (new World-Region region-x region-y region-z file)
+                  (create-file file)
+                  (new World-Region region-x region-y region-z file)))))
+          
+          (with-region-access-mutex index
+            (lambda ()
+              (let ((region (create-region)))
+                (with-regions-mutex
+                  (lambda ()
+                    (table-set! regions (copy-index index) region)))
+                region))))))
+  
+  
+  (method (load-region-if index <index>) <World-Region+>
+    (and (or (not truncate-y)
+             (>= (index-y index) (fxfloor/ truncate-y region-size)))
+         (load-region index)))
   
   
   (method (unlink-region region)
-    (table-clear regions (get-index&~ region)))
+    (with-regions-mutex
+      (lambda ()
+        (let ((index (get-index&~ region)))
+          (table-clear region-access-mutexes index)
+          (table-clear regions index)))))
+  
+  
+  (method (free-regions)
+    (iterate-regions
+      (lambda (region)
+        (with-mutex~ region
+          (lambda ()
+            (close~ region))))))
   
   
   (method (get-regions-dir) <Directory>
@@ -1523,7 +1604,7 @@
               (let ((x (string->number x))
                     (z (string->number z))
                     (y (if (null? rest) 0 (string->number y))))
-                (proc file x y z))))))))
+                (proc file (indexed x y z)))))))))
   
   
   (method public (change-dimension)
@@ -1534,15 +1615,15 @@
                           ((nether) 'end)
                           ((end) 'over)))
         (set! regions-dir #f)
-        (set! regions (make-table test: equal? weak-values: #t))
-        (set! areas (make-table test: equal? weak-values: #t)))))
+        (setup-regions)
+        (setup-areas))))
   
   
   ;; for exploration
   (method (preload-regions)
     (iterate-regions-dir
-      (lambda (file x y z)
-        (let ((region (load-region x y z)))
+      (lambda (file index)
+        (let ((region (load-region index)))
           (loop (for section-x from 0 below 32)
                 (loop (for section-z from 0 below 32)
                       (loop (for section-y from 0 below 16)
@@ -1558,7 +1639,7 @@
             (missing (new-queue)))
         (iterate-chunks~ region
           (lambda (x z)
-            (when (not (load-chunk~ region x z))
+            (when (not (load-chunk~ region (planar-index& x z)))
               (increase! count)
               (enqueue missing (list (+ (* region-x region-size) x)
                                      (+ (* region-z region-size) z))))))
@@ -1568,7 +1649,7 @@
     
     (loop (for x from from to to)
           (loop (for z from from to to)
-                (let ((region (load-region x 0 z)))
+                (let ((region (load-region (indexed& x 0 z))))
                   (explore region)))))
   
   
@@ -1595,53 +1676,11 @@
       (sort nu<? items key: ->string)))
   
   
-  (method (load-region region-x <fx> region-y <fx> region-z <fx>) <World-Region>
-    (define (region-name)
-      (if (= region-y 0)
-          (format "r.{a}.{a}.mca" region-x region-z)
-        (format "r.{a}.{a}.{a}.mca" region-x region-z region-y)))
-    
-    (define (create-region file)
-      (create-directories~ file)
-      (call-with-output-file (path-settings file)
-        (lambda (port)
-          (let ((locations/timestamps (make-u8vector 4096 0)))
-            (write-subu8vector locations/timestamps 0 4096 port)
-            (write-subu8vector locations/timestamps 0 4096 port)))))
-    
-    (with-regions-mutex
-      (lambda ()
-        (let ((region-index (index& region-x region-y region-z)))
-          (or (table-ref regions region-index #f)
-              (let ((dir (get-regions-dir))
-                    (name (region-name)))
-                (let ((file (new-file~ dir name)))
-                  (let ((region (if (exists?~ file)
-                                    (new World-Region region-x region-y region-z file)
-                                  (create-region file)
-                                  (new World-Region region-x region-y region-z file))))
-                    (table-set! regions (copy-index region-index) region)
-                    region))))))))
-  
-  
-  (method (load-region-if region-x <fx> region-y <fx> region-z <fx>) <World-Region+>
-    (and (or (not truncate-y)
-             (>= region-y (fxfloor/ truncate-y region-size)))
-         (load-region region-x region-y region-z)))
-  
-  
-  (method (find-region region-x <fx> region-y <fx> region-z <fx>) <World-Region+>
-    (with-regions-mutex
-      (lambda ()
-        (table-ref regions (index& region-x region-y region-z) #f))))
-  
-  
   (method (count-regions)
     (let ((count 0))
-      (iterate-table regions
-        (lambda (index region)
-          (when region
-            (increase! count))))
+      (iterate-regions
+        (lambda (region)
+          (increase! count)))
       count))
   
   
@@ -1658,26 +1697,25 @@
     (let ((section-x (index-x index))
           (section-y (index-y index))
           (section-z (index-z index)))
-      (let ((region (load-region (fxfloor/ section-x region-size)
-                                 (fxfloor/ section-y region-size)
-                                 (fxfloor/ section-z region-size))))
-        (load-section-chunk~ region section-x section-z))))
+      (let ((region (load-region (indexed& (fxfloor/ section-x region-size)
+                                           (fxfloor/ section-y region-size)
+                                           (fxfloor/ section-z region-size)))))
+        (load-section-chunk~ region (planar-index& section-x section-z)))))
   
   
   (method (find-chunk section-x section-y section-z) <World-Chunk+>
-    (let ((region (find-region (fxfloor/ section-x region-size)
-                               (fxfloor/ section-y region-size)
-                               (fxfloor/ section-z region-size))))
+    (let ((region (find-region (indexed& (fxfloor/ section-x region-size)
+                                         (fxfloor/ section-y region-size)
+                                         (fxfloor/ section-z region-size)))))
       (and region
-           (find-chunk~ region section-x section-z))))
+           (find-chunk~ region (planar-index& section-x section-z)))))
   
   
   (method (count-chunks)
     (let ((count 0))
-      (iterate-table regions
-        (lambda (index region)
-          (when region
-            (increase! count (table-length (get-chunks~ region))))))
+      (iterate-regions
+        (lambda (region)
+          (increase! count (table-length (get-chunks~ region)))))
       count))
   
   
@@ -1723,15 +1761,14 @@
   
   (method (indexed-section section-x section-y section-z (create?: create? #f)) <World-Section+>
     ;; quick try
-    (let ((region (if create?
-                      (load-region (fxfloor/ section-x region-size)
-                                   (fxfloor/ section-y region-size)
-                                   (fxfloor/ section-z region-size))
-                    (load-region-if (fxfloor/ section-x region-size)
-                                    (fxfloor/ section-y region-size)
-                                    (fxfloor/ section-z region-size)))))
+    (let ((region (let ((index (indexed& (fxfloor/ section-x region-size)
+                                         (fxfloor/ section-y region-size)
+                                         (fxfloor/ section-z region-size))))
+                    (if create?
+                        (load-region index)
+                      (load-region-if index)))))
       (and region
-           (let ((chunk (load-section-chunk~ region section-x section-z)))
+           (let ((chunk (load-section-chunk~ region (planar-index& section-x section-z))))
              (load-section~ chunk section-x section-y section-z create?: create?)))))
   
   
@@ -1750,15 +1787,14 @@
   
   (method (count-sections)
     (let ((count 0))
-      (iterate-table regions
-        (lambda (index region)
-          (when region
-            (iterate-table (get-chunks~ region)
-              (lambda (index chunk)
-                (when chunk
-                  (let ((sections-table (get-sections-table~ chunk)))
-                    (when sections-table
-                      (increase! count (table-length sections-table))))))))))
+      (iterate-regions
+        (lambda (region)
+          (iterate-table (get-chunks~ region)
+            (lambda (index chunk)
+              (when chunk
+                (let ((sections-table (get-sections-table~ chunk)))
+                  (when sections-table
+                    (increase! count (table-length sections-table)))))))))
       count))
   
   
@@ -3413,12 +3449,9 @@
                 sections))
     
     (define (save-regions)
-      (with-regions-mutex
-        (lambda ()
-          (iterate-table regions
-            (lambda (index region)
-              (when region
-                (save-region~ region)))))))
+      (iterate-regions
+        (lambda (region)
+          (save-region~ region))))
     
     (let ((sections '()))
       (define (add-section section)
