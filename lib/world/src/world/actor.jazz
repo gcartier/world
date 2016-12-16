@@ -30,6 +30,7 @@
         (world.dye)
         (world.element)
         (world.entity)
+        (world.folio)
         (world.generation.block)
         (world.geometry)
         (world.history)
@@ -112,6 +113,8 @@
   (slot velocity-angle          <fl>         initialize 0.                 getter generate)
   (slot motion                  <symbol>     initialize 'walk              accessors generate)
   (slot vehicle                 <Entity+>    initialize #f                 accessors generate)
+  (slot mounts-folio            <Folio>      initialize #f                 accessors generate)
+  (slot flyers-folio            <Folio>      initialize #f                 accessors generate)
   (slot life                    <fl>         initialize 100.               accessors generate)
   (slot alive?                  <bool>       initialize #t                 accessors generate)
   (slot global-cooldown         <fl>         initialize 0.                 accessors generate)
@@ -167,6 +170,8 @@
     (let ((color (copy-dye color)))
       (dye-alpha-set! color .2)
       (set! history-color color))
+    (set! mounts-folio (new Folio 'Wheels '(Wheels Hummer)))
+    (set! flyers-folio (new Folio 'Saucer '(Saucer Rocket)))
     (setup-area-cube))
   
   
@@ -1399,6 +1404,105 @@
   (method override (draw-target color)
     (draw-target-circle))
   
+  ;;;
+  ;;;; Vehicle
+  ;;;
+  
+  
+  (method (toggle-vehicle)
+    (if (not vehicle)
+        (bell)
+      (let ((folio (if fly? flyers-folio mounts-folio)))
+        (let ((next (next-element (get-list~ folio) (get-model~ vehicle))))
+          (set-current~ folio next)
+          (activate-vehicle next)))))
+  
+  
+  (method (activate-vehicle name)
+    (set-vehicle-change self name)
+    (when vehicle
+      (let ((saddle (get-saddle~ (cache-model~ vehicle))))
+        (when saddle
+          (set-position (vertex+& (get-position) (vertex& 0. saddle 0.)))))))
+  
+  
+  ;;;
+  ;;;; Mount
+  ;;;
+  
+  
+  (method (toggle-mount)
+    (let ((history (current-history))
+          (world (current-world)))
+      (unless (get-paused?~ history)
+        (person-motion~ world)
+        (deactivate-fly-change self)
+        (if mount?
+            (deactivate-mount-change self)
+          (activate-mount-change self)))))
+  
+  
+  (method (activate-mount (force?: force? #f))
+    (let ((world (current-world)))
+      (unless (and (not force?) mount?)
+        (set! mount? #t)
+        (activate-vehicle (get-current~ mounts-folio))
+        (update-parameter~ world 'mount)
+        (update-parameter~ world 'fly))))
+  
+  
+  (method (deactivate-mount)
+    (let ((world (current-world)))
+      (when mount?
+        (set! mount? #f)
+        (activate-vehicle #f)
+        (update-parameter~ world 'mount)
+        (update-parameter~ world 'fly))))
+  
+  
+  ;;;
+  ;;;; Fly
+  ;;;
+  
+  
+  (method (toggle-fly)
+    (unless (or (user?) (creator?))
+      (person-motion~ (current-world))
+      (deactivate-mount-change self)
+      (if fly?
+          (deactivate-fly-change self)
+        (activate-fly-change self))))
+  
+  
+  (method (activate-fly (force?: force? #f))
+    (let ((motion (current-motion))
+          (world (current-world)))
+      (unless (and (not force?) fly?)
+        (set! fly? #t)
+        (set-position (vertex+& (get-position) (vertex& 0. 0.1 0.)))
+        (activate-vehicle (get-current~ flyers-folio))
+        ;; quick hack for orb
+        (when (is? motion Target-Motion)
+          (adjust-player-alpha~ motion))
+        (update-parameter~ world 'mount)
+        (update-parameter~ world 'fly)
+        (follow-player~ motion))))
+  
+  
+  (method (deactivate-fly)
+    (let ((motion (current-motion))
+          (world (current-world)))
+      (when fly?
+        (set! fly? #f)
+        (activate-vehicle #f)
+        ;; quick hack for orb
+        (when (is? motion Target-Motion)
+          (adjust-player-alpha~ motion))
+        (update-parameter~ world 'mount)
+        (update-parameter~ world 'fly)
+        (when (is? motion Person-Motion)
+          (exit-fly~ motion)))))
+  
   
   ;;;
   ;;;; Vehicle
@@ -1523,4 +1627,172 @@
                     (push-entity push actor))
   backward-apply: (lambda (client-id pop)
                     (let* ((actor (pop-entity pop)))
-                      (apply-resurrect actor)))))
+                      (apply-resurrect actor))))
+
+
+(definition protected (set-vehicle-change actor name)
+  (let ((world (current-world))
+        (history (current-history)))
+    (unless (and (get-paused?~ history) (not (stepping-history?)))
+      (change-vehicle~ actor name)
+      (let ((old-name (vehicle-name~ actor)))
+        (bidirectional-change 'set-vehicle (current-seconds)
+          (lambda (store push) ;; action
+            )
+          (lambda (store push) ;; forward
+            (store push actor name))
+          (lambda (store push) ;; backward
+            (store push actor old-name)))))))
+
+
+(definition protected (activate-fly-change actor (force?: force? #f))
+  (let ((world (current-world))
+        (history (current-history)))
+    (unless (and (get-paused?~ history) (not (stepping-history?)))
+      (activate-fly~ actor force?: force?)
+      (bidirectional-change 'activate-fly (current-seconds)
+        (lambda (store push) ;; action
+          )
+        (lambda (store push) ;; forward
+          (store push actor force?))
+        (lambda (store push) ;; backward
+          (store push actor))))))
+
+
+(definition protected (deactivate-fly-change actor (force?: force? #f))
+  (let ((world (current-world))
+        (history (current-history)))
+    (unless (and (get-paused?~ history) (not (stepping-history?)))
+      (deactivate-fly~ actor)
+      (bidirectional-change 'deactivate-fly (current-seconds)
+        (lambda (store push) ;; action
+          )
+        (lambda (store push) ;; forward
+          (store push actor))
+        (lambda (store push) ;; backward
+          (store push actor force?))))))
+
+
+(definition protected (activate-mount-change actor (force?: force? #f))
+  (let ((world (current-world))
+        (history (current-history)))
+    (unless (and (get-paused?~ history) (not (stepping-history?)))
+      (activate-mount~ actor force?: force?)
+      (bidirectional-change 'activate-mount (current-seconds)
+        (lambda (store push) ;; action
+          )
+        (lambda (store push) ;; forward
+          (store push actor force?))
+        (lambda (store push) ;; backward
+          (store push actor))))))
+
+
+(definition protected (deactivate-mount-change actor (force?: force? #f))
+  (let ((world (current-world))
+        (history (current-history)))
+    (unless (and (get-paused?~ history) (not (stepping-history?)))
+      (deactivate-mount~ actor)
+      (bidirectional-change 'deactivate-mount (current-seconds)
+        (lambda (store push) ;; action
+          )
+        (lambda (store push) ;; forward
+          (store push actor))
+        (lambda (store push) ;; backward
+          (store push actor force?))))))
+
+
+(define-change set-vehicle
+  ;; forward
+  forward-layout: '(entity literal)
+  forward-store: (lambda (push actor name)
+                   (push-entity push actor)
+                   (push-literal push name))
+  forward-apply: (lambda (client-id pop)
+                   (let* ((actor (pop-entity pop))
+                          (name (pop-literal pop)))
+                     (change-vehicle~ actor name)))
+  ;; backward
+  backward-layout: '(entity literal)
+  backward-store: (lambda (push actor old-name)
+                    (push-entity push actor)
+                    (push-literal push old-name))
+  backward-apply: (lambda (client-id pop)
+                    (let* ((actor (pop-entity pop))
+                           (old-name (pop-literal pop)))
+                      (change-vehicle~ actor old-name))))
+
+
+(define-change activate-fly
+  ;; forward
+  forward-layout: '(entity boolean)
+  forward-store: (lambda (push actor force?)
+                   (push-entity push actor)
+                   (push-boolean push force?))
+  forward-apply: (lambda (client-id pop)
+                   (let* ((actor (pop-entity pop))
+                          (force? (pop-boolean pop)))
+                     (activate-fly~ actor force?: force?)))
+  ;; backward
+  backward-layout: '(entity)
+  backward-store: (lambda (push actor)
+                   (push-entity push actor))
+  backward-apply: (lambda (client-id pop)
+                    (let* ((actor (pop-entity pop)))
+                      (deactivate-fly~ actor))))
+
+
+(define-change deactivate-fly
+  ;; forward
+  forward-layout: '(entity)
+  forward-store: (lambda (push actor)
+                   (push-entity push actor))
+  forward-apply: (lambda (client-id pop)
+                   (let* ((actor (pop-entity pop)))
+                     (deactivate-fly~ actor)))
+  ;; backward
+  backward-layout: '(entity boolean)
+  backward-store: (lambda (push actor force?)
+                   (push-entity push actor)
+                   (push-boolean push force?))
+  backward-apply: (lambda (client-id pop)
+                    (let* ((actor (pop-entity pop))
+                           (force? (pop-boolean pop)))
+                      (activate-fly~ actor force?: force?))))
+
+
+(define-change activate-mount
+  ;; forward
+  forward-layout: '(entity boolean)
+  forward-store: (lambda (push actor force?)
+                   (push-entity push actor)
+                   (push-boolean push force?))
+  forward-apply: (lambda (client-id pop)
+                   (let* ((actor (pop-entity pop))
+                          (force? (pop-boolean pop)))
+                     (activate-mount~ actor force?: force?)))
+  ;; backward
+  backward-layout: '(entity)
+  backward-store: (lambda (push actor)
+                   (push-entity push actor))
+  backward-apply: (lambda (client-id pop)
+                    (let* ((actor (pop-entity pop)))
+                      (deactivate-mount~ actor))))
+
+
+(define-change deactivate-mount
+  ;; forward
+  forward-layout: '(entity)
+  forward-store: (lambda (push actor)
+                   (push-entity push actor))
+  forward-apply: (lambda (client-id pop)
+                   (let* ((actor (pop-entity pop)))
+                     (deactivate-mount~ actor)))
+  ;; backward
+  backward-layout: '(entity boolean)
+  backward-store: (lambda (push actor force?)
+                   (push-entity push actor)
+                   (push-boolean push force?))
+  backward-apply: (lambda (client-id pop)
+                    (let* ((actor (pop-entity pop))
+                           (force? (pop-boolean pop)))
+                      (activate-mount~ actor force?: force?)))))
