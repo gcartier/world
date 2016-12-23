@@ -40,6 +40,7 @@
   
   
   (slot configuration                  getter generate)
+  (slot mutex                          getter generate)
   (slot client-id        initialize #f getter generate)
   (slot client-no        initialize #f getter generate)
   (slot welcome          initialize #f getter generate)
@@ -61,6 +62,7 @@
   (method override (initialize dir)
     (nextmethod dir)
     (set! configuration (instantiate~ (read-form (new-file~ dir ".client"))))
+    (set! mutex (make-mutex 'client))
     (set! assets (gather-assets 'tier (new-directory~ directory "assets")))
     (set! players-cache (make-table test: eqv?))
     (simulate-protocol 'world.client-protocol)
@@ -91,6 +93,12 @@
   
   (method override (shutdown)
     (disconnect-from-server))
+  
+  
+  (method (with-mutex thunk)
+    (mutex-lock! mutex)
+    (prog1 (thunk)
+      (mutex-unlock! mutex)))
   
   
   ;;;
@@ -182,9 +190,15 @@
   (method (disconnect-from-server)
     (when remote-server
       (client-exit~ remote-server remote-client character-name)
-      (close-remote-proxy remote-server)
-      (set! remote-server #f)
-      (set! remote-client #f)))
+      (detach-from-server)))
+  
+  
+  (method (detach-from-server)
+    (with-mutex
+      (lambda ()
+        (close-remote-proxy remote-server)
+        (set! remote-server #f)
+        (set! remote-client #f))))
   
   
   (method (retrieve-assets server-assets)
@@ -192,11 +206,21 @@
   
   
   (method (send-client-update changes)
-    (client-update~ remote-processor remote-client (current-seconds) changes))
+    (with-mutex
+      (lambda ()
+        ;; we have to test because as we don't acquire the
+        ;; task mutex a detach client is asynchronous for us
+        (when remote-processor
+          (client-update~ remote-processor remote-client (current-seconds) changes)))))
   
   
   (method (send-client-alive)
-    (client-alive~ remote-server remote-client))
+    (with-mutex
+      (lambda ()
+        ;; we have to test because as we don't acquire the
+        ;; task mutex a detach client is asynchronous for us
+        (when remote-server
+          (client-alive~ remote-server remote-client)))))
   
   
   (method override (connected-player no)
@@ -374,6 +398,13 @@
     (let ((uuid (get-uuid~ (get-ior~ remote-server))))
       (let ((connection (require-remote-connection uuid)))
         (set-protocol~ connection protocol))))
+  
+  
+  (method (detach-client)
+    (let ((world (current-world)))
+      (detach-from-server)
+      (open-welcome~ world)
+      (report-exception~ (current-zone) "Disconnected from server" #f)))
   
   
   (method (pause-client)
