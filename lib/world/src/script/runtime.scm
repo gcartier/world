@@ -44,6 +44,13 @@
   (jazz:allocate-script-walker #f #f '() '() '() (jazz:new-queue) (jazz:new-queue) (%%make-table test: eq?) (%%make-table test: eq?) '()))
 
 
+(jazz:define-method (jazz:jazz-walker-supports-tilde? (jazz:Script-Walker walker))
+  #f)
+
+(jazz:define-method (jazz:jazz-walker-supports-composite? (jazz:Script-Walker walker))
+  #f)
+
+
 (jazz:define-method (jazz:walker-declarations (jazz:Script-Walker walker))
   (cons (jazz:get-dialect-declarations (jazz:get-dialect 'jazz))
         (nextmethod walker)))
