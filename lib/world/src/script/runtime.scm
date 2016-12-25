@@ -52,13 +52,40 @@
 
 
 (jazz:define-method (jazz:walker-declarations (jazz:Script-Walker walker))
-  (cons (jazz:get-dialect-declarations (jazz:get-dialect 'jazz))
-        (nextmethod walker)))
+  (let ((table (%%make-table test: eq?)))
+    (define (add dialect symbol #!optional (as #f))
+      (%%table-set! table (or as symbol) (%%table-ref (jazz:get-dialect-declarations (jazz:get-dialect dialect)) symbol)))
+    
+    (add 'foundation 'import '%%import)
+    (add 'scheme 'define)
+    (%%list table)))
 
 
 (jazz:define-method (jazz:walker-bindings (jazz:Script-Walker walker))
-  (cons (jazz:get-dialect-bindings (jazz:get-dialect 'jazz))
-        (nextmethod walker)))
+  (let ((table (%%make-table test: eq?)))
+    (define (add dialect symbol #!optional (as #f))
+      (%%table-set! table (or as symbol) (%%table-ref (jazz:get-dialect-bindings (jazz:get-dialect dialect)) symbol)))
+    
+    (add 'foundation 'import '%%import)
+    (add 'scheme 'and)
+    (add 'scheme 'begin)
+    (add 'scheme 'case)
+    (add 'scheme 'cond)
+    (add 'scheme 'define)
+    (add 'scheme 'delay)
+    (add 'scheme 'do)
+    (add 'scheme 'if)
+    (add 'scheme 'lambda)
+    (add 'scheme 'let)
+    (add 'scheme 'let*)
+    (add 'scheme 'letrec)
+    (add 'scheme 'or)
+    (add 'scheme 'quasiquote)
+    (add 'scheme 'quote)
+    (add 'scheme 'receive)
+    (add 'scheme 'set!)
+    (add 'jazz 'declare '%%declare)
+    (%%list table)))
 
 
 ;;;
