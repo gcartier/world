@@ -52,31 +52,36 @@
 
 
 (jazz:define-method (jazz:walker-declarations (jazz:Script-Walker walker))
-  (let ((table (%%make-table test: eq?)))
-    (define (add dialect symbol #!optional (as #f))
-      (%%table-set! table (or as symbol) (%%table-ref (jazz:get-dialect-declarations (jazz:get-dialect dialect)) symbol)))
+  (let ((table (jazz:get-dialect-declarations (jazz:get-dialect 'script))))
+    (define (add dialect symbol)
+      (%%table-set! table symbol (%%table-ref (jazz:get-dialect-declarations (jazz:get-dialect dialect)) symbol)))
     
-    (add 'foundation 'import '%%import)
-    (add 'scheme 'define)
+    (add 'foundation '%%import)
+    (add 'foundation '%%syntax)
+    
+    (add 'scheme '%%define)
+    
     (%%list table)))
 
 
 (jazz:define-method (jazz:walker-bindings (jazz:Script-Walker walker))
-  (let ((table (%%make-table test: eq?)))
-    (define (add dialect symbol #!optional (as #f))
-      (%%table-set! table (or as symbol) (%%table-ref (jazz:get-dialect-bindings (jazz:get-dialect dialect)) symbol)))
+  (let ((table (jazz:get-dialect-bindings (jazz:get-dialect 'script))))
+    (define (add dialect symbol)
+      (%%table-set! table symbol (%%table-ref (jazz:get-dialect-bindings (jazz:get-dialect dialect)) symbol)))
     
-    (add 'foundation 'import '%%import)
+    (add 'foundation '%%import)
+    (add 'foundation '%%syntax)
+    
     (add 'scheme 'and)
     (add 'scheme 'begin)
     (add 'scheme 'case)
     (add 'scheme 'cond)
-    (add 'scheme 'define)
+    (add 'scheme '%%define)
     (add 'scheme 'delay)
-    (add 'scheme 'do)
+    (add 'scheme '%%do)
     (add 'scheme 'if)
-    (add 'scheme 'lambda)
-    (add 'scheme 'let)
+    (add 'scheme '%%lambda)
+    (add 'scheme '%%let)
     (add 'scheme 'let*)
     (add 'scheme 'letrec)
     (add 'scheme 'or)
@@ -84,7 +89,9 @@
     (add 'scheme 'quote)
     (add 'scheme 'receive)
     (add 'scheme 'set!)
-    (add 'jazz 'declare '%%declare)
+    
+    (add 'jazz '%%declare)
+    
     (%%list table)))
 
 
@@ -94,4 +101,15 @@
 
 
 (jazz:define-dialect script
-  (jazz:new-script-dialect 'script)))
+  (jazz:new-script-dialect 'script))
+
+
+(jazz:define-walker-declaration %%import  foundation jazz:walk-import-declaration jazz:walk-import)
+(jazz:define-walker-declaration %%syntax  foundation jazz:walk-syntax-declaration jazz:walk-syntax)
+
+(jazz:define-walker-declaration %%define  scheme jazz:walk-define-declaration jazz:walk-define)
+(jazz:define-walker-special     %%lambda  scheme jazz:walk-lambda)
+(jazz:define-walker-special     %%let     scheme jazz:walk-let)
+(jazz:define-walker-special     %%do      scheme jazz:walk-do)
+
+(jazz:define-walker-special     %%declare jazz jazz:walk-declare))
