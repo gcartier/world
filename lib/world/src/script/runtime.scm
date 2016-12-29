@@ -96,6 +96,35 @@
 
 
 ;;;
+;;;; %%Syntax
+;;;
+
+
+(jazz:define-class jazz:%%Syntax-Declaration jazz:Syntax-Declaration (constructor: jazz:allocate-%%syntax-declaration)
+  ())
+
+
+(define (jazz:new-%%syntax-declaration name type access compatibility attributes parent signature syntax-form)
+  (let ((new-declaration (jazz:allocate-%%syntax-declaration name type #f access compatibility attributes #f parent #f #f signature #f)))
+    (jazz:setup-declaration new-declaration)
+    new-declaration))
+
+
+(jazz:define-method (jazz:outline-extract (jazz:Syntax-Declaration declaration) meta)
+  `(%%syntax ,@(jazz:outline-generate-access-list declaration) ,(jazz:get-lexical-binding-name declaration)))
+
+
+(define (jazz:walk-%%syntax-declaration walker resume declaration environment form-src)
+  (receive (access compatibility rest) (jazz:parse-modifiers walker resume declaration jazz:syntax-modifiers (%%cdr (jazz:source-code form-src)))
+    (let ((name (jazz:source-code (%%car rest))))
+      (let ((new-declaration (or (jazz:find-declaration-child declaration name)
+                                 (jazz:new-%%syntax-declaration name jazz:Any access compatibility '() declaration #f #f))))
+        (jazz:set-declaration-source new-declaration form-src)
+        (let ((effective-declaration (jazz:add-declaration-child walker resume declaration new-declaration)))
+          effective-declaration)))))
+
+
+;;;
 ;;;; Register
 ;;;
 
@@ -105,7 +134,7 @@
 
 
 (jazz:define-walker-declaration %%import  foundation jazz:walk-import-declaration jazz:walk-import)
-(jazz:define-walker-declaration %%syntax  foundation jazz:walk-syntax-declaration jazz:walk-syntax)
+(jazz:define-walker-declaration %%syntax  foundation jazz:walk-%%syntax-declaration jazz:walk-syntax)
 
 (jazz:define-walker-declaration %%define  scheme jazz:walk-define-declaration jazz:walk-define)
 (jazz:define-walker-special     %%lambda  scheme jazz:walk-lambda)
