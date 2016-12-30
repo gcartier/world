@@ -110,7 +110,7 @@
     new-declaration))
 
 
-(jazz:define-method (jazz:outline-extract (jazz:Syntax-Declaration declaration) meta)
+(jazz:define-method (jazz:outline-extract (jazz:%%Syntax-Declaration declaration) meta)
   `(%%syntax ,@(jazz:outline-generate-access-list declaration) ,(jazz:get-lexical-binding-name declaration)))
 
 
