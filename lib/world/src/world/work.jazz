@@ -72,8 +72,8 @@
   (set! world-repositories repositories)
   ;; spawning worker will setup repositories
   (and worker
-       (bind (what expr detail) (process-repositories~ worker repositories)
-         (worker-result what expr detail))))
+       (bind (what . data) (process-repositories~ worker repositories)
+         (worker-result what data))))
 
 
 (definition (worker-crashes)
@@ -114,8 +114,8 @@
 
 (definition protected (hide-worker-process)
   (and worker
-       (bind (what expr detail) (process-hide~ worker)
-         (worker-result what expr detail))))
+       (bind (what . data) (process-hide~ worker)
+         (worker-result what data))))
 
 
 (definition protected (kill-worker-process)
@@ -170,26 +170,29 @@
           (if (not worker?)
               (with-evaluating
                 (lambda ()
-                  (list 'eval (evaluate-forms syntax str container line col 'interpret readtable: 'scheme evaluate?: #f scripting?: #t) #f)))
+                  (cons 'eval (evaluate-forms syntax str container line col 'interpret readtable: 'scheme evaluate?: #f scripting?: #t))))
             (calling-worker
               (lambda ()
                 (process-run~ (require-worker) 'interpret #f syntax str container line col 'interpret))))))))
   
-  (bind (what expr detail) (evaluate-code)
+  (bind (what . data) (evaluate-code)
     (case what
       ((read)
-       (read-handler expr))
+       (bind (reason location) data
+         (read-handler reason location)))
       ((walk)
-       (walk-handler expr detail))
+       (bind (reason detail) data
+         (walk-handler reason detail)))
       ((error)
-       (error-handler expr))
+       (bind (reason location stack) data
+         (error-handler reason location stack)))
       ((eval)
        (let ()
          (define (eval-script)
            (when instance
              (startup~ instance))
            (result-handler
-             (eval expr))
+             (eval data))
            (when instance
              (fallthrough~ instance)))
          
@@ -203,7 +206,7 @@
                      (lambda (cont)
                        (continuation-graft exit
                          (lambda ()
-                           (error-handler (exception-reason exc) (exception-location exc cont)))))))
+                           (error-handler (exception-reason exc) (exception-location exc cont) (continuation-stack cont)))))))
                  eval-script)))))))))
 
 
@@ -219,8 +222,8 @@
     (let ((mode (worker-mode)))
       (with-feedback mode unit-name
         (lambda (feedback? time?)
-          (bind (what expr detail) (calling-worker (lambda () (process-unit~ (require-worker) mode feedback? time? unit-name)))
-            (worker-result what expr detail)))))
+          (bind (what . data) (calling-worker (lambda () (process-unit~ (require-worker) mode feedback? time? unit-name)))
+            (worker-result what data)))))
     #t))
 
 
@@ -229,8 +232,8 @@
     (when (world-setting 'world.worker-verbose? #f)
       (debug 'script path))
     (let ((mode 'interpret))
-      (bind (what expr detail) (calling-worker (lambda () (process-script~ (require-worker) mode path)))
-        (worker-result what expr detail)))
+      (bind (what . data) (calling-worker (lambda () (process-script~ (require-worker) mode path)))
+        (worker-result what data)))
     #t))
 
 
@@ -241,8 +244,8 @@
     (let ((mode (worker-mode)))
       (with-feedback mode 'evaluation
         (lambda (feedback? time?)
-          (bind (what expr detail) (calling-worker (lambda () (process-evaluate~ (require-worker) mode feedback? syntax str container line col evaluation-mode)))
-            (when (worker-result what expr detail walk-debugger: walk-debugger walk-cookie: walk-cookie)
+          (bind (what . data) (calling-worker (lambda () (process-evaluate~ (require-worker) mode feedback? syntax str container line col evaluation-mode)))
+            (when (worker-result what data walk-debugger: walk-debugger walk-cookie: walk-cookie)
               (hook-evaluate forms syntax str container line col))))))
     #t))
 
@@ -253,10 +256,10 @@
     (when (world-setting 'world.worker-verbose? #f)
       (debug 'console))
     (let ((mode 'interpret))
-      (bind (what expr detail) (calling-worker (lambda () (process-console~ (require-worker) unit-name expr)))
+      (bind (what . data) (calling-worker (lambda () (process-console~ (require-worker) unit-name expr)))
         (values (wrap-evaluate
                   (lambda ()
-                    (worker-result what expr detail evaluator: evaluator)))
+                    (worker-result what data evaluator: evaluator)))
                 #t)))))
 
 
@@ -275,7 +278,7 @@
       (proc (not visible?) time?))))
 
 
-(definition (worker-result what expr detail (evaluator: evaluator #f) (walk-handler: walk-handler #f) (walk-debugger: walk-debugger #f) (walk-cookie: walk-cookie #f) (error-handler: error-handler #f))
+(definition (worker-result what data (evaluator: evaluator #f) (read-handler: read-handler #f) (walk-handler: walk-handler #f) (walk-debugger: walk-debugger #f) (walk-cookie: walk-cookie #f) (error-handler: error-handler #f))
   (when (world-setting 'world.worker-verbose-result? #f)
     (debug 'result what))
   (case what
@@ -284,33 +287,40 @@
                     (generate-symbol-context (gensym))
                     (generate-symbol-counter 0))
        (let ((expansion (if (eq? what 'eval)
-                            expr
-                          (call-with-input-file expr
+                            data
+                          (call-with-input-file data
                             read-binary))))
          (if evaluator
              (evaluator expansion)
            (eval expansion)
            #t))))
     ((load)
-     (load-file expr #t))
+     (load-file data #t))
+    ((read)
+     (bind (reason location) data
+       (if read-handler
+           (read-handler reason location)
+         (error "{a}" reason))))
     ((walk)
-     (if walk-handler
-         (walk-handler expr detail)
-       (let ((world (current-world+))
-             (zone (current-zone+)))
-         (cond (walk-debugger
-                (report-walk-problems~ walk-debugger (get-local-process) detail walk-cookie))
-               ((and world zone (get-ready?~ zone) (not (get-controller-debugger)))
-                (display-walk-problems~ world detail))
-               (else
-                (error "{a}" expr))))
-       (if evaluator
-           (unspecified)
-         #f)))
+     (bind (reason detail) data
+       (if walk-handler
+           (walk-handler reason detail)
+         (let ((world (current-world+))
+               (zone (current-zone+)))
+           (cond (walk-debugger
+                  (report-walk-problems~ walk-debugger (get-local-process) detail walk-cookie))
+                 ((and world zone (get-ready?~ zone) (not (get-controller-debugger)))
+                  (display-walk-problems~ world detail))
+                 (else
+                  (error "{a}" reason))))
+         (if evaluator
+             (unspecified)
+           #f))))
     ((error)
-     (if error-handler
-         (error-handler expr)
-       (error "{a}" expr)))))
+     (bind (reason location stack) data
+       (if error-handler
+           (error-handler reason location stack)
+         (error "{a}" reason))))))
 
 
 (add-exit-job! kill-worker-process)
