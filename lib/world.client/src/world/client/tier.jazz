@@ -176,9 +176,11 @@
           (let ((server (load-object~ remote-register 'world.server.remote 'world-remote-server))
                 (client (load-object~ (get-local-register) 'world.client.remote 'world-remote-client)))
             (let ((info
-                    ;; quick hack until changing instance is asynchronous as client-enter might spawn an instance
-                    (parameterize ((receive-timeout 60))
-                      (client-enter~ server client character-name character-avatar character-script))))
+                    (calling-server
+                      (lambda ()
+                        ;; quick hack until changing instance is asynchronous as client-enter might spawn an instance
+                        (parameterize ((receive-timeout 60))
+                          (client-enter~ server client character-name character-avatar character-script))))))
               (if (string? info)
                   (throw info)
                 (set! remote-client client)
@@ -209,12 +211,23 @@
       (detach-from-server)))
   
   
+  (method (detach-client)
+    (detach-from-server)
+    (if (window?)
+        (let ((world (current-world)))
+          (open-welcome~ world)
+          (report-exception~ (current-zone) "Disconnected from server" #f))
+      (exit)))
+  
+  
   (method (detach-from-server)
+    (request-shutdown)
     (with-mutex
       (lambda ()
         (when remote-server
           (close-remote-proxy remote-server)
           (set! remote-server #f)
+          (set! remote-processor #f)
           (set! remote-client #f)))))
   
   
@@ -360,28 +373,43 @@
   
   
   (method (calling-server thunk)
-    (calling-server/processor thunk))
+    (calling-processing thunk))
   
   
   (method (calling-processor thunk)
-    (calling-server/processor thunk))
+    (calling-processing thunk))
   
   
-  (method (calling-server/processor thunk)
+  (method (calling-processing thunk)
     ;; longer timeout while in development
     ;; as we might be running under a debugger
     (parameterize ((receive-timeout 60))
       (parameterize ((post-problem-handler
                        (lambda (exc)
                          (delay-detach-client))))
-        (catch (connection-problem? exc
-                 (if (not (current-exit))
-                     (begin
-                       (snapshot-process exception: (new Error message: "No exit"))
-                       (exit-no-jobs))
-                   (delay-detach-client)
-                   (continuation-return (current-exit) #f)))
-          (thunk)))))
+        (let ((exit (current-exit)))
+          (define (detach)
+            (if (not exit)
+                (if (primordial-thread?)
+                    (let ((exit (boot-exit)))
+                      (if exit
+                          (continuation-graft exit
+                            (lambda ()
+                              (detach-client)))
+                        (with-maybe-task-mutex
+                          (lambda ()
+                            (detach-client)))))
+                  (snapshot-process exception: (new Error message: "No exit"))
+                  (exit-no-jobs))
+              (delay-detach-client)
+              (continuation-return exit #f)))
+          
+          (catch (connection-problem? exc
+                   (detach))
+            (let ((result (thunk)))
+              (if (eq? result disconnect-marker)
+                  (detach)
+                result)))))))
   
   
   (method (delay-detach-client)
@@ -443,15 +471,6 @@
     (let ((uuid (get-uuid~ (get-ior~ remote-server))))
       (let ((connection (require-remote-connection uuid)))
         (set-protocol~ connection protocol))))
-  
-  
-  (method (detach-client)
-    (detach-from-server)
-    (if (window?)
-        (let ((world (current-world)))
-          (open-welcome~ world)
-          (report-exception~ (current-zone) "Disconnected from server" #f))
-      (quit-process~ (get-process))))
   
   
   (method (pause-client)
