@@ -71,6 +71,7 @@
     
     (add 'foundation '%%import)
     (add 'foundation '%%syntax)
+    (add 'foundation 'walk-failed?)
     
     (add 'scheme 'and)
     (add 'scheme 'begin)
@@ -133,12 +134,13 @@
   (jazz:new-script-dialect 'script))
 
 
-(jazz:define-walker-declaration %%import  foundation jazz:walk-import-declaration jazz:walk-import)
-(jazz:define-walker-declaration %%syntax  foundation jazz:walk-%%syntax-declaration jazz:walk-syntax)
+(jazz:define-walker-declaration %%import     foundation jazz:walk-import-declaration jazz:walk-import)
+(jazz:define-walker-declaration %%syntax     foundation jazz:walk-%%syntax-declaration jazz:walk-syntax)
+(jazz:define-walker-special     walk-failed? foundation jazz:walk-walk-failed)
 
-(jazz:define-walker-declaration %%define  scheme jazz:walk-define-declaration jazz:walk-define)
-(jazz:define-walker-special     %%lambda  scheme jazz:walk-lambda)
-(jazz:define-walker-special     %%let     scheme jazz:walk-let)
-(jazz:define-walker-special     %%do      scheme jazz:walk-do)
+(jazz:define-walker-declaration %%define     scheme jazz:walk-define-declaration jazz:walk-define)
+(jazz:define-walker-special     %%lambda     scheme jazz:walk-lambda)
+(jazz:define-walker-special     %%let        scheme jazz:walk-let)
+(jazz:define-walker-special     %%do         scheme jazz:walk-do)
 
-(jazz:define-walker-special     %%declare jazz jazz:walk-declare))
+(jazz:define-walker-special     %%declare    jazz jazz:walk-declare))
