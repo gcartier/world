@@ -44,9 +44,11 @@
   (jazz:allocate-script-walker #f #f '() '() '() (jazz:new-queue) (jazz:new-queue) (%%make-table test: eq?) (%%make-table test: eq?) '()))
 
 
+#; ;; until all available functionaly
 (jazz:define-method (jazz:jazz-walker-supports-tilde? (jazz:Script-Walker walker))
   #f)
 
+#; ;; until all available functionaly
 (jazz:define-method (jazz:jazz-walker-supports-composite? (jazz:Script-Walker walker))
   #f)
 
@@ -56,7 +58,8 @@
     (define (add dialect symbol)
       (%%table-set! table symbol (%%table-ref (jazz:get-dialect-declarations (jazz:get-dialect dialect)) symbol)))
     
-    (add 'foundation '%%import)
+    (add 'foundation 'import)
+    (add 'foundation 'export)
     (add 'foundation '%%syntax)
     
     (add 'scheme '%%define)
@@ -69,7 +72,8 @@
     (define (add dialect symbol)
       (%%table-set! table symbol (%%table-ref (jazz:get-dialect-bindings (jazz:get-dialect dialect)) symbol)))
     
-    (add 'foundation '%%import)
+    (add 'foundation 'import)
+    (add 'foundation 'export)
     (add 'foundation '%%syntax)
     (add 'foundation 'walk-failed?)
     
@@ -91,7 +95,9 @@
     (add 'scheme 'receive)
     (add 'scheme 'set!)
     
-    (add 'jazz '%%declare)
+    ;; until all available functionaly
+    (add 'jazz 'declare)
+    (add 'jazz 'cast)
     
     (%%list table)))
 
@@ -134,7 +140,8 @@
   (jazz:new-script-dialect 'script))
 
 
-(jazz:define-walker-declaration %%import     foundation jazz:walk-import-declaration jazz:walk-import)
+(jazz:define-walker-declaration import       foundation jazz:walk-import-declaration jazz:walk-import)
+(jazz:define-walker-declaration export       foundation jazz:walk-export-declaration jazz:walk-export)
 (jazz:define-walker-declaration %%syntax     foundation jazz:walk-%%syntax-declaration jazz:walk-syntax)
 (jazz:define-walker-special     walk-failed? foundation jazz:walk-walk-failed)
 
@@ -143,4 +150,4 @@
 (jazz:define-walker-special     %%let        scheme jazz:walk-let)
 (jazz:define-walker-special     %%do         scheme jazz:walk-do)
 
-(jazz:define-walker-special     %%declare    jazz jazz:walk-declare))
+(jazz:define-walker-special     declare      jazz jazz:walk-declare))
