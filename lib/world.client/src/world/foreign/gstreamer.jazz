@@ -1,0 +1,243 @@
+;;;===============
+;;;  WorldScheme
+;;;===============
+;;;
+;;;; GStreamer
+;;;
+;;;  The Initial Developer of the Original Code is Guillaume Cartier.
+;;;  Portions created by the Initial Developer are Copyright (C) 2012-2016
+;;;  the Initial Developer. All Rights Reserved.
+;;;
+;;;  Contributor(s):
+
+
+(module world.foreign.gstreamer jazz
+
+
+(import (jazz.foreign)
+        (jazz.gstreamer)
+        (jazz.platform.types))
+
+
+;;;
+;;;; AppSink
+;;;
+
+
+(c-declare world.foreign.gstreamer #/C/
+#include <string.h>
+#include <gst/gst.h>
+#include <gst/app/gstappsink.h>
+
+static gboolean gst_app_sink_pull_to(GstElement* elem, void* data)
+{
+    gboolean result = FALSE;
+    GstSample *sample;
+    sample = gst_app_sink_try_pull_sample(GST_APP_SINK(elem), 0);
+    if (sample)
+    {
+        GstBuffer* buffer = gst_sample_get_buffer(sample);
+        if (buffer)
+        {
+            GstMapInfo map;
+            gst_buffer_map(buffer, &map, GST_MAP_READ);
+            memmove(data, map.data, map.size);
+            gst_buffer_unmap(buffer, &map);
+            result = TRUE;
+        }
+        gst_sample_unref(sample);
+    }
+    return result;
+}
+//#)
+
+
+(c-external (gst_app_sink_pull_to GstElement* void*) gboolean)
+
+
+(definition public (init-gstreamer)
+  (startup-gstreamer))
+
+
+(definition public (stream-video pipeline (width: width 1920) (height: height 1080) (framerate: framerate 60) (data: data #f) (sampled: sampled #f))
+  (let ((pipeline (gst_parse_launch pipeline)))
+    (let ((appsink (gst_bin_get_by_name pipeline "appsink")))
+      (gst_element_set_state pipeline GST_STATE_PLAYING)
+      (thread-start!
+        (new-thread
+          (lambda ()
+            (declare (proper-tail-calls))
+            (let (loop)
+              (when (gst_app_sink_pull_to appsink data)
+                (sampled))
+              (sleep .001)
+              (loop))))))))
+
+
+;;;
+;;;; OpenGL
+;;;
+
+
+@opengl (
+(c-type GstContext  (native "GstContext"))
+(c-type GstContext* (pointer GstContext GstContext*))
+
+
+(c-declare world.foreign.gstreamer #/C/
+#define GST_USE_UNSTABLE_API
+
+#include <gst/gst.h>
+#include <gst/gl/gl.h>
+#include <gst/app/gstappsink.h>
+
+GstGLDisplay *gst_gl_display = NULL;
+GstGLContext *gst_gl_context = NULL;
+CGLContextObj my_context = NULL;
+
+static void gst_setup_gl()
+{
+    GstGLDisplay *display = gst_gl_display_new();
+    CGLContextObj context = CGLGetCurrentContext();
+    printf("current display: %p\n", display);
+    printf("current context: %p\n", context);
+    CGLSetCurrentContext(NULL);
+    GstGLContext *new_context;
+    GstGLDisplay *new_display;
+    new_display = gst_gl_display_new();
+    new_context = gst_gl_context_new_wrapped(new_display, (guintptr) context, GST_GL_PLATFORM_CGL, GST_GL_API_OPENGL);
+    printf("new display: %p\n", new_display);
+    printf("new context: %p\n", new_context);
+    // printf("new context shared: %d\n", gst_gl_context_is_shared(new_context));
+    // printf("%p %p\n", display, new_context);
+    gst_gl_display = new_display;
+    gst_gl_context = new_context;
+    my_context = context;
+}
+
+static gboolean sync_bus_call (GstBus * bus, GstMessage * msg, gpointer data)
+{
+  switch (GST_MESSAGE_TYPE (msg)) {
+    case GST_MESSAGE_NEED_CONTEXT:
+    {
+      const gchar *context_type;
+
+      gst_message_parse_context_type (msg, &context_type);
+      g_print ("got need context %s\n", context_type);
+
+      if (g_strcmp0 (context_type, GST_GL_DISPLAY_CONTEXT_TYPE) == 0) {
+        g_print ("111\n");
+        GstContext *display_context =
+            gst_context_new (GST_GL_DISPLAY_CONTEXT_TYPE, TRUE);
+        gst_context_set_gl_display (display_context, gst_gl_display);
+        gst_element_set_context (GST_ELEMENT (msg->src), display_context);
+        return TRUE;
+      } else if (g_strcmp0 (context_type, "gst.gl.app_context") == 0) {
+        g_print ("222\n");
+        GstContext *app_context = gst_context_new ("gst.gl.app_context", TRUE);
+        GstStructure *s = gst_context_writable_structure (app_context);
+        gst_structure_set (s, "context", GST_GL_TYPE_CONTEXT, gst_gl_context,
+            NULL);
+        gst_element_set_context (GST_ELEMENT (msg->src), app_context);
+        return TRUE;
+      }
+      break;
+    }
+    default:
+      break;
+  }
+  return FALSE;
+}
+
+static void gst_setup_callback(GstElement* pipeline)
+{
+    GstBus *bus = NULL;
+    bus = gst_pipeline_get_bus(GST_PIPELINE (pipeline));
+    gst_bus_add_signal_watch(bus);
+    gst_bus_enable_sync_message_emission(bus);
+    g_signal_connect(bus, "sync-message", G_CALLBACK (sync_bus_call), NULL);
+    gst_object_unref(bus);
+    
+    /* NULL to PAUSED state pipeline to make sure the gst opengl context is created and
+     * shared with the sdl one */
+    gst_element_set_state (GST_ELEMENT (pipeline), GST_STATE_PAUSED);
+  
+    CGLSetCurrentContext(my_context);
+}
+
+unsigned int
+get_texture_id_from_buffer (GstBuffer * buf)
+{
+  GstMapInfo mapinfo;
+  unsigned int texture = 0;
+
+  if (!gst_buffer_map (buf, &mapinfo, (GstMapFlags) (GST_MAP_READ | GST_MAP_GL))) {
+    g_warning ("Failed to map the video buffer");
+    return texture;
+  }
+
+  texture = (unsigned int) mapinfo.data[0];
+
+  gst_buffer_unmap (buf, &mapinfo);
+
+  return texture;
+}
+
+// mega quicky for test
+unsigned int textureId = 0;
+
+static GstFlowReturn new_sample(GstElement* elem, gpointer user_data)
+{
+    GstSample *sample;
+    GstBuffer *buffer;
+    sample = gst_app_sink_pull_sample(GST_APP_SINK(elem));
+    buffer = gst_sample_get_buffer(sample);
+    unsigned int id = get_texture_id_from_buffer(buffer);
+    textureId = id;
+    // printf("%i\n", id);
+    return GST_FLOW_OK;
+}
+
+static unsigned int get_texture_id()
+{
+    return textureId;
+}
+
+static gulong gst_appsink_connect_to(gpointer instance, char* signal, gpointer data)
+{
+    return g_signal_connect(instance, signal, G_CALLBACK(new_sample), data);
+}
+//#)
+
+
+(c-external (gst_setup_gl) void)
+(c-external (gst_setup_callback GstElement*) void)
+(c-external (get_texture_id) uint)
+(c-external (gst_appsink_connect_to gpointer char-string NULL) gulong)
+
+
+(definition public (init-gstreamer)
+  (startup-gstreamer)
+  (gst_setup_gl))
+
+
+(definition public (stream-video (width: width 1920) (height: height 1080) (framerate: framerate 60))
+  (declare (proper-tail-calls))
+  (let ((pipeline (gst_parse_launch (format "videotestsrc ! video/x-raw, width={a}, height={a}, framerate={a}/1 ! queue max-size-buffers=3 ! glupload ! appsink caps=\"video/x-raw(memory:GLMemory), format=RGBA\" emit-signals=true name=appsink" width height framerate))))
+    (gst_setup_callback pipeline)
+    (let ((appsink (gst_bin_get_by_name pipeline "appsink")))
+      ;(gst_appsink_connect_to appsink "new-sample")
+      (gst_element_set_state pipeline GST_STATE_PLAYING)
+      (thread-start!
+        (new-thread
+          (lambda ()
+            (declare (proper-tail-calls))
+            (let ((previous-id 0))
+              (let (loop)
+                (let ((id (get_texture_id)))
+                  (when (/= id previous-id)
+                    ;(gst_element_set_state pipeline GST_STATE_PAUSED)
+                    (terminal id)
+                    (set! previous-id id)))
+                (sleep .01)
+                (loop)))))))))))

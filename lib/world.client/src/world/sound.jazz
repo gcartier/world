@@ -14,27 +14,57 @@
 (module world.sound jazz
 
 
-(import (jazz.sound)
+(import (jazz.audio)
+        (jazz.io)
         (jazz.syntax (phase syntax))
         (world)
         (world.autoload)
         (world.configure)
+        (world.geometry)
         (world.settings)
         (world.syntax (phase syntax))
         (world.task))
 
 
-(definition default-rate
-  44100)
+(definition public default-music-volume     1.)
+(definition public default-ambience-volume  .1)
+(definition public default-game-volume      .5)
+(definition public default-interface-volume .5)
 
-(definition default-format
-  SoundIoFormatFloat32NE)
 
-(definition default-channels
-  2)
+(definition public game-volume <fl+>
+  #f)
 
-(definition default-latency
-  .2)
+(definition public (set-game-volume volume <fl+>)
+  (set! game-volume volume))
+
+
+(definition public interface-volume <fl+>
+  #f)
+
+(definition public (set-interface-volume volume <fl+>)
+  (set! interface-volume volume))
+
+
+(definition public sounds? <bool>
+  #f)
+
+(definition public (set-sounds? flag <bool>)
+  (set! sounds? flag))
+
+
+(definition public selection-sounds? <bool>
+  #f)
+
+(definition public (set-selection-sounds? flag <bool>)
+  (set! selection-sounds? flag))
+
+
+(definition protected (prepare-sounds)
+  (set! game-volume (world-setting 'world.game-volume default-game-volume))
+  (set! interface-volume (world-setting 'world.interface-volume default-interface-volume))
+  (set! sounds? (world-setting 'world.sounds? #t))
+  (set! selection-sounds? (world-setting 'world.selection-sounds? #t)))
 
 
 ;;;
@@ -42,120 +72,194 @@
 ;;;
 
 
-(definition public (mic-task task <Task>)
+(definition public (audio-task task <Task>)
   (declare (proper-tail-calls))
-  (let ((mic (current-mic)))
-    (with-task task
-      (lambda (exit)
-        (let (iter (previous (current-seconds)))
-          (let ((time (current-seconds)))
-            (let ((elapse (- time previous)))
-              (unless (stopping?~ task)
-                (site (mic on?: #t)
-                  (process-mic~ mic)))
-              (let ((duration (- (current-seconds) time)))
-                (task-sleep task mic-period duration exit))
-              (iter time))))))))
+  (with-task task
+    (lambda (exit)
+      (let (iter (previous (current-seconds)))
+        (let ((time (current-seconds)))
+          (let ((elapse (- time previous)))
+            (unless (stopping?~ task)
+              (site (audio on?: #t)
+                (update-audio)))
+            (let ((duration (- (current-seconds) time)))
+              (task-sleep task audio-period duration exit))
+            (iter time)))))))
 
 
 ;;;
-;;;; Mic
+;;;; Sound
 ;;;
 
 
-(class World-Mic extends Object
-  
-  
-  (slot mic?   <bool>     initialize #f accessors generate)
-  (slot buffer <u8vector> initialize #f accessors generate)
-  
-  
-  (method override (initialize)
-    (set! mic? (world-setting 'world.mic? #f))
-    (when (and mic? (client?))
-      (start-mic)))
-  
-  
-  ;;;
-  ;;;; Events
-  ;;;
-  
-  
-  (method (on-toggle-mic evt)
-    (toggle-mic))
-  
-  
-  (method (toggle-mic)
-    (when (client?)
-      (let ((world (current-world)))
-        (if (not mic?)
-            (start-mic)
-          (stop-mic))
-        (update-parameter~ world 'mic)
-        (display-on/off~ world "Mic" mic?))))
-  
-  
-  ;;;
-  ;;;; Process
-  ;;;
-  
-  
-  (method (start-mic)
-    (unless mic?
-      (startup-sound)
-      (let ((in-device (sound-default-input-device))
-            (rate default-rate)
-            (format default-format)
-            (layout (sound-get-default-layout default-channels))
-            (latency default-latency))
-        (start-sound-input in-device rate format layout latency)
-        (set! buffer (make-u8vector (sound-input-ring-capacity)))
-        (set! mic? #t))))
-  
-  
-  (method (stop-mic)
-    (when mic?
-      (stop-sound-input)
-      ;(shutdown-sound)
-      (set! buffer #f)
-      (set! mic? #f)))
-  
-  
-  (method (process-mic)
-    (when mic?
-      (let ((read (sound-read-input-ring buffer)))
-        (when (> read 0)
-          (send-client-audio~ (client-tier) (subu8vector buffer 0 read)))))))
+(definition sounds
+  (make-table test: equal?))
+
+
+(definition protected (reset-sounds)
+  (empty-table sounds))
+
+
+(definition protected (cache-sound path)
+  (let ((cached (table-ref sounds path 'not-found)))
+    (if (neq? cached 'not-found)
+        cached
+      (let ((ckb (find-ckb-sound path)))
+        (let ((sound (and ckb (new-bank-sound ckb))))
+          (table-set! sounds path sound)
+          sound)))))
+
+
+(definition (find-ckb-sound path)
+  (let ((world (current-world)))
+    (continuation-capture
+      (lambda (return)
+        (iterate-assets~ world
+          (lambda (assets)
+            (let ((ckb (new-file~ (get-directory~ assets) (make-filename path "ckb"))))
+              (when (exists?~ ckb)
+                (continuation-return return ckb)))))
+        #f))))
+
+(definition (require-ckb-sound path)
+  (or (find-ckb-sound path)
+      (error "Unable to find ckb sound: {s}" path)))
+
+
+(definition public (play-3d-sound path pos (volume: volume #f))
+  (when (and sounds? (not (processing?)) (neq? path 'none))
+    (let ((sound (cache-sound path)))
+      (when sound
+        ;; quick try this should be an initialization
+        (set-3d-attenuation 1. 50.)
+        ;; quick try this should be updated when the player moves
+        (let ((seer (or (current-me+) (current-camera))))
+          (let ((position (get-position~ seer))
+                (lookat (get-lookat~ seer)))
+            (let ((lookingat (vertex+& position (get-sight~ lookat)))
+                  (up (get-up~ lookat)))
+              (set-3d-listener
+                (vertex-x position) (vertex-y position) (vertex-z position)
+                (vertex-x lookingat) (vertex-y lookingat) (vertex-z lookingat)
+                (vertex-x up) (vertex-y up) (vertex-z up)))))
+        (set-volume~ sound (or volume game-volume))
+        (set-3d-position~ sound (vertex-x pos) (vertex-y pos) (vertex-z pos))
+        (set-3d-enabled~ sound #t)
+        (play~ sound)))))
+
+
+(definition public (play-3d-sound-if path pos)
+  (when path
+    (play-3d-sound path pos)))
+
+
+(definition public (play-sound-file path (volume: volume #f))
+  (when (and sounds? (not (processing?)))
+    (let ((sound (cache-sound path)))
+      (when sound
+        (when volume
+          (set-volume~ sound volume))
+        (play~ sound)))))
+
+
+(definition public (play-game-sound path)
+  (play-sound-file path volume: game-volume))
+
+
+(definition public (play-interface-sound path)
+  (play-sound-file path volume: interface-volume))
 
 
 ;;;
-;;;; Speaker
+;;;; Stream
 ;;;
 
 
-(definition speaker?
+(definition protected (cache-stream-sound path)
+  (or (table-ref sounds path #f)
+      (let ((stream (require-stream-sound path)))
+        (let ((sound (new-stream-sound stream)))
+          (table-set! sounds path sound)
+          sound))))
+
+
+(definition (require-stream-sound path)
+  (let ((world (current-world)))
+    (continuation-capture
+      (lambda (return)
+        (iterate-assets~ world
+          (lambda (assets)
+            (let ((mp3 (new-file~ (get-directory~ assets) (make-filename path "mp3"))))
+              (when (exists?~ mp3)
+                (continuation-return return mp3)))))
+        (error "Unable to find stream sound: {s}" path)))))
+
+
+(definition public (play-stream-sound path (volume: volume #f))
+  (when (and sounds? (not (processing?)))
+    (let ((sound (cache-stream-sound path)))
+      (when volume
+        (set-volume~ sound volume))
+      (play~ sound))))
+
+
+;;;
+;;;; Steps
+;;;
+
+
+(definition categorized-steps
   #f)
 
 
-(definition public (start-speaker)
-  (unless speaker?
-    (startup-sound)
-    (let ((out-device (sound-default-output-device))
-          (rate default-rate)
-          (format default-format)
-          (layout (sound-get-default-layout default-channels))
-          (latency default-latency))
-      (start-sound-output out-device rate format layout latency)
-      (set! speaker? #t))))
+(definition public (random-step kind)
+  (let ((steps (table-ref (get-categorized-steps) kind #f)))
+    (when steps
+      (random-element steps))))
 
 
-(definition public (stop-speaker)
-  (when speaker?
-    (stop-sound-output)
-    ;(shutdown-sound)
-    (set! speaker? #f)))
+(definition protected (get-categorized-steps)
+  (or categorized-steps
+      (let ((steps (categorize-steps (collect-steps))))
+        (set! categorized-steps steps)
+        steps)))
 
 
-(definition public (write-server-audio bytes)
-  (start-speaker)
-  (sound-write-output-ring bytes (u8vector-length bytes))))
+(definition (categorize-steps steps)
+  (let ((table (make-table test: eq?))
+        (dirt (make-search-context "dirt" ignore-case?: #t))
+        (grass (make-search-context "grass" ignore-case?: #t))
+        (ladder (make-search-context "ladder" ignore-case?: #t))
+        (snow (make-search-context "snow" ignore-case?: #t))
+        (stone (make-search-context "stone" ignore-case?: #t))
+        (water (make-search-context "water" ignore-case?: #t))
+        (wood (make-search-context "wood" ignore-case?: #t)))
+    (for-each (lambda (step)
+                (cond ((search step dirt) (table-add table 'dirt step))
+                      ((search step grass) (table-add table 'grass step))
+                      ((search step ladder) (table-add table 'ladder step))
+                      ((search step snow) (table-add table 'snow step))
+                      ((search step stone) (table-add table 'stone step))
+                      ((search step water) (table-add table 'water step))
+                      ((search step wood) (table-add table 'wood step))
+                      (else (error "Uncategorized step: {s}" step))))
+              steps)
+    table))
+
+
+(definition (collect-steps)
+  (let ((world (current-world)))
+    (let ((queue (new-queue)))
+      (iterate-assets~ world
+        (lambda (assets)
+          (let ((step-dir (new-directory~ (get-directory~ assets) '("sound" "step"))))
+            (when (exists?~ step-dir)
+              (iterate-directory~ step-dir
+                (lambda (path kind)
+                  (let ((path (join path "/")))
+                    (when (extension=? (extract-extension path) "ckb")
+                      (enqueue queue (string-append "sound/step/" (extract-spine path))))))
+                full?: #f
+                files?: #t
+                directories?: #f)))))
+      (queue-list queue)))))
