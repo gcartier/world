@@ -14,8 +14,15 @@
 (module world.stream jazz
 
 
-(import (jazz.gstreamer)
-        (world.foreign.gstreamer))
+(import (jazz.cairo)
+        (jazz.geometry)
+        (jazz.gstreamer)
+        (world)
+        (world.autoload)
+        (world.foreign.gstreamer)
+        (world.geometry)
+        (world.quad-texture)
+        (world.syntax (phase syntax)))
 
 
 (definition public (init-gstreamer)
@@ -29,13 +36,14 @@
       (thread-start!
         (new-thread
           (lambda ()
-            (declare (proper-tail-calls))
-            (let (loop)
-              (let ((size (gst_pull_app_sink appsink data)))
-                (when (/= size -1)
-                  (sampled)))
-              (sleep .001)
-              (loop))))))))
+            (let ((info (make-u64vector 2)))
+              (declare (proper-tail-calls))
+              (let (loop)
+                (let ((size (gst_pull_app_sink appsink data info)))
+                  (when (/= size -1)
+                    (sampled)))
+                (sleep .001)
+                (loop)))))))))
 
 
 (definition public (test-pipeline ignore (width: width 1920) (height: height 1080) (framerate: framerate 60))
@@ -47,4 +55,191 @@
 
 
 (definition public (camera-pipeline ignore (width: width 1280) (height: height 720) (framerate: framerate 60))
-  (format "avfvideosrc ! videoscale ! videoconvert ! video/x-raw, width={a}, height={a}, framerate={a}/1 ! videoflip video-direction=180 ! appsink caps=\"video/x-raw, format=BGRA\" name=appsink" width height framerate)))
+  (format "avfvideosrc ! videoscale ! videoconvert ! video/x-raw, width={a}, height={a}, framerate={a}/1 ! videoflip video-direction=180 ! appsink caps=\"video/x-raw, format=BGRA\" name=appsink" width height framerate))
+
+
+;;;
+;;;; Video
+;;;
+
+
+(definition public (make-video-texture name pipeline-description data width height framerate matrix)
+  (let ((world (current-world))
+        (zone (current-zone)))
+    (init-gstreamer)
+    (let ((ratio (/ (cast <fl> width) (cast <fl> height))))
+      (let ((w ratio)
+            (h 1.))
+        (let ((v1 (vertex (/ w -2.) (/ h -2.) 0.))
+              (v2 (vertex (/ w -2.) (/ h  2.) 0.))
+              (v3 (vertex (/ w  2.) (/ h  2.) 0.))
+              (v4 (vertex (/ w  2.) (/ h -2.) 0.)))
+          (let ((quad-texture <Quad-Texture> (make-quad-texture width height v1 v2 v3 v4)))
+            (let ((texture (get-texture~ quad-texture)))
+              (let ((handle (get-handle~ (get-surface~ texture))))
+                (let ((width (cairo_image_surface_get_width handle))
+                      (height (cairo_image_surface_get_height handle))
+                      (stride (cairo_image_surface_get_stride handle)))
+                  (let ((description (pipeline-description data width: width height: height framerate: framerate))
+                        (data (get-data~ texture))
+                        (sampled (lambda ()
+                                   (map-texture~ texture))))
+                    (stream-video description data: data sampled: sampled)))))
+            (register-draw~ zone name
+              (lambda ()
+                (render-texture~ quad-texture matrix)))
+            #t))))))
+
+
+;;;
+;;;; Sink
+;;;
+
+
+(definition public (make-texture-sink name width height matrix)
+  (let ((world (current-world))
+        (zone (current-zone)))
+    (init-gstreamer)
+    (let ((ratio (/ (cast <fl> width) (cast <fl> height))))
+      (let ((w ratio)
+            (h 1.))
+        (let ((v1 (vertex (/ w -2.) (/ h -2.) 0.))
+              (v2 (vertex (/ w -2.) (/ h  2.) 0.))
+              (v3 (vertex (/ w  2.) (/ h  2.) 0.))
+              (v4 (vertex (/ w  2.) (/ h -2.) 0.)))
+          (let ((quad-texture <Quad-Texture> (make-quad-texture width height v1 v2 v3 v4)))
+            (let ((texture (get-texture~ quad-texture)))
+              (let ((handle (get-handle~ (get-surface~ texture))))
+                (let ((width (cairo_image_surface_get_width handle))
+                      (height (cairo_image_surface_get_height handle))
+                      (stride (cairo_image_surface_get_stride handle)))
+                  (let ((data (get-data~ texture))
+                        (info (make-u64vector 2)))
+                    (register-draw~ zone name
+                      (lambda ()
+                        (render-texture~ quad-texture matrix)))
+                    (lambda (appsink)
+                      (let ((size (gst_pull_app_sink appsink data info)))
+                        (when (/= size -1)
+                          (map-texture~ texture))))))))))))))
+
+
+;;;
+;;;; Test
+;;;
+
+
+; try with different output pipelines
+; why is it now ok with a high framerate when before it wasnt
+
+; ! x264enc pass=qual quantizer=20 tune=zerolatency
+; ! avdec_h264
+
+
+(definition screen-width
+  1280 @w 320)
+
+(definition screen-height
+  720 @w 180)
+
+
+(definition protected screen-sink
+  #f)
+
+
+(definition protected (setup-screen-sink)
+  (unless screen-sink
+    (let ((sink (make-texture-sink 'screen screen-width screen-height
+                  (copy-matrix (matrix-multiply& (make-translation-matrix (vertex 10. 7. 5.))
+                                                 (make-scaling-matrix (vertex 6. 6. 6.))
+                                                 (make-rotation-matrix (vertex 0. 1. 0.) (- PI/4)))))))
+      (set! screen-sink sink))))
+
+
+(definition public (test-stream)
+  (let ((width screen-width)
+        (height screen-height)
+        (framerate 30)
+        (debug? #f))
+    (setup-screen-sink)
+    (let ((input-pipeline (gst_parse_launch (format "avfvideosrc name=src ! videoscale ! videoconvert ! video/x-raw, format=I420, width={a}, height={a}, framerate={a}/1 ! appsink name=sink" width height framerate)))
+          (output-pipeline (gst_parse_launch (format "appsrc name=src ! videoconvert name=convert ! videoflip video-direction=180 ! video/x-raw, format=BGRA, width={a}, height={a}, framerate={a}/1 ! appsink name=sink" width height framerate))))
+      (gst_object_set_name input-pipeline "input")
+      (gst_object_set_name output-pipeline "output")
+      (let ((input-sink (gst_bin_get_by_name input-pipeline "sink"))
+            (input-bus (gst_pipeline_get_bus input-pipeline))
+            (output-src (gst_bin_get_by_name output-pipeline "src"))
+            (output-convert (gst_bin_get_by_name output-pipeline "convert"))
+            (output-sink (gst_bin_get_by_name output-pipeline "sink"))
+            (output-bus (gst_pipeline_get_bus output-pipeline))
+            (correction #f))
+        (define (messages)
+          (define (empty bus)
+            (let (loop)
+              (let ((msg (gst_bus_pop bus)))
+                (when msg
+                  (when (and (= (GST_MESSAGE_TYPE msg) GST_MESSAGE_STATE_CHANGED)
+                             (= (gst_state_changed_new_state msg) GST_STATE_PLAYING)
+                             (equal? (gst_object_get_name (GST_MESSAGE_SRC msg)) "output"))
+                    (when debug?
+                      (debug 'diff (- (gst_clock_get_time (gst_pipeline_get_clock output-pipeline))
+                                      (gst_clock_get_time (gst_pipeline_get_clock input-pipeline))))
+                      (debug 'base_time (gst_element_get_base_time input-pipeline)
+                        (gst_element_get_base_time output-pipeline))
+                      ;(gst_debug_pipeline input-pipeline)
+                      (gst_present_message msg))
+                    (let ((input-base (gst_element_get_base_time input-pipeline))
+                          (output-base (gst_element_get_base_time output-pipeline)))
+                      (let ((delta (- output-base input-base)))
+                        (terminal '******** input-base output-base delta)
+                        (set! correction delta))))
+                  (let ((type (GST_MESSAGE_TYPE msg)))
+                    (ecase type
+                      ((GST_MESSAGE_EOS)
+                       (exit))
+                      ((GST_MESSAGE_ERROR)
+                       (exit 1))))
+                  (loop)))))
+          
+          (empty input-bus)
+          (empty output-bus))
+        
+        (when debug?
+          ;(messages)
+          ;(gst_monitor_pad input-pipeline (gst_bin_get_by_name input-pipeline "src") "src")
+          ;(gst_monitor_element input-pipeline (gst_bin_get_by_name input-pipeline "enc"))
+          ;(gst_monitor_pad input-pipeline input-sink "sink")
+          ;(messages)
+          ;(gst_monitor_pad output-pipeline output-src "src")
+          ;(gst_monitor_element output-pipeline output-convert)
+          (gst_monitor_pad output-pipeline output-sink "sink")
+          (messages)
+          ;(gst_setup_app_src output-src "video/x-h264" width height framerate)
+          ;(debug 'LATENCY (gst_pipeline_get_latency output-pipeline))
+          ;(gst_pipeline_set_latency output-pipeline 200000000)
+          ;(debug 'LATENCY (gst_pipeline_get_latency output-pipeline))
+          )
+        (gst_setup_app_src2 output-src "video/x-raw" "I420" width height framerate)
+        (messages)
+        (gst_element_set_state input-pipeline GST_STATE_PAUSED)
+        (gst_element_set_state output-pipeline GST_STATE_PAUSED)
+        (messages)
+        (gst_element_set_state input-pipeline GST_STATE_PLAYING)
+        (sleep 2)
+        (gst_element_set_state output-pipeline GST_STATE_PLAYING)
+        (messages)
+        (let ((buffer (make-u8vector (* width height 4)))
+              (info (make-u64vector 2)))
+          (let (loop)
+            (messages)
+            (let ((size (gst_read_app_sink input-sink buffer info))
+                  (timestamp (u64vector-ref info 0))
+                  (duration (u64vector-ref info 1)))
+              (when (/= size -1)
+                ;(debug 'info info)
+                (let ((effective-timestamp (if correction (- timestamp correction) timestamp)))
+                  (terminal correction timestamp effective-timestamp)
+                  (gst_write_app_src output-src buffer size effective-timestamp duration))))
+            (screen-sink output-sink)
+            (sleep .0001)
+            (loop))))))))
