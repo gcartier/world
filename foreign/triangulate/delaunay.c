@@ -62,13 +62,13 @@ int Triangulate(int nv,XYZ *pxyz,ITRIANGLE *v,int *ntri)
 
    /* Allocate memory for the completeness list, flag for each triangle */
    trimax = 4 * nv;
-   if ((complete = malloc(trimax*sizeof(int))) == NULL) {
+   if ((complete = (int*) malloc(trimax*sizeof(int))) == NULL) {
       status = 1;
       goto skip;
    }
 
    /* Allocate memory for the edge list */
-   if ((edges = malloc(emax*(long)sizeof(IEDGE))) == NULL) {
+   if ((edges = (IEDGE*) malloc(emax*(long)sizeof(IEDGE))) == NULL) {
       status = 2;
       goto skip;
    }

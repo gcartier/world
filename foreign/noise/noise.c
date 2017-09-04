@@ -127,10 +127,10 @@ static int allocate_perm(struct osn_context* ctx, int nperm, int ngrad)
         free(ctx->perm);
     if (ctx->permGradIndex3D)
         free(ctx->permGradIndex3D);
-    ctx->perm = malloc(sizeof(*ctx->perm) * nperm);
+    ctx->perm = (int16_t*) malloc(sizeof(*ctx->perm) * nperm);
     if (!ctx->perm)
         return -ENOMEM;
-    ctx->permGradIndex3D = malloc(sizeof(*ctx->permGradIndex3D) * ngrad);
+    ctx->permGradIndex3D = (int16_t*) malloc(sizeof(*ctx->permGradIndex3D) * ngrad);
     if (!ctx->permGradIndex3D) {
         free(ctx->perm);
         return -ENOMEM;
@@ -170,7 +170,7 @@ int open_simplex_noise(int64_t seed, struct osn_context** ctx)
     int16_t* perm;
     int16_t* permGradIndex3D;
 
-    *ctx = malloc(sizeof(**ctx));
+    *ctx = (osn_context*) malloc(sizeof(**ctx));
     if (!(*ctx))
         return -ENOMEM;
     (*ctx)->perm = NULL;
