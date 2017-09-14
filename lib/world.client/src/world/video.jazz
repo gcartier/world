@@ -32,16 +32,22 @@
 
 
 (definition protected video-resolution
-  (world-setting 'world.video-resolution {Dimension 1280 720}))
+  (world-setting 'world.video-resolution {Dimension 640 360}))
 
 (definition video-framerate
-  (world-setting 'world.video-framerate 30))
+  (world-setting 'world.video-framerate 20))
+
+(definition video-bitrate
+  (world-setting 'world.video-bitrate 2048))
 
 (definition video-alpha
   (world-setting 'world.video-alpha 0.6))
 
 (definition video-overlay?
   (world-setting 'world.video-overlay? #f))
+
+(definition video-codec
+  (world-setting 'world.video-codec 'h264))
 
 
 (definition layouts
@@ -54,8 +60,17 @@
   (world-setting 'world.video-layout 'overhead))
 
 
+(definition video-debug?
+  (world-setting 'world.video-debug? #f))
+
+
 (definition public (kush-gauge width height rate motion)
   (/ (* width height rate motion 0.07) 1000.))
+
+
+(definition protected (start-video)
+  (when (and (client?) (world-setting 'world.video-input? #f))
+    (start-input~ (current-video))))
 
 
 ;;;
@@ -80,28 +95,24 @@
 
 
 ;;;
-;;;; Input
+;;;; Video
 ;;;
 
 
 (class World-Video extends Object
   
   
-  (slot video?          <bool>     initialize #f accessors generate)
-  (slot input-pipeline             initialize #f accessors generate)
-  (slot input-appsink              initialize #f accessors generate)
-  (slot input-buffer    <u8vector> initialize #f accessors generate)
-  (slot output?         <bool>     initialize #f accessors generate)
-  (slot output-pipeline            initialize #f accessors generate)
-  (slot output-appsrc              initialize #f accessors generate)
-  (slot output-appsink             initialize #f accessors generate)
-  (slot output-buffer   <u8vector> initialize #f accessors generate)
-  
-  
-  (method override (initialize)
-    (set! video? (world-setting 'world.video? #f))
-    (when (and video? (client?))
-      (start-video)))
+  (slot input?          <bool>      initialize #f accessors generate)
+  (slot input-pipeline              initialize #f accessors generate)
+  (slot input-sink                  initialize #f accessors generate)
+  (slot input-buffer    <u8vector>  initialize #f accessors generate)
+  (slot input-info      <u64vector> initialize #f accessors generate)
+  (slot output?         <bool>      initialize #f accessors generate)
+  (slot output-pipeline             initialize #f accessors generate)
+  (slot output-src                  initialize #f accessors generate)
+  (slot output-sink                 initialize #f accessors generate)
+  (slot output-buffer   <u8vector>  initialize #f accessors generate)
+  (slot output-info     <u64vector> initialize #f accessors generate)
   
   
   ;;;
@@ -110,7 +121,7 @@
   
   
   (method (on-toggle-video evt)
-    (toggle-video))
+    (toggle-input))
   
   
   (method (on-cycle-layouts evt)
@@ -118,46 +129,60 @@
   
   
   ;;;
-  ;;;; Process
+  ;;;; Input
   ;;;
   
   
-  (method (toggle-video)
+  (method (toggle-input)
     (when (client?)
       (let ((world (current-world)))
-        (if (not video?)
-            (start-video)
-          (stop-video))
+        (if (not input?)
+            (start-input)
+          (stop-input))
         (update-parameter~ world 'video)
-        (display-on/off~ world "Video" video?))))
+        (display-on/off~ world "Video" input?))))
   
   
-  (method (start-video)
-    (unless video?
+  (method (start-input)
+    (unless input?
       (init-gstreamer)
       (let ((width (get-width~ video-resolution))
             (height (get-height~ video-resolution))
             (framerate video-framerate)
-            (alpha video-alpha))
-        (let ((description (format "avfvideosrc ! videoscale ! videoconvert ! video/x-raw, width={a}, height={a}, framerate={a}/1 ! x264enc pass=qual quantizer=20 tune=zerolatency ! appsink name=appsink" width height framerate)))
-          (let ((pipeline (gst_parse_launch description)))
-            (let ((appsink (gst_bin_get_by_name pipeline "appsink"))
-                  (buffer (make-u8vector (* width height 4))))
-              (gst_element_set_state pipeline GST_STATE_PLAYING)
-              (set! input-buffer buffer)
-              (set! input-pipeline pipeline)
-              (set! input-appsink appsink)
-              (set! video? #t)))))))
+            (bitrate video-bitrate)
+            (codec video-codec))
+        (let ((pipeline (gst-launch "avfvideosrc"
+                                    "videoscale"
+                                    "videoconvert"
+                                    (tie "video/x-raw, format=I420, width={width}, height={height}, framerate={framerate}/1")
+                                    (and (eq? codec 'h264) (tie "x264enc pass=qual quantizer=20 bitrate={bitrate} tune=zerolatency speed-preset=ultrafast"))
+                                    "appsink name=sink")))
+          (gst_object_set_name pipeline "input")
+          (let ((sink (gst_bin_get_by_name pipeline "sink"))
+                (buffer (make-u8vector (* width height 4)))
+                (info (make-u64vector 2)))
+            (gst_element_set_state pipeline GST_STATE_PLAYING)
+            (set! input-buffer buffer)
+            (set! input-info info)
+            (set! input-pipeline pipeline)
+            (set! input-sink sink)
+            (set! input? #t))))))
   
   
-  (method (stop-video)
-    (when video?
+  (method (stop-input)
+    (when input?
       (gst_element_set_state input-pipeline GST_STATE_NULL)
       (gst_object_unref input-pipeline)
+      (set! input-info #f)
       (set! input-buffer #f)
       (set! input-pipeline #f)
-      (set! input-appsink #f)
-      (set! video? #f)))
+      (set! input-sink #f)
+      (set! input? #f)))
+  
+  
+  ;;;
+  ;;;; Output
+  ;;;
   
   
   (method (start-output)
@@ -166,45 +191,92 @@
       (let ((width (get-width~ video-resolution))
             (height (get-height~ video-resolution))
             (framerate video-framerate)
-            (alpha video-alpha))
-        (let ((description @w (format "appsrc name=appsrc ! video/x-h264, width={a}, height={a} ! avdec_h264 ! alpha alpha={a} ! appsink name=appsink" width height alpha)
-                           (format "appsrc name=appsrc ! avdec_h264 ! appsink name=appsink")))
-          (let ((pipeline (gst_parse_launch description)))
-            (let ((appsrc (gst_bin_get_by_name pipeline "appsrc"))
-                  (appsink (gst_bin_get_by_name pipeline "appsink"))
-                  (buffer (make-u8vector (* width height 4))))
-              (gst_app_src_set_stream_type appsrc GST_APP_STREAM_TYPE_STREAM)
-              (gst_element_set_state pipeline GST_STATE_PLAYING)
-              (set! output-buffer buffer)
-              (set! output-pipeline pipeline)
-              (set! output-appsrc appsrc)
-              (set! output-appsink appsink)
-              (set! output? #t)))))))
+            (alpha video-alpha)
+            (codec video-codec))
+        (let ((pipeline (gst-launch (tie "appsrc name=src")
+                                    (and (eq? codec 'h264) (tie "avdec_h264"))
+                                    "videoconvert"
+                                    "videoflip video-direction=horiz"
+                                    (tie "alpha alpha={alpha}")
+                                    (tie "video/x-raw, format=BGRA, width={width}, height={height}, framerate={framerate}/1")
+                                    (tie "appsink name=sink"))))
+          (gst_object_set_name pipeline "output")
+          (let ((src (gst_bin_get_by_name pipeline "src"))
+                (sink (gst_bin_get_by_name pipeline "sink"))
+                (buffer (make-u8vector (* width height 4)))
+                (info (make-u64vector 2)))
+            (case codec
+              ((h264)
+               (gst_app_src_set_caps src
+                 (gst_caps "video/x-h264"
+                   "width"         (g_value_int width)
+                   "height"        (g_value_int height)
+                   "framerate"     (g_value_fraction framerate 1)
+                   "stream-format" (g_value_string "avc")
+                   "alignment"     (g_value_string "au"))))
+              ((vp8)
+               (gst_app_src_set_caps src
+                 (gst_caps "video/x-vp8"
+                   "width"         (g_value_int width)
+                   "height"        (g_value_int height)
+                   "framerate"     (g_value_fraction framerate 1)
+                   "stream-format" (g_value_string "avc")
+                   "alignment"     (g_value_string "au"))))
+              (else
+               (gst_app_src_set_caps src
+                 (gst_caps "video/x-raw"
+                   "format"    (g_value_string "I420")
+                   "width"     (g_value_int width)
+                   "height"    (g_value_int height)
+                   "framerate" (g_value_fraction framerate 1)))))
+            (g_object_set src
+              "is-live"     (g_value_boolean #t)
+              "stream-type" (g_value_int GST_APP_STREAM_TYPE_STREAM)
+              "format"      (g_value_int GST_FORMAT_TIME))
+            (gst_element_set_state pipeline GST_STATE_PLAYING)
+            (set! output-buffer buffer)
+            (set! output-info info)
+            (set! output-pipeline pipeline)
+            (set! output-src src)
+            (set! output-sink sink)
+            (set! output? #t))))))
   
   
   (method (stop-output)
     (when output?
       (gst_element_set_state output-pipeline GST_STATE_NULL)
       (gst_object_unref output-pipeline)
+      (set! output-info #f)
       (set! output-buffer #f)
       (set! output-pipeline #f)
-      (set! output-appsrc #f)
-      (set! output-appsink #f)
+      (set! output-src #f)
+      (set! output-sink #f)
       (set! output? #f)))
+  
+  
+  ;;;
+  ;;;; Process
+  ;;;
   
   
   (method (process-video)
     (when (client?)
-      (when video?
-        (let ((size (gst_app_sink_read input-appsink input-buffer)))
+      (when input?
+        (let ((size (gst_app_sink_read input-sink input-buffer input-info)))
           (when (/= size -1)
-            (send-client-video~ (client-tier) (subu8vector input-buffer 0 size)))))
+            (let ((timestamp (u64vector-ref input-info 0))
+                  (duration (u64vector-ref input-info 1)))
+              (when video-debug?
+                (terminal 'encoded size))
+              (send-client-video~ (client-tier) (subu8vector input-buffer 0 size) timestamp duration)))))
       (when output?
-        (let ((size (gst_app_sink_read output-appsink output-buffer)))
+        (let ((size (gst_app_sink_read output-sink output-buffer output-info)))
           (when (/= size -1)
-            (terminal 'decoded size)
-            @w
-            (display-server-video mega-hack-id output-buffer)))))))
+            (let ((timestamp (u64vector-ref output-info 0))
+                  (duration (u64vector-ref output-info 1)))
+              (when video-debug?
+                (terminal 'decoded size))
+              (display-server-video mega-hack-id output-buffer timestamp duration))))))))
 
 
 ;;;
@@ -227,17 +299,17 @@
   #f)
 
 
-(definition public (write-server-video id bytes)
-  @w (
-  (terminal (u8vector-length bytes))
+(definition public (write-server-video id bytes timestamp duration)
   (let ((video (current-video)))
     (start-output~ video)
     (set! mega-hack-id id)
-    (let ((mega-hack-appsrc (get-output-appsrc~ video)))
-      (gst_app_src_write mega-hack-appsrc bytes (u8vector-length bytes) (gst_clock_get_time (gst_pipeline_get_clock (get-output-pipeline~ video))))))))
+    (let ((mega-hack-appsrc (get-output-src~ video)))
+      (when video-debug?
+        (terminal 'inject (u8vector-length bytes)))
+      (gst_app_src_write3 mega-hack-appsrc bytes (u8vector-length bytes) timestamp duration))))
 
 
-(definition public (display-server-video id bytes)
+(definition public (display-server-video id bytes timestamp duration)
   (define (update-texture texture)
     (define (add-overlay)
       (if (not frame-count)

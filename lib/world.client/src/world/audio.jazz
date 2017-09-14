@@ -14,31 +14,34 @@
 (module world.audio jazz
 
 
-(import @convert (jazz.sound)
+(import (jazz.graphic)
+        (jazz.gstreamer)
         (jazz.syntax (phase syntax))
         (world)
         (world.autoload)
+        (world.billboard)
         (world.configure)
+        (world.foreign.gstreamer)
+        (world.geometry)
+        (world.id)
+        (world.quad-texture)
         (world.settings)
+        (world.stream)
         (world.syntax (phase syntax))
         (world.task))
 
 
-@convert
-(definition default-rate
-  44100)
+(definition audio-codec
+  (world-setting 'world.audio-codec 'vorbis))
 
-@convert
-(definition default-format
-  SoundIoFormatFloat32NE)
 
-@convert
-(definition default-channels
-  2)
+(definition audio-debug?
+  (world-setting 'world.audio-debug? #f))
 
-@convert
-(definition default-latency
-  .2)
+
+(definition protected (start-audio)
+  (when (and (client?) (world-setting 'world.audio-input? #f))
+    (start-input~ (current-audio))))
 
 
 ;;;
@@ -63,21 +66,21 @@
 
 
 ;;;
-;;;; Input
+;;;; Audio
 ;;;
 
 
 (class World-Audio extends Object
   
   
-  (slot audio? <bool>     initialize #f accessors generate)
-  (slot buffer <u8vector> initialize #f accessors generate)
-  
-  
-  (method override (initialize)
-    (set! audio? (world-setting 'world.audio? #f))
-    (when (and audio? (client?))
-      (start-audio)))
+  (slot input?          <bool>      initialize #f accessors generate)
+  (slot input-pipeline              initialize #f accessors generate)
+  (slot input-sink                  initialize #f accessors generate)
+  (slot input-buffer    <u8vector>  initialize #f accessors generate)
+  (slot input-info      <u64vector> initialize #f accessors generate)
+  (slot output?         <bool>      initialize #f accessors generate)
+  (slot output-pipeline             initialize #f accessors generate)
+  (slot output-src                  initialize #f accessors generate)
   
   
   ;;;
@@ -86,7 +89,98 @@
   
   
   (method (on-toggle-audio evt)
-    (toggle-audio))
+    (toggle-input))
+  
+  
+  ;;;
+  ;;;; Input
+  ;;;
+  
+  
+  (method (toggle-input)
+    (when (client?)
+      (let ((world (current-world)))
+        (if (not input?)
+            (start-input)
+          (stop-input))
+        (update-parameter~ world 'audio)
+        (display-on/off~ world "Audio" input?))))
+  
+  
+  (method (start-input)
+    (unless input?
+      (init-gstreamer)
+      (let ((codec audio-codec))
+        (let ((pipeline (gst-launch "autoaudiosrc format=F32LE layout=interleaved rate=8000 channels=2 name=src"
+                                    (and (eq? codec 'opus) (tie "avenc_opus name=enc"))
+                                    (and (eq? codec 'vorbis) (tie "vorbisenc name=enc"))
+                                    "appsink name=sink")))
+          (gst_object_set_name pipeline "input")
+          (let ((sink (gst_bin_get_by_name pipeline "sink"))
+                (buffer (make-u8vector 4096))
+                (info (make-u64vector 2)))
+            (gst_element_set_state pipeline GST_STATE_PLAYING)
+            (set! input-buffer buffer)
+            (set! input-info info)
+            (set! input-pipeline pipeline)
+            (set! input-sink sink)
+            (set! input? #t))))))
+  
+  
+  (method (stop-input)
+    (when input?
+      (gst_element_set_state input-pipeline GST_STATE_NULL)
+      (gst_object_unref input-pipeline)
+      (set! input-info #f)
+      (set! input-buffer #f)
+      (set! input-pipeline #f)
+      (set! input-sink #f)
+      (set! input? #f)))
+  
+  
+  ;;;
+  ;;;; Output
+  ;;;
+  
+  
+  (method (start-output)
+    (unless output?
+      (init-gstreamer)
+      (let ((codec audio-codec))
+        (let ((pipeline (gst-launch (tie "appsrc name=src")
+                                    (and (eq? codec 'opus) "avdec_opus name=dec")
+                                    (and (eq? codec 'vorbis) "vorbisdec name=dec")
+                                    (tie "autoaudiosink name=sink"))))
+          (gst_object_set_name pipeline "output")
+          (let ((src (gst_bin_get_by_name pipeline "src")))
+            (case codec
+              ((vorbis)
+               (gst_app_src_set_caps src
+                 (gst_caps "audio/x-vorbis")))
+              (else
+               (gst_app_src_set_caps src
+                 (gst_caps "audio/x-raw"
+                   "format"   (g_value_string "F32LE")
+                   "layout"   (g_value_string "interleaved")
+                   "rate"     (g_value_int 8000)
+                   "channels" (g_value_int 2)))))
+            (g_object_set src
+              "is-live"     (g_value_boolean #t)
+              "stream-type" (g_value_int GST_APP_STREAM_TYPE_STREAM)
+              "format"      (g_value_int GST_FORMAT_TIME))
+            (gst_element_set_state pipeline GST_STATE_PLAYING)
+            (set! output-pipeline pipeline)
+            (set! output-src src)
+            (set! output? #t))))))
+  
+  
+  (method (stop-output)
+    (when output?
+      (gst_element_set_state output-pipeline GST_STATE_NULL)
+      (gst_object_unref output-pipeline)
+      (set! output-pipeline #f)
+      (set! output-src #f)
+      (set! output? #f)))
   
   
   ;;;
@@ -94,46 +188,16 @@
   ;;;
   
   
-  (method (toggle-audio)
-    (when (client?)
-      (let ((world (current-world)))
-        (if (not audio?)
-            (start-audio)
-          (stop-audio))
-        (update-parameter~ world 'audio)
-        (display-on/off~ world "Audio" audio?))))
-  
-  
-  (method (start-audio)
-    @convert
-    (unless audio?
-      (startup-sound)
-      (let ((in-device (sound-default-input-device))
-            (rate default-rate)
-            (format default-format)
-            (layout (sound-get-default-layout default-channels))
-            (latency default-latency))
-        (start-sound-input in-device rate format layout latency)
-        (set! buffer (make-u8vector (sound-input-ring-capacity)))
-        (set! audio? #t))))
-  
-  
-  (method (stop-audio)
-    @convert
-    (when audio?
-      (stop-sound-input)
-      (set! buffer #f)
-      (set! audio? #f)))
-  
-  
   (method (process-audio)
-    @convert
-    (when (and audio? (client?))
-      (let ((read (sound-read-input-ring buffer)))
-        (when (> read 0)
-          (if (local?)
-              (write-server-audio (get-id~ (current-me)) (subu8vector buffer 0 read))
-            (send-client-audio~ (client-tier) (subu8vector buffer 0 read))))))))
+    (when (client?)
+      (when input?
+        (let ((size (gst_app_sink_read input-sink input-buffer input-info)))
+          (when (/= size -1)
+            (let ((timestamp (u64vector-ref input-info 0))
+                  (duration (u64vector-ref input-info 1)))
+              (when audio-debug?
+                (terminal 'encoded size))
+              (send-client-audio~ (client-tier) (subu8vector input-buffer 0 size) timestamp duration))))))))
 
 
 ;;;
@@ -141,32 +205,16 @@
 ;;;
 
 
-(definition speaker?
+;; mega hack for quick test
+(definition mega-hack-id
   #f)
 
 
-(definition public (start-speaker)
-  @convert
-  (unless speaker?
-    (startup-sound)
-    (let ((out-device (sound-default-output-device))
-          (rate default-rate)
-          (format default-format)
-          (layout (sound-get-default-layout default-channels))
-          (latency default-latency))
-      (start-sound-output out-device rate format layout latency)
-      (set! speaker? #t))))
-
-
-(definition public (stop-speaker)
-  @convert
-  (when speaker?
-    (stop-sound-output)
-    ;(shutdown-sound)
-    (set! speaker? #f)))
-
-
-(definition public (write-server-audio id bytes)
-  @convert (
-  (start-speaker)
-  (sound-write-output-ring bytes (u8vector-length bytes)))))
+(definition public (write-server-audio id bytes timestamp duration)
+  (let ((audio (current-audio)))
+    (start-output~ audio)
+    (set! mega-hack-id id)
+    (let ((mega-hack-appsrc (get-output-src~ audio)))
+      (when audio-debug?
+        (terminal 'inject (u8vector-length bytes)))
+      (gst_app_src_write3 mega-hack-appsrc bytes (u8vector-length bytes) timestamp duration)))))
