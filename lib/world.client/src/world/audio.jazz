@@ -39,6 +39,11 @@
   (world-setting 'world.audio-debug? #f))
 
 
+;;;
+;;;; Start
+;;;
+
+
 (definition protected (start-audio)
   (when (and (client?) (world-setting 'world.audio-input? #f))
     (start-input~ (current-audio))))
@@ -59,10 +64,15 @@
             (let ((elapse (- time previous)))
               (unless (stopping?~ task)
                 (site (audio on?: #t)
-                  (process-audio~ audio)))
+                  (process-audio)))
               (let ((duration (- (current-seconds) time)))
                 (task-sleep task audio-period duration exit))
               (iter time))))))))
+
+
+(definition (process-audio)
+  (when (client?)
+    (process-input~ (current-audio))))
 
 
 ;;;
@@ -73,28 +83,15 @@
 (class World-Audio extends Object
   
   
-  (slot input?          <bool>      initialize #f accessors generate)
-  (slot input-pipeline              initialize #f accessors generate)
-  (slot input-sink                  initialize #f accessors generate)
-  (slot input-buffer    <u8vector>  initialize #f accessors generate)
-  (slot input-info      <u64vector> initialize #f accessors generate)
-  (slot output?         <bool>      initialize #f accessors generate)
-  (slot output-pipeline             initialize #f accessors generate)
-  (slot output-src                  initialize #f accessors generate)
-  
-  
-  ;;;
-  ;;;; Events
-  ;;;
+  (slot input?   <bool>      initialize #f accessors generate)
+  (slot pipeline             initialize #f accessors generate)
+  (slot sink                 initialize #f accessors generate)
+  (slot buffer   <u8vector>  initialize #f accessors generate)
+  (slot info     <u64vector> initialize #f accessors generate)
   
   
   (method (on-toggle-audio evt)
     (toggle-input))
-  
-  
-  ;;;
-  ;;;; Input
-  ;;;
   
   
   (method (toggle-input)
@@ -120,27 +117,58 @@
                 (buffer (make-u8vector 4096))
                 (info (make-u64vector 2)))
             (gst_element_set_state pipeline GST_STATE_PLAYING)
-            (set! input-buffer buffer)
-            (set! input-info info)
-            (set! input-pipeline pipeline)
-            (set! input-sink sink)
+            (set! buffer~self buffer)
+            (set! info~self info)
+            (set! pipeline~self pipeline)
+            (set! sink~self sink)
             (set! input? #t))))))
   
   
   (method (stop-input)
     (when input?
-      (gst_element_set_state input-pipeline GST_STATE_NULL)
-      (gst_object_unref input-pipeline)
-      (set! input-info #f)
-      (set! input-buffer #f)
-      (set! input-pipeline #f)
-      (set! input-sink #f)
+      (gst_element_set_state pipeline GST_STATE_NULL)
+      (gst_object_unref pipeline)
+      (set! info #f)
+      (set! buffer #f)
+      (set! pipeline #f)
+      (set! sink #f)
       (set! input? #f)))
   
   
-  ;;;
-  ;;;; Output
-  ;;;
+  (method (process-input)
+    (when input?
+      (let ((size (gst_app_sink_read sink buffer info)))
+        (when (/= size -1)
+          (let ((timestamp (u64vector-ref info 0))
+                (duration (u64vector-ref info 1)))
+            (when audio-debug?
+              (terminal 'audio 'input 'send size))
+            (send-client-audio~ (client-tier) (subu8vector buffer 0 size) timestamp duration)))))))
+
+
+;;;
+;;;; Output
+;;;
+
+
+(class World-Audio-Output extends Object
+  
+  
+  (slot id              initialize #f accessors generate)
+  (slot output?  <bool> initialize #f accessors generate)
+  (slot pipeline        initialize #f accessors generate)
+  (slot src             initialize #f accessors generate)
+  
+  
+  (method override (initialize id)
+    (nextmethod)
+    (set! id~self id))
+  
+  
+  (method override (print output readably)
+    (print-unreadable self output
+      (lambda (output)
+        (format output "{a}" id))))
   
   
   (method (start-output)
@@ -169,52 +197,43 @@
               "stream-type" (g_value_int GST_APP_STREAM_TYPE_STREAM)
               "format"      (g_value_int GST_FORMAT_TIME))
             (gst_element_set_state pipeline GST_STATE_PLAYING)
-            (set! output-pipeline pipeline)
-            (set! output-src src)
+            (set! pipeline~self pipeline)
+            (set! src~self src)
             (set! output? #t))))))
   
   
   (method (stop-output)
     (when output?
-      (gst_element_set_state output-pipeline GST_STATE_NULL)
-      (gst_object_unref output-pipeline)
-      (set! output-pipeline #f)
-      (set! output-src #f)
+      (gst_element_set_state pipeline GST_STATE_NULL)
+      (gst_object_unref pipeline)
+      (set! pipeline #f)
+      (set! src #f)
       (set! output? #f)))
   
   
-  ;;;
-  ;;;; Process
-  ;;;
-  
-  
-  (method (process-audio)
-    (when (client?)
-      (when input?
-        (let ((size (gst_app_sink_read input-sink input-buffer input-info)))
-          (when (/= size -1)
-            (let ((timestamp (u64vector-ref input-info 0))
-                  (duration (u64vector-ref input-info 1)))
-              (when audio-debug?
-                (terminal 'encoded size))
-              (send-client-audio~ (client-tier) (subu8vector input-buffer 0 size) timestamp duration))))))))
+  (method (receive-output bytes timestamp duration)
+    (when audio-debug?
+      (terminal 'audio 'output 'receive (u8vector-length bytes)))
+    (gst_app_src_write3 src bytes (u8vector-length bytes) timestamp duration)))
 
 
 ;;;
-;;;; Output
+;;;; Outputs
 ;;;
 
 
-;; mega hack for quick test
-(definition mega-hack-id
-  #f)
+(definition audio-outputs
+  (make-table test: equal?))
+
+
+(definition (cache-audio-output id)
+  (or (table-ref audio-outputs id #f)
+      (let ((output (new World-Audio-Output id)))
+        (table-set! audio-outputs id output)
+        output)))
 
 
 (definition public (receive-server-audio id bytes timestamp duration)
-  (let ((audio (current-audio)))
-    (start-output~ audio)
-    (set! mega-hack-id id)
-    (let ((mega-hack-appsrc (get-output-src~ audio)))
-      (when audio-debug?
-        (terminal 'inject (u8vector-length bytes)))
-      (gst_app_src_write3 mega-hack-appsrc bytes (u8vector-length bytes) timestamp duration)))))
+  (let ((output (cache-audio-output id)))
+    (start-output~ output)
+    (receive-output~ output bytes timestamp duration))))
