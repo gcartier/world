@@ -64,8 +64,18 @@
   (world-setting 'world.video-debug? #f))
 
 
+;;;
+;;;; Kush
+;;;
+
+
 (definition public (kush-gauge width height rate motion)
   (/ (* width height rate motion 0.07) 1000.))
+
+
+;;;
+;;;; Start
+;;;
 
 
 (definition protected (start-video)
@@ -80,57 +90,44 @@
 
 (definition public (video-task task <Task>)
   (declare (proper-tail-calls))
-  (let ((video (current-video)))
-    (with-task task
-      (lambda (exit)
-        (let (iter (previous (current-seconds)))
-          (let ((time (current-seconds)))
-            (let ((elapse (- time previous)))
-              (unless (stopping?~ task)
-                (site (video on?: #t)
-                  (process-video~ video)))
-              (let ((duration (- (current-seconds) time)))
-                (task-sleep task video-period duration exit))
-              (iter time))))))))
+  (with-task task
+    (lambda (exit)
+      (let (iter (previous (current-seconds)))
+        (let ((time (current-seconds)))
+          (let ((elapse (- time previous)))
+            (unless (stopping?~ task)
+              (site (video on?: #t)
+                (process-video)))
+            (let ((duration (- (current-seconds) time)))
+              (task-sleep task video-period duration exit))
+            (iter time)))))))
+
+
+(definition (process-video)
+  (when (client?)
+    (process-input~ (current-video))
+    (iterate-table video-outputs
+      (lambda (id output)
+        (extract-output~ output)))))
 
 
 ;;;
-;;;; Video
+;;;; Input
 ;;;
 
 
 (class World-Video extends Object
   
   
-  (slot input?          <bool>      initialize #f accessors generate)
-  (slot input-pipeline              initialize #f accessors generate)
-  (slot input-sink                  initialize #f accessors generate)
-  (slot input-buffer    <u8vector>  initialize #f accessors generate)
-  (slot input-info      <u64vector> initialize #f accessors generate)
-  (slot output?         <bool>      initialize #f accessors generate)
-  (slot output-pipeline             initialize #f accessors generate)
-  (slot output-src                  initialize #f accessors generate)
-  (slot output-sink                 initialize #f accessors generate)
-  (slot output-buffer   <u8vector>  initialize #f accessors generate)
-  (slot output-info     <u64vector> initialize #f accessors generate)
-  
-  
-  ;;;
-  ;;;; Events
-  ;;;
+  (slot input?   <bool>      initialize #f accessors generate)
+  (slot pipeline             initialize #f accessors generate)
+  (slot sink                 initialize #f accessors generate)
+  (slot buffer   <u8vector>  initialize #f accessors generate)
+  (slot info     <u64vector> initialize #f accessors generate)
   
   
   (method (on-toggle-video evt)
     (toggle-input))
-  
-  
-  (method (on-cycle-layouts evt)
-    (cycle-layouts))
-  
-  
-  ;;;
-  ;;;; Input
-  ;;;
   
   
   (method (toggle-input)
@@ -151,6 +148,8 @@
             (framerate video-framerate)
             (bitrate video-bitrate)
             (codec video-codec))
+        (when video-debug?
+          (terminal 'input 'start))
         (let ((pipeline (gst-launch "avfvideosrc"
                                     "videoscale"
                                     "videoconvert"
@@ -162,27 +161,72 @@
                 (buffer (make-u8vector (* width height 4)))
                 (info (make-u64vector 2)))
             (gst_element_set_state pipeline GST_STATE_PLAYING)
-            (set! input-buffer buffer)
-            (set! input-info info)
-            (set! input-pipeline pipeline)
-            (set! input-sink sink)
+            (set! buffer~self buffer)
+            (set! info~self info)
+            (set! pipeline~self pipeline)
+            (set! sink~self sink)
             (set! input? #t))))))
   
   
   (method (stop-input)
     (when input?
-      (gst_element_set_state input-pipeline GST_STATE_NULL)
-      (gst_object_unref input-pipeline)
-      (set! input-info #f)
-      (set! input-buffer #f)
-      (set! input-pipeline #f)
-      (set! input-sink #f)
+      (when video-debug?
+        (terminal 'input 'stop))
+      (gst_element_set_state pipeline GST_STATE_NULL)
+      (gst_object_unref pipeline)
+      (set! info #f)
+      (set! buffer #f)
+      (set! pipeline #f)
+      (set! sink #f)
       (set! input? #f)))
   
   
-  ;;;
-  ;;;; Output
-  ;;;
+  (method (process-input)
+    (when input?
+      (let ((size (gst_app_sink_read sink buffer info)))
+        (when (/= size -1)
+          (let ((timestamp (u64vector-ref info 0))
+                (duration (u64vector-ref info 1)))
+            (when video-debug?
+              (terminal 'input 'send size))
+            (send-client-video~ (client-tier) (subu8vector buffer 0 size) timestamp duration)))))))
+
+
+;;;
+;;;; Output
+;;;
+
+
+(class World-Video-Output extends Object
+  
+  
+  (slot id                      initialize #f accessors generate)
+  (slot output?     <bool>      initialize #f accessors generate)
+  (slot billboard               initialize #f accessors generate)
+  (slot player                  initialize #f accessors generate)
+  (slot pipeline                initialize #f accessors generate)
+  (slot src                     initialize #f accessors generate)
+  (slot sink                    initialize #f accessors generate)
+  (slot buffer      <u8vector>  initialize #f accessors generate)
+  (slot info        <u64vector> initialize #f accessors generate)
+  (slot frame-count             initialize #f)
+  (slot frame-start             initialize #f)
+  (slot total-size              initialize #f)
+  
+  
+  (method override (initialize id)
+    (nextmethod)
+    (set! id~self id))
+  
+  
+  (method override (print output readably)
+    (print-unreadable self output
+      (lambda (output)
+        (format output "{a}" id))))
+  
+  
+  (method (on-cycle-layouts evt)
+    (cycle-layouts))
   
   
   (method (start-output)
@@ -193,6 +237,8 @@
             (framerate video-framerate)
             (alpha video-alpha)
             (codec video-codec))
+        (when video-debug?
+          (terminal 'output 'start id))
         (let ((pipeline (gst-launch (tie "appsrc name=src")
                                     (and (eq? codec 'h264) (tie "avdec_h264"))
                                     "videoconvert"
@@ -234,113 +280,136 @@
               "stream-type" (g_value_int GST_APP_STREAM_TYPE_STREAM)
               "format"      (g_value_int GST_FORMAT_TIME))
             (gst_element_set_state pipeline GST_STATE_PLAYING)
-            (set! output-buffer buffer)
-            (set! output-info info)
-            (set! output-pipeline pipeline)
-            (set! output-src src)
-            (set! output-sink sink)
+            (set! buffer~self buffer)
+            (set! info~self info)
+            (set! pipeline~self pipeline)
+            (set! src~self src)
+            (set! sink~self sink)
             (set! output? #t))))))
   
   
   (method (stop-output)
     (when output?
-      (gst_element_set_state output-pipeline GST_STATE_NULL)
-      (gst_object_unref output-pipeline)
-      (set! output-info #f)
-      (set! output-buffer #f)
-      (set! output-pipeline #f)
-      (set! output-src #f)
-      (set! output-sink #f)
+      (when video-debug?
+        (terminal 'output 'stop id))
+      (gst_element_set_state pipeline GST_STATE_NULL)
+      (gst_object_unref pipeline)
+      (set! info #f)
+      (set! buffer #f)
+      (set! pipeline #f)
+      (set! src #f)
+      (set! sink #f)
       (set! output? #f)))
   
   
-  ;;;
-  ;;;; Process
-  ;;;
+  (method (receive-output bytes timestamp duration)
+    (when video-debug?
+      (terminal 'output 'receive (u8vector-length bytes)))
+    (gst_app_src_write3 src bytes (u8vector-length bytes) timestamp duration))
   
   
-  (method (process-video)
-    (when (client?)
-      (when input?
-        (let ((size (gst_app_sink_read input-sink input-buffer input-info)))
-          (when (/= size -1)
-            (let ((timestamp (u64vector-ref input-info 0))
-                  (duration (u64vector-ref input-info 1)))
-              (when video-debug?
-                (terminal 'encoded size))
-              (send-client-video~ (client-tier) (subu8vector input-buffer 0 size) timestamp duration)))))
-      (when output?
-        (let ((size (gst_app_sink_read output-sink output-buffer output-info)))
-          (when (/= size -1)
-            (let ((timestamp (u64vector-ref output-info 0))
-                  (duration (u64vector-ref output-info 1)))
-              (when video-debug?
-                (terminal 'decoded size))
-              (display-server-video mega-hack-id output-buffer timestamp duration))))))))
-
-
-;;;
-;;;; Output
-;;;
-
-
-(definition frame-count
-  #f)
-
-(definition frame-start
-  #f)
-
-(definition total-size
-  #f)
-
-
-;; mega hack for quick test
-(definition mega-hack-id
-  #f)
-
-
-(definition public (write-server-video id bytes timestamp duration)
-  (let ((video (current-video)))
-    (start-output~ video)
-    (set! mega-hack-id id)
-    (let ((mega-hack-appsrc (get-output-src~ video)))
-      (when video-debug?
-        (terminal 'inject (u8vector-length bytes)))
-      (gst_app_src_write3 mega-hack-appsrc bytes (u8vector-length bytes) timestamp duration))))
-
-
-(definition public (display-server-video id bytes timestamp duration)
-  (define (update-texture texture)
-    (define (add-overlay)
-      (if (not frame-count)
-          (begin
-            (set! frame-count 1)
-            (set! frame-start (current-seconds))
-            (set! total-size (u8vector-length bytes)))
-        (increase! frame-count)
-        (increase! total-size (u8vector-length bytes))
-        (let ((elapse (- (current-seconds) frame-start)))
-          (let ((rate (/ (cast <fl> frame-count) elapse))
-                (size (/ (cast <fl> total-size) frame-count)))
-            (set-font~ (get-surface~ texture) {Font font-name: tahoma point-size: 24 hint-style: slight hint-metrics: on})
-            (draw-text~ (get-surface~ texture) 5 (- (get-height~ video-resolution) 30) (format "Rate: {r precision: 3}, Size: {a}" rate size) {Color World-Red})))))
+  (method (extract-output)
+    (let ((size (gst_app_sink_read sink buffer info)))
+      (when (/= size -1)
+        (let ((timestamp (u64vector-ref info 0))
+              (duration (u64vector-ref info 1)))
+          (when video-debug?
+            (terminal 'output 'extract size))
+          (display-output buffer timestamp duration)))))
+  
+  
+  (method (display-output bytes timestamp duration)
+    (define (update-texture texture)
+      (define (add-overlay)
+        (if (not frame-count)
+            (begin
+              (set! frame-count 1)
+              (set! frame-start (current-seconds))
+              (set! total-size (u8vector-length bytes)))
+          (increase! frame-count)
+          (increase! total-size (u8vector-length bytes))
+          (let ((elapse (- (current-seconds) frame-start)))
+            (let ((rate (/ (cast <fl> frame-count) elapse))
+                  (size (/ (cast <fl> total-size) frame-count)))
+              (set-font~ (get-surface~ texture) {Font font-name: tahoma point-size: 24 hint-style: slight hint-metrics: on})
+              (draw-text~ (get-surface~ texture) 5 (- (get-height~ video-resolution) 30) (format "Rate: {r precision: 3}, Size: {a}" rate size) {Color World-Red})))))
+      
+      (copy_to_texture bytes (u8vector-length bytes) (get-data~ texture))
+      (when video-overlay?
+        (add-overlay))
+      (map-texture~ texture))
     
-    (copy_to_texture bytes (u8vector-length bytes) (get-data~ texture))
-    (when video-overlay?
-      (add-overlay))
-    (map-texture~ texture))
+    (define (find-texture)
+      (case video-layout
+        ((overhead)
+         (get-texture~ (cache-quad-texture~ (cache-billboard))))
+        ((sidebar fullscreen)
+         (get-texture~ (cache-player {Dimension 320 180})))))
+    
+    (update-texture (find-texture)))
   
-  (case video-layout
-    ((overhead)
-     (let ((player (find-entity id)))
-       (let ((elem (cache-billboard-camera~ player (list (eq? player (current-me))))))
-         (update-texture (get-texture~ (cache-quad-texture~ elem))))))
-    ((sidebar fullscreen)
-     (let ((player (find-entity id)))
-       (let ((view (cache-camera-player~ player (case video-layout
-                                                  ((sidebar) video-resolution @w {Dimension 320 180})
-                                                  ((fullscreen) video-resolution @w {Dimension 1280 720})))))
-         (update-texture (get-texture~ view)))))))
+  
+  (method (render-output)
+    (let ((world (current-world)))
+      (case video-layout
+        ((overhead)
+         )
+        ((sidebar fullscreen)
+         (when billboard
+           (let ((x 0.)
+                 (y 0.)
+                 (h (cast <fl> (get-height~ world.video:video-resolution)) @w 720.))
+             (let ((matrix (make-translation-matrix (vertex x (- (get-height~ world) y h) 0.))))
+               (render-player~ billboard matrix))))))))
+  
+  
+  (method (cache-billboard)
+    (or billboard
+        (let ((player (find-entity id)))
+          (let ((elem (cache-billboard-camera~ player (list (eq? player (current-me))))))
+            (set! billboard elem)
+            elem))))
+  
+  
+  (method (cache-player size)
+    (or player
+        (let ((world (current-world)))
+          (let ((play (world.interface.player:make-world-player 'video world.interface.player:World-Player (get-width~ size) (get-height~ size))))
+            (make-orthographic-matrix! (get-projection-matrix~ player) 0. (get-width~ world) 0. (get-height~ world) 0. 10.)
+            (set! player play)
+            play)))))
+
+
+;;;
+;;;; Outputs
+;;;
+
+
+(definition video-outputs
+  (make-table test: equal?))
+
+
+(definition (cache-video-output id)
+  (or (table-ref video-outputs id #f)
+      (let ((output (create-video-output id)))
+        (table-set! video-outputs id output)
+        output)))
+
+
+(definition (create-video-output id)
+  (new World-Video-Output id))
+
+
+(definition public (receive-server-video id bytes timestamp duration)
+  (let ((output (cache-video-output id)))
+    (start-output~ output)
+    (receive-output~ output bytes timestamp duration)))
+
+
+(definition public (render-video-outputs)
+  (iterate-table video-outputs
+    (lambda (id output)
+      (render-output~ output))))
 
 
 ;;;
@@ -372,7 +441,7 @@
                        (set-render?~ elem #f))))
                  (get-players~ zone))
        (set! video-layout 'fullscreen))
-      ((sidebar)
+      ((fullscreen)
        (for-each (lambda (player)
                    (let ((elem (get-billboard-camera~ player)))
                      (when elem
