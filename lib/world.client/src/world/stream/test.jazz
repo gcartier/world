@@ -60,6 +60,9 @@
 (definition script
   'app)
 
+(definition audio?
+  #f)
+
 ;; none     no codec used
 ;; opus     seems a bug that avenc_opus reports src as unknown/unknown
 ;; vorbis   working
@@ -93,7 +96,7 @@
   30)
 
 (definition video-bitrate
-  4096)
+  2048)
 
 (definition lag
   #f)
@@ -133,6 +136,7 @@
         (else #f)))
     
     (set! script (or (symbol-argument (get-option "script" options)) script))
+    (set! audio? (get-option "audio" options #f))
     (set! audio-codec (or (symbol-argument (get-option "audio-codec" options)) audio-codec))
     (set! video-size (or (size-argument (get-option "size" options)) video-size))
     (set! video-codec (or (symbol-argument (get-option "codec" options)) video-codec))
@@ -284,35 +288,36 @@
   (let ((audio-pipe (open-vector))
         (video-pipe (open-vector)))
     ;; audio input
-    (thread-start!
-      (new-thread
-        (lambda ()
-          (let ((codec audio-codec))
-            (let ((pipeline (gst-launch "autoaudiosrc format=F32LE layout=interleaved rate=8000 channels=2 name=src"
-                                        (and (eq? codec 'opus) (tie "avenc_opus name=enc"))
-                                        (and (eq? codec 'vorbis) (tie "vorbisenc name=enc"))
-                                        "appsink name=sink")))
-              (gst_object_set_name pipeline "input")
-              (let ((sink (gst_bin_get_by_name pipeline "sink"))
-                    (process-messages (pipeline-messages-processor pipeline debug?)))
-                (when debug?
-                  (when (neq? codec 'none)
-                    (gst_monitor pipeline monitor "enc" "identity" "dec"))
-                  (gst_monitor pipeline monitor "sink"))
-                (gst_element_set_state pipeline GST_STATE_PLAYING)
-                (let ((buffer (make-u8vector 4096))
-                      (info (make-u64vector 2)))
-                  (let (loop)
-                    (let ((size (gst_app_sink_read sink buffer info)))
-                      (when (/= size -1)
-                        (let ((timestamp (u64vector-ref info 0))
-                              (duration (u64vector-ref info 1)))
-                          (write (list (u8vector-copy buffer) size timestamp duration) audio-pipe)
-                          (force-output audio-pipe))))
-                    (process-messages)
-                    (sleep .001)
-                    (loop)))))))
-        'audio-input))
+    (when audio?
+      (thread-start!
+        (new-thread
+          (lambda ()
+            (let ((codec audio-codec))
+              (let ((pipeline (gst-launch "autoaudiosrc format=F32LE layout=interleaved rate=8000 channels=2 name=src"
+                                          (and (eq? codec 'opus) (tie "avenc_opus name=enc"))
+                                          (and (eq? codec 'vorbis) (tie "vorbisenc name=enc"))
+                                          "appsink name=sink")))
+                (gst_object_set_name pipeline "input")
+                (let ((sink (gst_bin_get_by_name pipeline "sink"))
+                      (process-messages (pipeline-messages-processor pipeline debug?)))
+                  (when debug?
+                    (when (neq? codec 'none)
+                      (gst_monitor pipeline monitor "enc" "identity" "dec"))
+                    (gst_monitor pipeline monitor "sink"))
+                  (gst_element_set_state pipeline GST_STATE_PLAYING)
+                  (let ((buffer (make-u8vector 4096))
+                        (info (make-u64vector 2)))
+                    (let (loop)
+                      (let ((size (gst_app_sink_read sink buffer info)))
+                        (when (/= size -1)
+                          (let ((timestamp (u64vector-ref info 0))
+                                (duration (u64vector-ref info 1)))
+                            (write (list (u8vector-copy buffer) size timestamp duration) audio-pipe)
+                            (force-output audio-pipe))))
+                      (process-messages)
+                      (sleep .001)
+                      (loop)))))))
+          'audio-input)))
     ;; video input
     (thread-start!
       (new-thread
@@ -353,45 +358,46 @@
     (when lag
       (sleep lag))
     ;; audio output
-    (thread-start!
-      (new-thread
-        (lambda ()
-          (let ((codec audio-codec))
-            (let ((pipeline (gst-launch "appsrc name=src"
-                                        (and (eq? codec 'opus) "avdec_opus name=dec")
-                                        (and (eq? codec 'vorbis) "vorbisdec name=dec")
-                                        "autoaudiosink name=sink")))
-              (gst_object_set_name pipeline "output")
-              (let ((src (gst_bin_get_by_name pipeline "src"))
-                    (process-messages (pipeline-messages-processor pipeline debug?)))
-                (when debug?
-                  (when (neq? codec 'none)
-                    (gst_monitor pipeline monitor "enc" "identity" "dec"))
-                  (gst_monitor pipeline monitor "sink"))
-                (case codec
-                  ((vorbis)
-                   (gst_app_src_set_caps src
-                     (gst_caps "audio/x-vorbis")))
-                  (else
-                   (gst_app_src_set_caps src
-                     (gst_caps "audio/x-raw"
-                       "format"   (g_value_string "F32LE")
-                       "layout"   (g_value_string "interleaved")
-                       "rate"     (g_value_int 8000)
-                       "channels" (g_value_int 2)))))
-                (g_object_set src
-                  "is-live"     (g_value_boolean #t)
-                  "stream-type" (g_value_int GST_APP_STREAM_TYPE_STREAM)
-                  "format"      (g_value_int GST_FORMAT_TIME))
-                (gst_element_set_state pipeline GST_STATE_PLAYING)
-                (process-messages)
-                (let (loop)
-                  (let ((info (read audio-pipe)))
-                    (bind (buffer size timestamp duration) info
-                      (gst_app_src_write3 src buffer size timestamp duration)))
+    (when audio?
+      (thread-start!
+        (new-thread
+          (lambda ()
+            (let ((codec audio-codec))
+              (let ((pipeline (gst-launch "appsrc name=src"
+                                          (and (eq? codec 'opus) "avdec_opus name=dec")
+                                          (and (eq? codec 'vorbis) "vorbisdec name=dec")
+                                          "autoaudiosink name=sink")))
+                (gst_object_set_name pipeline "output")
+                (let ((src (gst_bin_get_by_name pipeline "src"))
+                      (process-messages (pipeline-messages-processor pipeline debug?)))
+                  (when debug?
+                    (when (neq? codec 'none)
+                      (gst_monitor pipeline monitor "enc" "identity" "dec"))
+                    (gst_monitor pipeline monitor "sink"))
+                  (case codec
+                    ((vorbis)
+                     (gst_app_src_set_caps src
+                                           (gst_caps "audio/x-vorbis")))
+                    (else
+                     (gst_app_src_set_caps src
+                       (gst_caps "audio/x-raw"
+                         "format"   (g_value_string "F32LE")
+                         "layout"   (g_value_string "interleaved")
+                         "rate"     (g_value_int 8000)
+                         "channels" (g_value_int 2)))))
+                  (g_object_set src
+                    "is-live"     (g_value_boolean #t)
+                    "stream-type" (g_value_int GST_APP_STREAM_TYPE_STREAM)
+                    "format"      (g_value_int GST_FORMAT_TIME))
+                  (gst_element_set_state pipeline GST_STATE_PLAYING)
                   (process-messages)
-                  (loop))))))
-        'audio-output))
+                  (let (loop)
+                    (let ((info (read audio-pipe)))
+                      (bind (buffer size timestamp duration) info
+                        (gst_app_src_write3 src buffer size timestamp duration)))
+                    (process-messages)
+                    (loop))))))
+          'audio-output)))
     ;; video output
     (thread-start!
       (new-thread
