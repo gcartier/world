@@ -40,79 +40,123 @@
 
 
 ;;;
-;;;; Start
-;;;
-
-
-(definition protected (start-audio)
-  (when (and (client?) (world-setting 'world.audio-input? #f))
-    (start-input~ (current-audio))))
-
-
-(definition protected (stop-audio)
-  (stop-input~ (current-audio))
-  (iterate-table audio-outputs
-    (lambda (id output)
-      (stop-output~ output))))
-
-
-;;;
-;;;; Task
-;;;
-
-
-(definition public (audio-task task <Task>)
-  (declare (proper-tail-calls))
-  (let ((audio (current-audio)))
-    (with-task task
-      (lambda (exit)
-        (let (iter (previous (current-seconds)))
-          (let ((time (current-seconds)))
-            (let ((elapse (- time previous)))
-              (unless (stopping?~ task)
-                (site (audio on?: #t)
-                  (process-audio)))
-              (let ((duration (- (current-seconds) time)))
-                (task-sleep task audio-period duration exit))
-              (iter time))))))))
-
-
-(definition (process-audio)
-  (when (client?)
-    (process-input~ (current-audio))))
-
-
-;;;
 ;;;; Audio
 ;;;
+
+
+(definition protected (new-world-audio)
+  (let ((mic-src (new Mic-Src))
+        (server-sink (new Stream-Sink
+                       consumer: (lambda (buffer timestamp duration)
+                                   (send-client-audio~ (client-tier) buffer timestamp duration)))))
+    (new World-Audio input: (pipeline mic-src server-sink))))
 
 
 (class World-Audio extends Object
   
   
-  (slot input?   <bool>      initialize #f accessors generate)
-  (slot pipeline             initialize #f accessors generate)
-  (slot sink                 initialize #f accessors generate)
-  (slot buffer   <u8vector>  initialize #f accessors generate)
-  (slot info     <u64vector> initialize #f accessors generate)
+  (slot input   getter generate)
+  (slot outputs getter generate)
+  
+  
+  (method override (initialize (input: input #f))
+    (nextmethod)
+    (set! input~self input)
+    (set! outputs~self (make-table test: equal?)))
+  
+  
+  (method (autostart)
+    (when (world-setting 'world.audio-autostart? #f)
+      (start)))
+  
+  
+  (method (start)
+    (start~ input))
+  
+  
+  (method (stop)
+    (stop~ input)
+    (iterate-table outputs
+      (lambda (id output)
+        (stop~ output))))
+  
+  
+  ;;;
+  ;;;; Input
+  ;;;
   
   
   (method (on-toggle-audio evt)
-    (toggle-input))
+    (toggle))
   
   
-  (method (toggle-input)
+  (method (toggle)
     (when (client?)
       (let ((world (current-world)))
-        (if (not input?)
-            (start-input)
-          (stop-input))
+        (if (stopped?~ input)
+            (start)
+          (stop))
         (update-parameter~ world 'audio)
-        (display-on/off~ world "Audio" input?))))
+        (display-on/off~ world "Audio" (playing?~ input)))))
   
   
-  (method (start-input)
-    (unless input?
+  ;;;
+  ;;;; Output
+  ;;;
+  
+  
+  (method (cache-output id)
+    (or (table-ref outputs id #f)
+        (let ((output (new-output)))
+          (table-set! outputs id output)
+          output)))
+  
+  (method (find-output id)
+    (table-ref outputs id #f))
+  
+  
+  (method (new-output)
+    (new Audio-Sink
+      codec: audio-codec))
+  
+  
+  (method (receive-server-audio id buffer timestamp duration)
+    (if (not buffer)
+        (let ((output (find-output id)))
+          (when output
+            (table-clear outputs id)
+            (stop~ output)))
+      (let ((output (cache-output id)))
+        (start~ output)
+        (consume~ output buffer timestamp duration)))))
+
+
+;;;
+;;;; Mic-Src
+;;;
+
+
+(class Mic-Src extends Stream-Src
+  
+  
+  (slot pipeline             initialize #f accessors generate)
+  (slot appsink              initialize #f accessors generate)
+  (slot data     <u8vector>  initialize #f accessors generate)
+  (slot info     <u64vector> initialize #f accessors generate)
+  (slot task                 initialize #f accessors generate)
+  
+  
+  (method override (start)
+    (define (task-start)
+      (let ((procedure
+              (lambda (task)
+                (mic-task task))))
+        (let ((task (new Task 'mic procedure)))
+          (start-task task)
+          (thread-base-priority-set! (get-thread~ task) audio-priority)
+          task)))
+    
+    (unless (eq? state 'playing)
       (init-gstreamer)
       (let ((codec audio-codec))
         (let ((pipeline (gst-launch "autoaudiosrc format=F32LE layout=interleaved rate=8000 channels=2 name=src"
@@ -120,38 +164,64 @@
                                     (and (eq? codec 'vorbis) (tie "vorbisenc name=enc"))
                                     "appsink name=sink")))
           (gst_object_set_name pipeline "input")
-          (let ((sink (gst_bin_get_by_name pipeline "sink"))
-                (buffer (make-u8vector 4096))
+          (let ((appsink (gst_bin_get_by_name pipeline "sink"))
+                (data (make-u8vector 4096))
                 (info (make-u64vector 2)))
             (gst_element_set_state pipeline GST_STATE_PLAYING)
-            (set! buffer~self buffer)
+            (set! data~self data)
             (set! info~self info)
             (set! pipeline~self pipeline)
-            (set! sink~self sink)
-            (set! input? #t))))))
+            (set! appsink~self appsink)
+            (set! task~self (task-start))
+            (set! state 'playing))))))
   
   
-  (method (stop-input)
-    (when input?
+  (method override (stop)
+    (define (task-stop)
+      (cease-task task))
+    
+    (when (eq? state 'playing)
       (gst_element_set_state pipeline GST_STATE_NULL)
       (gst_object_unref pipeline)
       (set! info #f)
-      (set! buffer #f)
+      (set! data #f)
       (set! pipeline #f)
-      (set! sink #f)
-      (set! input? #f)
-      (send-client-audio~ (client-tier) #f #f #f)))
+      (set! appsink #f)
+      (set! task #f)
+      (set! state #f)))
   
   
-  (method (process-input)
-    (when input?
-      (let ((size (gst_app_sink_read sink buffer info)))
+  (method (mic-task task)
+    (declare (proper-tail-calls))
+    (with-task task
+      (lambda (exit)
+        (let (iter (previous (current-seconds)))
+          ;; not 100% correct if preempted before task-mutex
+          (let ((time (current-seconds)))
+            (with-task-mutex
+              (lambda ()
+                (unless (stopping?~ task)
+                  (let ((elapse (- time previous))
+                        (max-elapse 10.))
+                    ;; ignore ridiculous elapses like
+                    ;; coming back from computer sleep
+                    (unless (> elapse max-elapse)
+                      (let ((history (current-history)))
+                        (unless (get-paused?~ history)
+                          (process))))))))
+            (let ((duration (- (current-seconds) time)))
+              (task-sleep task audio-period duration exit))
+            (iter time))))))
+  
+  
+  (method override (process)
+    (when (eq? state 'playing)
+      (let ((size (gst_app_sink_read appsink data info)))
         (when (/= size -1)
-          (let ((timestamp (u64vector-ref info 0))
+          (let ((buffer (subu8vector data 0 size))
+                (timestamp (u64vector-ref info 0))
                 (duration (u64vector-ref info 1)))
-            (when audio-debug?
-              (terminal 'audio 'input 'send size))
-            (send-client-audio~ (client-tier) (subu8vector buffer 0 size) timestamp duration)))))))
+            (consume~ sink buffer timestamp duration)))))))
 
 
 ;;;
@@ -159,97 +229,57 @@
 ;;;
 
 
-(class World-Audio-Output extends Object
+(class Audio-Sink extends Stream-Sink
   
   
-  (slot id              initialize #f accessors generate)
-  (slot output?  <bool> initialize #f accessors generate)
-  (slot pipeline        initialize #f accessors generate)
-  (slot src             initialize #f accessors generate)
+  (slot codec    initialize #f accessors generate)
+  (slot pipeline initialize #f accessors generate)
+  (slot appsrc   initialize #f accessors generate)
   
   
-  (method override (initialize id)
+  (method override (initialize (codec: codec #f))
     (nextmethod)
-    (set! id~self id))
+    (set! codec~self codec))
   
   
-  (method override (print output readably)
-    (print-unreadable self output
-      (lambda (output)
-        (format output "{a}" id))))
-  
-  
-  (method (start-output)
-    (unless output?
+  (method override (start)
+    (unless (eq? state 'playing)
       (init-gstreamer)
-      (let ((codec audio-codec))
-        (let ((pipeline (gst-launch (tie "appsrc name=src")
-                                    (and (eq? codec 'opus) "avdec_opus name=dec")
-                                    (and (eq? codec 'vorbis) "vorbisdec name=dec")
-                                    (tie "autoaudiosink name=sink"))))
-          (gst_object_set_name pipeline "output")
-          (let ((src (gst_bin_get_by_name pipeline "src")))
-            (case codec
-              ((vorbis)
-               (gst_app_src_set_caps src
-                 (gst_caps "audio/x-vorbis")))
-              (else
-               (gst_app_src_set_caps src
-                 (gst_caps "audio/x-raw"
-                   "format"   (g_value_string "F32LE")
-                   "layout"   (g_value_string "interleaved")
-                   "rate"     (g_value_int 8000)
-                   "channels" (g_value_int 2)))))
-            (g_object_set src
-              "is-live"     (g_value_boolean #t)
-              "stream-type" (g_value_int GST_APP_STREAM_TYPE_STREAM)
-              "format"      (g_value_int GST_FORMAT_TIME))
-            (gst_element_set_state pipeline GST_STATE_PLAYING)
-            (set! pipeline~self pipeline)
-            (set! src~self src)
-            (set! output? #t))))))
+      (let ((pipeline (gst-launch (tie "appsrc name=src")
+                                  (and (eq? codec 'opus) "avdec_opus name=dec")
+                                  (and (eq? codec 'vorbis) "vorbisdec name=dec")
+                                  (tie "autoaudiosink name=sink"))))
+        (gst_object_set_name pipeline "output")
+        (let ((appsrc (gst_bin_get_by_name pipeline "src")))
+          (case codec
+            ((vorbis)
+             (gst_app_src_set_caps appsrc
+               (gst_caps "audio/x-vorbis")))
+            (else
+             (gst_app_src_set_caps appsrc
+               (gst_caps "audio/x-raw"
+                 "format"   (g_value_string "F32LE")
+                 "layout"   (g_value_string "interleaved")
+                 "rate"     (g_value_int 8000)
+                 "channels" (g_value_int 2)))))
+          (g_object_set appsrc
+            "is-live"     (g_value_boolean #t)
+            "stream-type" (g_value_int GST_APP_STREAM_TYPE_STREAM)
+            "format"      (g_value_int GST_FORMAT_TIME))
+          (gst_element_set_state pipeline GST_STATE_PLAYING)
+          (set! pipeline~self pipeline)
+          (set! appsrc~self appsrc)
+          (set! state 'playing)))))
   
   
-  (method (stop-output)
-    (when output?
+  (method override (stop)
+    (when (eq? state 'playing)
       (gst_element_set_state pipeline GST_STATE_NULL)
       (gst_object_unref pipeline)
       (set! pipeline #f)
-      (set! src #f)
-      (set! output? #f)))
+      (set! appsrc #f)
+      (set! state #f)))
   
   
-  (method (receive-output bytes timestamp duration)
-    (when audio-debug?
-      (terminal 'audio 'output 'receive (u8vector-length bytes)))
-    (gst_app_src_write3 src bytes (u8vector-length bytes) timestamp duration)))
-
-
-;;;
-;;;; Outputs
-;;;
-
-
-(definition audio-outputs
-  (make-table test: equal?))
-
-
-(definition (cache-audio-output id)
-  (or (table-ref audio-outputs id #f)
-      (let ((output (new World-Audio-Output id)))
-        (table-set! audio-outputs id output)
-        output)))
-
-(definition (find-audio-output id)
-  (table-ref audio-outputs id #f))
-
-
-(definition public (receive-server-audio id bytes timestamp duration)
-  (if (not bytes)
-      (let ((output (find-audio-output id)))
-        (when output
-          (table-clear audio-outputs id)
-          (stop-output~ output)))
-    (let ((output (cache-audio-output id)))
-      (start-output~ output)
-      (receive-output~ output bytes timestamp duration)))))
+  (method override (consume buffer timestamp duration)
+    (gst_app_src_write3 appsrc buffer (u8vector-length buffer) timestamp duration))))
