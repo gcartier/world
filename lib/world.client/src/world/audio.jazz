@@ -75,10 +75,10 @@
   
   
   (method (stop)
-    (stop~ input)
+    (terminate~ input)
     (iterate-table outputs
       (lambda (id output)
-        (stop~ output))))
+        (terminate~ output))))
   
   
   ;;;
@@ -93,9 +93,9 @@
   (method (toggle)
     (when (client?)
       (let ((world (current-world)))
-        (if (stopped?~ input)
-            (start)
-          (stop))
+        (if (playing?~ input)
+            (stop)
+          (start))
         (update-parameter~ world 'audio)
         (display-on/off~ world "Audio" (playing?~ input)))))
   
@@ -105,14 +105,18 @@
   ;;;
   
   
-  (method (cache-output id)
+  (method (find-output id)
+    (table-ref outputs id #f))
+  
+  (method (register-output id output)
+    (table-set! outputs id output))
+  
+  
+  (method (player-output id)
     (or (table-ref outputs id #f)
         (let ((output (new-output)))
           (table-set! outputs id output)
           output)))
-  
-  (method (find-output id)
-    (table-ref outputs id #f))
   
   
   (method (new-output)
@@ -125,8 +129,9 @@
         (let ((output (find-output id)))
           (when output
             (table-clear outputs id)
-            (stop~ output)))
-      (let ((output (cache-output id)))
+            (terminate~ output)))
+      (let ((output (player-output id)))
+        (setup~ output)
         (start~ output)
         (consume~ output buffer timestamp duration)))))
 
@@ -146,7 +151,25 @@
   (slot task                 initialize #f accessors generate)
   
   
-  (method override (start)
+  (method override (setup-element)
+    (nextmethod)
+    (let ((codec audio-codec))
+      (let ((pipeline (gst-launch "autoaudiosrc format=F32LE layout=interleaved rate=8000 channels=2 name=src"
+                                  (and (eq? codec 'opus) (tie "avenc_opus name=enc"))
+                                  (and (eq? codec 'vorbis) (tie "vorbisenc name=enc"))
+                                  "appsink name=sink")))
+        (gst_object_set_name pipeline "mic")
+        (let ((appsink (gst_bin_get_by_name pipeline "sink"))
+              (data (make-u8vector 4096))
+              (info (make-u64vector 2)))
+          (gst_element_set_state pipeline GST_STATE_READY)
+          (set! data~self data)
+          (set! info~self info)
+          (set! pipeline~self pipeline)
+          (set! appsink~self appsink)))))
+  
+  
+  (method override (start-element)
     (define (task-start)
       (let ((procedure
               (lambda (task)
@@ -156,40 +179,30 @@
           (thread-base-priority-set! (get-thread~ task) audio-priority)
           task)))
     
-    (unless (eq? state 'playing)
-      (init-gstreamer)
-      (let ((codec audio-codec))
-        (let ((pipeline (gst-launch "autoaudiosrc format=F32LE layout=interleaved rate=8000 channels=2 name=src"
-                                    (and (eq? codec 'opus) (tie "avenc_opus name=enc"))
-                                    (and (eq? codec 'vorbis) (tie "vorbisenc name=enc"))
-                                    "appsink name=sink")))
-          (gst_object_set_name pipeline "input")
-          (let ((appsink (gst_bin_get_by_name pipeline "sink"))
-                (data (make-u8vector 4096))
-                (info (make-u64vector 2)))
-            (gst_element_set_state pipeline GST_STATE_PLAYING)
-            (set! data~self data)
-            (set! info~self info)
-            (set! pipeline~self pipeline)
-            (set! appsink~self appsink)
-            (set! task~self (task-start))
-            (set! state 'playing))))))
+    (nextmethod)
+    (gst_element_set_state pipeline GST_STATE_PLAYING)
+    (set! task~self (task-start)))
   
   
-  (method override (stop)
+  (method override (stop-element)
     (define (task-stop)
       (cease-task task))
     
-    (when (eq? state 'playing)
-      (gst_element_set_state pipeline GST_STATE_NULL)
-      (gst_object_unref pipeline)
-      (set! info #f)
-      (set! data #f)
-      (set! pipeline #f)
-      (set! appsink #f)
-      (set! task #f)
-      (set! state #f)
-      (consume~ sink #f #f #f)))
+    (nextmethod)
+    (task-stop)
+    (gst_element_set_state pipeline GST_STATE_READY)
+    (set! task #f))
+  
+  
+  (method override (terminate-element)
+    (nextmethod)
+    (gst_element_set_state pipeline GST_STATE_NULL)
+    (gst_object_unref pipeline)
+    (set! info #f)
+    (set! data #f)
+    (set! pipeline #f)
+    (set! appsink #f)
+    (consume~ sink #f #f #f))
   
   
   (method (mic-task task)
@@ -216,13 +229,12 @@
   
   
   (method override (process)
-    (when (eq? state 'playing)
-      (let ((size (gst_app_sink_read appsink data info)))
-        (when (/= size -1)
-          (let ((buffer (subu8vector data 0 size))
-                (timestamp (u64vector-ref info 0))
-                (duration (u64vector-ref info 1)))
-            (consume~ sink buffer timestamp duration)))))))
+    (let ((size (gst_app_sink_read appsink data info)))
+      (when (/= size -1)
+        (let ((buffer (subu8vector data 0 size))
+              (timestamp (u64vector-ref info 0))
+              (duration (u64vector-ref info 1)))
+          (consume~ sink buffer timestamp duration))))))
 
 
 ;;;
@@ -243,43 +255,50 @@
     (set! codec~self codec))
   
   
-  (method override (start)
-    (unless (eq? state 'playing)
-      (init-gstreamer)
-      (let ((pipeline (gst-launch (tie "appsrc name=src")
-                                  (and (eq? codec 'opus) "avdec_opus name=dec")
-                                  (and (eq? codec 'vorbis) "vorbisdec name=dec")
-                                  (tie "autoaudiosink name=sink"))))
-        (gst_object_set_name pipeline "output")
-        (let ((appsrc (gst_bin_get_by_name pipeline "src")))
-          (case codec
-            ((vorbis)
-             (gst_app_src_set_caps appsrc
-               (gst_caps "audio/x-vorbis")))
-            (else
-             (gst_app_src_set_caps appsrc
-               (gst_caps "audio/x-raw"
-                 "format"   (g_value_string "F32LE")
-                 "layout"   (g_value_string "interleaved")
-                 "rate"     (g_value_int 8000)
-                 "channels" (g_value_int 2)))))
-          (g_object_set appsrc
-            "is-live"     (g_value_boolean #t)
-            "stream-type" (g_value_int GST_APP_STREAM_TYPE_STREAM)
-            "format"      (g_value_int GST_FORMAT_TIME))
-          (gst_element_set_state pipeline GST_STATE_PLAYING)
-          (set! pipeline~self pipeline)
-          (set! appsrc~self appsrc)
-          (set! state 'playing)))))
+  (method override (setup-element)
+    (nextmethod)
+    (let ((pipeline (gst-launch (tie "appsrc name=src")
+                                (and (eq? codec 'opus) "avdec_opus name=dec")
+                                (and (eq? codec 'vorbis) "vorbisdec name=dec")
+                                (tie "autoaudiosink name=sink"))))
+      (gst_object_set_name pipeline "output")
+      (let ((appsrc (gst_bin_get_by_name pipeline "src")))
+        (case codec
+          ((vorbis)
+           (gst_app_src_set_caps appsrc
+             (gst_caps "audio/x-vorbis")))
+          (else
+           (gst_app_src_set_caps appsrc
+             (gst_caps "audio/x-raw"
+               "format"   (g_value_string "F32LE")
+               "layout"   (g_value_string "interleaved")
+               "rate"     (g_value_int 8000)
+               "channels" (g_value_int 2)))))
+        (g_object_set appsrc
+          "is-live"     (g_value_boolean #t)
+          "stream-type" (g_value_int GST_APP_STREAM_TYPE_STREAM)
+          "format"      (g_value_int GST_FORMAT_TIME))
+        (gst_element_set_state pipeline GST_STATE_READY)
+        (set! pipeline~self pipeline)
+        (set! appsrc~self appsrc))))
   
   
-  (method override (stop)
-    (when (eq? state 'playing)
-      (gst_element_set_state pipeline GST_STATE_NULL)
-      (gst_object_unref pipeline)
-      (set! pipeline #f)
-      (set! appsrc #f)
-      (set! state #f)))
+  (method override (start-element)
+    (nextmethod)
+    (gst_element_set_state pipeline GST_STATE_PLAYING))
+  
+  
+  (method override (stop-element)
+    (nextmethod)
+    (gst_element_set_state pipeline GST_STATE_READY))
+  
+  
+  (method override (terminate-element)
+    (nextmethod)
+    (gst_element_set_state pipeline GST_STATE_NULL)
+    (gst_object_unref pipeline)
+    (set! pipeline #f)
+    (set! appsrc #f))
   
   
   (method override (consume buffer timestamp duration)

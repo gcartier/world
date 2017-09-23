@@ -14,7 +14,9 @@
 (module world.video jazz
 
 
-(import (jazz.graphic)
+(import (jazz.cairo)
+        (jazz.geometry)
+        (jazz.graphic)
         (jazz.gstreamer)
         (jazz.syntax (phase syntax))
         (world)
@@ -24,6 +26,7 @@
         (world.foreign)
         (world.geometry)
         (world.id)
+        (world.interface.sheet)
         (world.quad-texture)
         (world.settings)
         (world.stream)
@@ -55,6 +58,7 @@
   '(none
     overhead
     sidebar
+    gallery
     fullscreen))
 
 (definition video-layout
@@ -94,14 +98,18 @@
 (class World-Video extends Object
   
   
-  (slot input   getter generate)
-  (slot outputs getter generate)
+  (slot input          getter generate)
+  (slot inputs         getter generate)
+  (slot outputs        getter generate)
+  (slot player-outputs getter generate)
   
   
   (method override (initialize (input: input #f))
     (nextmethod)
     (set! input~self input)
-    (set! outputs~self (make-table test: equal?)))
+    (set! inputs~self (make-table test: equal?))
+    (set! outputs~self (make-table test: equal?))
+    (set! player-outputs '()))
   
   
   (method (autostart)
@@ -114,10 +122,21 @@
   
   
   (method (stop)
-    (stop~ input)
+    (terminate~ input)
+    (iterate-table inputs
+      (lambda (id input)
+        (terminate~ input)))
     (iterate-table outputs
       (lambda (id output)
-        (stop~ output))))
+        (terminate~ output))))
+  
+  
+  (method (resize)
+    (iterate-table outputs
+      (lambda (id output)
+        (when (interface?~ output)
+          (resize~ output))))
+    (layout-gallery))
   
   
   ;;;
@@ -132,63 +151,97 @@
   (method (toggle)
     (when (client?)
       (let ((world (current-world)))
-        (if (stopped?~ input)
-            (start)
-          (stop))
+        (if (playing?~ input)
+            (stop)
+          (start))
         (update-parameter~ world 'video)
         (display-on/off~ world "Video" (playing?~ input)))))
   
   
   ;;;
-  ;;;; Output
+  ;;;; Inputs
   ;;;
   
   
-  (method (cache-output id)
-    (or (table-ref outputs id #f)
-        (let ((output (new-output id)))
-          (table-set! outputs id output)
-          output)))
+  (method (register-input id input)
+    (table-set! inputs id input))
+  
+  
+  (method (close-input id input)
+    (table-clear inputs id)
+    (terminate~ input))
+  
+  
+  ;;;
+  ;;;; Outputs
+  ;;;
+  
   
   (method (find-output id)
     (table-ref outputs id #f))
   
+  (method (register-output id output)
+    (table-set! outputs id output))
   
-  (method (new-output id)
-    (case video-layout
+  
+  (method (player-output id (size: size #f) (resolution: resolution #f) (layout: layout #f) (codec: codec #f))
+    (or (table-ref outputs id #f)
+        (let ((output (new-output id size: size resolution: resolution layout: layout codec: codec)))
+          (table-set! outputs id output)
+          (set! player-outputs (append! player-outputs (list output)))
+          output)))
+  
+  
+  (method (new-output id (size: size #f) (resolution: resolution #f) (layout: layout #f) (codec: codec #f))
+    (case (or layout video-layout)
       ((overhead)
        (new Billboard-Video-Sink id
-         resolution: video-resolution
+         resolution: (or resolution video-resolution)
          framerate: video-framerate
          bitrate: video-bitrate
-         codec: video-codec
+         codec: (or codec video-codec)
          alpha: video-alpha
          overlay?: video-overlay?))
       (else
        (new Sheet-Video-Sink
-         resolution: video-resolution
+         size: size
+         resolution: (or resolution video-resolution)
          framerate: video-framerate
          bitrate: video-bitrate
-         codec: video-codec
+         codec: (or codec video-codec)
          alpha: video-alpha
          overlay?: video-overlay?))))
+  
+  
+  (method (close-output id output)
+    (table-clear outputs id)
+    (set! player-outputs (remove! output player-outputs))
+    (terminate~ output))
   
   
   (method (receive-server-video id buffer timestamp duration)
     (if (not buffer)
         (let ((output (find-output id)))
           (when output
-            (table-clear outputs id)
-            (stop~ output)))
-      (let ((output (cache-output id)))
+            (close-output id output)))
+      (let ((output (player-output id)))
+        (setup~ output)
         (start~ output)
         (consume~ output buffer timestamp duration))))
   
   
-  (method (render-outputs)
+  (method (render-scene)
     (iterate-table outputs
       (lambda (id output)
-        (render~ output))))
+        (unless (interface?~ output)
+          (render~ output)))))
+  
+  
+  (method (render-interface)
+    (iterate-table outputs
+      (lambda (id output)
+        (when (interface?~ output)
+          (render~ output)))))
   
   
   ;;;
@@ -233,133 +286,103 @@
          (set! video-layout 'none)))))
   
   
+  (method (layout-gallery)
+    (when (not-null? player-outputs)
+      (let ((player-rectangles (gallery (length player-outputs))))
+        (for-each (lambda (output rect)
+                    (move~ output rect))
+                  player-outputs
+                  player-rectangles))))
+  
+  
   (method (gallery num-players)
-    (let ((max-box-area 0)
-          (best-box-width 0)
-          (best-box-height 0)
-          (best-col 0)
-          (best-row 0))
-      (loop (for row from 1 to num-players)
-            (let ((col (fxceiling/ num-players row)))
-              (define (calculate-box)
-                (let ((actual-box-ratio (/ (* box-ratio col) (cast <fl> row))))
-                  (if (< actual-box-ratio screen-ratio)
-                      (let ((height (/ screen-height (cast <fl> row))))
-                        (values (* height box-ratio) height))
-                    (let ((width (/ screen-width col)))
-                      (values width ( / width box-ratio))))))
-              
-              (receive (box-width box-height) (calculate-box)
-                (let ((box-area (* box-width box-height)))
-                  (when (> box-area max-box-area)
-                    (set! max-box-area box-area)
-                    (set! best-box-width box-width)
-                    (set! best-box-height box-height)
-                    (set! best-col col)
-                    (set! best-row row))))))
-      (let ((box-origin-x 0)
-            (box-origin-y 0)
-            (box-width best-box-width)
-            (box-height best-box-height)
-            (column-iter best-col)
-            (final-row-cols (modulo num-players best-row))
-            (queue (new-queue)))
-        (loop (for row from 1 to best-row)
-              (set! box-origin-x 0)
-              (when (and (= row best-row) (> final-row-cols 0))
-                (set! column-iter final-row-cols))
-              (let ((border (center (* box-width column-iter) screen-width)))
-                (loop (for column from 1 to column-iter)
-                      (let ((rectangle
-                              (new Rect
-                                (fxceiling (exact->inexact (+ border box-origin-x)))
-                                (fxceiling (exact->inexact box-origin-y))
-                                (fxfloor (exact->inexact (+ border box-origin-x box-width)))
-                                (fxfloor (exact->inexact (+ box-origin-y box-height))))))
-                        (enqueue queue rectangle))
-                      (set! box-origin-x (+ box-origin-x box-width))))
-              (set! box-origin-y (+ box-origin-y box-height)))
-        (queue-list queue)))))
+    ;; FOR TESTS
+    (if (= num-players 1)
+        (list (new Rect 0 0 1920 1200))
+    (if (= num-players 2)
+        (list (new Rect 0 0 1920 1200) @w (new Rect 0 0 320 180) (new Rect 1600 1020 1920 1200) @w (new Rect 1600 0 1920 180))
+    (let ((world (current-world)))
+      (let ((screen-width (get-width~ world))
+            (screen-height (get-height~ world)))
+        (let ((screen-ratio (/ screen-width screen-height))
+              (box-ratio (/ 1280. 720.)))
+          (let ((max-box-area 0)
+                (best-box-width 0)
+                (best-box-height 0)
+                (best-col 0)
+                (best-row 0))
+            (loop (for row from 1 to num-players)
+                  (let ((col (fxceiling/ num-players row)))
+                    (define (calculate-box)
+                      (let ((actual-box-ratio (/ (* box-ratio col) (cast <fl> row))))
+                        (if (< actual-box-ratio screen-ratio)
+                            (let ((height (/ screen-height (cast <fl> row))))
+                              (values (* height box-ratio) height))
+                          (let ((width (/ screen-width col)))
+                            (values width ( / width box-ratio))))))
+                    
+                    (receive (box-width box-height) (calculate-box)
+                      (let ((box-area (* box-width box-height)))
+                        (when (> box-area max-box-area)
+                          (set! max-box-area box-area)
+                          (set! best-box-width box-width)
+                          (set! best-box-height box-height)
+                          (set! best-col col)
+                          (set! best-row row))))))
+            (let ((box-origin-x 0)
+                  (box-origin-y 0)
+                  (box-width best-box-width)
+                  (box-height best-box-height)
+                  (column-iter best-col)
+                  (last-row-cols (modulo num-players best-row))
+                  (queue (new-queue)))
+              (loop (for row from 1 to best-row)
+                    (set! box-origin-x 0)
+                    (when (and (= row best-row) (> last-row-cols 0))
+                      (set! column-iter last-row-cols))
+                    (let ((border (center (* box-width column-iter) screen-width)))
+                      (loop (for col from 1 to column-iter)
+                            (let ((rectangle
+                                    (new Rect
+                                      (fxceiling (exact->inexact (+ border box-origin-x)))
+                                      (fxceiling (exact->inexact box-origin-y))
+                                      (fxfloor (exact->inexact (+ border box-origin-x box-width)))
+                                      (fxfloor (exact->inexact (+ box-origin-y box-height))))))
+                              (enqueue queue rectangle))
+                            (set! box-origin-x (+ box-origin-x box-width))))
+                    (set! box-origin-y (+ box-origin-y box-height)))
+              (queue-list queue))))))))))
 
 
 ;;;
-;;;; Camera-Src
+;;;; Video-Src
 ;;;
 
 
-(class Camera-Src extends Stream-Src
+(class Video-Src extends Stream-Src
   
   
-  (slot resolution           initialize #f accessors generate)
-  (slot framerate            initialize #f accessors generate)
-  (slot bitrate              initialize #f accessors generate)
-  (slot codec                initialize #f accessors generate)
-  (slot pipeline             initialize #f accessors generate)
   (slot appsink              initialize #f accessors generate)
   (slot data     <u8vector>  initialize #f accessors generate)
   (slot info     <u64vector> initialize #f accessors generate)
   (slot task                 initialize #f accessors generate)
   
   
-  (method override (initialize (resolution: resolution #f) (framerate: framerate #f) (bitrate: bitrate #f) (codec: codec #f))
-    (nextmethod)
-    (set! resolution~self resolution)
-    (set! framerate~self framerate)
-    (set! bitrate~self bitrate)
-    (set! codec~self codec))
+  (method (task-start name)
+    (let ((procedure
+            (lambda (task)
+              (video-task task))))
+      (let ((task (new Task name procedure)))
+        (start-task task)
+        (thread-base-priority-set! (get-thread~ task) video-priority)
+        task)))
   
   
-  (method override (start)
-    (define (task-start)
-      (let ((procedure
-              (lambda (task)
-                (camera-task task))))
-        (let ((task (new Task 'camera procedure)))
-          (start-task task)
-          (thread-base-priority-set! (get-thread~ task) video-priority)
-          task)))
-    
-    (unless (eq? state 'playing)
-      (init-gstreamer)
-      (let ((width (get-width~ resolution))
-            (height (get-height~ resolution)))
-        (let ((pipeline (gst-launch "avfvideosrc"
-                                    "videoscale"
-                                    "videoconvert"
-                                    (tie "video/x-raw, format=I420, width={width}, height={height}, framerate={framerate}/1")
-                                    (and (eq? codec 'h264) (tie "x264enc pass=qual quantizer=20 bitrate={bitrate} tune=zerolatency speed-preset=ultrafast"))
-                                    "appsink name=sink")))
-          (gst_object_set_name pipeline "camera")
-          (let ((appsink (gst_bin_get_by_name pipeline "sink"))
-                (data (make-u8vector (* width height 4)))
-                (info (make-u64vector 2)))
-            (gst_element_set_state pipeline GST_STATE_PLAYING)
-            (set! data~self data)
-            (set! info~self info)
-            (set! pipeline~self pipeline)
-            (set! appsink~self appsink)
-            (set! task~self (task-start))
-            (set! state 'playing))))))
+  (method (task-stop)
+    (cease-task task))
   
   
-  (method override (stop)
-    (define (task-stop)
-      (cease-task task))
-    
-    (when (eq? state 'playing)
-      (task-stop)
-      (gst_element_set_state pipeline GST_STATE_NULL)
-      (gst_object_unref pipeline)
-      (set! info #f)
-      (set! data #f)
-      (set! pipeline #f)
-      (set! appsink #f)
-      (set! task #f)
-      (set! state #f)
-      (consume~ sink #f #f #f)))
-  
-  
-  (method (camera-task task)
+  (method protected virtual (video-task task)
     (declare (proper-tail-calls))
     (with-task task
       (lambda (exit)
@@ -383,13 +406,246 @@
   
   
   (method override (process)
-    (when (eq? state 'playing)
-      (let ((size (gst_app_sink_read appsink data info)))
-        (when (/= size -1)
-          (let ((buffer (subu8vector data 0 size))
-                (timestamp (u64vector-ref info 0))
-                (duration (u64vector-ref info 1)))
-            (consume~ sink buffer timestamp duration)))))))
+    (let ((size (gst_app_sink_read appsink data info)))
+      (when (/= size -1)
+        (let ((buffer (subu8vector data 0 size))
+              (timestamp (u64vector-ref info 0))
+              (duration (u64vector-ref info 1)))
+          (consume~ sink buffer timestamp duration))))))
+
+
+;;;
+;;;; Camera-Src
+;;;
+
+
+(class Camera-Src extends Video-Src
+  
+  
+  (slot resolution initialize #f accessors generate)
+  (slot framerate  initialize #f accessors generate)
+  (slot bitrate    initialize #f accessors generate)
+  (slot codec      initialize #f accessors generate)
+  (slot pipeline   initialize #f accessors generate)
+  
+  
+  (method override (initialize (resolution: resolution #f) (framerate: framerate #f) (bitrate: bitrate #f) (codec: codec #f))
+    (nextmethod)
+    (set! resolution~self resolution)
+    (set! framerate~self framerate)
+    (set! bitrate~self bitrate)
+    (set! codec~self codec))
+  
+  
+  (method override (setup-element)
+    (nextmethod)
+    (let ((width (get-width~ resolution))
+          (height (get-height~ resolution)))
+      (let ((pipeline (gst-launch "avfvideosrc"
+                                  "videoscale"
+                                  "videoconvert"
+                                  (tie "video/x-raw, format=I420, width={width}, height={height}, framerate={framerate}/1")
+                                  (and (eq? codec 'h264) (tie "x264enc pass=qual quantizer=20 bitrate={bitrate} tune=zerolatency speed-preset=ultrafast"))
+                                  "appsink name=sink")))
+        (gst_object_set_name pipeline "camera")
+        (let ((appsink (gst_bin_get_by_name pipeline "sink"))
+              (data (make-u8vector (* width height 4)))
+              (info (make-u64vector 2)))
+          (gst_element_set_state pipeline GST_STATE_READY)
+          (set! data~self data)
+          (set! info~self info)
+          (set! pipeline~self pipeline)
+          (set! appsink~self appsink)))))
+  
+  
+  (method override (start-element)
+    (nextmethod)
+    (set! task (task-start 'camera))
+    (gst_element_set_state pipeline GST_STATE_PLAYING))
+  
+  
+  (method override (stop-element)
+    (nextmethod)
+    (task-stop)
+    (gst_element_set_state pipeline GST_STATE_READY)
+    (set! task #f))
+  
+  
+  (method override (terminate-element)
+    (nextmethod)
+    (gst_element_set_state pipeline GST_STATE_NULL)
+    (gst_object_unref pipeline)
+    (set! info #f)
+    (set! data #f)
+    (set! pipeline #f)
+    (set! appsink #f)
+    (consume~ sink #f #f #f)))
+
+
+;;;
+;;;; Screen-Src
+;;;
+
+
+(class Screen-Src extends Video-Src)
+
+
+;;;
+;;;; Test-Video-Src
+;;;
+
+
+(class Test-Video-Src extends Video-Src
+  
+  
+  (slot resolution initialize #f accessors generate)
+  (slot framerate  initialize #f accessors generate)
+  (slot bitrate    initialize #f accessors generate)
+  (slot codec      initialize #f accessors generate)
+  (slot pipeline   initialize #f accessors generate)
+  
+  
+  (method override (initialize (resolution: resolution #f) (framerate: framerate #f) (bitrate: bitrate #f) (codec: codec #f))
+    (nextmethod)
+    (set! resolution~self resolution)
+    (set! framerate~self framerate)
+    (set! bitrate~self bitrate)
+    (set! codec~self codec))
+  
+  
+  (method override (setup-element)
+    (nextmethod)
+    (let ((width (get-width~ resolution))
+          (height (get-height~ resolution)))
+      (let ((pipeline (gst-launch "videotestsrc"
+                                  "videoscale"
+                                  "videoconvert"
+                                  (tie "video/x-raw, format=I420, width={width}, height={height}, framerate={framerate}/1")
+                                  (and (eq? codec 'h264) (tie "x264enc pass=qual quantizer=20 bitrate={bitrate} tune=zerolatency speed-preset=ultrafast"))
+                                  "appsink name=sink")))
+        (gst_object_set_name pipeline "test")
+        (let ((appsink (gst_bin_get_by_name pipeline "sink"))
+              (data (make-u8vector (* width height 4)))
+              (info (make-u64vector 2)))
+          (gst_element_set_state pipeline GST_STATE_READY)
+          (set! data~self data)
+          (set! info~self info)
+          (set! pipeline~self pipeline)
+          (set! appsink~self appsink)))))
+  
+  
+  (method override (start-element)
+    (nextmethod)
+    (set! task (task-start 'test))
+    (gst_element_set_state pipeline GST_STATE_PLAYING))
+  
+  
+  (method override (stop-element)
+    (nextmethod)
+    (task-stop)
+    (gst_element_set_state pipeline GST_STATE_READY)
+    (set! task #f))
+  
+  
+  (method override (terminate-element)
+    (nextmethod)
+    (gst_element_set_state pipeline GST_STATE_NULL)
+    (gst_object_unref pipeline)
+    (set! info #f)
+    (set! data #f)
+    (set! pipeline #f)
+    (set! appsink #f)
+    (consume~ sink #f #f #f)))
+
+
+;;;
+;;;; File-Video-Src
+;;;
+
+
+(class File-Video-Src extends Video-Src
+  
+  
+  (slot location   initialize #f accessors generate)
+  (slot resolution initialize #f accessors generate)
+  (slot framerate  initialize #f accessors generate)
+  (slot bitrate    initialize #f accessors generate)
+  (slot codec      initialize #f accessors generate)
+  (slot pipeline   initialize #f accessors generate)
+  (slot audiosink  initialize #f accessors generate)
+  
+  
+  (method override (initialize location (resolution: resolution #f) (framerate: framerate #f) (bitrate: bitrate #f) (codec: codec #f))
+    (nextmethod)
+    (set! location~self location)
+    (set! resolution~self resolution)
+    (set! framerate~self framerate)
+    (set! bitrate~self bitrate)
+    (set! codec~self codec))
+  
+  
+  (method override (setup-element)
+    (nextmethod)
+    (let ((width (get-width~ resolution))
+          (height (get-height~ resolution)))
+      (let ((pipeline (gst-launch (tie "filesrc location={location}")
+                                  "matroskademux name=demux demux.video_0"
+                                  "vp8dec"
+                                  "videoconvert"
+                                  "videoscale"
+                                  "queue max-size-buffers=3"
+                                  "videoflip video-direction=vert"
+                                  "appsink caps=\"video/x-raw, format=BGRA\" name=appsink demux.audio_0"
+                                  "queue"
+                                  "decodebin"
+                                  "audioconvert"
+                                  "audioresample"
+                                  "appsink name=audiosink")))
+        (gst_object_set_name pipeline "file")
+        (let ((appsink (gst_bin_get_by_name pipeline "appsink"))
+              (audiosink (gst_bin_get_by_name pipeline "audiosink"))
+              (data (make-u8vector (* width height 4)))
+              (info (make-u64vector 2)))
+          (gst_element_set_state pipeline GST_STATE_READY)
+          (set! data~self data)
+          (set! info~self info)
+          (set! pipeline~self pipeline)
+          (set! appsink~self appsink)
+          (set! audiosink~self audiosink)))))
+  
+  
+  (method override (start-element)
+    (nextmethod)
+    (set! task (task-start 'file))
+    (gst_element_set_state pipeline GST_STATE_PLAYING))
+  
+  
+  (method override (stop-element)
+    (nextmethod)
+    (task-stop)
+    (gst_element_set_state pipeline GST_STATE_READY)
+    (set! task #f))
+  
+  
+  (method override (terminate-element)
+    (nextmethod)
+    (gst_element_set_state pipeline GST_STATE_NULL)
+    (gst_object_unref pipeline)
+    (set! info #f)
+    (set! data #f)
+    (set! pipeline #f)
+    (set! appsink #f)
+    (consume~ sink #f #f #f))
+  
+  
+  (method override (process)
+    (nextmethod)
+    (let ((size (gst_app_sink_read audiosink data info)))
+      (when (/= size -1)
+        (let ((buffer (subu8vector data 0 size))
+              (timestamp (u64vector-ref info 0))
+              (duration (u64vector-ref info 1)))
+          (terminal 'audio size timestamp duration))))))
 
 
 ;;;
@@ -404,6 +660,7 @@
   (slot framerate            initialize #f accessors generate)
   (slot bitrate              initialize #f accessors generate)
   (slot codec                initialize #f accessors generate)
+  (slot flip                 initialize #f accessors generate)
   (slot alpha                initialize #f accessors generate)
   (slot overlay?             initialize #f accessors generate)
   (slot pipeline             initialize #f accessors generate)
@@ -417,90 +674,110 @@
   (slot total-size           initialize #f)
   
   
-  (method override (initialize (resolution: resolution #f) (framerate: framerate #f) (bitrate: bitrate #f) (codec: codec #f) (alpha: alpha #f) (overlay?: overlay? #f))
+  (method override (initialize (resolution: resolution #f) (framerate: framerate #f) (bitrate: bitrate #f) (codec: codec #f) (flip: flip #f) (alpha: alpha #f) (overlay?: overlay? #f))
     (nextmethod)
     (set! resolution~self resolution)
     (set! framerate~self framerate)
     (set! bitrate~self bitrate)
     (set! codec~self codec)
+    (set! flip~self (or flip 'horiz))
     (set! alpha~self alpha)
     (set! overlay?~self overlay?))
   
   
-  (method override (start)
-    (define (task-start)
+  (method protected virtual (interface?)
+    #f)
+  
+  
+  (method override (setup-element)
+    (nextmethod)
+    (let ((video-width (get-width~ video-resolution))
+          (video-height (get-height~ video-resolution))
+          (width (get-width~ resolution))
+          (height (get-height~ resolution)))
+      (let ((pipeline (gst-launch (tie "appsrc name=src")
+                                  (and (eq? codec 'h264) (tie "avdec_h264"))
+                                  "videoscale"
+                                  "videoconvert"
+                                  (and flip (tie "videoflip video-direction={flip}"))
+                                  (tie "alpha alpha={alpha}")
+                                  (tie "video/x-raw, format=BGRA, width={width}, height={height}, framerate={framerate}/1")
+                                  (tie "appsink name=sink"))))
+        (gst_object_set_name pipeline "output")
+        (let ((appsrc (gst_bin_get_by_name pipeline "src"))
+              (appsink (gst_bin_get_by_name pipeline "sink"))
+              (data (make-u8vector (* width height 4)))
+              (info (make-u64vector 2)))
+          (case codec
+            ((h264)
+             (gst_app_src_set_caps appsrc
+               (gst_caps "video/x-h264"
+                 "width"         (g_value_int video-width)
+                 "height"        (g_value_int video-height)
+                 "framerate"     (g_value_fraction framerate 1)
+                 "stream-format" (g_value_string "avc")
+                 "alignment"     (g_value_string "au"))))
+            (else
+             (gst_app_src_set_caps appsrc
+               (gst_caps "video/x-raw"
+                 "format"    (g_value_string "I420")
+                 "width"     (g_value_int video-width)
+                 "height"    (g_value_int video-height)
+                 "framerate" (g_value_fraction framerate 1)))))
+          (g_object_set appsrc
+            "is-live"     (g_value_boolean #t)
+            "stream-type" (g_value_int GST_APP_STREAM_TYPE_STREAM)
+            "format"      (g_value_int GST_FORMAT_TIME))
+          (gst_element_set_state pipeline GST_STATE_READY)
+          (set! data~self data)
+          (set! info~self info)
+          (set! pipeline~self pipeline)
+          (set! appsrc~self appsrc)
+          (set! appsink~self appsink)))))
+  
+  
+  (method override (start-element)
+    (define (task-start name)
       (let ((procedure
               (lambda (task)
                 (video-task task))))
-        (let ((task (new Task 'video procedure)))
+        (let ((task (new Task name procedure)))
           (start-task task)
           (thread-base-priority-set! (get-thread~ task) video-priority)
           task)))
     
-    (unless (eq? state 'playing)
-      (init-gstreamer)
-      (let ((width (get-width~ resolution))
-            (height (get-height~ resolution)))
-        (let ((pipeline (gst-launch (tie "appsrc name=src")
-                                    (and (eq? codec 'h264) (tie "avdec_h264"))
-                                    "videoconvert"
-                                    "videoflip video-direction=horiz"
-                                    (tie "alpha alpha={alpha}")
-                                    (tie "video/x-raw, format=BGRA, width={width}, height={height}, framerate={framerate}/1")
-                                    (tie "appsink name=sink"))))
-          (gst_object_set_name pipeline "output")
-          (let ((appsrc (gst_bin_get_by_name pipeline "src"))
-                (appsink (gst_bin_get_by_name pipeline "sink"))
-                (data (make-u8vector (* width height 4)))
-                (info (make-u64vector 2)))
-            (case codec
-              ((h264)
-               (gst_app_src_set_caps appsrc
-                 (gst_caps "video/x-h264"
-                   "width"         (g_value_int width)
-                   "height"        (g_value_int height)
-                   "framerate"     (g_value_fraction framerate 1)
-                   "stream-format" (g_value_string "avc")
-                   "alignment"     (g_value_string "au"))))
-              (else
-               (gst_app_src_set_caps src
-                 (gst_caps "video/x-raw"
-                   "format"    (g_value_string "I420")
-                   "width"     (g_value_int width)
-                   "height"    (g_value_int height)
-                   "framerate" (g_value_fraction framerate 1)))))
-            (g_object_set appsrc
-              "is-live"     (g_value_boolean #t)
-              "stream-type" (g_value_int GST_APP_STREAM_TYPE_STREAM)
-              "format"      (g_value_int GST_FORMAT_TIME))
-            (gst_element_set_state pipeline GST_STATE_PLAYING)
-            (set! data~self data)
-            (set! info~self info)
-            (set! pipeline~self pipeline)
-            (set! appsrc~self appsrc)
-            (set! appsink~self appsink)
-            (set! task~self (task-start))
-            (set! state 'playing))))))
+    (nextmethod)
+    (set! task~self (task-start 'video))
+    (gst_element_set_state pipeline GST_STATE_PLAYING))
   
   
-  (method override (stop)
+  (method override (stop-element)
     (define (task-stop)
       (cease-task task))
     
-    (when (eq? state 'playing)
-      (gst_element_set_state pipeline GST_STATE_NULL)
-      (gst_object_unref pipeline)
-      (set! info #f)
-      (set! data #f)
-      (set! pipeline #f)
-      (set! appsrc #f)
-      (set! appsink #f)
-      (set! task #f)
-      (set! state #f)))
+    (nextmethod)
+    (task-stop)
+    (gst_element_set_state pipeline GST_STATE_READY)
+    (set! task #f))
+  
+  
+  (method override (terminate-element)
+    (nextmethod)
+    (gst_element_set_state pipeline GST_STATE_NULL)
+    (gst_object_unref pipeline)
+    (set! info #f)
+    (set! data #f)
+    (set! pipeline #f)
+    (set! appsrc #f)
+    (set! appsink #f))
   
   
   (method override (consume buffer timestamp duration)
-    (gst_app_src_write3 appsrc buffer (u8vector-length buffer) timestamp duration))
+    ;; QUICK TEST
+    (when appsrc
+    ;; QUICK TEST
+      (when buffer
+    (gst_app_src_write3 appsrc buffer (u8vector-length buffer) timestamp duration))))
   
   
   (method (video-task task)
@@ -584,7 +861,7 @@
         (set! billboard elem))))
   
   
-  (method override (stop)
+  (method override (terminate-element)
     (nextmethod)
     (when player
       (set-billboard-camera~ player #f)
@@ -645,7 +922,42 @@
 ;;;
 
 
-(class Texture-Video-Sink extends Video-Sink)
+(class Texture-Video-Sink extends Video-Sink
+  
+  
+  (slot quad-texture initialize #f getter generate)
+  (slot matrix       initialize #f getter generate)
+  
+  
+  (method override (initialize matrix . rest)
+    (apply nextmethod rest)
+    (let ((width (get-width~ resolution))
+          (height (get-height~ resolution)))
+      (let ((ratio (/ (cast <fl> width) (cast <fl> height))))
+        (let ((w ratio)
+              (h 1.))
+          (let ((v1 (vertex (/ w -2.) (/ h -2.) 0.))
+                (v2 (vertex (/ w -2.) (/ h  2.) 0.))
+                (v3 (vertex (/ w  2.) (/ h  2.) 0.))
+                (v4 (vertex (/ w  2.) (/ h -2.) 0.)))
+            (let ((quad-texture (make-quad-texture width height v1 v2 v3 v4)))
+              (set! quad-texture~self quad-texture)
+              (set! matrix~self matrix)))))))
+  
+  
+  (method override (terminate-element)
+    (nextmethod)
+    (when quad-texture
+      (glDeleteTextures* (get-id~ (get-texture~ quad-texture)))
+      (set! quad-texture #f)))
+  
+  
+  (method override (draw buffer timestamp duration)
+    (update buffer (get-texture~ quad-texture)))
+  
+  
+  (method override (render)
+    (render-texture~ quad-texture matrix)))
 
 
 ;;;
@@ -656,18 +968,37 @@
 (class Sheet-Video-Sink extends Video-Sink
   
   
+  (slot size  initialize #f accessors generate)
   (slot sheet initialize #f accessors generate)
   
   
   (method override (initialize . rest)
-    (apply nextmethod rest)
+    (bind-keywords ((size #f) . others) rest
+      (apply nextmethod others)
+      (let ((world (current-world)))
+        (let ((size (or size {Dimension 640 360})))
+          (let ((s (make-world-sheet 'video World-Sheet size resolution: resolution)))
+            (make-orthographic-matrix! (get-projection-matrix~ s) 0. (get-width~ world) 0. (get-height~ world) 0. 10.)
+            (set-size~ s size)
+            (set! sheet s))))))
+  
+  
+  (method override (interface?)
+    #t)
+  
+  
+  (method (resize)
     (let ((world (current-world)))
-      (let ((s (world.interface.sheet:make-world-sheet 'video world.interface.sheet:World-Sheet (get-width~ resolution) (get-height~ resolution))))
-        (make-orthographic-matrix! (get-projection-matrix~ s) 0. (get-width~ world) 0. (get-height~ world) 0. 10.)
-        (set! sheet s))))
+      (let ((width (get-width~ world))
+            (height (get-height~ world)))
+        (make-orthographic-matrix! (get-projection-matrix~ sheet) 0. width 0. height 0. 10.))))
   
   
-  (method override (stop)
+  (method (move rect)
+    (set-rect~ sheet rect))
+  
+  
+  (method override (terminate-element)
     (nextmethod)
     (when sheet
       (glDeleteTextures* (get-id~ (get-texture~ sheet)))
@@ -679,12 +1010,14 @@
   
   
   (method override (render)
+    ;; QUICKY
+    (when sheet
     (let ((world (current-world)))
-      (let ((x 0.)
-            (y 0.)
-            (h (cast <fl> (get-height~ resolution))))
+      (let ((x (cast <fl> (get-left~ sheet)))
+            (y (cast <fl> (get-top~ sheet)))
+            (h (cast <fl> (get-height~ sheet))))
         (let ((matrix (make-translation-matrix (vertex x (- (get-height~ world) y h) 0.))))
-          (render-sheet~ sheet matrix))))))
+          (render-sheet~ sheet matrix)))))))
 
 
 ;;;
@@ -692,21 +1025,147 @@
 ;;;
 
 
-@w
-(definition public (test-video resolution framerate bitrate codec)
-  (let ((camera (new Camera-Src resolution: resolution framerate: framerate bitrate: bitrate codec: codec))
-        (debug (new Debug-Sink)))
-    (let ((pipeline (pipeline camera debug)))
-      (start~ camera resolution framerate bitrate codec)
-      (start~ debug)
-      pipeline)))
+(definition test-pipeline #f)
+(definition file-pipeline #f)
+(definition camera-pipeline #f)
+(definition circle-pipelines #f)
+(definition gallery-pipelines #f)
+
+
+(definition (make-texture-video name resolution framerate video-src matrix)
+  (let ((video (current-video)))
+    (let ((bitrate video-bitrate)
+          (codec 'none))
+      (let ((video-sink (new Texture-Video-Sink
+                          matrix
+                          resolution: resolution
+                          framerate: framerate
+                          bitrate: bitrate
+                          codec: codec
+                          flip: 'vert)))
+        (let ((pipeline (pipeline video-src video-sink)))
+          (register-input~ video name video-src)
+          (register-output~ video name video-sink)
+          (start~ pipeline)
+          pipeline)))))
+
+
+(definition (make-test-video)
+  (let ((resolution {Dimension 300 200})
+        (framerate 30)
+        (bitrate video-bitrate)
+        (codec 'none))
+    (make-texture-video 'test resolution framerate
+      (new Test-Video-Src
+        resolution: resolution
+        framerate: framerate
+        bitrate: bitrate
+        codec: codec)
+      (copy-matrix (matrix-multiply& (make-translation-matrix (vertex -9.5 7. 4.5))
+                                     (make-scaling-matrix (vertex 6. 6. 6.))
+                                     (make-rotation-matrix (vertex 0. 1. 0.) PI/4))))))
+
+
+(definition (make-file-video)
+  (let ((file-src (new File-Video-Src
+                    "/Users/cartier/Devel/gstreamer/media/sintel.webm"
+                    resolution: {Dimension 1280 720}))
+        (debug-sink (new Debug-Sink)))
+    (let ((pipeline (pipeline file-src debug-sink)))
+      (start~ pipeline)
+      pipeline))
+  @w
+  (make-video-texture 'file file-pipeline "/Users/cartier/Devel/gstreamer/media/sintel.webm" 854 480 30
+    (copy-matrix (matrix-multiply& (make-translation-matrix (vertex 0. 7. 0.))
+                                   (make-scaling-matrix (vertex 6. 6. 6.))))))
+
+
+(definition (make-camera-video)
+  (let ((resolution {Dimension 1280 720})
+        (framerate 30)
+        (bitrate video-bitrate)
+        (codec 'none))
+    (make-texture-video 'camera resolution framerate
+      (new Camera-Src
+        resolution: resolution
+        framerate: framerate
+        bitrate: bitrate
+        codec: codec)
+      (copy-matrix (matrix-multiply& (make-translation-matrix (vertex 10. 7. 5.))
+                                     (make-scaling-matrix (vertex 6. 6. 6.))
+                                     (make-rotation-matrix (vertex 0. 1. 0.) (- PI/4)))))))
+
+
+(definition (make-circle-videos)
+  (let ((count 15))
+    (loop (for n from 0 below count)
+          (collect (let ((name (string->symbol (format "circle{a}" n)))
+                         (resolution {Dimension 300 200})
+                         (framerate 30)
+                         (bitrate video-bitrate)
+                         (codec 'none))
+                     (make-texture-video name resolution framerate
+                       (new Test-Video-Src
+                         resolution: resolution
+                         framerate: framerate
+                         bitrate: bitrate
+                         codec: codec)
+                       (copy-matrix (matrix-multiply& (make-translation-matrix (vertex 0. 7. 0.))
+                                                      (make-scaling-matrix (vertex 6. 6. 6.))
+                                                      (make-rotation-matrix (vertex 0. 1. 0.) (* (/ PI*2 (cast <fl> count)) (cast <fl> n)))
+                                                      (make-translation-matrix (vertex 0. 0. 4.))))))))))
+
+
+(definition (make-gallery-videos)
+  (let ((video (current-video)))
+    (let ((count 3)
+          (queue (new-queue)))
+      (loop (for n from 0 below count)
+            (enqueue queue (let ((name (string->symbol (format "gallery{a}" n)))
+                                 (resolution video-resolution)
+                                 (framerate 30)
+                                 (bitrate video-bitrate)
+                                 (codec 'none))
+                             (let ((video-src (new Camera-Src
+                                                resolution: resolution
+                                                framerate: framerate
+                                                bitrate: bitrate
+                                                codec: codec))
+                                   (video-sink (player-output~ video name layout: 'gallery size: {Dimension 320 180} resolution: resolution codec: codec)))
+                               (let ((pipeline (pipeline video-src video-sink)))
+                                 (register-input~ video name video-src)
+                                 (start~ pipeline)
+                                 pipeline)))))
+      (layout-gallery~ video)
+      (queue-list queue))))
+
+
+(definition protected (test-video)
+  @w
+  (set! file-pipeline (make-file-video))
+  @w
+  (if (not test-pipeline)
+      (set! test-pipeline (make-test-video))
+    (if (not file-pipeline)
+        (set! file-pipeline (make-file-video))
+      (set! camera-pipeline (make-camera-video))))
+  @w
+  (set! circle-pipelines (make-circle-videos))
+  (set! gallery-pipelines (if (not gallery-pipelines)
+                              (make-gallery-videos)
+                            (let ((video (current-video)))
+                              (for-each (lambda (pipeline)
+                                          (bind (input output) (get-elements~ pipeline)
+                                            (let ((id (table-find (get-outputs~ video) output)))
+                                              (close-input~ video id input)
+                                              (close-output~ video id output))))
+                                        gallery-pipelines))
+                            #f)))
 
 
 (definition protected (start-test)
-  (debug 'start-test)
   )
 
 
 (definition protected (stop-test)
-  (debug 'stop-test)
   ))
