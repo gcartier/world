@@ -45,7 +45,7 @@
 
 
 #; ;; until all available functionaly
-(jazz:define-method (jazz:jazz-walker-supports-tilde? (jazz:Script-Walker walker))
+(jazz:define-method (jazz:jazz-walker-supports-selfdot? (jazz:Script-Walker walker))
   #f)
 
 #; ;; until all available functionaly
@@ -112,7 +112,7 @@
 
 
 (define (jazz:new-%%syntax-declaration name type access compatibility attributes parent signature syntax-form)
-  (let ((new-declaration (jazz:allocate-%%syntax-declaration name type #f access compatibility attributes #f parent #f #f signature #f)))
+  (let ((new-declaration (jazz:allocate-%%syntax-declaration name type #f access compatibility attributes #f parent #f #f #f signature #f)))
     (jazz:setup-declaration new-declaration)
     new-declaration))
 
