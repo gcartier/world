@@ -31,6 +31,16 @@
   (jazz:new-script-walker))
 
 
+(jazz:define-method (jazz:dialect-wrap (jazz:Script-Dialect dialect) body)
+  `((declare (proper-tail-calls))
+    (import (script.syntax (phase syntax))
+            (world.script.syntax (phase syntax))
+            (world.script))
+    (%%define me (current-instance))
+    (%%define %%poll-script? #t)
+    ,@body))
+
+
 ;;;
 ;;;; Walker
 ;;;
@@ -44,11 +54,9 @@
   (jazz:allocate-script-walker #f #f '() '() '() (jazz:new-queue) (jazz:new-queue) (%%make-table test: eq?) (%%make-table test: eq?) '()))
 
 
-#; ;; until all available functionaly
 (jazz:define-method (jazz:jazz-walker-supports-selfdot? (jazz:Script-Walker walker))
   #f)
 
-#; ;; until all available functionaly
 (jazz:define-method (jazz:jazz-walker-supports-composite? (jazz:Script-Walker walker))
   #f)
 
