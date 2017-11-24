@@ -35,8 +35,8 @@
   `((declare (proper-tail-calls))
     (import (script.syntax (phase syntax))
             (world.script.syntax (phase syntax))
-            (world.script))
-    (%%define me (current-instance))
+            (world.scriptum))
+    (%%define me (%%current-instance))
     (%%define %%poll-script? #t)
     ,@body))
 
