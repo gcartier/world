@@ -25,12 +25,15 @@
         (world.autoload)
         (world.billboard)
         (world.configure)
+        (world.console)
         (world.context)
+        (world.entity)
         (world.foreign)
         (world.geometry)
         (world.id)
         (world.interface.sheet)
         (world.io)
+        (world.layout)
         (world.pane)
         (world.quad-texture)
         (world.settings)
@@ -192,35 +195,46 @@
     (table-set! outputs id output))
   
   
+  (method package (entity-output self id (position: position #f) (size: size #f) (resolution: resolution #f) (layout: layout #f) (codec: codec #f))
+    (or (table-ref outputs id #f)
+        (let ((entity (find-entity id)))
+          (let ((output (new Draw-Video-Sink entity
+                             resolution: (or resolution {Dimension 1280 720})
+                             framerate: video-framerate
+                             bitrate: video-bitrate
+                             codec: (or codec video-codec)
+                             alpha-overlay: video-alpha
+                             overlay?: video-overlay?)))
+            (table-set! outputs id output)
+            output))))
+  
+  
   (method package (player-output self id (position: position #f) (size: size #f) (resolution: resolution #f) (layout: layout #f) (codec: codec #f))
     (or (table-ref outputs id #f)
-        (let ((output (new-output self id position: position size: size resolution: resolution layout: layout codec: codec)))
-          (table-set! outputs id output)
-          (set! player-outputs (append! player-outputs (list output)))
-          (layout-outputs self)
-          output)))
-  
-  
-  (method (new-output self id (position: position #f) (size: size #f) (resolution: resolution #f) (layout: layout #f) (codec: codec #f))
-    (case (or layout video-layout)
-      ((overhead)
-       (new Billboard-Video-Sink id
-         resolution: (or resolution video-resolution)
-         framerate: video-framerate
-         bitrate: video-bitrate
-         codec: (or codec video-codec)
-         alpha: video-alpha
-         overlay?: video-overlay?))
-      (else
-       (new Sheet-Video-Sink
-         position: position
-         size: size
-         resolution: (or resolution video-resolution)
-         framerate: video-framerate
-         bitrate: video-bitrate
-         codec: (or codec video-codec)
-         alpha: video-alpha
-         overlay?: video-overlay?))))
+        (let ((player (find-entity id)))
+          (let ((output (case (or layout video-layout)
+                          ((overhead)
+                           (new Camera-Video-Sink player
+                                resolution: (or resolution video-resolution)
+                                framerate: video-framerate
+                                bitrate: video-bitrate
+                                codec: (or codec video-codec)
+                                alpha-overlay: video-alpha
+                                overlay?: video-overlay?))
+                          (else
+                           (new Sheet-Video-Sink
+                             position: position
+                             size: size
+                             resolution: (or resolution video-resolution)
+                             framerate: video-framerate
+                             bitrate: video-bitrate
+                             codec: (or codec video-codec)
+                             alpha-overlay: video-alpha
+                             overlay?: video-overlay?)))))
+            (table-set! outputs id output)
+            (set! player-outputs (append! player-outputs (list output)))
+            (layout-outputs self)
+            output))))
   
   
   (method package (close-output self id output)
@@ -238,6 +252,17 @@
         (setup output)
         (start output)
         (consume output buffer timestamp duration))))
+  
+  
+  (method package (receive-server-draw self id color alpha timestamp duration)
+    (if (not color)
+        (let ((output (find-output self id)))
+          (when output
+            (close-output self id output)))
+      (let ((output (entity-output self id)))
+        (setup output)
+        (start output)
+        (consume output color timestamp duration alpha))))
   
   
   (method package (render-scene self)
@@ -308,70 +333,13 @@
               (b (get-bottom bounds)))
           (case video-layout
             ((sidebar)
-             (fill self num-players (new Rect 10 70 210 (- b 100))))
+             (layout-tiles num-players (new Rect 10 70 210 (- b 100))))
             ((gallery)
-             (fill self num-players bounds))
+             (layout-tiles num-players bounds))
             ((fullscreen)
              (cons bounds (fill self (- num-players 1) (new Rect (- r 200) 500 r b))))
             (else
-             #f))))))
-  
-  
-  (method package (fill self num-players outer)
-    (if (= num-players 0)
-        '()
-      (let ((outer-left (get-left outer))
-            (outer-top (get-top outer))
-            (outer-width (cast <fl> (rect-width outer)))
-            (outer-height (cast <fl> (rect-height outer))))
-        (let ((outer-ratio (/ outer-width outer-height))
-              (box-ratio (/ 1280. 720.)))
-          (let ((max-box-area 0)
-                (best-box-width 0)
-                (best-box-height 0)
-                (best-col 0)
-                (best-row 0))
-            (loop (for row from 1 to num-players)
-                  (let ((col (fxceiling/ num-players row)))
-                    (define (calculate-box)
-                      (let ((actual-box-ratio (/ (* box-ratio col) (cast <fl> row))))
-                        (if (< actual-box-ratio outer-ratio)
-                            (let ((height (/ outer-height (cast <fl> row))))
-                              (values (* height box-ratio) height))
-                          (let ((width (/ outer-width col)))
-                            (values width ( / width box-ratio))))))
-                    
-                    (receive (box-width box-height) (calculate-box)
-                      (let ((box-area (* box-width box-height)))
-                        (when (> box-area max-box-area)
-                          (set! max-box-area box-area)
-                          (set! best-box-width box-width)
-                          (set! best-box-height box-height)
-                          (set! best-col col)
-                          (set! best-row row))))))
-            (let ((box-origin-x 0)
-                  (box-origin-y 0)
-                  (box-width best-box-width)
-                  (box-height best-box-height)
-                  (column-iter best-col)
-                  (last-row-cols (- best-col (modulo num-players best-row)))
-                  (queue (new-queue)))
-              (loop (for row from 1 to best-row)
-                    (set! box-origin-x 0)
-                    (when (and (= row best-row) (> last-row-cols 0))
-                      (set! column-iter last-row-cols))
-                    (let ((border (center (* box-width column-iter) outer-width)))
-                      (loop (for col from 1 to column-iter)
-                            (let ((rectangle
-                                    (new Rect
-                                      (fxceiling (exact->inexact (+ outer-left border box-origin-x)))
-                                      (fxceiling (exact->inexact (+ outer-top box-origin-y)))
-                                      (fxfloor (exact->inexact (+ outer-left border box-origin-x box-width)))
-                                      (fxfloor (exact->inexact (+ outer-top box-origin-y box-height))))))
-                              (enqueue queue rectangle))
-                            (set! box-origin-x (+ box-origin-x box-width))))
-                    (set! box-origin-y (+ box-origin-y box-height)))
-              (queue-list queue))))))))
+             #f)))))))
 
 
 ;;;
@@ -705,34 +673,44 @@
 (class Video-Sink extends Stream-Sink
   
   
-  (slot resolution           initialize #f accessors generate)
-  (slot framerate            initialize #f accessors generate)
-  (slot bitrate              initialize #f accessors generate)
-  (slot codec                initialize #f accessors generate)
-  (slot flip                 initialize #f accessors generate)
-  (slot alpha                initialize #f accessors generate)
-  (slot overlay?             initialize #f accessors generate)
-  (slot pipeline             initialize #f accessors generate)
-  (slot appsrc               initialize #f accessors generate)
-  (slot appsink              initialize #f accessors generate)
-  (slot data     <u8vector>  initialize #f accessors generate)
-  (slot info     <u64vector> initialize #f accessors generate)
-  (slot task                 initialize #f accessors generate)
-  (slot drawn?               initialize #f accessors generate)
-  (slot frame-count          initialize #f)
-  (slot frame-start          initialize #f)
-  (slot total-size           initialize #f)
+  (slot resolution                 initialize #f accessors generate)
+  (slot framerate                  initialize #f accessors generate)
+  (slot bitrate                    initialize #f accessors generate)
+  (slot codec                      initialize #f accessors generate)
+  (slot flip                       initialize #f accessors generate)
+  (slot alpha-overlay              initialize #f accessors generate)
+  (slot overlay?                   initialize #f accessors generate)
+  (slot color-pipeline             initialize #f accessors generate)
+  (slot color-appsrc               initialize #f accessors generate)
+  (slot color-appsink              initialize #f accessors generate)
+  (slot color-data     <u8vector>  initialize #f accessors generate)
+  (slot color-info     <u64vector> initialize #f accessors generate)
+  (slot color-bytes                initialize #f accessors generate)
+  (slot alpha?                     initialize #f accessors generate)
+  (slot alpha-pipeline             initialize #f accessors generate)
+  (slot alpha-appsrc               initialize #f accessors generate)
+  (slot alpha-appsink              initialize #f accessors generate)
+  (slot alpha-data     <u8vector>  initialize #f accessors generate)
+  (slot alpha-info     <u64vector> initialize #f accessors generate)
+  (slot alpha-bytes                initialize #f accessors generate)
+  (slot alpha-surface              initialize #f accessors generate)
+  (slot task                       initialize #f accessors generate)
+  (slot drawn?                     initialize #f accessors generate)
+  (slot frame-count                initialize #f)
+  (slot frame-start                initialize #f)
+  (slot total-size                 initialize #f)
   
   
-  (method override (initialize self (resolution: resolution #f) (framerate: framerate #f) (bitrate: bitrate #f) (codec: codec #f) (flip: flip #f) (alpha: alpha #f) (overlay?: overlay? #f))
+  (method override (initialize self (resolution: resolution #f) (framerate: framerate #f) (bitrate: bitrate #f) (codec: codec #f) (flip: flip #f) (alpha-overlay: alpha-overlay #f) (overlay?: overlay? #f) (alpha?: alpha? #f))
     (nextmethod self)
     (set! self.resolution resolution)
     (set! self.framerate framerate)
     (set! self.bitrate bitrate)
     (set! self.codec codec)
     (set! self.flip flip)
-    (set! self.alpha alpha)
-    (set! self.overlay? overlay?))
+    (set! self.alpha-overlay alpha-overlay)
+    (set! self.overlay? overlay?)
+    (set! self.alpha? alpha?))
   
   
   (method package virtual (sheet? self)
@@ -748,7 +726,7 @@
                                   "videoscale"
                                   "videoconvert"
                                   (and flip (tie "videoflip video-direction={flip}"))
-                                  (and alpha (tie "alpha alpha={alpha}"))
+                                  (and alpha-overlay (tie "alpha alpha={alpha-overlay}"))
                                   (tie "video/x-raw, format=BGRA, width={width}, height={height}, framerate={framerate}/1")
                                   (tie "appsink name=sink"))))
         (gst_object_set_name pipeline "output")
@@ -777,11 +755,40 @@
             "stream-type" (g_value_int GST_APP_STREAM_TYPE_STREAM)
             "format"      (g_value_int GST_FORMAT_TIME))
           (gst_element_set_state pipeline GST_STATE_READY)
-          (set! self.data data)
-          (set! self.info info)
-          (set! self.pipeline pipeline)
-          (set! self.appsrc appsrc)
-          (set! self.appsink appsink)))))
+          (set! self.color-data data)
+          (set! self.color-info info)
+          (set! self.color-bytes #f)
+          (set! self.color-pipeline pipeline)
+          (set! self.color-appsrc appsrc)
+          (set! self.color-appsink appsink)))
+      (when alpha?
+        (let ((pipeline (gst-launch "appsrc name=src"
+                                    "avdec_h264 name=dec"
+                                    "appsink name=sink")))
+          (gst_object_set_name pipeline "output")
+          (let ((appsrc (gst_bin_get_by_name pipeline "src"))
+                (appsink (gst_bin_get_by_name pipeline "sink"))
+                (data (make-u8vector (/ (* width height 12) 8)))
+                (info (make-u64vector 2)))
+            (gst_app_src_set_caps appsrc
+              (gst_caps "video/x-h264"
+                 "width"         (g_value_int width)
+                 "height"        (g_value_int height)
+                 "framerate"     (g_value_fraction framerate 1)
+                 "stream-format" (g_value_string "avc")
+                 "alignment"     (g_value_string "au")))
+            (g_object_set appsrc
+              "is-live"     (g_value_boolean #t)
+              "stream-type" (g_value_int GST_APP_STREAM_TYPE_STREAM)
+              "format"      (g_value_int GST_FORMAT_TIME))
+            (gst_element_set_state pipeline GST_STATE_READY)
+            (set! self.alpha-data data)
+            (set! self.alpha-info info)
+            (set! self.alpha-bytes #f)
+            (set! self.alpha-pipeline pipeline)
+            (set! self.alpha-appsrc appsrc)
+            (set! self.alpha-appsink appsink)
+            (set! self.alpha-surface (new Memory-Surface #f (new Dimension width height))))))))
   
   
   (method override (start-element self)
@@ -796,7 +803,9 @@
     
     (nextmethod self)
     (task-start 'video)
-    (gst_element_set_state pipeline GST_STATE_PLAYING))
+    (gst_element_set_state color-pipeline GST_STATE_PLAYING)
+    (when alpha?
+      (gst_element_set_state alpha-pipeline GST_STATE_PLAYING)))
   
   
   (method override (stop-element self)
@@ -806,27 +815,47 @@
     
     (nextmethod self)
     (task-stop)
-    (gst_element_set_state pipeline GST_STATE_READY))
+    (gst_element_set_state color-pipeline GST_STATE_READY)
+    (when alpha?
+      (gst_element_set_state alpha-pipeline GST_STATE_READY)))
   
   
   (method override (conclude-element self)
     (nextmethod self)
-    (gst_element_set_state pipeline GST_STATE_NULL)
-    (gst_object_unref pipeline)
-    (set! info #f)
-    (set! data #f)
-    (set! pipeline #f)
-    (set! appsrc #f)
-    (set! appsink #f)
+    (gst_element_set_state color-pipeline GST_STATE_NULL)
+    (gst_object_unref color-pipeline)
+    (set! color-info #f)
+    (set! color-data #f)
+    (set! color-bytes #f)
+    (set! color-pipeline #f)
+    (set! color-appsrc #f)
+    (set! color-appsink #f)
+    (when alpha?
+      (gst_element_set_state alpha-pipeline GST_STATE_NULL)
+      (gst_object_unref alpha-pipeline)
+      (close alpha-surface)
+      (set! alpha-info #f)
+      (set! alpha-data #f)
+      (set! alpha-bytes #f)
+      (set! alpha-pipeline #f)
+      (set! alpha-appsrc #f)
+      (set! alpha-appsink #f)
+      (set! alpha-surface #f))
     (set! drawn? #f))
   
   
-  (method override (consume self buffer timestamp duration)
+  (method override (consume self color timestamp duration (alpha #f))
     ;; QUICK TEST
-    (when appsrc
+    (when color-appsrc
     ;; QUICK TEST
-      (when buffer
-    (gst_app_src_write3 appsrc buffer (u8vector-length buffer) timestamp duration))))
+      (when color
+        (gst_app_src_write3 color-appsrc color (u8vector-length color) timestamp duration)))
+    (when alpha?
+      ;; QUICK TEST
+      (when alpha-appsrc
+        ;; QUICK TEST
+        (when alpha
+          (gst_app_src_write3 alpha-appsrc alpha (u8vector-length alpha) timestamp duration)))))
   
   
   (method (video-task self task)
@@ -853,35 +882,57 @@
   
   
   (method override (process self)
-    (let ((size (gst_app_sink_read appsink data info)))
-      (when (/= size -1)
-        (let ((buffer (subu8vector data 0 size))
-              (timestamp (u64vector-ref info 0))
-              (duration (u64vector-ref info 1)))
-          (draw self buffer timestamp duration)
-          (set! drawn? #t)))))
+    (when (not color-bytes)
+      (let ((size (gst_app_sink_read color-appsink color-data color-info)))
+        (when (/= size -1)
+          (set! color-bytes size))))
+    (when (not alpha-bytes)
+      (let ((size (gst_app_sink_read alpha-appsink alpha-data alpha-info)))
+        (when (/= size -1)
+          (set! alpha-bytes size))))
+    (when (and color-bytes alpha-bytes)
+      (let ((timestamp (u64vector-ref color-info 0))
+            (duration (u64vector-ref color-info 1)))
+        (draw self color-data alpha-data timestamp duration)
+        (set! color-bytes #f)
+        (set! alpha-bytes #f)
+        (set! drawn? #t))))
   
   
-  (method package virtual (draw self buffer timestamp duration)
+  (method package virtual (draw self color alpha timestamp duration)
     )
   
   
-  (method package (update self buffer texture)
+  (method package (update self color alpha texture)
     (define (add-overlay)
       (if (not frame-count)
           (begin
             (set! frame-count 1)
             (set! frame-start (current-seconds))
-            (set! total-size (u8vector-length buffer)))
+            (set! total-size (u8vector-length color)))
         (increase! frame-count)
-        (increase! total-size (u8vector-length buffer))
+        (increase! total-size (u8vector-length color))
         (let ((elapse (- (current-seconds) frame-start)))
           (let ((rate (/ (cast <fl> frame-count) elapse))
                 (size (/ (cast <fl> total-size) frame-count)))
             (set-font (get-surface texture) {Font font-name: tahoma point-size: 24 hint-style: slight hint-metrics: on})
             (draw-text (get-surface texture) 5 (- (get-height resolution) 30) (format "Rate: {r precision: 3}, Size: {a}" rate size) {Color World-Red})))))
     
-    (copy_to_texture buffer (u8vector-length buffer) (get-data texture))
+    (if (not alpha?)
+        (move-u8vector->pointer! color (get-data texture))
+      (let ((width (get-width resolution))
+            (height (get-height resolution))
+            (data (cairo_image_surface_get_data (get-handle alpha-surface))))
+        (cairo_surface_flush (get-handle alpha-surface))
+        (combine-alpha color alpha data (* width height))
+        (cairo_surface_mark_dirty (get-handle alpha-surface))
+        (let ((rect (new Rect 0 0 width height))
+              (color {Color red: .000 green: .000 blue: .200 alpha: .25})
+              (surface (get-surface texture)))
+          (clear surface)
+          (fill-rect surface rect color)
+          (frame-rect surface rect color)
+          (draw-surface surface alpha-surface 0 0))))
     (when overlay?
       (add-overlay))
     (map-texture texture))
@@ -892,24 +943,90 @@
 
 
 ;;;
-;;;; Billboard-Video-Sink
+;;;; Draw-Video-Sink
 ;;;
 
 
-(class Billboard-Video-Sink extends Video-Sink
+(class Draw-Video-Sink extends Video-Sink
   
   
-  (slot player    initialize #f accessors generate)
-  (slot billboard initialize #f accessors generate)
+  (slot entity initialize #f accessors generate)
+  (slot pane   initialize #f accessors generate)
   
   
-  (method override (initialize self id . rest)
+  (method override (initialize self ent . rest)
+    (apply nextmethod self alpha?: #t rest)
+    (let ((p (cache-draw-pane ent (list (eq? ent (current-me)) resolution))))
+      (set! entity ent)
+      (set! pane p)))
+  
+  
+  (method override (conclude-element self)
+    (nextmethod self)
+    (when entity
+      (set-draw-pane entity #f)
+      (set! entity #f)
+      (set! pane #f)))
+  
+  
+  (method override (draw self color alpha timestamp duration)
+    ;; quicky
+    (when pane
+      (update self color alpha (get-texture (cache-quad-texture pane)))))
+  
+  
+  (method override (render self)
+    ;; nothing to do render done by player pane
+    ))
+
+
+;;;
+;;;; Draw-Pane
+;;;
+
+
+(definition public (make-draw-pane entity draw)
+  (new Draw-Pane
+    size: {Dimension$fl$ 6. 3.375}
+    resolution: @w {Dimension 640 360} {Dimension 1280 720}
+    billboard: draw
+    entity: entity))
+
+
+(class Draw-Pane extends Entity-Pane
+  
+  
+  (method (clear self surface)
+    (let ((width (get-width resolution))
+          (height (get-height resolution)))
+      (let ((rect (new Rect 0 0 width height))
+            (color {Color red: .000 green: .000 blue: .200 alpha: .25}))
+        (clear surface)
+        (fill-rect surface rect color)
+        (frame-rect surface rect color))))
+  
+  
+  (method override (draw self surface)
+    (clear self surface)))
+
+
+;;;
+;;;; Camera-Video-Sink
+;;;
+
+
+(class Camera-Video-Sink extends Video-Sink
+  
+  
+  (slot player initialize #f accessors generate)
+  (slot pane   initialize #f accessors generate)
+  
+  
+  (method override (initialize self entity . rest)
     (apply nextmethod self rest)
-    ;; (current-me) is quicky for tests
-    (let ((p (or (find-entity id) (current-me))))
-      (let ((elem (cache-camera-pane p (list (eq? p (current-me)) resolution))))
-        (set! player p)
-        (set! billboard elem))))
+    (let ((p (cache-camera-pane entity (list (eq? entity (current-me)) resolution))))
+      (set! player entity)
+      (set! pane p)))
   
   
   (method override (conclude-element self)
@@ -917,15 +1034,15 @@
     (when player
       (set-camera-pane player #f)
       (set! player #f)
-      (set! billboard #f)))
+      (set! pane #f)))
   
   
-  (method override (draw self buffer timestamp duration)
-    (update self buffer (get-texture (cache-quad-texture billboard))))
+  (method override (draw self color alpha timestamp duration)
+    (update self color alpha (get-texture (cache-quad-texture pane))))
   
   
   (method override (render self)
-    ;; nothing to do render done by player billboard
+    ;; nothing to do render done by player pane
     ))
 
 
@@ -990,8 +1107,8 @@
       (set! quad-texture #f)))
   
   
-  (method override (draw self buffer timestamp duration)
-    (update self buffer (get-texture quad-texture)))
+  (method override (draw self color alpha timestamp duration)
+    (update self color alpha (get-texture quad-texture)))
   
   
   (method override (render self)
@@ -1046,8 +1163,8 @@
       (set! sheet #f)))
   
   
-  (method override (draw self buffer timestamp duration)
-    (update self buffer (get-texture sheet)))
+  (method override (draw self color alpha timestamp duration)
+    (update self color alpha (get-texture sheet)))
   
   
   (method override (render self)
@@ -1224,7 +1341,7 @@
                                framerate: framerate
                                bitrate: bitrate
                                codec: codec)))
-                (video-sink (player-output video name position: position size: size resolution: resolution codec: codec))
+                (video-sink (entity-output video name position: position size: size resolution: resolution codec: codec))
                 (audio-sink (and (and file? audio?)
                                  (new world.audio:Audio-Sink
                                    codec: 'none))))

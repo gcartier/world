@@ -15,9 +15,14 @@
 
 
 (import (jazz.audio)
+        (jazz.cairo)
         (jazz.component)
         (jazz.geometry)
+        (jazz.graphic)
+        (jazz.gstreamer)
         (jazz.io)
+        (jazz.platform.types)
+        (jazz.syntax (phase syntax))
         (jazz.time)
         (jazz.view)
         (world)
@@ -29,11 +34,13 @@
         (world.dyes)
         (world.generation.base)
         (world.geometry)
+        (world.stream)
         (world.homogeneous)
         (world.index)
         (world.interface.inventory)
         (world.scriptum)
         (world.sound)
+        (world.stream.foreign)
         (world.syntax (phase syntax))
         (world.task)
         (world.work))
@@ -74,6 +81,16 @@
     (display-message world (->string msg))))
 
 
+(definition public (%%name name)
+  (let ((entity (%%current-entity)))
+    (world.changes:name-change entity name)))
+
+
+(definition public (%%unname)
+  (let ((entity (%%current-entity)))
+    (world.changes:name-change entity #f)))
+
+
 (definition public (%%say msg (size: size #f))
   (let ((entity (%%current-entity))
         (message (if (and (pair? msg)
@@ -88,14 +105,113 @@
     (world.changes:say-change entity #f)))
 
 
-(definition public (%%name name)
-  (let ((entity (%%current-entity)))
-    (world.changes:name-change entity name)))
+;;;
+;;;; Draw
+;;;
 
 
-(definition public (%%unname)
+(definition color-pipeline
+  #f)
+
+(definition (cache-color-pipeline width height framerate bitrate)
+  (or color-pipeline
+      (let ((pipeline (make-color-pipeline width height framerate bitrate)))
+        (set! color-pipeline pipeline)
+        pipeline)))
+
+(definition (make-color-pipeline width height framerate bitrate)
+  (let ((pipeline (gst-launch "appsrc name=src"
+                              "videoconvert name=convert"
+                              (tie "video/x-raw, format=I420, width={width}, height={height}, framerate={framerate}/1")
+                              (tie "x264enc pass=qual quantizer=20 bitrate={bitrate} tune=zerolatency speed-preset=ultrafast name=enc")
+                              "appsink name=sink")))
+    (let ((src (gst_bin_get_by_name pipeline "src"))
+          (sink (gst_bin_get_by_name pipeline "sink")))
+      (gst-setup-source src "video/x-raw" "BGRA" width height framerate)
+      (gst_element_set_state pipeline GST_STATE_PLAYING))
+    pipeline))
+
+
+(definition alpha-pipeline
+  #f)
+
+(definition (cache-alpha-pipeline width height framerate bitrate)
+  (or alpha-pipeline
+      (let ((pipeline (make-alpha-pipeline width height framerate bitrate)))
+        (set! alpha-pipeline pipeline)
+        pipeline)))
+
+(definition (make-alpha-pipeline width height framerate bitrate)
+  (let ((pipeline (gst-launch "appsrc name=src"
+                              (tie "x264enc pass=qual quantizer=20 bitrate={bitrate} tune=zerolatency speed-preset=ultrafast name=enc")
+                              "appsink name=sink")))
+    (let ((src (gst_bin_get_by_name pipeline "src"))
+          (sink (gst_bin_get_by_name pipeline "sink")))
+      (gst-setup-source src "video/x-raw" "I420" width height framerate)
+      (gst_element_set_state pipeline GST_STATE_PLAYING))
+    pipeline))
+
+
+(definition public (%%draw proc)
   (let ((entity (%%current-entity)))
-    (world.changes:name-change entity #f)))
+    (cond ((local?)
+           (set-console-draw entity proc)
+           (let ((pane (get-draw-pane entity)))
+             (let ((resolution (get-resolution pane))
+                   (surface (get-surface (get-texture (cache-quad-texture pane)))))
+               (clear pane surface)
+               (proc surface resolution)
+               (map-texture (get-texture (cache-quad-texture pane))))))
+          (else
+           (startup-gstreamer)
+           (let ((width @w 640 1280)
+                 (height @w 360 720)
+                 (framerate 30)
+                 (bitrate 4096)
+                 (debug? #f))
+             (let ((start (real-time))
+                   (surface (new Memory-Surface #f (new Dimension width height)))
+                   (pixels (* width height)))
+               (proc surface (new Dimension width height))
+               (let ((color-pipeline (cache-color-pipeline width height framerate bitrate))
+                     (alpha-pipeline (cache-alpha-pipeline width height framerate bitrate)))
+                 (let ((color-src (gst_bin_get_by_name color-pipeline "src"))
+                       (color-sink (gst_bin_get_by_name color-pipeline "sink"))
+                       (alpha-src (gst_bin_get_by_name alpha-pipeline "src"))
+                       (alpha-sink (gst_bin_get_by_name alpha-pipeline "sink")))
+                   ;; feed drawing into src
+                   (let ((data (cairo_image_surface_get_data (get-handle surface)))
+                         (size (* pixels 4))
+                         (alpha-size (/ (* pixels 12) 8))
+                         (timestamp 0)
+                         (duration 100))
+                     (let ((color-buffer (make-u8vector size))
+                           (color-info (make-u64vector 2))
+                           (color-bytes #f)
+                           (alpha-buffer (make-u8vector alpha-size))
+                           (alpha-info (make-u64vector 2))
+                           (alpha-bytes #f)
+                           (alpha-data (heap-calloc alpha-size 1)))
+                       (separate-alpha data alpha-data pixels)
+                       (gst_app_src_write4 color-src data size timestamp duration)
+                       (gst_app_src_write4 alpha-src alpha-data alpha-size timestamp duration)
+                       ;; retrieve frames from sink
+                       (let (loop)
+                         (when (not color-bytes)
+                           (let ((size (gst_app_sink_read color-sink color-buffer color-info)))
+                             (when (/= size -1)
+                               (set! color-bytes size))))
+                         (when (not alpha-bytes)
+                           (let ((size (gst_app_sink_read alpha-sink alpha-buffer alpha-info)))
+                             (when (/= size -1)
+                               (set! alpha-bytes size))))
+                         (if (and color-bytes alpha-bytes)
+                             (let ((timestamp (u64vector-ref color-info 0))
+                                   (duration (u64vector-ref color-info 1)))
+                               ;(debug (- (real-time) start) color-bytes alpha-bytes)
+                               (broadcast-processor-draw (current-processor) (get-id entity) (subu8vector color-buffer 0 color-bytes) (subu8vector alpha-buffer 0 alpha-bytes) timestamp duration))
+                           (sleep .001)
+                           (loop)))))))))))))
 
 
 ;;;
