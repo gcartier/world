@@ -15,6 +15,7 @@
 
 
 (import (jazz.audio)
+        (jazz.geometry)
         (jazz.io)
         (jazz.syntax (phase syntax))
         (world)
@@ -22,6 +23,7 @@
         (world.configure)
         (world.context)
         (world.geometry)
+        (world.homogeneous)
         (world.settings)
         (world.syntax (phase syntax))
         (world.task))
@@ -82,6 +84,7 @@
           (let ((elapse (- time previous)))
             (unless (stopping? task)
               (site (sound on?: #t)
+                @this-task-is-not-needed-with-gstreamer-i-think
                 (update-audio)))
             (let ((duration (- (current-seconds) time)))
               (task-sleep task sound-period duration exit))
@@ -93,7 +96,7 @@
 ;;;
 
 
-(definition sounds
+(definition protected sounds
   (make-table test: equal?))
 
 
@@ -101,51 +104,50 @@
   (empty-table sounds))
 
 
-(definition protected (cache-sound path)
-  (let ((cached (table-ref sounds path 'not-found)))
-    (if (neq? cached 'not-found)
-        cached
-      (let ((ckb (find-ckb-sound path)))
-        (let ((sound (and ckb (new-bank-sound ckb))))
-          (table-set! sounds path sound)
-          sound)))))
+(definition protected (autoclose-sound path)
+  (let ((sound (new-sound path)))
+    (set-eos-proc sound close-sound)
+    sound))
 
 
-(definition (find-ckb-sound path)
+(definition protected (wav-sound path)
+  (let ((wav (find-wav-sound path)))
+    (and wav (autoclose-sound wav))))
+
+
+(definition (find-wav-sound path)
   (let ((world (current-world)))
     (continuation-capture
       (lambda (return)
         (iterate-assets world
           (lambda (assets)
-            (let ((ckb (new-file (get-directory assets) (make-filename path "ckb"))))
-              (when (exists? ckb)
-                (continuation-return return ckb)))))
+            (let ((wav (new-file (get-directory assets) (make-filename path "wav"))))
+              (when (exists? wav)
+                (continuation-return return wav)))))
         #f))))
 
-(definition (require-ckb-sound path)
-  (or (find-ckb-sound path)
-      (error "Unable to find ckb sound: {s}" path)))
+(definition (require-wav-sound path)
+  (or (find-wav-sound path)
+      (error "Unable to find sound: {s}" path)))
+
+
+(definition package (close-sound sound)
+  (with-task-mutex
+    (lambda ()
+      (close sound))))
 
 
 (definition public (play-3d-sound path pos (volume: volume #f))
   (when (and sounds? (not (processing?)) (neq? path 'none))
-    (let ((sound (cache-sound path)))
+    (let ((sound (wav-sound path)))
       (when sound
-        ;; quick try this should be an initialization
-        (set-3d-attenuation 1. 50.)
-        ;; quick try this should be updated when the player moves
-        (let ((seer (or (current-me+) (current-camera))))
-          (let ((position (get-position seer))
-                (lookat (get-lookat seer)))
-            (let ((lookingat (vertex+& position (get-sight lookat)))
-                  (up (get-up lookat)))
-              (set-3d-listener
-                (vertex-x position) (vertex-y position) (vertex-z position)
-                (vertex-x lookingat) (vertex-y lookingat) (vertex-z lookingat)
-                (vertex-x up) (vertex-y up) (vertex-z up)))))
+        (set-eos-proc sound (lambda (sound)
+                              (with-task-mutex
+                                (lambda ()
+                                  (close sound)
+                                  (unregister-3d-sound sound)))))
         (set-volume sound (or volume game-volume))
-        (set-3d-position sound (vertex-x pos) (vertex-y pos) (vertex-z pos))
-        (set-3d-enabled sound #t)
+        (register-3d-sound sound pos)
         (play sound)))))
 
 
@@ -156,7 +158,7 @@
 
 (definition public (play-sound-file path (volume: volume #f))
   (when (and sounds? (not (processing?)))
-    (let ((sound (cache-sound path)))
+    (let ((sound (wav-sound path)))
       (when sound
         (when volume
           (set-volume sound volume))
@@ -172,36 +174,96 @@
 
 
 ;;;
-;;;; Stream
+;;;; 3d
 ;;;
 
 
-(definition protected (cache-stream-sound path)
-  (or (table-ref sounds path #f)
-      (let ((stream (require-stream-sound path)))
-        (let ((sound (new-stream-sound stream)))
-          (table-set! sounds path sound)
-          sound))))
+(definition package 3d-sounds
+  (make-table test: eq?))
+
+(definition public (register-3d-sound sound position)
+  (table-set! 3d-sounds sound position))
+
+(definition public (unregister-3d-sound sound)
+  (table-clear 3d-sounds sound))
 
 
-(definition (require-stream-sound path)
-  (let ((world (current-world)))
-    (continuation-capture
-      (lambda (return)
-        (iterate-assets world
-          (lambda (assets)
-            (let ((mp3 (new-file (get-directory assets) (make-filename path "mp3"))))
-              (when (exists? mp3)
-                (continuation-return return mp3)))))
-        (error "Unable to find stream sound: {s}" path)))))
+(definition listener-position
+  #f)
+
+(definition listener-sight
+  #f)
 
 
-(definition public (play-stream-sound path (volume: volume #f))
-  (when (and sounds? (not (processing?)))
-    (let ((sound (cache-stream-sound path)))
-      (when volume
-        (set-volume sound volume))
-      (play sound))))
+(definition near-distance
+  2.5)
+
+(definition near-volume
+  1.)
+
+(definition far-distance
+  50.)
+
+(definition far-volume
+  0.)
+
+
+(definition package (update-3d-sounds position sight)
+  (when (or (not listener-position)
+            (not listener-sight)
+            (not (vertex-near? position listener-position))
+            (not (vertex-near? sight listener-sight)))
+    (set! listener-position (copy-vertex position))
+    (set! listener-sight (copy-vertex sight))
+    (iterate-table 3d-sounds
+      (lambda (sound position)
+        (when (playing? sound)
+          ;; volume
+          (let ((dist (vertex-distance position listener-position)))
+            (let ((attenuation (linear-attenuation dist)))
+              (set-volume sound (* game-volume attenuation))))
+          ;; pan
+          (let ((angle (vector-signed-angle listener-sight (vertex-& position listener-position) (f64vector 0. 1. 0.))))
+            (let ((pan (sight-panning angle)))
+              (set-panorama sound pan))))))))
+
+
+(definition (linear-attenuation dist)
+  (cond ((<= dist near-distance)
+         near-volume)
+        ((>= dist far-distance)
+         far-volume)
+        (else
+         (interpolate dist near-distance far-distance 1. 0.))))
+
+
+(definition (inverse-attenuation dist)
+  )
+
+
+;; SetListenerGain 
+;; 0 is not heard
+;; 1 is no attenuation
+;; values between 0..1 give attenuation
+;; 
+;; Also use SetDistanceModel to set the proper distance model.
+;; None
+;; Bypasses distance attenuation for all sound sources.
+;; 
+;; InverseDistance
+;; Inverse distance attenuation described by the following formula:
+;; 
+;; gain = referenceDistance / (referenceDistance + rolloffFactor * (distance - referenceDistance))
+;; 
+;; InverseDistanceClamped
+;; Essentially the InverseDistance model extended to guarantee that for distances below the ReferenceDistance, gain is clamped.
+
+
+(definition (sight-panning angle)
+  (cond ((between? angle 0. PI/2) (interpolate angle 0. PI/2 0. -1.))
+        ((between? angle PI/2 PI) (interpolate angle PI/2 PI -1. 0.))
+        ((between? angle (- PI) (- PI/2)) (interpolate angle (- PI) (- PI/2) 0. 1.))
+        ((between? angle (- PI/2) 0.) (interpolate angle (- PI/2) 0. 1. 0.))))
 
 
 ;;;
@@ -258,7 +320,7 @@
               (iterate-directory step-dir
                 (lambda (path kind)
                   (let ((path (join path "/")))
-                    (when (extension=? (extract-extension path) "ckb")
+                    (when (extension=? (extract-extension path) "wav")
                       (enqueue queue (string-append "sound/step/" (extract-spine path))))))
                 full?: #f
                 files?: #t
