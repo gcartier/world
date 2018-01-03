@@ -75,6 +75,10 @@
   (world-setting 'world.video-debug? #f))
 
 
+(definition slide-duration
+  (world-setting 'world.slide-duration .2))
+
+
 ;;;
 ;;;; Kush
 ;;;
@@ -254,13 +258,18 @@
         (consume output buffer timestamp duration))))
   
   
-  (method package (receive-processor-draw self id color alpha timestamp duration)
+  (method package (receive-processor-draw self id color alpha timestamp duration slide?)
     (if (not color)
         (let ((output (find-output self id)))
           (when output
             (close-output self id output)))
       (let ((output (entity-output self id)))
-        (consume output color timestamp duration alpha))))
+        (if (not slide?)
+            (consume output color timestamp duration alpha)
+          (let ((texture (get-texture (cache-quad-texture (get-pane output)))))
+            (with-slide output texture
+              (lambda ()
+                (consume output color timestamp duration alpha))))))))
   
   
   (method package (render-scene self)
@@ -691,7 +700,8 @@
   (slot alpha-data     <u8vector>  initialize #f accessors generate)
   (slot alpha-info     <u64vector> initialize #f accessors generate)
   (slot alpha-bytes                initialize #f accessors generate)
-  (slot alpha-surface              initialize #f accessors generate)
+  (slot image-surface              initialize #f accessors generate)
+  (slot image-inhibit?             initialize #f accessors generate)
   (slot task                       initialize #f accessors generate)
   (slot drawn?                     initialize #f accessors generate)
   (slot frame-count                initialize #f)
@@ -786,7 +796,7 @@
             (set! self.alpha-pipeline pipeline)
             (set! self.alpha-appsrc appsrc)
             (set! self.alpha-appsink appsink)
-            (set! self.alpha-surface (new Memory-Surface #f (new Dimension width height))))))))
+            (set! self.image-surface (new Memory-Surface #f (new Dimension width height))))))))
   
   
   (method override (start-element self)
@@ -831,14 +841,14 @@
     (when alpha?
       (gst_element_set_state alpha-pipeline GST_STATE_NULL)
       (gst_object_unref alpha-pipeline)
-      (close alpha-surface)
+      (close image-surface)
       (set! alpha-info #f)
       (set! alpha-data #f)
       (set! alpha-bytes #f)
       (set! alpha-pipeline #f)
       (set! alpha-appsrc #f)
       (set! alpha-appsink #f)
-      (set! alpha-surface #f))
+      (set! image-surface #f))
     (set! drawn? #f))
   
   
@@ -920,24 +930,51 @@
         (move-u8vector->pointer! color (get-data texture))
       (let ((width (get-width resolution))
             (height (get-height resolution))
-            (data (cairo_image_surface_get_data (get-handle alpha-surface))))
-        (cairo_surface_flush (get-handle alpha-surface))
+            (data (cairo_image_surface_get_data (get-handle image-surface))))
+        (cairo_surface_flush (get-handle image-surface))
         (combine-alpha color alpha data (* width height))
-        (cairo_surface_mark_dirty (get-handle alpha-surface))
-        (let ((rect (new Rect 0 0 width height))
-              (color {Color red: .000 green: .000 blue: .200 alpha: .25})
-              (surface (get-surface texture)))
-          (clear surface)
-          (fill-rect surface rect color)
-          (frame-rect surface rect color)
-          (draw-surface surface alpha-surface 0 0))))
+        (cairo_surface_mark_dirty (get-handle image-surface))
+        (unless image-inhibit?
+          (let ((surface (get-surface texture)))
+            (clear-glass surface resolution)
+            (draw-surface surface image-surface 0 0)))))
     (when overlay?
       (add-overlay))
-    (map-texture texture))
+    (unless image-inhibit?
+      (map-texture texture)))
   
   
   (method package virtual (render self)
-    ))
+    )
+  
+  
+  (method (with-slide self texture thunk)
+    (set! image-inhibit? #t)
+    (thunk)
+    (thread-start!
+      (new-thread
+        (lambda ()
+          (let ((height (cast <fl> (get-height resolution))))
+            (let ((delta (/ height render-rate slide-duration))
+                  (surface (get-surface texture)))
+              (let (loop (slide (- height delta)))
+                (let ((slide (max 0. slide)))
+                  (let ((done? (<= slide 0.)))
+                    (with-task-mutex
+                      (lambda ()
+                        (if (not image-surface)
+                            (set! done? #t)
+                          (translate surface 0 slide)
+                          (clear-glass surface resolution)
+                          (draw-surface surface image-surface 0 0)
+                          (translate surface 0 (- slide))
+                          (map-texture texture))
+                        (when done?
+                          (set! image-inhibit? #f))))
+                    (when (not done?)
+                      (sleep render-period)
+                      (loop (- slide delta)))))))))
+        'slide))))
 
 
 ;;;
