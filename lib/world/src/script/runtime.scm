@@ -72,6 +72,14 @@
     
     (add 'scheme '%%define)
     
+    ;; going with the clos oo
+    (add 'jazz 'generic)
+    (add 'jazz '%class)
+    (add 'jazz 'interface)
+    (add 'jazz '%slot)
+    (add 'jazz '%property)
+    (add 'jazz 'method)
+    
     (%%list table)))
 
 
@@ -106,6 +114,19 @@
     ;; until all available functionaly
     (add 'jazz 'declare)
     (add 'jazz 'cast)
+    
+    ;; going with the clos oo
+    (add 'jazz 'generic)
+    (add 'jazz 'specific)
+    (add 'jazz 'class)
+    (add 'jazz '%class)
+    (add 'jazz 'interface)
+    (add 'jazz 'slot)
+    (add 'jazz 'property)
+    (add 'jazz '%slot)
+    (add 'jazz '%property)
+    (add 'jazz 'method)
+    (add 'jazz 'with-self)
     
     (%%list table)))
 
@@ -158,4 +179,17 @@
 (jazz:define-walker-special     %%let        scheme jazz:walk-let)
 (jazz:define-walker-special     %%do         scheme jazz:walk-do)
 
-(jazz:define-walker-special     declare      jazz jazz:walk-declare))
+(jazz:define-walker-special     declare      jazz jazz:walk-declare)
+
+;; going with the clos oo
+(jazz:define-walker-declaration generic      jazz jazz:walk-generic-declaration jazz:walk-generic)
+(jazz:define-walker-special     specific     jazz jazz:walk-specific)
+(jazz:define-walker-syntax      class        jazz jazz:expand-class)
+(jazz:define-walker-declaration %class       jazz jazz:walk-%class-declaration jazz:walk-%class)
+(jazz:define-walker-declaration interface    jazz jazz:walk-interface-declaration jazz:walk-interface)
+(jazz:define-walker-syntax      slot         jazz jazz:expand-slot)
+(jazz:define-walker-syntax      property     jazz jazz:expand-property)
+(jazz:define-walker-declaration %slot        jazz jazz:walk-%slot-declaration jazz:walk-%slot)
+(jazz:define-walker-declaration %property    jazz jazz:walk-%slot-declaration jazz:walk-%slot)
+(jazz:define-walker-declaration method       jazz jazz:walk-method-declaration jazz:walk-method)
+(jazz:define-walker-special     with-self    jazz jazz:walk-with-self))
