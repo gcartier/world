@@ -16,6 +16,7 @@
 
 (import (jazz.graphic)
         (jazz.syntax (phase syntax))
+        (jazz.view)
         (world)
         (world.animation)
         (world.autoload)
@@ -76,12 +77,13 @@
   (slot animated?         <bool>           initialize #f getter generate)
   (slot animation-tick    <object>         initialize #f getter generate)
   (slot renderer          <object>         initialize #f accessors generate)
-  (slot state-billboard   <object>         initialize #f getter generate)
+  (slot state-entity      <object>         initialize #f getter generate)
   (slot name-pane         <object>         initialize #f getter generate)
   (slot script-pane       <object>         initialize #f getter generate)
   (slot console-pane      <object>         initialize #f getter generate)
   (slot draw-pane         <object>         initialize #f getter generate)
   (slot camera-pane       <object>         initialize #f getter generate)
+  (slot cycled-pane       <object>         initialize #f getter generate)
   (slot overlay           <dye>            initialize #f accessors generate)
   (slot camera            <object>         initialize #f accessors generate)
   (slot expanse           <Expanse+>       initialize #f accessors generate)
@@ -463,28 +465,28 @@
   ;;;
   
   
-  (method public (set-state-billboard self obj)
-    (when state-billboard
-      (close state-billboard))
-    (set! state-billboard obj))
+  (method public (set-state-entity self obj)
+    (when state-entity
+      (close state-entity))
+    (set! state-entity obj))
   
   
-  (method (cache-state-billboard self)
+  (method (cache-state-entity self)
     (let ((script (get-script self)))
       (if (not script)
-          state-billboard
+          state-entity
         (and (not (user?))
              (and interface-script?
                   (let ((state (get-state script)))
-                    (if (and state-billboard (or (eq? (get-state state-billboard) state)
-                                                 ;; reduce state change flicker
-                                                 @wait-seems-worse-at-the-moment!
-                                                 (let ((time (get-state-time script)))
-                                                   (and time
-                                                        (< (- (current-seconds) time) .05)))))
-                        state-billboard
-                      (let ((board (make-state-billboard script)))
-                        (set-state-billboard self board)
+                    (if (and state-entity (or (eq? (get-state state-entity) state)
+                                              ;; reduce state change flicker
+                                              @wait-seems-worse-at-the-moment!
+                                              (let ((time (get-state-time script)))
+                                                (and time
+                                                     (< (- (current-seconds) time) .05)))))
+                        state-entity
+                      (let ((board (make-state-entity script)))
+                        (set-state-entity self board)
                         board))))))))
 
   
@@ -509,14 +511,17 @@
       (unless script-pane
         (let ((pane (make-script-pane self '())))
           (register-pane zone pane)
+          (update-parts self)
           (set! script-pane pane)))))
     
   
   (method public (deactivate-script-pane self)
-    (let ((zone (current-zone)))
+    (let ((window (current-world-window))
+          (zone (current-zone)))
       (when script-pane
         (close script-pane)
         (unregister-pane zone script-pane)
+        (set-focus-pane window #f)
         (set! script-pane #f))))
 
   
@@ -530,7 +535,8 @@
       (close console-pane))
     (if (not message)
         (set! console-pane #f)
-      (set! console-pane (make-console-pane self (list message size)))))
+      (set! console-pane (make-console-pane self (list message size)))
+      (update-parts self)))
   
   
   (method public (update-console-output self)
@@ -553,6 +559,7 @@
       (if (not info)
           (set! draw-pane #f)
         (set! draw-pane (world.video:make-draw-pane self info))
+        (update-parts self)
         (when (get-root draw-pane)
           (register-pane zone draw-pane)))))
   
@@ -572,7 +579,8 @@
   (method public (set-camera-pane self info)
     (if (not info)
         (set! camera-pane #f)
-      (set! camera-pane (world.video:make-camera-pane info))))
+      (set! camera-pane (world.video:make-camera-pane info))
+      (update-parts self)))
   
   
   (method public (cache-camera-pane self info)
@@ -583,70 +591,91 @@
 
   
   ;;;
-  ;;;; Update
+  ;;;; Panes
   ;;;
   
   
-  (method (update-billboards self)
-    (let ((me (current-me)))
-      (define (rendered-pane pane)
-        (and pane (get-render? pane) pane))
-      
-      (let ((state-billboard (cache-state-billboard self))
-            (name-pane (rendered-pane name-pane))
-            (script-pane (rendered-pane script-pane))
-            (console-pane (rendered-pane console-pane))
-            (draw-pane (rendered-pane draw-pane))
-            (camera-pane (rendered-pane camera-pane)))
-        (let ((pane (or script-pane console-pane camera-pane))
-              (height (transformed-height self)))
-          (when state-billboard
-            (set-matrix state-billboard (billboard-matrix& me self (+ height (if pane (get-height pane) 0.) (if name-pane (get-height name-pane) 0.)))))
-          (when name-pane
-            (set-matrix name-pane (billboard-matrix& me self (+ height (get-radius-y name-pane) (if pane (get-height pane) 0.)))))
-          (cond (script-pane
-                 (set-matrix script-pane (entity-matrix& me self (+ height (get-radius-y script-pane)))))
-                (console-pane
-                 (set-matrix console-pane (billboard-matrix& me self (+ height (get-radius-y console-pane)))))
-                (draw-pane
-                 (set-matrix draw-pane (entity-matrix& me self (+ height (get-radius-y draw-pane)))))
-                (camera-pane
-                 (set-matrix camera-pane (billboard-matrix& me self (+ height (get-radius-y camera-pane))))))))))
+  (definition (rendered-pane pane)
+    (and pane (get-render? pane) pane))
+  
+  
+  (method (entity-pane self)
+    (or (rendered-pane script-pane)
+        (rendered-pane console-pane)
+        (rendered-pane draw-pane)
+        (rendered-pane camera-pane)))
+  
+  
+  (method (effective-entity-pane self)
+    (or (and cycled-pane (rendered-pane cycled-pane))
+        (entity-pane self)))
+
+
+  (method (cycle-panes self)
+    (let ((world (current-world)))
+      (let ((panes (collect rendered-pane (list script-pane console-pane draw-pane camera-pane))))
+        (if (null? panes)
+            (bell)
+          (let ((entity-pane (entity-pane self)))
+            (let ((pane (next-element panes (or cycled-pane entity-pane))))
+              (let ((default? (eq? pane entity-pane))
+                    (title (get-title pane)))
+                (set! cycled-pane (if default? #f pane))
+                (display-message world (if default?
+                                           (format "{a} (default)" title)
+                                         title)))))))))
+  
+  
+  (method (reset-layout self)
+    (set! cycled-pane #f))
 
   
   ;;;
-  ;;;; Register
+  ;;;; Parts
   ;;;
   
   
-  (method package virtual (register-billboards self)
+  (method (update-parts self)
     (let ((me (current-me)))
-      (define (rendered-pane pane)
-        (and pane (get-render? pane) pane))
-      
-      (update-billboards self)
-      (let ((state-billboard (cache-state-billboard self))
+      (let ((state-entity (cache-state-entity self))
             (name-pane (rendered-pane name-pane))
-            (script-pane (rendered-pane script-pane))
-            (console-pane (rendered-pane console-pane))
-            (draw-pane (rendered-pane draw-pane))
-            (camera-pane (rendered-pane camera-pane)))
-        (when state-billboard
-          (world.renderer:register-entity state-billboard))
+            (entity-pane (effective-entity-pane self))
+            (auxiliary-pane (or (rendered-pane console-pane) (rendered-pane draw-pane))))
+        (let ((height (transformed-height self)))
+          (when state-entity
+            (set-matrix state-entity (billboard-matrix& me self (+ height (if entity-pane (get-height entity-pane) 0.) (if name-pane (get-height name-pane) 0.)))))
+          (when name-pane
+            (set-matrix name-pane (billboard-matrix& me self (+ height (get-radius-y name-pane) (if entity-pane (get-height entity-pane) 0.)))))
+          (when entity-pane
+            (set-matrix entity-pane (entity-matrix& me self (+ height (get-radius-y entity-pane)))))
+          (when (and entity-pane (eq? entity-pane script-pane) auxiliary-pane)
+            (let ((sight (matrix-direction (get-matrix auxiliary-pane))))
+              (set-matrix auxiliary-pane (auxiliary-matrix& me self (vertex+& (vertex-scalar*& sight .01)
+                                                                              (vertex& 0. (+ height (get-radius-y auxiliary-pane)) 0.))))))))))
+  
+  
+  (method package virtual (register-parts self)
+    (let ((me (current-me)))
+      (update-parts self)
+      (let ((state-entity (cache-state-entity self))
+            (name-pane (rendered-pane name-pane))
+            (entity-pane (effective-entity-pane self))
+            (auxiliary-pane (or (rendered-pane console-pane) (rendered-pane draw-pane))))
+        (when state-entity
+          (world.renderer:register-entity state-entity))
         (when name-pane
           (world.renderer:register-texture-element name-pane))
-        (cond (script-pane
-               (world.renderer:register-console-element script-pane))
-              (console-pane
-               (world.renderer:register-console-element console-pane))
-              (draw-pane
-               (world.renderer:register-console-element draw-pane))
-              (camera-pane
-               (world.renderer:register-texture-element camera-pane))))))
+        (when entity-pane
+          (if #t;(eq? entity-pane camera-pane)
+              (world.renderer:register-texture-element entity-pane)
+            (world.renderer:register-console-element entity-pane)))
+        (when (and entity-pane (eq? entity-pane script-pane) auxiliary-pane)
+          ;; put back to console renderer when fixed
+          (world.renderer:register-texture-element auxiliary-pane)))))
 
   
   ;;;
-  ;;;; Draw
+  ;;;; Target
   ;;;
   
   
@@ -762,10 +791,10 @@
         (when (and animate? animated? morphing)
           (when (in-frustum? (or camera (current-camera)) position)
             (tick-animation self elapse)))
-        (when state-billboard
-          (when (and (get-animate? state-billboard) (get-animated? state-billboard) (get-morphing state-billboard))
+        (when state-entity
+          (when (and (get-animate? state-entity) (get-animated? state-entity) (get-morphing state-entity))
             (when (in-frustum? (or camera (current-camera)) position)
-              (tick-animation state-billboard elapse)))))))
+              (tick-animation state-entity elapse)))))))
   
   
   (method protected virtual (animated self)
