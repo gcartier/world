@@ -84,8 +84,7 @@
           (let ((elapse (- time previous)))
             (unless (stopping? task)
               (site (sound on?: #t)
-                @this-task-is-not-needed-with-gstreamer-i-think
-                (update-audio)))
+                (update-playing-sounds)))
             (let ((duration (- (current-seconds) time)))
               (task-sleep task sound-period duration exit))
             (iter time)))))))
@@ -108,38 +107,33 @@
   (let ((cached (table-ref sounds path 'not-found)))
     (if (neq? cached 'not-found)
         cached
-      (let ((wav (find-wav-sound path)))
-        (let ((sound (and wav (new-sound wav))))
+      (let ((file (find-sound-file path)))
+        (let ((sound (and file (new-sound file))))
           (table-set! sounds path sound)
           sound)))))
 
 
-(definition (find-wav-sound path)
+(definition (find-sound-file path)
   (let ((world (current-world)))
     (continuation-capture
       (lambda (return)
         (iterate-assets world
           (lambda (assets)
-            (let ((wav (new-file (get-directory assets) (make-filename path "wav"))))
-              (when (exists? wav)
-                (continuation-return return wav)))))
+            (let ((dir (get-directory assets)))
+              (let ((wav (new-file dir (make-filename path "wav"))))
+                (if (exists? wav)
+                    (continuation-return return wav)
+                  (let ((mp3 (new-file dir (make-filename path "mp3"))))
+                     (if (exists? mp3)
+                         (continuation-return return mp3)
+                       (let ((ogg (new-file dir (make-filename path "ogg"))))
+                         (when (exists? ogg)
+                           (continuation-return return ogg))))))))))
         #f))))
 
-(definition (require-wav-sound path)
-  (or (find-wav-sound path)
+(definition (require-sound-file path)
+  (or (find-sound-file path)
       (error "Unable to find sound: {s}" path)))
-
-
-(definition package (close-sound sound)
-  (with-task-mutex
-    (lambda ()
-      (close sound))))
-
-
-(definition protected (autoclose-sound path)
-  (let ((sound (new-sound path)))
-    (add-eos-proc sound close-sound)
-    sound))
 
 
 (definition protected (effective-cache-sound path/sound)
@@ -151,40 +145,60 @@
          (cache-sound path/sound))))
 
 
-(definition public (play-3d-sound path/sound pos (volume: volume #f))
+;;;
+;;;; Playing
+;;;
+
+
+(definition package playing-sounds
+  (make-table test: eq?))
+
+(definition public (register-playing-sound sound (ended-proc #f))
+  (table-set! playing-sounds sound ended-proc))
+
+(definition public (unregister-playing-sound sound)
+  (table-clear playing-sounds sound))
+
+
+(definition package (update-playing-sounds)
+  (with-task-mutex
+    (lambda ()
+      (let ((ended '()))
+        (iterate-table playing-sounds
+          (lambda (sound ended-proc)
+            (when (ended? sound)
+              (set! ended (cons sound ended)))))
+        (for-each (lambda (sound)
+                    (let ((ended-proc (table-ref playing-sounds sound)))
+                      (when ended-proc
+                        (ended-proc sound)))
+                    (table-clear playing-sounds sound))
+                  ended)))))
+
+
+;;;
+;;;; Ambient
+;;;
+
+
+(definition public (play-ambient-sound path/sound (volume: volume #f) (error?: error? #f))
   (let ((sound (effective-cache-sound path/sound)))
-    (when sound
-      (add-eos-proc sound (lambda (sound)
-                            (with-task-mutex
-                              (lambda ()
-                                (unregister-3d-sound sound)))))
-      (set-volume sound (or volume game-volume))
-      (register-3d-sound sound pos)
-      (update-3d-sound sound pos)
-      (rewind sound)
-      (play sound))))
-
-
-(definition public (play-3d-sound-if path pos)
-  (when path
-    (play-3d-sound path pos)))
-
-
-(definition public (play-sound-file path/sound (volume: volume #f))
-  (let ((sound (effective-cache-sound path/sound)))
-    (when sound
+    (if (not sound)
+        (when error?
+          (error "Unable to find sound: {a}" path/sound))
       (when volume
         (set-volume sound volume))
+      (register-playing-sound sound)
       (rewind sound)
       (play sound))))
 
 
 (definition public (play-game-sound path)
-  (play-sound-file path volume: game-volume))
+  (play-ambient-sound path volume: game-volume))
 
 
 (definition public (play-interface-sound path)
-  (play-sound-file path volume: interface-volume))
+  (play-ambient-sound path volume: interface-volume))
 
 
 ;;;
@@ -270,6 +284,25 @@
         ((between? angle PI/2 PI) (interpolate angle PI/2 PI -1. 0.))
         ((between? angle (- PI) (- PI/2)) (interpolate angle (- PI) (- PI/2) 0. 1.))
         ((between? angle (- PI/2) 0.) (interpolate angle (- PI/2) 0. 1. 0.))))
+
+
+(definition public (play-3d-sound path/sound pos (volume: volume #f) (close?: close? #f))
+  (let ((sound (effective-cache-sound path/sound)))
+    (when sound
+      (set-volume sound (or volume game-volume))
+      (register-playing-sound sound (lambda (sound)
+                                      (unregister-3d-sound sound)
+                                      (when close?
+                                        (close sound))))
+      (register-3d-sound sound pos)
+      (update-3d-sound sound pos)
+      (rewind sound)
+      (play sound))))
+
+
+(definition public (play-3d-sound-if path pos)
+  (when path
+    (play-3d-sound path pos)))
 
 
 ;;;
