@@ -72,8 +72,8 @@
   
   
   (slot flags           <fx+>       accessors generate)
-  (slot vertex-indices  <list>      accessors generate)
-  (slot vertex-normals  <list>      accessors generate)
+  (slot vertex-indices  <vector>    accessors generate)
+  (slot vertex-normals  <vector>    accessors generate)
   (slot s               <f64vector> accessors generate)
   (slot t               <f64vector> accessors generate)
   (slot d               <f64vector> accessors generate)
@@ -202,15 +202,15 @@
               (s (get-s triangle))
               (t (get-t triangle))
               (d (get-d triangle)))
-          (let ((v1 (vertex-ref (cast <fx> (first indices))))
-                (v2 (vertex-ref (cast <fx> (second indices))))
-                (v3 (vertex-ref (cast <fx> (third indices))))
+          (let ((v1 (vertex-ref (cast <fx> (vector-ref indices 0))))
+                (v2 (vertex-ref (cast <fx> (vector-ref indices 1))))
+                (v3 (vertex-ref (cast <fx> (vector-ref indices 2))))
                 (uv (f32vector (vertex-x s) (vertex-x t) (vertex-y s) (vertex-y t) (vertex-z s) (vertex-z t)))
                 (tdepth (vertex-x d)))
             (add-triangle mesher
-              (get-vertex v1) (first  normals) 0 1 (get-bone-id v1)
-              (get-vertex v2) (second normals) 2 3 (get-bone-id v2)
-              (get-vertex v3) (third  normals) 4 5 (get-bone-id v3)
+              (get-vertex v1) (vector-ref normals 0) 0 1 (get-bone-id v1)
+              (get-vertex v2) (vector-ref normals 1) 2 3 (get-bone-id v2)
+              (get-vertex v3) (vector-ref normals 2) 4 5 (get-bone-id v3)
               uv
               tdepth))))
       
@@ -370,14 +370,14 @@
           (define (<-color reader) <f32vector>
             (<-floats32! reader (make-dye)))
           
-          (define (<-indices reader) <list>
-            (list
+          (define (<-indices reader) <vector>
+            (vector
               (<-u16 reader)
               (<-u16 reader)
               (<-u16 reader)))
           
-          (define (<-normals reader) <list>
-            (list
+          (define (<-normals reader) <vector>
+            (vector
               (<-normal reader)
               (<-normal reader)
               (<-normal reader)))
@@ -568,16 +568,14 @@
             (->floats32 writer dye))
           
           (define (->indices writer indices)
-            (list
-              (->u16 writer (first indices))
-              (->u16 writer (second indices))
-              (->u16 writer (third indices))))
+            (->u16 writer (vector-ref indices 0))
+            (->u16 writer (vector-ref indices 1))
+            (->u16 writer (vector-ref indices 2)))
           
           (define (->normals writer normals)
-            (list
-              (->normal writer (first normals))
-              (->normal writer (second normals))
-              (->normal writer (third normals))))
+            (->normal writer (vector-ref normals 0))
+            (->normal writer (vector-ref normals 1))
+            (->normal writer (vector-ref normals 2)))
           
           ;; vertices
           (define (->vertices writer)
@@ -683,4 +681,72 @@
           (->float writer (get-current-frame ms3d))
           (->s32 writer (get-total-frames ms3d))
           ;; bones
-          (->bones writer (get-animation-fps ms3d))))))))
+          (->bones writer (get-animation-fps ms3d)))))))
+
+
+;;;
+;;;; Utility
+;;;
+
+
+;; remove duplicate vertices in the same smoothing group
+(definition public (smooth-vertices! ms3d <MS3D-Model>)
+  (define (determine-smoothing-groups)
+    (let ((triangles (get-triangles ms3d))
+          (smoothing-groups '()))
+      (loop (for triangle in-vector triangles)
+            (let ((group (get-smoothing-group triangle)))
+              (unless (memv? group smoothing-groups)
+                (set! smoothing-groups (cons group smoothing-groups)))))
+      smoothing-groups))
+  
+  (define (smooth-group group)
+    (let ((vertices (get-vertices ms3d))
+          (triangles (get-triangles ms3d)))
+      (let ((uniques (make-table test: vertex=? hash: vertex-hash))
+            (duplicates (make-vector (vector-length vertices) #f))
+            (redundant 0))
+        ;; analyse
+        (loop (for triangle in-vector triangles)
+              (when (= (get-smoothing-group triangle) group)
+                (loop (for index in-vector (get-vertex-indices triangle))
+                      (let ((vertex (vector-ref vertices index)))
+                        (let ((vert (get-vertex vertex)))
+                          (let ((unique-index (table-ref uniques vert #f)))
+                            (if (not unique-index)
+                                (table-set! uniques vert index)
+                              (let ((unique (vector-ref vertices unique-index)))
+                                (assert (and (= (get-flags unique) (get-flags vertex))
+                                             (= (get-bone-id unique) (get-bone-id vertex)))
+                                  (vector-set! duplicates index unique-index)
+                                  (increase! redundant))))))))))
+        (when (> redundant 0)
+          (let ((num-vertices (vector-length vertices)))
+            (let ((new-vertices (make-vector (- num-vertices redundant)))
+                  (remapped (make-vector num-vertices #f))
+                  (slide 0))
+              ;; move
+              (loop (for i from 0 below num-vertices)
+                    (let ((vertex (vector-ref vertices i)))
+                      (let ((vert (get-vertex vertex)))
+                        (let ((unique-index (vector-ref duplicates i)))
+                          (if unique-index
+                              (begin
+                                (vector-set! remapped i (vector-ref remapped unique-index))
+                                (increase! slide))
+                            (let ((slided-index (- i slide)))
+                              (vector-set! new-vertices slided-index vertex)
+                              (vector-set! remapped i slided-index)))))))
+              ;; adjust
+              (loop (for triangle in-vector triangles)
+                    (let ((indices (get-vertex-indices triangle)))
+                      (loop (for i from 0 below (vector-length indices))
+                            (let ((index (vector-ref indices i)))
+                              (let ((remapped-index (vector-ref remapped index)))
+                                (assert (< remapped-index (- num-vertices redundant)))
+                                (vector-set! indices i remapped-index))))))
+              ;; replace
+              (set-vertices ms3d new-vertices)))))))
+  
+  (let ((smoothing-groups (determine-smoothing-groups)))
+    (for-each smooth-group smoothing-groups))))
