@@ -50,15 +50,17 @@
 (class MS3D-Vertex extends Object
   
   
-  (slot flags   <fx>                              accessors generate)
-  (slot vertex  <vertex> initialize (make-vertex) accessors generate)
-  (slot bone-id <fx>                              accessors generate)
+  (slot flags           <fx>                              accessors generate)
+  (slot vertex          <vertex> initialize (make-vertex) accessors generate)
+  (slot bone-id         <fx>                              accessors generate)
+  (slot reference-count <fx>                              accessors generate)
   
   
-  (method override (initialize self flags vertex bone-id)
+  (method override (initialize self flags vertex bone-id reference-count)
     (set! self.flags flags)
     (set! self.vertex vertex)
-    (set! self.bone-id bone-id)))
+    (set! self.bone-id bone-id)
+    (set! self.reference-count reference-count)))
 
 
 ;;;
@@ -108,7 +110,13 @@
     (set! self.flags flags)
     (set! self.name name)
     (set! self.triangles triangles)
-    (set! self.material-index material-index)))
+    (set! self.material-index material-index))
+  
+  
+  (method override (print self output readably)
+    (print-unreadable self output
+      (lambda (output)
+        (format output "{a}" name)))))
 
 
 ;;;
@@ -348,7 +356,7 @@
   (call-with-input-file (path-settings file)
     (lambda (port)
       (let ((MAX_TEXTURE_FILENAME_SIZE 128))
-        (let ((reader (new Binary-Reader file)))
+        (with ((reader (new Binary-Reader file)))
           (define (<-vertex reader) <f64vector>
             (<-floats64! reader (make-vertex)))
           
@@ -382,7 +390,7 @@
                             (vertex (<-vertex reader))
                             (bone-id (<-u8 reader))
                             (reference-count (<-u8 reader)))
-                        (vector-set! vertices i (new MS3D-Vertex flags vertex bone-id))))
+                        (vector-set! vertices i (new MS3D-Vertex flags vertex bone-id reference-count))))
                 vertices)))
           
           ;; triangles
@@ -417,7 +425,7 @@
               (let ((groups (make-vector num-groups)))
                 (loop (for i from 0 below num-groups)
                       (let ((flags (<-u8 reader))
-                            (name (<-string reader 32))
+                            (name (<-c-string reader 32))
                             (triangles
                               (let ((num-group-triangles (<-u16 reader)))
                                 (let ((group-triangles (make-vector num-group-triangles)))
@@ -439,7 +447,7 @@
             (let ((num-materials (<-u16 reader)))
               (let ((materials (make-vector num-materials)))
                 (loop (for i from 0 below num-materials)
-                      (let ((name (<-string reader 32))
+                      (let ((name (<-c-string reader 32))
                             (ambient (<-color reader))
                             (diffuse (<-color reader))
                             (specular (<-color reader))
@@ -447,8 +455,8 @@
                             (shininess (<-float reader))
                             (transparency (<-float reader))
                             (mode (<-u8 reader))
-                            (texture (<-string reader MAX_TEXTURE_FILENAME_SIZE))
-                            (alphamap (<-string reader MAX_TEXTURE_FILENAME_SIZE)))
+                            (texture (<-c-string reader MAX_TEXTURE_FILENAME_SIZE))
+                            (alphamap (<-c-string reader MAX_TEXTURE_FILENAME_SIZE)))
                         ;; set alpha
                         (dye-alpha-set! ambient transparency)
                         (dye-alpha-set! diffuse transparency)
@@ -475,8 +483,8 @@
               (let ((bones (and (window?) (make-vector num-bones))))
                 (loop (for i from 0 below num-bones)
                       (let ((flags (<-u8 reader))
-                            (name (<-string reader 32))
-                            (parent-name (<-string reader 32))
+                            (name (<-c-string reader 32))
+                            (parent-name (<-c-string reader 32))
                             (rot (euler-quaternion (<-vertex reader)))
                             (pos (<-vertex reader))
                             (num-key-frames-rot (<-u16 reader))
@@ -502,34 +510,174 @@
                 bones)))
           
           ;; header
-          (assert (equal? (<-string reader 10) "MS3D000000"))
+          (assert (equal? (<-size-string reader 10) "MS3D000000"))
           (assert (= (<-s32 reader) 4))
-          
           ;; content
-          (let ((model (new MS3D-Model))
+          (let ((ms3d (new MS3D-Model))
                 (vertices (<-vertices reader))
                 (triangles (<-triangles reader))
                 (groups (<-groups reader))
                 (materials (<-materials reader)))
             ;; vertices
-            (set-vertices model vertices)
+            (set-vertices ms3d vertices)
             ;; triangles
-            (set-triangles model triangles)
+            (set-triangles ms3d triangles)
             ;; groups
-            (set-groups model groups)
+            (set-groups ms3d groups)
             ;; materials
-            (set-materials model materials)
+            (set-materials ms3d materials)
             ;; animation
             (let ((animation-fps (max 1. (<-float reader)))
                   (current-frame (<-float reader))
                   (total-frames (<-s32 reader)))
-              (set-animation-fps model animation-fps)
-              (set-current-frame model current-frame)
-              (set-total-frames model total-frames))
+              (set-animation-fps ms3d animation-fps)
+              (set-current-frame ms3d current-frame)
+              (set-total-frames ms3d total-frames))
             ;; bones
-            (set-bones model (<-bones reader (get-animation-fps model)))
+            (set-bones ms3d (<-bones reader (get-animation-fps ms3d)))
             ;; comments
             ;; vertex extra
             ;; bone extra
             ;; model extra
-            model)))))))
+            ms3d))))))
+
+
+;;;
+;;;; Export
+;;;
+
+
+(definition package (write-ms3d ms3d <MS3D-Model> file)
+  (call-with-output-file (path-settings file)
+    (lambda (port)
+      (let ((MAX_TEXTURE_FILENAME_SIZE 128))
+        (with ((writer (new Binary-Writer file maximum: MAX_TEXTURE_FILENAME_SIZE)))
+          (define (->vertex writer vert)
+            (->floats64 writer vert))
+          
+          (define (->normal writer vert)
+            (->vertex writer vert))
+          
+          (define (->tex writer uv)
+            (->floats64 writer uv))
+          
+          (define (->color writer dye)
+            (->floats32 writer dye))
+          
+          (define (->indices writer indices)
+            (list
+              (->u16 writer (first indices))
+              (->u16 writer (second indices))
+              (->u16 writer (third indices))))
+          
+          (define (->normals writer normals)
+            (list
+              (->normal writer (first normals))
+              (->normal writer (second normals))
+              (->normal writer (third normals))))
+          
+          ;; vertices
+          (define (->vertices writer)
+            (let ((vertices (get-vertices ms3d)))
+              (let ((num-vertices (vector-length vertices)))
+                (->u16 writer num-vertices)
+                (loop (for i from 0 below num-vertices)
+                      (let ((vert (vector-ref vertices i)))
+                        (->u8 writer (get-flags vert))
+                        (->vertex writer (get-vertex vert))
+                        (->u8 writer (get-bone-id vert))
+                        (->u8 writer (get-reference-count vert)))))))
+          
+          ;; triangles
+          (define (->triangles writer)
+            (let ((triangles (get-triangles ms3d)))
+              (let ((num-triangles (vector-length triangles)))
+                (->u16 writer num-triangles)
+                (loop (for i from 0 below num-triangles)
+                      (let ((triangle (vector-ref triangles i)))
+                        (->u16 writer (get-flags triangle))
+                        (->indices writer (get-vertex-indices triangle))
+                        (->normals writer (get-vertex-normals triangle))
+                        (->tex writer (get-s triangle))
+                        (->tex writer (get-t triangle))
+                        (->u8 writer (get-smoothing-group triangle))
+                        (->u8 writer (get-group-index triangle)))))))
+          
+          ;; groups
+          (define (->groups writer)
+            (let ((groups (get-groups ms3d)))
+              (let ((num-groups (vector-length groups)))
+                (->u16 writer num-groups)
+                (loop (for i from 0 below num-groups)
+                      (let ((group (vector-ref groups i)))
+                        (->u8 writer (get-flags group))
+                        (->c-string writer (get-name group) 32)
+                        (let ((triangles (get-triangles group)))
+                          (let ((num-triangles (vector-length triangles)))
+                            (->u16 writer num-triangles)
+                            (loop (for j from 0 below num-triangles)
+                                  (->u16 writer (vector-ref triangles j)))))
+                        (->s8 writer (get-material-index group)))))))
+          
+          ;; materials
+          (define (->materials writer)
+            (let ((materials (get-materials ms3d)))
+              (let ((num-materials (vector-length materials)))
+                (->u16 writer num-materials)
+                (loop (for i from 0 below num-materials)
+                      (let ((material (vector-ref materials i)))
+                        (->c-string writer (get-name material) 32)
+                        (->color writer (get-ambient material))
+                        (->color writer (get-diffuse material))
+                        (->color writer (get-specular material))
+                        (->color writer (get-emissive material))
+                        (->float writer (get-shininess material))
+                        (->float writer (get-transparency material))
+                        (->u8 writer (get-mode material))
+                        (->c-string writer (get-texture-name material) MAX_TEXTURE_FILENAME_SIZE)
+                        (->c-string writer (get-alphamap material) MAX_TEXTURE_FILENAME_SIZE))))))
+          
+          ;; bones
+          (define (->bones writer animation-fps <fl>)
+            (let ((bones (get-bones ms3d)))
+              (let ((num-bones (vector-length bones)))
+                (->u16 writer num-bones)
+                (loop (for i from 0 below num-bones)
+                      (let ((bone (vector-ref bones i)))
+                        (->u8 writer (get-flags bone))
+                        (->c-string writer (get-name bone) 32)
+                        (->c-string writer (get-parent-name bone) 32)
+                        (->vertex writer (quaternion-euler (get-rotation bone)))
+                        (->vertex writer (get-position bone))
+                        (let ((rotation-keys (get-rotation-keys bone))
+                              (position-keys (get-position-keys bone)))
+                          (let ((num-rotation-keys (vector-length rotation-keys))
+                                (num-position-keys (vector-length position-keys)))
+                            (->u16 writer num-rotation-keys)
+                            (->u16 writer num-position-keys)
+                            ;; the frame time is in seconds, so multiply it by the animation fps
+                            ;; to get the frames rotation channel
+                            (loop (for j from 0 below num-rotation-keys)
+                                  (let ((keyframe (vector-ref rotation-keys j)))
+                                    (->float writer (/ (get-frame keyframe) animation-fps))
+                                    (->vertex writer (quaternion-euler (get-key keyframe)))))
+                            ;; translation channel
+                            (loop (for j from 0 below num-position-keys)
+                                  (let ((keyframe (vector-ref position-keys j)))
+                                    (->float writer (/ (get-frame keyframe) animation-fps))
+                                    (->vertex writer (get-key keyframe)))))))))))
+          
+          ;; header
+          (->size-string writer "MS3D000000" 10)
+          (->s32 writer 4)
+          ;; content
+          (->vertices writer)
+          (->triangles writer)
+          (->groups writer)
+          (->materials writer)
+          ;; animation
+          (->float writer (get-animation-fps ms3d))
+          (->float writer (get-current-frame ms3d))
+          (->s32 writer (get-total-frames ms3d))
+          ;; bones
+          (->bones writer (get-animation-fps ms3d))))))))
