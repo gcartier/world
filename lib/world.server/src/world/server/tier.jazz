@@ -37,7 +37,15 @@
         (world.server.client)
         (world.server.serving)
         (world.settings)
-        (world.syntax (phase syntax)))
+        (world.syntax (phase syntax))
+        (world.tier))
+
+
+(definition audio-self?
+  (world-setting 'world.audio-self? #f))
+
+(definition video-self?
+  (world-setting 'world.video-self? #f))
 
 
 (class Server-Tier extends Serving-Tier implements Server-Interface
@@ -48,6 +56,7 @@
   (slot instances     initialize (make-table test: equal?) getter generate)
   (slot zones         initialize '()                       getter generate)
   (slot hits          initialize 0                         getter generate)
+  (slot udp-server    initialize #f                        getter generate)
   
   
   (method override (initialize self dir)
@@ -61,6 +70,11 @@
     (setup-zones self))
   
   
+  (method override (startup self)
+    (nextmethod self)
+    (start-udp-server self))
+  
+  
   (method override (enter self)
     (let ((me (current-me+)))
       (when me
@@ -69,6 +83,7 @@
   
   
   (method override (shutdown self)
+    (stop-udp-server self)
     (detach-clients self))
   
   
@@ -586,8 +601,28 @@
                               (world-setting 'world.video-self? #f))
                       (calling-client tier delegate
                         (lambda ()
-                          (processor-video client id buffer timestamp duration))))))
+                          (server-video client id buffer timestamp duration))))))
                 delegates)))
+  
+  
+  ;;;
+  ;;;; UDP
+  ;;;
+  
+  
+  (method (start-udp-server self)
+    (let ((listener (get-remote-listener)))
+      (let ((host (or (listening-host listener) "localhost"))
+            (service (listening-port listener)))
+        (let ((server (new UDP-Server)))
+          (start server host service)
+          (set! udp-server server)))))
+  
+  
+  (method (stop-udp-server self)
+    (when udp-server
+      (stop udp-server)
+      (set! udp-server #f)))
   
   
   ;;;
@@ -700,6 +735,116 @@
     (call-with-output-file (path-settings (cache-log-file self) append: #t)
       (lambda (output)
         (format output "{a} {a}{%}" sender message)))))
+
+
+;;;
+;;;; UDP Server
+;;;
+
+
+(class UDP-Server extends Object
+  
+  
+  (slot udp-port    initialize #f getter generate)
+  (slot connections initialize #f getter generate)
+  (slot stopping?   initialize #f getter generate)
+  
+  
+  (method (start self host service)
+    (set! udp-port (open-udp (list
+                               local-address: host
+                               local-port-number: service)))
+    (set! connections '())
+    (set! stopping? #f)
+    (thread-start!
+      (new-thread
+        (lambda ()
+          (process self))
+        'udp)))
+  
+  
+  (method (process self)
+    (declare (proper-tail-calls))
+    (let (loop)
+      (let ((data (read udp-port)))
+        (if (eof-object? data)
+            (when (not stopping?)
+              #f) ;; how should we handle errors?
+          (process-data self data)
+          (loop)))))
+  
+  
+  (method (process-data self data)
+    (define (extract-kind)
+      (let ((b1 (u8vector-ref data 0))
+            (b2 (u8vector-ref data 1))
+            (b3 (u8vector-ref data 2))
+            (b4 (u8vector-ref data 3)))
+        (bytes->32-bit-integer b1 b2 b3 b4)))
+    
+    (let ((kind (extract-kind)))
+      (ecase kind
+        ((udp-connect)
+         (connect-source self))
+        ((udp-chunk udp-audio udp-audio-off udp-video udp-video-off)
+         (broadcast-media self kind data))
+        (else
+         (error "Unknown UDP kind: {s}" kind)))))
+  
+  
+  (method (connect-source self)
+    (let ((source-info (udp-source-socket-info udp-port)))
+      (let ((source-host (socket-info-address source-info))
+            (source-port (socket-info-port-number source-info)))
+        (let ((connection (new UDP-Connection source-host source-port)))
+          (set! connections (cons connection connections))))))
+  
+  
+  (method (broadcast-media self kind data)
+    (let ((source-info (udp-source-socket-info udp-port)))
+      (let ((source-host (socket-info-address source-info))
+            (source-port (socket-info-port-number source-info)))
+        (for-each (lambda (connection)
+                    (let ((host (get-host connection))
+                          (port (get-port connection)))
+                      (when (or (not (host=? host source-host))
+                                (not (service=? port source-port))
+                                @wait-channel-in-chunk #t
+                                @wait-channel-in-chunk (and (= kind udp-audio) audio-self?)
+                                @wait-channel-in-chunk (and (= kind udp-video) video-self?))
+                        (udp-destination-set! host port udp-port)
+                        (write data udp-port))))
+                  connections))))
+  
+  
+  (method (stop self)
+    (set! stopping? #t)
+    (close-port udp-port)
+    (set! udp-port #f)))
+
+
+;;;
+;;;; UDP Connection
+;;;
+
+
+(class UDP-Connection extends Object
+  
+  
+  (slot host getter generate)
+  (slot port getter generate)
+  
+  
+  (method override (initialize self host port)
+    (nextmethod self)
+    (set! self.host host)
+    (set! self.port port))
+  
+  
+  (method override (print self output readably)
+    (print-unreadable self output
+      (lambda (output)
+        (format output "{a} {a}" host port)))))
 
 
 ;;;
