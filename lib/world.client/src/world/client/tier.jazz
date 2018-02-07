@@ -764,6 +764,34 @@
   ;;;
   
   
+  (method (send-acknowledge self id sequence channel-kind)
+    (mutex-lock! write-mutex)
+    (let ((size (+ 4 18 4 4)))
+      (let ((data (make-u8vector size))
+            (head 0))
+        (define (push-32-bit n)
+          (receive (b1 b2 b3 b4) (32-bit-integer->bytes n)
+            (u8vector-set! data head b1)
+            (u8vector-set! data (+ head 1) b2)
+            (u8vector-set! data (+ head 2) b3)
+            (u8vector-set! data (+ head 3) b4)
+            (increase! head 4)))
+        
+        (define (push-id id)
+          (let ((v (object->u8vector id))
+                (len 18))
+            (subu8vector-move! v 0 len data head)
+            (increase! head len)))
+        
+        (push-32-bit udp-acknowledge)
+        (push-id id)
+        (push-32-bit sequence)
+        (push-32-bit channel-kind)
+        (assert (= head size)
+          (write data udp-port))))
+    (mutex-unlock! write-mutex))
+  
+  
   (method (send-audio self buffer timestamp duration)
     (let ((kind udp-audio)
           (kind-off udp-audio-off)
@@ -928,7 +956,14 @@
       (let ((kind (read-32-bit))
             (id (read-id))
             (sequence (read-32-bit)))
+        (define (receive-acknowledge)
+          (let ((channel-kind (read-32-bit)))
+            (let ((channel (require-channel self channel-kind id)))
+              (when udp-debug?
+                (terminal (get-remote-name) (udp-name kind) id sequence)))))
+        
         (define (receive-chunk)
+          (send-acknowledge self id sequence kind)
           (let ((channel-kind (read-32-bit))
                 (part (read-32-bit))
                 (total (read-32-bit))
@@ -977,8 +1012,9 @@
                          (lambda (id)
                            (receive-server-video (current-video) id #f #f #f))))
         
-        (define (receive-media kind kind-off on off)
-          (let ((channel (require-channel self kind id)))
+        (define (receive-media kind-on kind-off on off)
+          (send-acknowledge self id sequence kind)
+          (let ((channel (require-channel self kind-on id)))
             (unless (discard? channel)
               (show-missing channel)
               (set-last-sequence channel sequence)
@@ -1017,6 +1053,8 @@
                       (terminal (get-remote-name) '***missing*** (udp-name kind) expected 'to (- sequence 1)))))))))
         
         (ecase kind
+          ((udp-acknowledge)
+           (receive-acknowledge))
           ((udp-chunk)
            (receive-chunk))
           ((udp-audio udp-audio-off)
