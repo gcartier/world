@@ -9,6 +9,7 @@
 ;;;  the Initial Developer. All Rights Reserved.
 ;;;
 ;;;  Contributor(s):
+;;;    Barbara Samson
 
 
 (module world.client.tier jazz
@@ -36,7 +37,9 @@
         (world.id)
         (world.io)
         (world.log)
+        (world.player)
         (world.protocol)
+        (world.ring)
         (world.scriptum)
         (world.scriptum)
         (world.settings)
@@ -45,6 +48,7 @@
         (world.syntax (phase syntax))
         (world.task)
         (world.tier)
+        (world.udp)
         (world.video))
 
 
@@ -70,6 +74,7 @@
   (slot character-avatar  initialize #f getter generate)
   (slot character-script  initialize #f getter generate)
   (slot player-id         initialize #f getter generate)
+  (slot player-no         initialize #f getter generate)
   (slot player-position   initialize #f getter generate)
   (slot player-lookat     initialize #f getter generate)
   (slot other-players     initialize #f getter generate)
@@ -104,14 +109,15 @@
       (set-name me character-name)
       (set-avatar me character-avatar)
       (register-id me player-id)
+      (register-no me player-no)
       (set-position me player-position)
       (set-lookat me player-lookat)
       ;; quick hack around server not having camera info
       (set-position (player-camera me) player-position)
       (set-lookat (player-camera me) player-lookat)
       (for-each (lambda (info)
-                  (bind (character-name character-avatar player-id player-position player-lookat player-script) info
-                    (add-player self character-name character-avatar player-id player-position (make-standard-lookat) @why-is-it-corrupted??? player-lookat player-script)))
+                  (bind (character-name character-avatar player-id player-no player-position player-lookat player-script) info
+                    (add-player self character-name character-avatar player-id player-no player-position (make-standard-lookat) @why-is-it-corrupted??? player-lookat player-script)))
                 other-players)
       (autostart (current-audio))
       (autostart (current-video))))
@@ -219,7 +225,7 @@
           (set! remote-client client)
           (set! remote-server server)
           (add-exit-job! (~ disconnect-from-server self))
-          (bind (client-id client-no assets processor welcome form spawnpoint player-spawnpoint player-id player-position player-lookat other-players) info
+          (bind (client-id client-no assets processor welcome form spawnpoint player-spawnpoint player-id player-no player-position player-lookat other-players) info
             (set! self.client-id client-id)
             (set! self.client-no client-no)
             (reset-last-forward)
@@ -230,6 +236,7 @@
             (set! self.spawnpoint spawnpoint)
             (set! self.player-spawnpoint player-spawnpoint)
             (set! self.player-id player-id)
+            (set! self.player-no player-no)
             (set! self.player-position player-position)
             (set! self.player-lookat player-lookat)
             (set! self.other-players other-players))))))
@@ -401,7 +408,7 @@
                     ;; quick hack until changing zone is asynchronous
                     (parameterize ((receive-timeout 60))
                       (client-change-zone remote-server remote-client zone))))))
-      (bind (processor form spawnpoint player-spawnpoint player-id player-position player-lookat other-players) info
+      (bind (processor form spawnpoint player-spawnpoint player-id player-no player-position player-lookat other-players) info
         (reset-last-forward)
         (set! self.remote-processor (connect-remote-proxy processor))
         ;; open test quicky to send form as a string
@@ -410,6 +417,7 @@
           (set! self.spawnpoint spawnpoint)
           (set! self.player-spawnpoint player-spawnpoint)
           (set! self.player-id player-id)
+          (set! self.player-no player-no)
           (set! self.player-position player-position)
           (set! self.player-lookat player-lookat)
           (set! self.other-players other-players)
@@ -515,10 +523,11 @@
   ;;;
   
   
-  (method (add-player self character-name character-avatar player-id player-position player-lookat player-script)
+  (method (add-player self character-name character-avatar player-id player-no player-position player-lookat player-script)
     (let ((zone (current-zone)))
       (let ((player (new Player name: character-name me?: #f avatar: character-avatar position: player-position lookat: player-lookat)))
         (register-id player player-id)
+        (register-no player player-no)
         (set-name-pane player character-name color: (if player-script {Color World-Yellow} {Color World-Purple}))
         (add-element zone player))))
   
@@ -531,9 +540,9 @@
           (remove-element zone player)))))
   
   
-  (method package (processor-entered self client-id client-no character-name character-avatar character-script player-id player-position player-lookat player-script)
+  (method package (processor-entered self client-id client-no character-name character-avatar character-script player-id player-no player-position player-lookat player-script)
     (let ((world (current-world)))
-      (add-player self character-name character-avatar player-id player-position player-lookat player-script)
+      (add-player self character-name character-avatar player-id player-no player-position player-lookat player-script)
       (display-message world (format "{a} entered world" character-name))))
   
   
@@ -678,8 +687,11 @@
 ;;;
 
 
-(definition udp-max-datagram-size
-  (* (world-setting 'world.udp-max-datagram-kb 1) 1024))
+(definition udp-datagram-max
+  (* (world-setting 'world.udp-datagram-max 1) 1024))
+
+(definition udp-jitter-window
+  (world-setting 'world.udp-jitter-window .5))
 
 
 (definition udp-debug-discard?
@@ -697,14 +709,19 @@
   
   (slot udp-port       initialize #f getter generate)
   (slot udp-thread     initialize #f getter generate)
+  (slot udp-stopping?  initialize #f getter generate)
   (slot write-mutex    initialize #f getter generate)
-  (slot audio-sequence initialize 0  getter generate)
-  (slot video-sequence initialize 0  getter generate)
   (slot channels       initialize #f getter generate)
-  (slot stopping?      initialize #f getter generate)
   
   
   (method (connect self local-host host service)
+    (define (send-connect)
+      (mutex-lock! write-mutex)
+      (let ((data (make-u8vector 4)))
+        (write-udp-kind data udp-connect)
+        (write data udp-port))
+      (mutex-unlock! write-mutex))
+    
     (when udp-debug?
       (terminal (get-remote-name) 'connect local-host host service))
     (set! udp-port (open-udp (list
@@ -715,28 +732,15 @@
                        (lambda ()
                          (process self))
                        'udp))
+    (set! udp-stopping? #f)
     (set! write-mutex (make-mutex 'write))
     (set! channels (make-table))
-    (set! stopping? #f)
-    (mutex-lock! write-mutex)
-    (let ((data (make-u8vector 4))
-          (head 0))
-      (define (push-32-bit n)
-        (receive (b1 b2 b3 b4) (32-bit-integer->bytes n)
-          (u8vector-set! data head b1)
-          (u8vector-set! data (+ head 1) b2)
-          (u8vector-set! data (+ head 2) b3)
-          (u8vector-set! data (+ head 3) b4)
-          (increase! head 4)))
-      
-      (push-32-bit udp-connect)
-      (write data udp-port))
-    (mutex-unlock! write-mutex)
+    (send-connect)
     (thread-start! udp-thread))
 
   
   (method (disconnect self)
-    (set! stopping? #t)
+    (set! udp-stopping? #t)
     (close-port udp-port)
     (thread-join! udp-thread)
     (set! udp-port #f)
@@ -748,10 +752,10 @@
   ;;;
   
   
-  (method (require-channel self kind id)
-    (let ((key (cons kind id)))
+  (method (require-channel self kind origin)
+    (let ((key (cons kind origin)))
       (or (table-ref channels key #f)
-          (let ((channel (new UDP-Channel)))
+          (let ((channel (new UDP-Channel kind origin)))
             (table-set! channels key channel)
             channel))))
   
@@ -761,133 +765,56 @@
   ;;;
   
   
-  (method (send-acknowledge self id sequence channel-kind)
+  (method (send-nack self origin sequence channel-kind)
     (mutex-lock! write-mutex)
-    (let ((size (+ 4 18 4 4)))
-      (let ((data (make-u8vector size))
-            (head 0))
-        (define (push-32-bit n)
-          (receive (b1 b2 b3 b4) (32-bit-integer->bytes n)
-            (u8vector-set! data head b1)
-            (u8vector-set! data (+ head 1) b2)
-            (u8vector-set! data (+ head 2) b3)
-            (u8vector-set! data (+ head 3) b4)
-            (increase! head 4)))
-        
-        (define (push-id id)
-          (let ((v (object->u8vector id))
-                (len 18))
-            (subu8vector-move! v 0 len data head)
-            (increase! head len)))
-        
-        (push-32-bit udp-acknowledge)
-        (push-id id)
-        (push-32-bit sequence)
-        (push-32-bit channel-kind)
-        (assert (= head size)
-          (write data udp-port))))
+    (let ((size (+ 4 4 4 4)))
+      (let ((data (make-u8vector size)))
+        (write-udp-kind data udp-nack)
+        (write-udp-origin data origin)
+        (write-udp-sequence data sequence)
+        (write-udp-nack-kind data channel-kind)
+        (write data udp-port)))
     (mutex-unlock! write-mutex))
   
   
   (method (send-audio self buffer timestamp duration)
-    (let ((kind udp-audio)
-          (kind-off udp-audio-off)
-          (id (get-client-id (current-tier)))
-          (sequence audio-sequence))
-      (increase! audio-sequence)
-      (send-media self kind kind-off id sequence buffer timestamp duration)))
+    (send-media self udp-audio buffer timestamp duration))
   
   
   (method (send-video self buffer timestamp duration)
-    (let ((kind udp-video)
-          (kind-off udp-video-off)
-          (id (get-client-id (current-tier)))
-          (sequence video-sequence))
-      (increase! video-sequence)
-      (send-media self kind kind-off id sequence buffer timestamp duration)))
+    (send-media self udp-video buffer timestamp duration))
   
   
-  (method (send-media self kind kind-off id sequence buffer timestamp duration)
+  (method (send-media self kind buffer timestamp duration)
     (mutex-lock! write-mutex)
-    (let ((size (+ 4 18 4 (if (not buffer)
-                              0
-                            (+ (+ 4 (u8vector-length buffer)) 8 8)))))
-      (let ((data (make-u8vector size))
-            (head 0))
-        (define (push-32-bit n)
-          (receive (b1 b2 b3 b4) (32-bit-integer->bytes n)
-            (u8vector-set! data head b1)
-            (u8vector-set! data (+ head 1) b2)
-            (u8vector-set! data (+ head 2) b3)
-            (u8vector-set! data (+ head 3) b4)
-            (increase! head 4)))
-        
-        (define (push-64-bit n)
-          (receive (b1 b2 b3 b4 b5 b6 b7 b8) (64-bit-integer->bytes n)
-            (u8vector-set! data head b1)
-            (u8vector-set! data (+ head 1) b2)
-            (u8vector-set! data (+ head 2) b3)
-            (u8vector-set! data (+ head 3) b4)
-            (u8vector-set! data (+ head 4) b5)
-            (u8vector-set! data (+ head 5) b6)
-            (u8vector-set! data (+ head 6) b7)
-            (u8vector-set! data (+ head 7) b8)
-            (increase! head 8)))
-        
-        (define (push-id id)
-          (let ((v (object->u8vector id))
-                (len 18))
-            (subu8vector-move! v 0 len data head)
-            (increase! head len)))
-        
-        (define (push-u8vector v)
-          (let ((len (u8vector-length v)))
-            (push-32-bit len)
-            (subu8vector-move! v 0 len data head)
-            (increase! head len)))
-        
-        (define (push-subu8vector v pos count)
-          (push-32-bit count)
-          (subu8vector-move! v pos (+ pos count) data head)
-          (increase! head count))
-        
-        (if (not buffer)
-            (begin
-              (push-32-bit kind-off)
-              (push-id id)
-              (push-32-bit sequence)
-              (assert (= head size)
-                (write data udp-port)))
-          (push-32-bit kind)
-          (push-id id)
-          (push-32-bit sequence)
-          (push-u8vector buffer)
-          (push-64-bit timestamp)
-          (push-64-bit duration)
-          (assert (= head size)
-            (if (<= size udp-max-datagram-size)
-                (write data udp-port)
-              (let ((unchunked data)
-                    (header-size (+ 4 18 4 4 4 4 4)))
-                (let ((max-content-size (- udp-max-datagram-size header-size)))
-                  (let ((total (fxceiling/ size max-content-size)))
-                    (let (loop (part 1) (pos 0))
-                      (let ((remain (- size pos)))
-                        (when (> remain 0)
-                          (let ((content-size (min remain max-content-size)))
-                            (let ((data-size (+ header-size content-size)))
-                              (set! data (make-u8vector data-size))
-                              (set! head 0)
-                              (push-32-bit udp-chunk)
-                              (push-id id)
-                              (push-32-bit sequence)
-                              (push-32-bit kind)
-                              (push-32-bit part)
-                              (push-32-bit total)
-                              (push-subu8vector unchunked pos content-size)
-                              (assert (= head data-size)
-                                (write data udp-port)
-                                (loop (+ part 1) (+ pos content-size))))))))))))))))
+    (let ((origin (get-client-no (current-tier))))
+      (let ((channel (require-channel self kind origin)))
+        (let ((frame (next-frame-sequence! channel))
+              (timestamp (or timestamp 0))
+              (duration (or duration 0))
+              (buffer (or buffer #u8())))
+          (let ((header-size (+ 4 4 4 4 4 4 8 8 4))
+                (payload-size (u8vector-length buffer)))
+            (let ((max-content-size (- udp-datagram-max header-size)))
+              (let ((total (fxceiling/ payload-size max-content-size)))
+                (let (loop (part 0) (pos 0))
+                  (let ((remain (- payload-size pos)))
+                    (when (> remain 0)
+                      (let ((sequence (next-data-sequence! channel))
+                            (content-size (min remain max-content-size)))
+                        (let ((size (+ header-size content-size)))
+                          (let ((data (make-u8vector size)))
+                            (write-udp-kind data kind)
+                            (write-udp-origin data origin)
+                            (write-udp-sequence data sequence)
+                            (write-udp-frame data frame)
+                            (write-udp-part data part)
+                            (write-udp-total data total)
+                            (write-udp-timestamp data timestamp)
+                            (write-udp-duration data duration)
+                            (write-udp-subpayload data buffer pos content-size)
+                            (write data udp-port)
+                            (loop (+ part 1) (+ pos content-size))))))))))))))
     (mutex-unlock! write-mutex))
   
   
@@ -901,7 +828,7 @@
     (let (loop)
       (let ((data (with-exception-filter
                     (lambda (exc)
-                      stopping?)
+                      udp-stopping?)
                     (lambda (exc)
                       #f)
                     (lambda ()
@@ -917,151 +844,33 @@
   
   
   (method (receive-data self data)
-    (let ((head 0))
-      (define (read-32-bit)
-        (let ((b1 (u8vector-ref data head))
-              (b2 (u8vector-ref data (+ head 1)))
-              (b3 (u8vector-ref data (+ head 2)))
-              (b4 (u8vector-ref data (+ head 3))))
-          (increase! head 4)
-          (bytes->32-bit-integer b1 b2 b3 b4)))
+    (let ((kind (read-udp-kind data))
+          (origin (read-udp-origin data))
+          (sequence (read-udp-sequence data))
+          (frame (read-udp-frame data)))
+      (define (receive-nack)
+        (let ((channel-kind (read-udp-nack-kind data)))
+          (let ((channel (require-channel self channel-kind origin)))
+            (when udp-debug?
+              (terminal (get-remote-name) (udp-name kind) origin frame)))))
       
-      (define (read-64-bit)
-        (let ((b1 (u8vector-ref data head))
-              (b2 (u8vector-ref data (+ head 1)))
-              (b3 (u8vector-ref data (+ head 2)))
-              (b4 (u8vector-ref data (+ head 3)))
-              (b5 (u8vector-ref data (+ head 4)))
-              (b6 (u8vector-ref data (+ head 5)))
-              (b7 (u8vector-ref data (+ head 6)))
-              (b8 (u8vector-ref data (+ head 7))))
-          (increase! head 8)
-          (bytes->64-bit-integer b1 b2 b3 b4 b5 b6 b7 b8)))
+      (define (receive-media)
+        (let ((part (read-udp-part data))
+              (total (read-udp-total data))
+              (timestamp (read-udp-timestamp data)))
+          (let ((channel (require-channel self kind origin)))
+            (update-time channel timestamp)
+            (give-data channel data)
+            (let ((frame2 (require-frame2 channel timestamp frame)))
+              (add-chunk frame2 data part total)))))
       
-      (define (read-id)
-        (let ((len 18))
-          (let ((v (make-u8vector len)))
-            (subu8vector-move! data head (+ head len) v 0)
-            (increase! head len)
-            (u8vector->object v))))
-      
-      (define (read-u8vector)
-        (let ((len (read-32-bit)))
-          (let ((v (make-u8vector len)))
-            (subu8vector-move! data head (+ head len) v 0)
-            (increase! head len)
-            v)))
-      
-      (let ((kind (read-32-bit))
-            (id (read-id))
-            (sequence (read-32-bit)))
-        (define (receive-acknowledge)
-          (let ((channel-kind (read-32-bit)))
-            (let ((channel (require-channel self channel-kind id)))
-              (when udp-debug?
-                (terminal (get-remote-name) (udp-name kind) id sequence)))))
-        
-        (define (receive-chunk)
-          (send-acknowledge self id sequence kind)
-          (let ((channel-kind (read-32-bit))
-                (part (read-32-bit))
-                (total (read-32-bit))
-                (chunk (read-u8vector)))
-            (let ((channel (require-channel self channel-kind id)))
-              (unless (discard? channel)
-                (show-missing channel)
-                (when udp-debug?
-                  (terminal (get-remote-name) (udp-name kind) id sequence part total (u8vector-length chunk)))
-                (if (> sequence (get-last-sequence channel))
-                    ;; first
-                    (begin
-                      (set-last-sequence channel sequence)
-                      (set-wait-total channel total)
-                      (set-wait-chunks channel (list (cons part chunk))))
-                  (let ((chunks (cons (cons part chunk) (get-wait-chunks channel))))
-                    (if (= (length chunks) (get-wait-total channel))
-                        ;; join
-                        (let ((chunks (map cdr (sort < chunks key: car))))
-                          (let ((data (make-u8vector (apply + (map u8vector-length chunks))))
-                                (pos 0))
-                            (for-each (lambda (chunk)
-                                        (let ((len (u8vector-length chunk)))
-                                          (subu8vector-move! chunk 0 len data pos)
-                                          (increase! pos len)))
-                                      chunks)
-                            (set-wait-total channel #f)
-                            (set-wait-chunks channel #f)
-                            (receive-data self data)))
-                      ;; add
-                      (set-wait-chunks channel chunks))))))))
-        
-        (define (receive-audio)
-          (receive-media udp-audio
-                         udp-audio-off
-                         (lambda (id buffer timestamp duration)
-                           (receive-server-audio (current-audio) id buffer timestamp duration))
-                         (lambda (id)
-                           (receive-server-audio (current-audio) id #f #f #f))))
-        
-        (define (receive-video)
-          (receive-media udp-video
-                         udp-video-off
-                         (lambda (id buffer timestamp duration)
-                           (receive-server-video (current-video) id buffer timestamp duration))
-                         (lambda (id)
-                           (receive-server-video (current-video) id #f #f #f))))
-        
-        (define (receive-media kind-on kind-off on off)
-          (send-acknowledge self id sequence kind)
-          (let ((channel (require-channel self kind-on id)))
-            (unless (discard? channel)
-              (show-missing channel)
-              (set-last-sequence channel sequence)
-              (if (= kind kind-off)
-                  (begin
-                    (when udp-debug?
-                      (terminal (get-remote-name) (udp-name kind) id sequence))
-                    (off id))
-                (let ((buffer (read-u8vector))
-                      (timestamp (read-64-bit))
-                      (duration (read-64-bit)))
-                  (when udp-debug?
-                    (terminal (get-remote-name) (udp-name kind) id sequence (u8vector-length buffer)))
-                  (on id buffer timestamp duration))))))
-        
-        (define (discard? channel)
-          (if (< sequence (get-last-sequence channel))
-              (begin
-                (when udp-debug-discard?
-                  (terminal (get-remote-name) '***discard*** (udp-name kind) sequence))
-                #t)
-            #f))
-        
-        (define (show-missing channel)
-          (when udp-debug-missing?
-            (let ((last-sequence (get-last-sequence channel)))
-              (let ((expected (+ last-sequence 1)))
-                (if (and (= sequence expected)
-                         (get-wait-total channel))
-                    (let ((total (get-wait-total channel))
-                          (received (map car (get-wait-chunks channel))))
-                      (let ((missing (difference (naturals 1 (+ total 1)) received)))
-                        (format :terminal "{s} {s} {s} {s} {s} {l}{%}" (get-remote-name) '***missing*** (udp-name kind) last-sequence 'parts missing)))
-                  (let ((missing (- sequence expected)))
-                    (when (> missing 0)
-                      (terminal (get-remote-name) '***missing*** (udp-name kind) expected 'to (- sequence 1)))))))))
-        
-        (ecase kind
-          ((udp-acknowledge)
-           (receive-acknowledge))
-          ((udp-chunk)
-           (receive-chunk))
-          ((udp-audio udp-audio-off)
-           (receive-audio))
-          ((udp-video udp-video-off)
-           (receive-video))
-          (else
-           (error "Unknown UDP kind: {s}" kind)))))))
+      (ecase kind
+        ((udp-nack)
+         (receive-nack))
+        ((udp-audio udp-video)
+         (receive-media))
+        (else
+         (error "Unknown UDP kind: {s}" kind))))))
 
 
 ;;;
@@ -1069,9 +878,211 @@
 ;;;
 
 
+(definition nanosecond
+  (cast <fl> (expt 10 9)))
+
+
 (class UDP-Channel extends Object
   
   
-  (slot last-sequence initialize -1 accessors generate)
-  (slot wait-total    initialize #f accessors generate)
-  (slot wait-chunks   initialize #f accessors generate)))
+  (slot kind             getter generate)
+  (slot origin           getter generate)
+  (slot data-sequence    accessors generate)
+  (slot frame-sequence   accessors generate)
+  (slot remote-timestamp getter generate)
+  (slot local-seconds    getter generate)
+  (slot b-ring           getter generate)
+  (slot jitter-ring      getter generate)
+  (slot jitter-thread    getter generate)
+  (slot jitter-frames    getter generate)
+  
+  
+  (method override (initialize self kind origin)
+    (nextmethod self)
+    (set! self.kind kind)
+    (set! self.origin origin)
+    (set! self.data-sequence 0)
+    (set! self.frame-sequence 0)
+    (set! self.remote-timestamp #f)
+    (set! self.local-seconds #f)
+    (set! self.b-ring (new Ring 512 max-size: +inf.0))
+    (set! self.jitter-ring (new Ring 64 max-size: +inf.0))
+    (set! self.jitter-thread (new-thread
+                               (lambda ()
+                                 (process-jitter self))))
+    (set! self.jitter-frames (make-table))
+    (thread-start! jitter-thread))
+  
+  
+  (method protected (next-data-sequence! self)
+    (prog1 data-sequence
+      (increase! data-sequence)))
+  
+  
+  (method protected (next-frame-sequence! self)
+    (prog1 frame-sequence
+      (increase! frame-sequence)))
+  
+  
+  (method protected (update-time self timestamp)
+    (set! remote-timestamp timestamp)
+    (set! local-seconds (current-seconds)))
+  
+  
+  (method protected (timestamp->second self timestamp)
+    (+ local-seconds (/ (cast <fl> (- timestamp remote-timestamp)) nanosecond)))
+  
+  
+  (method protected (give-data self data)
+    (give b-ring data))
+  
+  
+  (method protected (require-frame2 self timestamp frame)
+    (or (table-ref jitter-frames frame #f)
+        (let ((frame2 (new Jitter-Frame2 timestamp frame)))
+          (table-set! jitter-frames frame frame2)
+          (give jitter-ring frame2)
+          frame2)))
+  
+  
+  ;;;
+  ;;;; Jitter
+  ;;;
+  
+  
+  (method (process-jitter self)
+    (declare (proper-tail-calls))
+    (let (loop)
+      (let ((frame2 (take jitter-ring)))
+        (let ((now (current-seconds)))
+          (let ((time (+ (timestamp->second self (get-timestamp frame2)) udp-jitter-window)))
+            (let ((wait (- time now)))
+              ;; don't discard for the moment because a garbage collection
+              ;; might make us discard a lot of buffers incorrectly
+              (when (> wait 0.)
+                (sleep wait))
+              (process-frame self frame2)))))
+      (loop)))
+  
+  
+  (method (process-frame self frame2)
+    (define (process-data kind origin sequence frame timestamp duration buffer)
+      (define (player-no->id no)
+        (get-id (find-player-by-no no)))
+      
+      (define (process-audio)
+        (process-media udp-audio
+          (lambda (buffer timestamp duration)
+            (if (= (u8vector-length buffer) 0)
+                (receive-server-audio (current-audio) (player-no->id origin) #f #f #f)
+              (receive-server-audio (current-audio) (player-no->id origin) buffer timestamp duration)))))
+      
+      (define (process-video)
+        (process-media udp-video
+          (lambda (buffer timestamp duration)
+            (if (= (u8vector-length buffer) 0)
+                (receive-server-video (current-video) (player-no->id origin) #f #f #f)
+              (receive-server-video (current-video) (player-no->id origin) buffer timestamp duration)))))
+      
+      (define (process-media kind process)
+        (when udp-debug?
+          (terminal (get-remote-name) (udp-name kind) origin frame (u8vector-length buffer)))
+        (process buffer timestamp duration))
+      
+      (ecase kind
+        ((udp-audio)
+         (process-audio))
+        ((udp-video)
+         (process-video))))
+    
+    (define (process-chunks chunks)
+      (let ((total (get-chunks-total frame2))
+            (received (get-chunks-received frame2)))
+        (define (show-missing-parts)
+          (define (collect-missing)
+            (collect-if (lambda (part)
+                          (not (vector-ref chunks part)))
+                        (naturals 0 total)))
+          
+          (when udp-debug-missing?
+            (let ((missing (collect-missing)))
+              (format :terminal "{s} {s} {s} {s} {s} {l}{%}" (get-remote-name) '***missing*** (udp-name kind) (get-sequence frame2) 'parts missing))))
+        
+        (if (= total received)
+            (let ((first (vector-ref chunks 0)))
+              (let ((kind (read-udp-kind first))
+                    (origin (read-udp-origin first))
+                    (sequence (read-udp-sequence first))
+                    (frame (read-udp-frame first))
+                    (part (read-udp-part first))
+                    (total (read-udp-total first))
+                    (timestamp (read-udp-timestamp first))
+                    (duration (read-udp-duration first))
+                    (payload (read-udp-payload first)))
+                (if (= total 1)
+                    (process-data kind origin sequence frame timestamp duration payload)
+                  (let ((chunks (loop (for data in-vector chunks)
+                                      (collect 
+                                        (let ((kind (read-udp-kind data))
+                                              (origin (read-udp-origin data))
+                                              (sequence (read-udp-sequence data))
+                                              (frame (read-udp-frame data))
+                                              (part (read-udp-part data))
+                                              (total (read-udp-total data))
+                                              (timestamp (read-udp-timestamp data))
+                                              (duration (read-udp-duration data))
+                                              (chunk (read-udp-payload data)))
+                                          (when udp-debug?
+                                            (terminal (get-remote-name) (udp-name kind) origin frame part total (u8vector-length chunk)))
+                                          chunk)))))
+                    (let ((data (make-u8vector (apply + (map u8vector-length chunks))))
+                          (pos 0))
+                      (for-each (lambda (chunk)
+                                  (let ((len (u8vector-length chunk)))
+                                    (subu8vector-move! chunk 0 len data pos)
+                                    (increase! pos len)))
+                                chunks)
+                      (process-data kind origin sequence frame timestamp duration data))))))
+          (show-missing-parts))))
+    
+    (define (show-missing)
+      (when udp-debug-missing?
+        (terminal (get-remote-name) '***missing*** (udp-name kind) (get-sequence frame2))))
+    
+    (cond ((get-chunks frame2)
+           => process-chunks)
+          (else
+           (show-missing)))))
+
+
+;;;
+;;;; Jitter Frame2
+;;;
+
+
+(class Jitter-Frame2 extends Object
+  
+  
+  (slot timestamp       getter generate)
+  (slot sequence        getter generate)
+  (slot chunks-total    getter generate)
+  (slot chunks-received getter generate)
+  (slot chunks          getter generate)
+  
+  
+  (method override (initialize self timestamp sequence)
+    (nextmethod self)
+    (set! self.timestamp timestamp)
+    (set! self.sequence sequence)
+    (set! self.chunks-total #f)
+    (set! self.chunks-received #f)
+    (set! self.chunks #f))
+  
+  
+  (method protected (add-chunk self data part total)
+    (unless chunks
+      (set! chunks-total total)
+      (set! chunks-received 0)
+      (set! chunks (make-vector total #f)))
+    (increase! chunks-received)
+    (vector-set! chunks part data))))
