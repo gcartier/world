@@ -28,9 +28,9 @@
   (slot content      <vector> getter generate)
   (slot mutex        <object> getter generate)
   (slot take-condvar <object> getter generate)
-  (slot head         <fx>     accessors generate)
-  (slot tail         <fx>     accessors generate)
-  (slot count        <fx>     accessors generate)
+  (slot head         <fx>     getter generate)
+  (slot tail         <fx>     getter generate)
+  (slot count        <fx>     getter generate)
   
   
   (method override (initialize self size <fx> (max-size: max-size #f))
@@ -38,12 +38,12 @@
     (assert (> size 0))
     (set! self.size size)
     (set! self.max-size (or max-size size))
-    (set! content (make-vector size))
-    (set! mutex (make-mutex 'ring))
-    (set! take-condvar (make-condition-variable 'take))
-    (set! head 0)
-    (set! tail 0)
-    (set! count 0))
+    (set! self.content (make-vector size))
+    (set! self.mutex (make-mutex 'ring))
+    (set! self.take-condvar (make-condition-variable 'take))
+    (set! self.head 0)
+    (set! self.tail 0)
+    (set! self.count 0))
   
   
   (method public (give self obj)
@@ -85,4 +85,137 @@
              (mutex-lock! mutex)
              (assert (> count 0)
                (get)))
-      (mutex-unlock! mutex)))))
+      (mutex-unlock! mutex))))
+
+
+;;;
+;;;; Time Ring
+;;;
+
+
+;;               ---> time
+;;  wait +----+----+----+----+----+ insert
+;;  <--- | T0 | T1 | T2 | T3 | T4 | <---
+;;       +----+----+----+----+----+
+;;       ^                        ^
+;;      HEAD                     TAIL
+;;   (earliest)                (latest)
+
+
+;; to convert to a full ring at a later stage
+
+
+(class Time-Ring extends Object
+  
+  
+  (slot size           <fx>     getter generate)
+  (slot content        <vector> getter generate)
+  (slot mutex          <object> getter generate)
+  (slot wait-condvar   <object> getter generate)
+  (slot count          <fx>     getter generate)
+  (slot timestamp-proc          getter generate)
+  (slot now-proc                getter generate)
+  
+  
+  (method override (initialize self size <fx> (timestamp-proc: timestamp-proc #f) (now-proc: now-proc #f))
+    (nextmethod self)
+    (assert (> size 0))
+    (set! self.size size)
+    (set! self.content (make-vector size))
+    (set! self.mutex (make-mutex 'ring))
+    (set! self.wait-condvar (make-condition-variable 'wait))
+    (set! self.count 0)
+    (set! self.timestamp-proc timestamp-proc)
+    (set! self.now-proc now-proc))
+  
+  
+  (method public (insert self obj)
+    (mutex-lock! mutex)
+    (prog1 (let ((now (now-proc))
+                 (timestamp (timestamp-proc obj)))
+             (define (insert-at n)
+               (if (= n count)
+                   (vector-set! content n obj)
+                 (subvector-shift! content n count 1)
+                 (vector-set! content n obj))
+               (increase! count)
+               #t)
+             
+             (if (>= timestamp now)
+                 (let (loop (scan count))
+                   (if (= scan 0)
+                       (begin
+                         (insert-at scan)
+                         (condition-variable-signal! wait-condvar))
+                     (let ((candidate (vector-ref content (- scan 1))))
+                       (if (<= (timestamp-proc candidate) timestamp)
+                           (insert-at scan)
+                         (loop (- scan 1))))))
+               #f))
+      (mutex-unlock! mutex)))
+  
+  
+  (method public (locate self predicate)
+    (mutex-lock! mutex)
+    (prog1 (let (loop (pos 0))
+             (if (>= pos count)
+                 #f
+               (let ((obj (vector-ref content pos)))
+                 (if (predicate obj)
+                     obj
+                   (loop (+ pos 1))))))
+      (mutex-unlock! mutex)))
+  
+  
+  (method public (wait self)
+    (declare (proper-tail-calls))
+    (let (loop)
+      (mutex-lock! mutex)
+      (if (= count 0)
+          (begin
+            (mutex-unlock! mutex wait-condvar)
+            (loop))
+        (let ((now (now-proc))
+              (earliest (vector-ref content 0)))
+          (let ((wait-duration (- (timestamp-proc earliest) now)))
+            (if (<= wait-duration 0)
+                (let (collect (pos 1) (card 1) (result (list earliest)))
+                  (let ((next (and (< pos count)
+                                   (let ((next (vector-ref content pos)))
+                                     (let ((wait-duration (- (timestamp-proc next) now)))
+                                       (and (<= wait-duration 0)
+                                            next))))))
+                    (if next
+                        (collect (+ pos 1) (+ card 1) (cons next result))
+                      (prog1 result
+                        (subvector-shift! content card count (- card))
+                        (subvector-fill! content (- count card) count #f)
+                        (decrease! count card)
+                        (mutex-unlock! mutex)))))
+              (mutex-unlock! mutex wait-condvar (/ wait-duration 1000000000.))
+              (loop)))))))
+  
+  
+  (method public (peek self)
+    (declare (proper-tail-calls))
+    (mutex-lock! mutex)
+    (if (= count 0)
+        (begin
+          (mutex-unlock! mutex)
+          #f)
+      (let ((now (now-proc))
+            (earliest (vector-ref content 0)))
+        (let ((wait-duration (- (timestamp-proc earliest) now)))
+          (if (<= wait-duration 0)
+              (let (collect (pos 1) (card 1) (result (list earliest)))
+                (let ((next (and (< pos count)
+                                 (let ((next (vector-ref content pos)))
+                                   (let ((wait-duration (- (timestamp-proc next) now)))
+                                     (and (<= wait-duration 0)
+                                          next))))))
+                  (if next
+                      (collect (+ pos 1) (+ card 1) (cons next result))
+                    (prog1 result
+                      (mutex-unlock! mutex)))))
+            (mutex-unlock! mutex)
+            #f)))))))

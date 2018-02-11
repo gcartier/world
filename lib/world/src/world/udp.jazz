@@ -15,6 +15,15 @@
 (module world.udp jazz
 
 
+(import (jazz.presence)
+        (world)
+        (world.context)
+        (world.player)
+        (world.ring)
+        (world.settings)
+        (world.support))
+
+
 (definition protected udp-connect
   0)
 
@@ -33,6 +42,272 @@
 
 (definition protected (udp-name kind)
   (vector-ref udp-names kind))
+
+
+(definition protected nanosecond
+  (cast <fl> (expt 10 9)))
+
+
+(definition protected udp-datagram-max
+  (* (world-setting 'world.udp-datagram-max 1) 1024))
+
+(definition protected udp-process-window
+  (world-setting 'world.udp-process-window .2))
+
+(definition protected udp-process-window-nanoseconds
+  (fxround (* udp-process-window nanosecond)))
+
+
+(definition protected udp-debug-discard?
+  (world-setting 'world.udp-debug-discard? #f))
+
+(definition protected udp-debug-missing?
+  (world-setting 'world.udp-debug-missing? #f))
+
+(definition protected udp-debug-nack?
+  (world-setting 'world.udp-debug-nack? #f))
+
+(definition protected udp-drop-percentage
+  (world-setting 'world.udp-drop-percentage #f))
+
+
+(definition protected udp-media-off
+  #u8(111 102 102))
+
+
+;;;
+;;;; Channel
+;;;
+
+
+(class UDP-Channel extends Object
+  
+  
+  (slot kind             getter generate)
+  (slot origin           getter generate)
+  (slot remote-timestamp getter generate)
+  (slot local-seconds    getter generate)
+  
+  
+  (method override (initialize self kind origin)
+    (nextmethod self)
+    (set! self.kind kind)
+    (set! self.origin origin)
+    (set! self.remote-timestamp #f)
+    (set! self.local-seconds #f))
+  
+  
+  (method override (print self output readably)
+    (print-unreadable self output
+      (lambda (output)
+        (format output "{a} {a}" kind origin))))
+  
+  
+  (method protected (update-time self data)
+    (set! remote-timestamp (read-udp-timestamp data))
+    (set! local-seconds (current-seconds)))
+  
+  
+  (method protected (now-timestamp self)
+    (let ((now (current-seconds)))
+      (- (+ remote-timestamp (fxround (* (- now local-seconds) nanosecond)))
+         udp-process-window-nanoseconds))))
+
+
+;;;
+;;;; Send Channel
+;;;
+
+
+(class UDP-Send-Channel extends UDP-Channel
+  
+  
+  (slot data-sequence  accessors generate)
+  (slot frame-sequence accessors generate)
+  (slot last-timestamp accessors generate)
+  (slot retain-ring    getter generate)
+  (slot release-thread getter generate)
+  
+  
+  (method override (initialize self kind origin)
+    (nextmethod self kind origin)
+    (set! self.data-sequence 0)
+    (set! self.frame-sequence 0)
+    (set! self.last-timestamp #f)
+    ;; make it really big until time ring is a real ring
+    (set! self.retain-ring (new Time-Ring 400096 @w 512 @max-size: +inf.0 timestamp-proc: read-udp-timestamp now-proc: (~ now-timestamp self)))
+    ;; development
+    (set-$s retain-ring)
+    (set! self.release-thread (new-thread
+                                (lambda ()
+                                  (release-data self))))
+    (thread-start! release-thread))
+  
+  
+  (method protected (next-data-sequence! self)
+    (prog1 data-sequence
+      (increase! data-sequence)))
+  
+  
+  (method protected (next-frame-sequence! self)
+    (prog1 frame-sequence
+      (increase! frame-sequence)))
+  
+  
+  (method protected (retain self data)
+    (update-time self data)
+    (insert retain-ring data))
+  
+  
+  (method protected (release-data self)
+    (declare (proper-tail-calls))
+    (let (loop)
+      (wait retain-ring)
+      (loop))))
+
+
+;;;
+;;;; Receive Channel
+;;;
+
+
+(class UDP-Receive-Channel extends UDP-Channel
+  
+  
+  (slot receive-last-sequence accessors generate)
+  (slot process-last-sequence getter generate)
+  (slot process-ring          getter generate)
+  (slot process-thread        getter generate)
+  ;; quicky for test
+  (slot nack-sequences        accessors generate)
+  
+  
+  (method override (initialize self kind origin)
+    (nextmethod self kind origin)
+    (set! self.receive-last-sequence #f)
+    (set! self.process-last-sequence #f)
+    ;; make it really big until time ring is a real ring
+    (set! self.process-ring (new Time-Ring 40096 @w 512 @max-size: +inf.0 timestamp-proc: read-udp-timestamp now-proc: (~ now-timestamp self)))
+    ;; development
+    (set-$c self)
+    (set-$r process-ring)
+    (set! self.process-thread (new-thread
+                                (lambda ()
+                                  (process self))))
+    (set! self.nack-sequences '())
+    (thread-start! process-thread))
+  
+  
+  ;;;
+  ;;;; Insert
+  ;;;
+  
+  
+  (method protected (insert-nack self data)
+    )
+  
+  
+  (method protected (insert-media self data)
+    (insert-data self data))
+  
+  
+  (method protected (insert-data self data)
+    (let ((sequence (read-udp-sequence data)))
+      (let ((nack? (member? sequence nack-sequences)))
+        (when (and udp-debug-nack? nack?)
+          (terminal remote-name (udp-name kind) 'insert-resent sequence))
+        (unless nack?
+          (update-time self data))
+        (let ((inserted? (insert process-ring data)))
+          (when (and udp-debug-discard? (not inserted?))
+            (let ((kind (read-udp-kind data))
+                  (sequence (read-udp-sequence data)))
+              (if nack?
+                  (format :terminal "{s} {s} {s} {s}{%}" remote-name (udp-name kind) '***discard-resent*** sequence)
+                (format :terminal "{s} {s} {s} {s} {s}{%}" remote-name (udp-name kind) '***discard*** sequence (read-udp-payload-size data)))))))))
+  
+  
+  (method protected (wait-data self)
+    (wait process-ring))
+  
+  
+  ;;;
+  ;;;; Process
+  ;;;
+  
+  
+  (method (process self)
+    (declare (proper-tail-calls))
+    (let (loop)
+      (let ((lst (wait-data self)))
+        (process-missing self lst)
+        (when udp-debug-nack?
+          (for-each (lambda (data)
+                      (let ((kind (read-udp-kind data))
+                            (sequence (read-udp-sequence data)))
+                        (when (member? sequence nack-sequences)
+                          (terminal remote-name (udp-name kind) 'process-resent sequence))))
+                    lst))
+        ;; if we always receive in-order from wait then we should be able to
+        ;; just validate that it is the case and just scan the list we got
+        (for-each (lambda (partition)
+                    (bind (frame . datas) partition
+                      (process-frame self (sort < datas key: read-udp-sequence))))
+                  (sort < (partition lst key: read-udp-frame) key: car)))
+      (loop)))
+  
+  
+  (method (process-missing self lst)
+    (let ((sorted (sort < lst key: read-udp-sequence)))
+      (for-each (lambda (data)
+                  (let ((sequence (read-udp-sequence data)))
+                    (when (and udp-debug-missing? process-last-sequence)
+                      (let ((expected (+ process-last-sequence 1)))
+                        (when (/= sequence expected)
+                          (loop (for seq from expected below sequence)
+                                (format :terminal "{s} {s} {s} {s}{%}" remote-name (udp-name kind) '***missing*** seq)))))
+                    (set! process-last-sequence sequence)))
+                sorted)))
+  
+  
+  (method (process-frame self datas)
+    (let ((received (length datas))
+          (first (car datas)))
+      (let ((kind (read-udp-kind first))
+            (origin (read-udp-origin first))
+            (sequence (read-udp-sequence first))
+            (frame (read-udp-frame first))
+            (part (read-udp-part first))
+            (total (read-udp-total first))
+            (timestamp (read-udp-timestamp first))
+            (duration (read-udp-duration first)))
+        (if (= total received)
+            (if (= total 1)
+                (process-data self kind origin sequence frame timestamp duration (read-udp-payload first))
+              (let ((chunks (map read-udp-payload datas)))
+                (let ((data (apply u8vector-append chunks)))
+                  (process-data self kind origin sequence frame timestamp duration data))))))))
+  
+  
+  (method (process-data self kind origin sequence frame timestamp duration buffer)
+    (define (player-no->id no)
+      (get-id (find-player-by-no no)))
+    
+    (define (process-audio)
+      (if (equal? buffer udp-media-off)
+          (receive-server-audio (current-audio) (player-no->id origin) #f #f #f)
+        (receive-server-audio (current-audio) (player-no->id origin) buffer timestamp duration)))
+    
+    (define (process-video)
+      (if (equal? buffer udp-media-off)
+          (receive-server-video (current-video) (player-no->id origin) #f #f #f)
+        (receive-server-video (current-video) (player-no->id origin) buffer timestamp duration)))
+    
+    (ecase kind
+      ((udp-audio)
+       (process-audio))
+      ((udp-video)
+       (process-video)))))
 
 
 ;;;
@@ -118,6 +393,9 @@
 (definition public (read-udp-timestamp data) (read-64-bit   data 24)) (definition public (write-udp-timestamp data value) (write-64-bit   data 24 value))
 (definition public (read-udp-duration  data) (read-64-bit   data 32)) (definition public (write-udp-duration  data value) (write-64-bit   data 32 value))
 (definition public (read-udp-payload   data) (read-u8vector data 40)) (definition public (write-udp-payload   data value) (write-u8vector data 40 value))
+
+(definition public (read-udp-payload-size data)
+  (read-32-bit data 40))
 
 (definition public (write-udp-subpayload data value offset count)
   (write-subu8vector! data 40 value offset count))

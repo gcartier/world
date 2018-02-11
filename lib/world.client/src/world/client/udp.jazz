@@ -1,0 +1,212 @@
+;;;===============
+;;;  WorldScheme
+;;;===============
+;;;
+;;;; Client UDP
+;;;
+;;;  The Initial Developer of the Original Code is Guillaume Cartier.
+;;;  Portions created by the Initial Developer are Copyright (C) 2012-2018
+;;;  the Initial Developer. All Rights Reserved.
+;;;
+;;;  Contributor(s):
+;;;    Barbara Samson
+
+
+(module world.client.udp jazz
+
+
+(import (jazz.network)
+        (jazz.presence)
+        (world)
+        (world.context)
+        (world.settings)
+        (world.udp))
+
+
+(class UDP-Client extends Object
+  
+  
+  (slot udp-port         initialize #f getter generate)
+  (slot udp-thread       initialize #f getter generate)
+  (slot udp-stopping?    initialize #f getter generate)
+  (slot write-mutex      initialize #f getter generate)
+  (slot send-channels    initialize #f getter generate)
+  (slot receive-channels initialize #f getter generate)
+  
+  
+  (method (connect self local-host host service)
+    (define (send-connect)
+      (mutex-lock! write-mutex)
+      (let ((data (make-u8vector 4)))
+        (write-udp-kind data udp-connect)
+        (write data udp-port))
+      (mutex-unlock! write-mutex))
+    
+    (set! udp-port (open-udp (list
+                               local-address: local-host
+                               address: host
+                               port-number: service)))
+    (set! udp-thread (new-thread
+                       (lambda ()
+                         (process self))
+                       'udp))
+    (set! udp-stopping? #f)
+    (set! write-mutex (make-mutex 'write))
+    (set! send-channels (make-table))
+    (set! receive-channels (make-table))
+    (send-connect)
+    (thread-start! udp-thread))
+
+  
+  (method (disconnect self)
+    (set! udp-stopping? #t)
+    (close-port udp-port)
+    (thread-join! udp-thread)
+    (set! udp-port #f)
+    (set! udp-thread #f))
+  
+  
+  ;;;
+  ;;;; Channel
+  ;;;
+  
+  
+  (method (require-send-channel self kind origin)
+    (let ((key (cons kind origin)))
+      (or (table-ref send-channels key #f)
+          (let ((channel (new UDP-Send-Channel kind origin)))
+            (table-set! send-channels key channel)
+            channel))))
+  
+  
+  (method (require-receive-channel self kind origin)
+    (let ((key (cons kind origin)))
+      (or (table-ref receive-channels key #f)
+          (let ((channel (new UDP-Receive-Channel kind origin)))
+            (table-set! receive-channels key channel)
+            channel))))
+  
+  
+  ;;;
+  ;;;; Send
+  ;;;
+  
+  
+  (method (send-audio self buffer timestamp duration)
+    (send-media self udp-audio buffer timestamp duration))
+  
+  
+  (method (send-video self buffer timestamp duration)
+    (send-media self udp-video buffer timestamp duration))
+  
+  
+  (method (send-media self kind buffer timestamp duration)
+    (mutex-lock! write-mutex)
+    (let ((origin (get-client-no (current-tier))))
+      (let ((channel (require-send-channel self kind origin)))
+        ;; quick hack to give media off a timestamp
+        (let ((last-timestamp (or (get-last-timestamp channel) 0)))
+          (let ((frame (next-frame-sequence! channel))
+                (timestamp (or timestamp (+ last-timestamp 1)))
+                (duration (or duration 1))
+                (buffer (or buffer udp-media-off)))
+            (set-last-timestamp channel timestamp)
+            (let ((header-size (+ 4 4 4 4 4 4 8 8 4))
+                  (payload-size (u8vector-length buffer)))
+              (let ((max-content-size (- udp-datagram-max header-size)))
+                (let ((total (fxceiling/ payload-size max-content-size)))
+                  (let (loop (part 0) (pos 0))
+                    (let ((remain (- payload-size pos)))
+                      (when (> remain 0)
+                        (let ((sequence (next-data-sequence! channel))
+                              (content-size (min remain max-content-size)))
+                          (let ((size (+ header-size content-size)))
+                            (let ((data (make-u8vector size)))
+                              (write-udp-kind data kind)
+                              (write-udp-origin data origin)
+                              (write-udp-sequence data sequence)
+                              (write-udp-frame data frame)
+                              (write-udp-part data part)
+                              (write-udp-total data total)
+                              (write-udp-timestamp data timestamp)
+                              (write-udp-duration data duration)
+                              (write-udp-subpayload data buffer pos content-size)
+                              (when (or (not udp-drop-percentage)
+                                        (> (random-real) (/ udp-drop-percentage 100.)))
+                                (write data udp-port))
+                              (retain channel data)
+                              (loop (+ part 1) (+ pos content-size)))))))))))))))
+    (mutex-unlock! write-mutex))
+  
+  
+  ;;;
+  ;;;; Receive
+  ;;;
+  
+  
+  (method (process self)
+    (declare (proper-tail-calls))
+    (let (loop)
+      (let ((data (with-exception-filter
+                    (lambda (exc)
+                      udp-stopping?)
+                    (lambda (exc)
+                      #f)
+                    (lambda ()
+                      (read udp-port)))))
+        (when data
+          (receive-data self data)
+          (loop)))))
+  
+  
+  (method (receive-data self data)
+    (let ((kind (read-udp-kind data))
+          (origin (read-udp-origin data)))
+      (define (receive-nack)
+        (let ((kind (read-udp-nack-kind data))
+              (sequence (read-udp-sequence data)))
+          (let ((channel (require-send-channel self kind origin)))
+            (let ((ring (get-retain-ring channel)))
+              (let ((found (locate ring (lambda (data)
+                                          (= (read-udp-sequence data) sequence)))))
+                (if found
+                    (write found udp-port)
+                  (terminal remote-name (udp-name kind) '***nack-not-found*** sequence)))))))
+      
+      (define (receive-media)
+        (let ((kind (read-udp-kind data))
+              (sequence (read-udp-sequence data)))
+          (let ((channel (require-receive-channel self kind origin)))
+            (unless (member? sequence (get-nack-sequences channel))
+              (let ((last-sequence (get-receive-last-sequence channel)))
+                (when last-sequence
+                  (let ((expected (+ last-sequence 1)))
+                    (when (> sequence expected)
+                      (let ((origin (read-udp-origin data)))
+                        (loop (for seq from expected below sequence)
+                              (send-nack self origin seq kind)
+                              (set-nack-sequences channel (cons seq (get-nack-sequences channel)))))))))
+              (set-receive-last-sequence channel sequence))
+            (insert-media channel data))))
+      
+      (ecase kind
+        ((udp-nack)
+         (receive-nack))
+        ((udp-audio udp-video)
+         (receive-media))
+        (else
+         (error "Unknown UDP kind: {s}" kind)))))
+  
+  
+  (method (send-nack self origin sequence channel-kind)
+    (when udp-debug-nack?
+      (terminal remote-name (udp-name channel-kind) 'send-nack sequence))
+    (mutex-lock! write-mutex)
+    (let ((size (+ 4 4 4 4)))
+      (let ((data (make-u8vector size)))
+        (write-udp-kind data udp-nack)
+        (write-udp-origin data origin)
+        (write-udp-sequence data sequence)
+        (write-udp-nack-kind data channel-kind)
+        (write data udp-port)))
+    (mutex-unlock! write-mutex))))

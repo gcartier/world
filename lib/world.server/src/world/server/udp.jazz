@@ -1,0 +1,157 @@
+;;;===============
+;;;  WorldScheme
+;;;===============
+;;;
+;;;; Server UDP
+;;;
+;;;  The Initial Developer of the Original Code is Guillaume Cartier.
+;;;  Portions created by the Initial Developer are Copyright (C) 2012-2018
+;;;  the Initial Developer. All Rights Reserved.
+;;;
+;;;  Contributor(s):
+;;;    Barbara Samson
+
+
+(module world.server.udp jazz
+
+
+(import (jazz.network)
+        (jazz.presence)
+        (world)
+        (world.context)
+        (world.settings)
+        (world.support)
+        (world.udp))
+
+
+(definition udp-debug?
+  (world-setting 'world.udp-debug? #f))
+
+
+(class UDP-Server extends Object
+  
+  
+  (slot udp-port    initialize #f getter generate)
+  (slot udp-thread  initialize #f getter generate)
+  (slot connections initialize #f getter generate)
+  (slot stopping?   initialize #f getter generate)
+  
+  
+  (method (start self host service)
+    (when udp-debug?
+      (terminal remote-name 'listen host service))
+    (set! udp-port (open-udp (list
+                               local-address: host
+                               local-port-number: service)))
+    (set! udp-thread (new-thread
+                       (lambda ()
+                         (process self))
+                       'udp))
+    (set! connections '())
+    (set! stopping? #f)
+    (thread-start! udp-thread))
+  
+  
+  (method (stop self)
+    (set! stopping? #t)
+    (close-port udp-port)
+    (thread-join! udp-thread)
+    (set! udp-port #f)
+    (set! udp-thread #f))
+  
+  
+  (method (process self)
+    (declare (proper-tail-calls))
+    (let (loop)
+      (let ((data (with-exception-filter
+                    (lambda (exc)
+                      stopping?)
+                    (lambda (exc)
+                      #f)
+                    (lambda ()
+                      (read udp-port)))))
+        (when data
+          (process-data self data)
+          (loop)))))
+  
+  
+  (method (process-data self data)
+    (let ((kind (read-udp-kind data)))
+      (ecase kind
+        ((udp-connect)
+         (connect-source self))
+        ((udp-nack)
+         (broadcast-nack self kind data))
+        ((udp-audio udp-video)
+         (broadcast-media self kind data))
+        (else
+         (error "Unknown UDP kind: {s}" kind)))))
+  
+  
+  (method (connect-source self)
+    (let ((source-info (udp-source-socket-info udp-port)))
+      (let ((source-host (socket-info-address source-info))
+            (source-port (socket-info-port-number source-info)))
+        (when udp-debug?
+          (terminal remote-name 'connect source-host source-port))
+        (let ((connection (new UDP-Connection source-host source-port)))
+          (set! connections (cons connection connections))))))
+  
+  
+  ;; todo resend from server if it has missing data
+  (method (resend-missing self data)
+    (let ((origin (read-udp-origin data))
+          (kind (read-udp-nack-kind data)))
+      ))
+  
+  
+  ;; quick first try to broadcast nack
+  (method (broadcast-nack self kind data)
+    (broadcast-data self kind data))
+  
+  
+  (method (broadcast-media self kind data)
+    (broadcast-data self kind data))
+  
+  
+  (method (broadcast-data self kind data)
+    (let ((source-info (udp-source-socket-info udp-port)))
+      (let ((source-host (socket-info-address source-info))
+            (source-port (socket-info-port-number source-info)))
+        (when udp-debug?
+          (terminal remote-name 'broadcast source-host source-port (udp-name kind) (u8vector-length data)))
+        (for-each (lambda (connection)
+                    (let ((host (get-host connection))
+                          (port (get-port connection)))
+                      (when (or (not (host=? host source-host))
+                                (not (service=? port source-port))
+                                (or audio-self? video-self?)
+                                @wait-channel-in-chunk (and (= kind udp-audio) audio-self?)
+                                @wait-channel-in-chunk (and (= kind udp-video) video-self?))
+                        (udp-destination-set! host port udp-port)
+                        (write data udp-port))))
+                  connections)))))
+
+
+;;;
+;;;; UDP Connection
+;;;
+
+
+(class UDP-Connection extends Object
+  
+  
+  (slot host getter generate)
+  (slot port getter generate)
+  
+  
+  (method override (initialize self host port)
+    (nextmethod self)
+    (set! self.host host)
+    (set! self.port port))
+  
+  
+  (method override (print self output readably)
+    (print-unreadable self output
+      (lambda (output)
+        (format output "{a} {a}" host port))))))
