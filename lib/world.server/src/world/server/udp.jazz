@@ -31,10 +31,11 @@
 (class UDP-Server extends Object
   
   
-  (slot udp-port    initialize #f getter generate)
-  (slot udp-thread  initialize #f getter generate)
-  (slot connections initialize #f getter generate)
-  (slot stopping?   initialize #f getter generate)
+  (slot udp-port      initialize #f getter generate)
+  (slot udp-thread    initialize #f getter generate)
+  (slot connections   initialize #f getter generate)
+  (slot stopping?     initialize #f getter generate)
+  (slot send-channels initialize #f getter generate)
   
   
   (method (start self host service)
@@ -49,6 +50,7 @@
                        'udp))
     (set! connections '())
     (set! stopping? #f)
+    (set! send-channels (make-table))
     (thread-start! udp-thread))
   
   
@@ -58,6 +60,24 @@
     (thread-join! udp-thread)
     (set! udp-port #f)
     (set! udp-thread #f))
+  
+  
+  ;;;
+  ;;;; Channel
+  ;;;
+  
+  
+  (method (require-send-channel self kind origin)
+    (let ((key (cons kind origin)))
+      (or (table-ref send-channels key #f)
+          (let ((channel (new UDP-Send-Channel kind origin)))
+            (table-set! send-channels key channel)
+            channel))))
+  
+  
+  ;;;
+  ;;;; Receive
+  ;;;
   
   
   (method (process self)
@@ -71,17 +91,17 @@
                     (lambda ()
                       (read udp-port)))))
         (when data
-          (process-data self data)
+          (receive-data self data)
           (loop)))))
   
   
-  (method (process-data self data)
+  (method (receive-data self data)
     (let ((kind (read-udp-kind data)))
       (ecase kind
         ((udp-connect)
          (connect-source self))
         ((udp-nack)
-         (broadcast-nack self kind data))
+         (receive-nack self kind data))
         ((udp-audio udp-video)
          (broadcast-media self kind data))
         (else
@@ -98,20 +118,29 @@
           (set! connections (cons connection connections))))))
   
   
-  ;; todo resend from server if it has missing data
-  (method (resend-missing self data)
-    (let ((origin (read-udp-origin data))
-          (kind (read-udp-nack-kind data)))
-      ))
-  
-  
-  ;; quick first try to broadcast nack
-  (method (broadcast-nack self kind data)
-    (broadcast-data self kind data))
+  (method (receive-nack self kind data)
+    (let ((kind (read-udp-nack-kind data))
+          (origin (read-udp-origin data))
+          (sequence (read-udp-sequence data)))
+      (let ((channel (require-send-channel self kind origin)))
+        (let ((ring (get-retain-ring channel)))
+          (let ((found (locate ring (lambda (data)
+                                      (= (read-udp-sequence data) sequence)))))
+            (if found
+                (let ((source-info (udp-source-socket-info udp-port)))
+                  (let ((source-host (socket-info-address source-info))
+                        (source-port (socket-info-port-number source-info)))
+                    (udp-destination-set! source-host source-port udp-port)
+                    (terminal remote-name (udp-name kind) '***nack-found-on-server!!!*** sequence)
+                    (write found udp-port)))
+              (broadcast-data self kind data)))))))
   
   
   (method (broadcast-media self kind data)
-    (broadcast-data self kind data))
+    (let ((origin (read-udp-origin data)))
+      (let ((channel (require-send-channel self kind origin)))
+        (retain channel data)
+        (broadcast-data self kind data))))
   
   
   (method (broadcast-data self kind data)
