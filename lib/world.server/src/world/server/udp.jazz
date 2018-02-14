@@ -31,11 +31,12 @@
 (class UDP-Server extends Object
   
   
-  (slot udp-port      initialize #f getter generate)
-  (slot udp-thread    initialize #f getter generate)
-  (slot connections   initialize #f getter generate)
-  (slot stopping?     initialize #f getter generate)
-  (slot send-channels initialize #f getter generate)
+  (slot udp-port         initialize #f getter generate)
+  (slot udp-thread       initialize #f getter generate)
+  (slot connections      initialize #f getter generate)
+  (slot stopping?        initialize #f getter generate)
+  (slot send-channels    initialize #f getter generate)
+  (slot receive-channels initialize #f getter generate)
   
   
   (method (start self host service)
@@ -51,6 +52,7 @@
     (set! connections '())
     (set! stopping? #f)
     (set! send-channels (make-table))
+    (set! receive-channels (make-table))
     (thread-start! udp-thread))
   
   
@@ -72,6 +74,14 @@
       (or (table-ref send-channels key #f)
           (let ((channel (new UDP-Send-Channel kind origin)))
             (table-set! send-channels key channel)
+            channel))))
+  
+  
+  (method (require-receive-channel self kind origin)
+    (let ((key (cons kind origin)))
+      (or (table-ref receive-channels key #f)
+          (let ((channel (new UDP-Receive-Channel kind origin)))
+            (table-set! receive-channels key channel)
             channel))))
   
   
@@ -103,7 +113,7 @@
         ((udp-nack)
          (receive-nack self kind data))
         ((udp-audio udp-video)
-         (broadcast-media self kind data))
+         (receive-media self kind data))
         (else
          (error "Unknown UDP kind: {s}" kind)))))
   
@@ -119,21 +129,59 @@
   
   
   (method (receive-nack self kind data)
-    (let ((kind (read-udp-nack-kind data))
+    (let ((media-kind (read-udp-nack-kind data))
           (origin (read-udp-origin data))
           (sequence (read-udp-sequence data)))
-      (let ((channel (require-send-channel self kind origin)))
-        (let ((ring (get-retain-ring channel)))
-          (let ((found (locate ring (lambda (data)
-                                      (= (read-udp-sequence data) sequence)))))
-            (if found
-                (let ((source-info (udp-source-socket-info udp-port)))
-                  (let ((source-host (socket-info-address source-info))
-                        (source-port (socket-info-port-number source-info)))
-                    (udp-destination-set! source-host source-port udp-port)
-                    (terminal remote-name (udp-name kind) '***nack-found-on-server!!!*** sequence)
-                    (write found udp-port)))
-              (broadcast-data self kind data)))))))
+      ;; we already nacked the source and will broacast
+      ;; when we receive the resent so ignore this nack
+      (unless (member? sequence (get-nack-sequences (require-receive-channel self media-kind origin)))
+        (let ((channel (require-send-channel self media-kind origin)))
+          (let ((ring (get-retain-ring channel)))
+            (let ((found (locate ring (lambda (data)
+                                        (= (read-udp-sequence data) sequence)))))
+              (if found
+                  (let ((source-info (udp-source-socket-info udp-port)))
+                    (let ((source-host (socket-info-address source-info))
+                          (source-port (socket-info-port-number source-info)))
+                      (udp-destination-set! source-host source-port udp-port)
+                      (when udp-debug-nack?
+                        (terminal remote-name (udp-name media-kind) '***nack-found-on-server*** sequence))
+                      (write found udp-port)))
+                (broadcast-data self media-kind data))))))))
+  
+  
+  (method (receive-media self kind data)
+    (let ((origin (read-udp-origin data))
+          (sequence (read-udp-sequence data)))
+      (let ((channel (require-receive-channel self kind origin)))
+        (unless (member? sequence (get-nack-sequences channel))
+          (let ((last-sequence (get-receive-last-sequence channel)))
+            (when last-sequence
+              (let ((expected (+ last-sequence 1)))
+                (when (> sequence expected)
+                  (let ((source-info (udp-source-socket-info udp-port)))
+                    (let ((source-host (socket-info-address source-info))
+                          (source-port (socket-info-port-number source-info)))
+                      (udp-destination-set! source-host source-port udp-port)
+                      (loop (for seq from expected below sequence)
+                            (send-nack self origin seq kind)
+                            (set-nack-sequences channel (cons seq (get-nack-sequences channel))))))))))
+          (set-receive-last-sequence channel sequence))
+        (when (and udp-debug-nack? (member? sequence (get-nack-sequences channel)))
+          (terminal remote-name (udp-name kind) '***resent-received-early*** sequence))
+        (broadcast-media self kind data))))
+  
+  
+  (method (send-nack self origin sequence media-kind)
+    (when udp-debug-nack?
+      (terminal remote-name (udp-name media-kind) 'send-nack sequence))
+    (let ((size (+ 4 4 4 4)))
+      (let ((data (make-u8vector size)))
+        (write-udp-kind data udp-nack)
+        (write-udp-origin data origin)
+        (write-udp-sequence data sequence)
+        (write-udp-nack-kind data media-kind)
+        (write data udp-port))))
   
   
   (method (broadcast-media self kind data)
@@ -158,7 +206,9 @@
                                 @wait-channel-in-chunk (and (= kind udp-audio) audio-self?)
                                 @wait-channel-in-chunk (and (= kind udp-video) video-self?))
                         (udp-destination-set! host port udp-port)
-                        (write data udp-port))))
+                        (when (or (not udp-drop-percentage)
+                                  (> (random-real) (/ udp-drop-percentage 100.)))
+                          (write data udp-port)))))
                   connections)))))
 
 

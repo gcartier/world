@@ -15,12 +15,25 @@
 (module world.client.udp jazz
 
 
-(import (jazz.network)
+(import (jazz.io)
+        (jazz.network)
         (jazz.presence)
         (world)
         (world.context)
+        (world.player)
+        (world.ring)
         (world.settings)
         (world.udp))
+
+
+(definition udp-video-action
+  (world-setting 'world.udp-video-action #f))
+
+(definition udp-video-file
+  {File Home "video.mpj"})
+
+(definition udp-video-port
+  #f)
 
 
 (class UDP-Client extends Object
@@ -74,7 +87,7 @@
   (method (require-send-channel self kind origin)
     (let ((key (cons kind origin)))
       (or (table-ref send-channels key #f)
-          (let ((channel (new UDP-Send-Channel kind origin)))
+          (let ((channel (new UDP-Client-Send-Channel kind origin)))
             (table-set! send-channels key channel)
             channel))))
   
@@ -82,7 +95,7 @@
   (method (require-receive-channel self kind origin)
     (let ((key (cons kind origin)))
       (or (table-ref receive-channels key #f)
-          (let ((channel (new UDP-Receive-Channel kind origin)))
+          (let ((channel (new UDP-Client-Receive-Channel kind origin)))
             (table-set! receive-channels key channel)
             channel))))
   
@@ -103,6 +116,17 @@
   (method (send-media self kind buffer timestamp duration)
     (mutex-lock! write-mutex)
     (let ((origin (get-client-no (current-tier))))
+      (when udp-video-action
+        (let ((key (cons kind origin)))
+          (cond ((and buffer (not (table-ref send-channels key #f)))
+                 (set! udp-video-port (case udp-video-action
+                                        ((record)
+                                         (open-output-file (path-settings udp-video-file)))
+                                        ((play)
+                                         (open-input-file (path-settings udp-video-file))))))
+                ((and (not buffer) (table-ref send-channels key #f))
+                 (close-port udp-video-port)
+                 (set! udp-video-port #f)))))
       (let ((channel (require-send-channel self kind origin)))
         ;; quick hack to give media off a timestamp
         (let ((last-timestamp (or (get-last-timestamp channel) 0)))
@@ -131,6 +155,16 @@
                               (write-udp-timestamp data timestamp)
                               (write-udp-duration data duration)
                               (write-udp-subpayload data buffer pos content-size)
+                              (when udp-video-port
+                                (case udp-video-action
+                                  ((record)
+                                   (write data udp-video-port)
+                                   (newline udp-video-port)
+                                   (force-output udp-video-port))
+                                  ((play)
+                                   (let ((obj (read udp-video-port)))
+                                     (unless (eof-object? obj)
+                                       (set! data obj))))))
                               (when (or (not udp-drop-percentage)
                                         (> (random-real) (/ udp-drop-percentage 100.)))
                                 (write data udp-port))
@@ -160,53 +194,221 @@
   
   
   (method (receive-data self data)
-    (let ((kind (read-udp-kind data))
-          (origin (read-udp-origin data)))
-      (define (receive-nack)
-        (let ((kind (read-udp-nack-kind data))
-              (sequence (read-udp-sequence data)))
-          (let ((channel (require-send-channel self kind origin)))
-            (let ((ring (get-retain-ring channel)))
-              (let ((found (locate ring (lambda (data)
-                                          (= (read-udp-sequence data) sequence)))))
-                (if found
-                    (write found udp-port)
-                  (terminal remote-name (udp-name kind) '***nack-missing*** sequence)))))))
-      
-      (define (receive-media)
-        (let ((kind (read-udp-kind data))
-              (sequence (read-udp-sequence data)))
-          (let ((channel (require-receive-channel self kind origin)))
-            (unless (member? sequence (get-nack-sequences channel))
-              (let ((last-sequence (get-receive-last-sequence channel)))
-                (when last-sequence
-                  (let ((expected (+ last-sequence 1)))
-                    (when (> sequence expected)
-                      (let ((origin (read-udp-origin data)))
-                        (loop (for seq from expected below sequence)
-                              (send-nack self origin seq kind)
-                              (set-nack-sequences channel (cons seq (get-nack-sequences channel)))))))))
-              (set-receive-last-sequence channel sequence))
-            (insert-media channel data))))
-      
+    (let ((kind (read-udp-kind data)))
       (ecase kind
         ((udp-nack)
-         (receive-nack))
+         (receive-nack self kind data))
         ((udp-audio udp-video)
-         (receive-media))
+         (receive-media self kind data))
         (else
          (error "Unknown UDP kind: {s}" kind)))))
   
   
-  (method (send-nack self origin sequence channel-kind)
+  (method (receive-nack self kind data)
+    (let ((media-kind (read-udp-nack-kind data))
+          (origin (read-udp-origin data))
+          (sequence (read-udp-sequence data)))
+      (let ((channel (require-send-channel self media-kind origin)))
+        (let ((ring (get-retain-ring channel)))
+          (let ((found (locate ring (lambda (data)
+                                      (= (read-udp-sequence data) sequence)))))
+            (if found
+                (write found udp-port)
+              (terminal remote-name (udp-name media-kind) '***nack-missing*** sequence)))))))
+  
+  
+  (method (receive-media self kind data)
+    (let ((origin (read-udp-origin data))
+          (sequence (read-udp-sequence data)))
+      (let ((channel (require-receive-channel self kind origin)))
+        (unless (member? sequence (get-nack-sequences channel))
+          (let ((last-sequence (get-receive-last-sequence channel)))
+            (when last-sequence
+              (let ((expected (+ last-sequence 1)))
+                (when (> sequence expected)
+                  (loop (for seq from expected below sequence)
+                        (send-nack self origin seq kind)
+                        (set-nack-sequences channel (cons seq (get-nack-sequences channel))))))))
+          (set-receive-last-sequence channel sequence))
+        (insert-media channel data))))
+  
+  
+  (method (send-nack self origin sequence media-kind)
     (when udp-debug-nack?
-      (terminal remote-name (udp-name channel-kind) 'send-nack sequence))
+      (terminal remote-name (udp-name media-kind) 'send-nack sequence))
     (mutex-lock! write-mutex)
     (let ((size (+ 4 4 4 4)))
       (let ((data (make-u8vector size)))
         (write-udp-kind data udp-nack)
         (write-udp-origin data origin)
         (write-udp-sequence data sequence)
-        (write-udp-nack-kind data channel-kind)
+        (write-udp-nack-kind data media-kind)
         (write data udp-port)))
-    (mutex-unlock! write-mutex))))
+    (mutex-unlock! write-mutex)))
+
+
+;;;
+;;;; Client Send Channel
+;;;
+
+
+(class UDP-Client-Send-Channel extends UDP-Send-Channel
+  
+  
+  (slot data-sequence  accessors generate)
+  (slot frame-sequence accessors generate)
+  (slot last-timestamp accessors generate)
+  
+  
+  (method override (initialize self kind origin)
+    (nextmethod self kind origin)
+    (set! self.data-sequence 0)
+    (set! self.frame-sequence 0)
+    (set! self.last-timestamp #f))
+  
+  
+  (method protected (next-data-sequence! self)
+    (prog1 data-sequence
+      (increase! data-sequence)))
+  
+  
+  (method protected (next-frame-sequence! self)
+    (prog1 frame-sequence
+      (increase! frame-sequence))))
+
+
+;;;
+;;;; Client Receive Channel
+;;;
+
+
+(class UDP-Client-Receive-Channel extends UDP-Receive-Channel
+  
+  
+  (slot process-last-sequence getter generate)
+  (slot process-ring          getter generate)
+  (slot process-thread        getter generate)
+  
+  
+  (method override (initialize self kind origin)
+    (nextmethod self kind origin)
+    (set! self.process-last-sequence #f)
+    ;; make it really big until time ring is a real ring
+    (set! self.process-ring (new Time-Ring 40096 @w 512 @max-size: +inf.0 timestamp-proc: read-udp-timestamp now-proc: (~ now-timestamp self)))
+    ;; development
+    (set-$c self)
+    (set-$r process-ring)
+    (set! self.process-thread (new-thread
+                                (lambda ()
+                                  (process self))))
+    (thread-start! process-thread))
+  
+  
+  ;;;
+  ;;;; Insert
+  ;;;
+  
+  
+  (method protected (insert-nack self data)
+    )
+  
+  
+  (method protected (insert-media self data)
+    (insert-data self data))
+  
+  
+  (method protected (insert-data self data)
+    (let ((sequence (read-udp-sequence data)))
+      (let ((nack? (member? sequence nack-sequences)))
+        (when (and udp-debug-nack? nack?)
+          (terminal remote-name (udp-name kind) 'insert-resent sequence))
+        (unless nack?
+          (update-time self data))
+        (let ((inserted? (insert process-ring data)))
+          (when (and udp-show-discard? (not inserted?))
+            (let ((kind (read-udp-kind data))
+                  (sequence (read-udp-sequence data)))
+              (let ((label (if nack? '***discard-resent*** '***discard***)))
+                (format :terminal "{s} {s} {s} {s}{%}" remote-name (udp-name kind) label sequence))))))))
+  
+  
+  (method protected (wait-data self)
+    (wait process-ring))
+  
+  
+  ;;;
+  ;;;; Process
+  ;;;
+  
+  
+  (method (process self)
+    (declare (proper-tail-calls))
+    (let (loop)
+      (let ((lst (wait-data self)))
+        (process-missing self lst)
+        (for-each (lambda (partition)
+                    (bind (frame . datas) partition
+                      (let ((unique-datas (remove-duplicates datas key: read-udp-sequence)))
+                        (when (and udp-show-duplicates? (> (length datas) (length unique-datas)))
+                          (let ((duplicates (difference datas unique-datas)))
+                            (format :terminal "{s} {s} {s} {l}{%}" remote-name (udp-name kind) '***received-duplicates*** (map read-udp-sequence duplicates))))
+                        (process-frame self (sort < unique-datas key: read-udp-sequence)))))
+                  (sort < (partition lst key: read-udp-frame) key: car)))
+      (loop)))
+  
+  
+  (method (process-missing self lst)
+    (let ((sorted (sort < lst key: read-udp-sequence)))
+      (for-each (lambda (data)
+                  (let ((sequence (read-udp-sequence data)))
+                    (when (and udp-show-missing? process-last-sequence)
+                      (let ((expected (+ process-last-sequence 1)))
+                        (when (/= sequence expected)
+                          (loop (for seq from expected below sequence)
+                                (let ((label (if (member? seq nack-sequences) '***missing-resent*** '***missing***)))
+                                  (format :terminal "{s} {s} {s} {s}{%}" remote-name (udp-name kind) label seq))))))
+                    (set! process-last-sequence sequence)))
+                sorted)))
+  
+  
+  (method (process-frame self datas)
+    (let ((received (length datas))
+          (first (car datas)))
+      (let ((kind (read-udp-kind first))
+            (origin (read-udp-origin first))
+            (sequence (read-udp-sequence first))
+            (frame (read-udp-frame first))
+            (part (read-udp-part first))
+            (total (read-udp-total first))
+            (timestamp (read-udp-timestamp first))
+            (duration (read-udp-duration first)))
+        (if (= total received)
+            (if (= total 1)
+                (process-data self kind origin sequence frame timestamp duration (read-udp-payload first))
+              (let ((chunks (map read-udp-payload datas)))
+                (let ((data (apply u8vector-append chunks)))
+                  (process-data self kind origin sequence frame timestamp duration data))))
+          @should-be-reported-by-process-missing
+          (let ((missing (difference (naturals sequence (+ sequence total)) (map read-udp-sequence datas))))
+            (format :terminal "{s} {s} {s} {s} {l}{%}" remote-name (udp-name kind) '***partial-frame*** 'missing missing))))))
+  
+  
+  (method (process-data self kind origin sequence frame timestamp duration buffer)
+    (define (player-no->id no)
+      (get-id (find-player-by-no no)))
+    
+    (define (process-audio)
+      (if (equal? buffer udp-media-off)
+          (receive-server-audio (current-audio) (player-no->id origin) #f #f #f)
+        (receive-server-audio (current-audio) (player-no->id origin) buffer timestamp duration)))
+    
+    (define (process-video)
+      (if (equal? buffer udp-media-off)
+          (receive-server-video (current-video) (player-no->id origin) #f #f #f)
+        (receive-server-video (current-video) (player-no->id origin) buffer timestamp duration)))
+    
+    (ecase kind
+      ((udp-audio)
+       (process-audio))
+      ((udp-video)
+       (process-video))))))

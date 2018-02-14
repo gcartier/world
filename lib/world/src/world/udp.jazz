@@ -18,7 +18,6 @@
 (import (jazz.presence)
         (world)
         (world.context)
-        (world.player)
         (world.ring)
         (world.settings)
         (world.support))
@@ -58,11 +57,14 @@
   (fxround (* udp-process-window nanosecond)))
 
 
-(definition protected udp-debug-discard?
-  (world-setting 'world.udp-debug-discard? #f))
+(definition protected udp-show-discard?
+  (world-setting 'world.udp-show-discard? #f))
 
-(definition protected udp-debug-missing?
-  (world-setting 'world.udp-debug-missing? #f))
+(definition protected udp-show-missing?
+  (world-setting 'world.udp-show-missing? #f))
+
+(definition protected udp-show-duplicates?
+  (world-setting 'world.udp-show-duplicates? #f))
 
 (definition protected udp-debug-nack?
   (world-setting 'world.udp-debug-nack? #f))
@@ -122,18 +124,12 @@
 (class UDP-Send-Channel extends UDP-Channel
   
   
-  (slot data-sequence  accessors generate)
-  (slot frame-sequence accessors generate)
-  (slot last-timestamp accessors generate)
   (slot retain-ring    getter generate)
   (slot release-thread getter generate)
   
   
   (method override (initialize self kind origin)
     (nextmethod self kind origin)
-    (set! self.data-sequence 0)
-    (set! self.frame-sequence 0)
-    (set! self.last-timestamp #f)
     ;; make it really big until time ring is a real ring
     (set! self.retain-ring (new Time-Ring 400096 @w 512 @max-size: +inf.0 timestamp-proc: read-udp-timestamp now-proc: (~ now-timestamp self)))
     ;; development
@@ -142,16 +138,6 @@
                                 (lambda ()
                                   (release-data self))))
     (thread-start! release-thread))
-  
-  
-  (method protected (next-data-sequence! self)
-    (prog1 data-sequence
-      (increase! data-sequence)))
-  
-  
-  (method protected (next-frame-sequence! self)
-    (prog1 frame-sequence
-      (increase! frame-sequence)))
   
   
   (method protected (retain self data)
@@ -175,9 +161,6 @@
   
   
   (slot receive-last-sequence accessors generate)
-  (slot process-last-sequence getter generate)
-  (slot process-ring          getter generate)
-  (slot process-thread        getter generate)
   ;; quicky for test
   (slot nack-sequences        accessors generate)
   
@@ -185,129 +168,7 @@
   (method override (initialize self kind origin)
     (nextmethod self kind origin)
     (set! self.receive-last-sequence #f)
-    (set! self.process-last-sequence #f)
-    ;; make it really big until time ring is a real ring
-    (set! self.process-ring (new Time-Ring 40096 @w 512 @max-size: +inf.0 timestamp-proc: read-udp-timestamp now-proc: (~ now-timestamp self)))
-    ;; development
-    (set-$c self)
-    (set-$r process-ring)
-    (set! self.process-thread (new-thread
-                                (lambda ()
-                                  (process self))))
-    (set! self.nack-sequences '())
-    (thread-start! process-thread))
-  
-  
-  ;;;
-  ;;;; Insert
-  ;;;
-  
-  
-  (method protected (insert-nack self data)
-    )
-  
-  
-  (method protected (insert-media self data)
-    (insert-data self data))
-  
-  
-  (method protected (insert-data self data)
-    (let ((sequence (read-udp-sequence data)))
-      (let ((nack? (member? sequence nack-sequences)))
-        (when (and udp-debug-nack? nack?)
-          (terminal remote-name (udp-name kind) 'insert-resent sequence))
-        (unless nack?
-          (update-time self data))
-        (let ((inserted? (insert process-ring data)))
-          (when (and udp-debug-discard? (not inserted?))
-            (let ((kind (read-udp-kind data))
-                  (sequence (read-udp-sequence data)))
-              (let ((label (if nack? '***discard-resent*** '***discard***)))
-                (format :terminal "{s} {s} {s} {s}{%}" remote-name (udp-name kind) label sequence))))))))
-  
-  
-  (method protected (wait-data self)
-    (wait process-ring))
-  
-  
-  ;;;
-  ;;;; Process
-  ;;;
-  
-  
-  (method (process self)
-    (declare (proper-tail-calls))
-    (let (loop)
-      (let ((lst (wait-data self)))
-        (process-missing self lst)
-        (when udp-debug-nack?
-          (for-each (lambda (data)
-                      (let ((kind (read-udp-kind data))
-                            (sequence (read-udp-sequence data)))
-                        (when (member? sequence nack-sequences)
-                          (terminal remote-name (udp-name kind) 'process-resent sequence))))
-                    lst))
-        ;; if we always receive in-order from wait then we should be able to
-        ;; just validate that it is the case and just scan the list we got
-        (for-each (lambda (partition)
-                    (bind (frame . datas) partition
-                      (process-frame self (sort < datas key: read-udp-sequence))))
-                  (sort < (partition lst key: read-udp-frame) key: car)))
-      (loop)))
-  
-  
-  (method (process-missing self lst)
-    (let ((sorted (sort < lst key: read-udp-sequence)))
-      (for-each (lambda (data)
-                  (let ((sequence (read-udp-sequence data)))
-                    (when (and udp-debug-missing? process-last-sequence)
-                      (let ((expected (+ process-last-sequence 1)))
-                        (when (/= sequence expected)
-                          (loop (for seq from expected below sequence)
-                                (let ((label (if (member? seq nack-sequences) '***missing-resent*** '***missing***)))
-                                  (format :terminal "{s} {s} {s} {s}{%}" remote-name (udp-name kind) label seq))))))
-                    (set! process-last-sequence sequence)))
-                sorted)))
-  
-  
-  (method (process-frame self datas)
-    (let ((received (length datas))
-          (first (car datas)))
-      (let ((kind (read-udp-kind first))
-            (origin (read-udp-origin first))
-            (sequence (read-udp-sequence first))
-            (frame (read-udp-frame first))
-            (part (read-udp-part first))
-            (total (read-udp-total first))
-            (timestamp (read-udp-timestamp first))
-            (duration (read-udp-duration first)))
-        (when (= total received)
-          (if (= total 1)
-              (process-data self kind origin sequence frame timestamp duration (read-udp-payload first))
-            (let ((chunks (map read-udp-payload datas)))
-              (let ((data (apply u8vector-append chunks)))
-                (process-data self kind origin sequence frame timestamp duration data))))))))
-  
-  
-  (method (process-data self kind origin sequence frame timestamp duration buffer)
-    (define (player-no->id no)
-      (get-id (find-player-by-no no)))
-    
-    (define (process-audio)
-      (if (equal? buffer udp-media-off)
-          (receive-server-audio (current-audio) (player-no->id origin) #f #f #f)
-        (receive-server-audio (current-audio) (player-no->id origin) buffer timestamp duration)))
-    
-    (define (process-video)
-      (if (equal? buffer udp-media-off)
-          (receive-server-video (current-video) (player-no->id origin) #f #f #f)
-        (receive-server-video (current-video) (player-no->id origin) buffer timestamp duration)))
-    
-    (ecase kind
-      ((udp-audio)
-       (process-audio))
-      ((udp-video)
-       (process-video)))))
+    (set! self.nack-sequences '())))
 
 
 ;;;
