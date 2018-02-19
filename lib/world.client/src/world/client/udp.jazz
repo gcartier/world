@@ -24,6 +24,8 @@
         (world.player)
         (world.ring)
         (world.settings)
+        (world.support)
+        (world.task)
         (world.udp))
 
 
@@ -48,11 +50,12 @@
   (slot receive-channels initialize #f getter generate)
   
   
-  (method (connect self local-host host service)
+  (method (connect self client-no local-host host service)
     (define (send-connect)
       (mutex-lock! write-mutex)
-      (let ((data (make-u8vector 4)))
+      (let ((data (make-u8vector 8)))
         (write-udp-kind data udp-connect)
+        (write-udp-origin data client-no)
         (write data udp-port))
       (mutex-unlock! write-mutex))
     
@@ -68,7 +71,17 @@
     (set! write-mutex (make-mutex 'write))
     (set! send-channels (make-table))
     (set! receive-channels (make-table))
+    (record-event udp-id-connect
+                  0.
+                  0.
+                  0.)
     (send-connect)
+    (let ((data (read udp-port)))
+      (assert (equal? data udp-connected)
+        (record-event udp-id-connected
+                      0.
+                      0.
+                      0.)))
     (thread-start! udp-thread))
 
   
@@ -85,18 +98,18 @@
   ;;;
   
   
-  (method (require-send-channel self kind origin)
-    (let ((key (cons kind origin)))
+  (method (require-send-channel self origin media-kind)
+    (let ((key (cons origin media-kind)))
       (or (table-ref send-channels key #f)
-          (let ((channel (new UDP-Client-Send-Channel kind origin)))
+          (let ((channel (new UDP-Client-Send-Channel origin media-kind)))
             (table-set! send-channels key channel)
             channel))))
   
   
-  (method (require-receive-channel self kind origin)
-    (let ((key (cons kind origin)))
+  (method (require-receive-channel self origin media-kind)
+    (let ((key (cons origin media-kind)))
       (or (table-ref receive-channels key #f)
-          (let ((channel (new UDP-Client-Receive-Channel kind origin)))
+          (let ((channel (new UDP-Client-Receive-Channel origin media-kind self)))
             (table-set! receive-channels key channel)
             channel))))
   
@@ -118,7 +131,7 @@
     (mutex-lock! write-mutex)
     (let ((origin (get-client-no (current-tier))))
       (when udp-video-action
-        (let ((key (cons kind origin)))
+        (let ((key (cons origin kind)))
           (cond ((and buffer (not (table-ref send-channels key #f)))
                  (set! udp-video-port (case udp-video-action
                                         ((record)
@@ -129,7 +142,7 @@
                  (when udp-video-port
                    (close-port udp-video-port)
                    (set! udp-video-port #f))))))
-      (let ((channel (require-send-channel self kind origin)))
+      (let ((channel (require-send-channel self origin kind)))
         ;; quick hack to give media off a timestamp
         (let ((last-timestamp (or (get-last-timestamp channel) 0)))
           (let ((off? (not buffer))
@@ -203,19 +216,30 @@
   (method (receive-data self data)
     (let ((kind (read-udp-kind data)))
       (ecase kind
+        ((udp-ack)
+         (receive-ack self data))
         ((udp-nack)
-         (receive-nack self kind data))
+         (receive-nack self data))
         ((udp-audio udp-video)
          (receive-media self kind data))
         (else
          (error "Unknown UDP kind: {s}" kind)))))
   
   
-  (method (receive-nack self kind data)
-    (let ((media-kind (read-udp-nack-kind data))
-          (origin (read-udp-origin data))
+  (method (receive-ack self data)
+    (let ((media-kind (read-udp-media-kind data))
           (sequence (read-udp-sequence data)))
-      (let ((channel (require-send-channel self media-kind origin)))
+      (record-event udp-id-receive-ack
+                    (fixnum->flonum media-kind)
+                    (fixnum->flonum sequence)
+                    0.)))
+  
+  
+  (method (receive-nack self data)
+    (let ((origin (read-udp-origin data))
+          (media-kind (read-udp-media-kind data))
+          (sequence (read-udp-sequence data)))
+      (let ((channel (require-send-channel self origin media-kind)))
         (let ((ring (get-retain-ring channel)))
           (let ((found (locate ring (lambda (data)
                                       (= (read-udp-sequence data) sequence)))))
@@ -225,13 +249,14 @@
                           (if found 1. 0.))
             (if found
                 (write found udp-port)
-              (terminal remote-name (udp-name media-kind) '***nack-missing*** sequence)))))))
+              (when udp-debug-nack?
+                (terminal remote-name (udp-name media-kind) '***nack-missing*** sequence))))))))
   
   
   (method (receive-media self kind data)
     (let ((origin (read-udp-origin data))
           (sequence (read-udp-sequence data)))
-      (let ((channel (require-receive-channel self kind origin)))
+      (let ((channel (require-receive-channel self origin kind)))
         (unless (member? sequence (get-nack-sequences channel))
           (let ((last-sequence (get-receive-last-sequence channel)))
             (when last-sequence
@@ -244,6 +269,18 @@
         (insert-media channel data))))
   
   
+  (method protected (send-ack self origin sequence media-kind)
+    (mutex-lock! write-mutex)
+    (let ((size (+ 4 4 4 4)))
+      (let ((data (make-u8vector size)))
+        (write-udp-kind data udp-ack)
+        (write-udp-origin data origin)
+        (write-udp-sequence data sequence)
+        (write-udp-media-kind data media-kind)
+        (write data udp-port)))
+    (mutex-unlock! write-mutex))
+  
+  
   (method (send-nack self origin sequence media-kind)
     (when udp-debug-nack?
       (terminal remote-name (udp-name media-kind) 'send-nack sequence))
@@ -253,13 +290,13 @@
         (write-udp-kind data udp-nack)
         (write-udp-origin data origin)
         (write-udp-sequence data sequence)
-        (write-udp-nack-kind data media-kind)
+        (write-udp-media-kind data media-kind)
         (write data udp-port)))
     (mutex-unlock! write-mutex)))
 
 
 ;;;
-;;;; Client Send Channel
+;;;; Send Channel
 ;;;
 
 
@@ -271,8 +308,8 @@
   (slot last-timestamp accessors generate)
   
   
-  (method override (initialize self kind origin)
-    (nextmethod self kind origin)
+  (method override (initialize self origin media-kind)
+    (nextmethod self origin media-kind)
     (set! self.data-sequence 0)
     (set! self.frame-sequence 0)
     (set! self.last-timestamp #f))
@@ -289,20 +326,22 @@
 
 
 ;;;
-;;;; Client Receive Channel
+;;;; Receive Channel
 ;;;
 
 
 (class UDP-Client-Receive-Channel extends UDP-Receive-Channel
   
   
+  (slot client                getter generate)
   (slot process-last-sequence getter generate)
   (slot process-ring          getter generate)
   (slot process-thread        getter generate)
   
   
-  (method override (initialize self kind origin)
-    (nextmethod self kind origin)
+  (method override (initialize self origin media-kind client)
+    (nextmethod self origin media-kind)
+    (set! self.client client)
     (set! self.process-last-sequence #f)
     ;; make it really big until time ring is a real ring
     (set! self.process-ring (new Time-Ring 40096 @w 512 @max-size: +inf.0 timestamp-proc: read-udp-timestamp now-proc: (~ now-timestamp self)))
@@ -332,13 +371,18 @@
     (let ((sequence (read-udp-sequence data)))
       (let ((nack? (member? sequence nack-sequences)))
         (when (and udp-debug-nack? nack?)
-          (terminal remote-name (udp-name kind) 'insert-resent sequence))
+          (terminal remote-name (udp-name media-kind) 'insert-resent sequence))
         (unless nack?
           (update-time self data))
         (let ((inserted? (insert process-ring data)))
           (when (and udp-show-discard? (not inserted?))
             (let ((kind (read-udp-kind data))
                   (sequence (read-udp-sequence data)))
+              (when (and nack? video-self?)
+                (record-event udp-id-discard-resent
+                              (fixnum->flonum media-kind)
+                              (fixnum->flonum sequence)
+                              0.))
               (let ((label (if nack? '***discard-resent*** '***discard***)))
                 (format :terminal "{s} {s} {s} {s}{%}" remote-name (udp-name kind) label sequence))))))))
   
@@ -362,7 +406,7 @@
                       (let ((unique-datas (remove-duplicates datas key: read-udp-sequence)))
                         (when (and udp-show-duplicates? (> (length datas) (length unique-datas)))
                           (let ((duplicates (difference datas unique-datas)))
-                            (format :terminal "{s} {s} {s} {l}{%}" remote-name (udp-name kind) '***received-duplicates*** (map read-udp-sequence duplicates))))
+                            (format :terminal "{s} {s} {s} {l}{%}" remote-name (udp-name media-kind) '***received-duplicates*** (map read-udp-sequence duplicates))))
                         (process-frame self (sort < unique-datas key: read-udp-sequence)))))
                   (sort < (partition lst key: read-udp-frame) key: car)))
       (loop)))
@@ -376,8 +420,14 @@
                       (let ((expected (+ process-last-sequence 1)))
                         (when (/= sequence expected)
                           (loop (for seq from expected below sequence)
-                                (let ((label (if (member? seq nack-sequences) '***missing-resent*** '***missing***)))
-                                  (format :terminal "{s} {s} {s} {s}{%}" remote-name (udp-name kind) label seq))))))
+                                (let ((nack? (member? seq nack-sequences)))
+                                  (when (and nack? video-self?)
+                                    (record-event udp-id-missing-resent
+                                                  (fixnum->flonum media-kind)
+                                                  (fixnum->flonum seq)
+                                                  0.))
+                                  (let ((label (if nack? '***missing-resent*** '***missing***)))
+                                    (format :terminal "{s} {s} {s} {s}{%}" remote-name (udp-name media-kind) label seq)))))))
                     (set! process-last-sequence sequence)))
                 sorted)))
   
@@ -418,6 +468,9 @@
           (receive-server-video (current-video) (player-no->id origin) #f #f #f)
         (receive-server-video (current-video) (player-no->id origin) buffer timestamp duration)))
     
+    ;; sending ack by frame seems a reasonable approach to
+    ;; complement nacks that get sent when parts are missing
+    (send-ack client origin sequence kind)
     (ecase kind
       ((udp-audio)
        (process-audio))

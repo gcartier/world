@@ -49,7 +49,7 @@
                        (lambda ()
                          (process self))
                        'udp))
-    (set! connections '())
+    (set! connections (make-table))
     (set! stopping? #f)
     (set! send-channels (make-table))
     (set! receive-channels (make-table))
@@ -65,22 +65,38 @@
   
   
   ;;;
+  ;;;; Connection
+  ;;;
+  
+  
+  (method (register-connection self origin connection)
+    (table-set! connections origin connection))
+  
+  (method (unregister-connection self origin)
+    (table-clear connections origin))
+  
+  
+  (method (find-connection self origin)
+    (table-ref connections origin #f))
+  
+  
+  ;;;
   ;;;; Channel
   ;;;
   
   
-  (method (require-send-channel self kind origin)
-    (let ((key (cons kind origin)))
+  (method (require-send-channel self origin media-kind)
+    (let ((key (cons origin media-kind)))
       (or (table-ref send-channels key #f)
-          (let ((channel (new UDP-Send-Channel kind origin)))
+          (let ((channel (new UDP-Server-Send-Channel origin media-kind)))
             (table-set! send-channels key channel)
             channel))))
   
   
-  (method (require-receive-channel self kind origin)
-    (let ((key (cons kind origin)))
+  (method (require-receive-channel self origin media-kind)
+    (let ((key (cons origin media-kind)))
       (or (table-ref receive-channels key #f)
-          (let ((channel (new UDP-Receive-Channel kind origin)))
+          (let ((channel (new UDP-Server-Receive-Channel origin media-kind)))
             (table-set! receive-channels key channel)
             channel))))
   
@@ -109,23 +125,28 @@
     (let ((kind (read-udp-kind data)))
       (ecase kind
         ((udp-connect)
-         (connect-source self))
+         (connect-source self data))
+        ((udp-ack)
+         (receive-ack self data))
         ((udp-nack)
-         (receive-nack self kind data))
+         (receive-nack self data))
         ((udp-audio udp-video)
          (receive-media self kind data))
         (else
          (error "Unknown UDP kind: {s}" kind)))))
   
   
-  (method (connect-source self)
-    (let ((source-info (udp-source-socket-info udp-port)))
+  (method (connect-source self data)
+    (let ((origin (read-udp-origin data))
+          (source-info (udp-source-socket-info udp-port)))
       (let ((source-host (socket-info-address source-info))
             (source-port (socket-info-port-number source-info)))
         (when udp-debug?
           (terminal remote-name 'connect source-host source-port))
         (let ((connection (new UDP-Connection source-host source-port)))
-          (set! connections (cons connection connections))))))
+          (register-connection self origin connection))
+        (udp-destination-set! source-host source-port udp-port)
+        (write udp-connected udp-port))))
   
   
   ;; at the moment centro will return a network is unreachable
@@ -143,14 +164,30 @@
           (write data port)))))
   
   
-  (method (receive-nack self kind data)
-    (let ((media-kind (read-udp-nack-kind data))
-          (origin (read-udp-origin data))
+  (method (receive-ack self data)
+    (let ((origin (read-udp-origin data))
+          (media-kind (read-udp-media-kind data))
+          (sequence (read-udp-sequence data)))
+      (let ((connection (find-connection self origin)))
+        (when connection
+          (relay-ack self connection data)))))
+  
+  
+  (method (relay-ack self connection data)
+    (let ((host (get-host connection))
+          (port (get-port connection)))
+      (udp-destination-set! host port udp-port)
+      (retrying-write self data udp-port)))
+  
+  
+  (method (receive-nack self data)
+    (let ((origin (read-udp-origin data))
+          (media-kind (read-udp-media-kind data))
           (sequence (read-udp-sequence data)))
       ;; we already nacked the source and will broacast
       ;; when we receive the resent so ignore this nack
-      (unless (member? sequence (get-nack-sequences (require-receive-channel self media-kind origin)))
-        (let ((channel (require-send-channel self media-kind origin)))
+      (unless (member? sequence (get-nack-sequences (require-receive-channel self origin media-kind)))
+        (let ((channel (require-send-channel self origin media-kind)))
           (let ((ring (get-retain-ring channel)))
             (let ((found (locate ring (lambda (data)
                                         (= (read-udp-sequence data) sequence)))))
@@ -168,7 +205,7 @@
   (method (receive-media self kind data)
     (let ((origin (read-udp-origin data))
           (sequence (read-udp-sequence data)))
-      (let ((channel (require-receive-channel self kind origin)))
+      (let ((channel (require-receive-channel self origin kind)))
         (unless (member? sequence (get-nack-sequences channel))
           (let ((last-sequence (get-receive-last-sequence channel)))
             (when last-sequence
@@ -195,13 +232,13 @@
         (write-udp-kind data udp-nack)
         (write-udp-origin data origin)
         (write-udp-sequence data sequence)
-        (write-udp-nack-kind data media-kind)
+        (write-udp-media-kind data media-kind)
         (retrying-write self data udp-port))))
   
   
   (method (broadcast-media self kind data)
     (let ((origin (read-udp-origin data)))
-      (let ((channel (require-send-channel self kind origin)))
+      (let ((channel (require-send-channel self origin kind)))
         (retain channel data)
         (broadcast-data self kind data))))
   
@@ -212,19 +249,19 @@
             (source-port (socket-info-port-number source-info)))
         (when udp-debug?
           (terminal remote-name 'broadcast source-host source-port (udp-name kind) (u8vector-length data)))
-        (for-each (lambda (connection)
-                    (let ((host (get-host connection))
-                          (port (get-port connection)))
-                      (when (or (not (host=? host source-host))
-                                (not (service=? port source-port))
-                                (or audio-self? video-self?)
-                                @wait-channel-in-chunk (and (= kind udp-audio) audio-self?)
-                                @wait-channel-in-chunk (and (= kind udp-video) video-self?))
-                        (udp-destination-set! host port udp-port)
-                        (when (or (not udp-drop-percentage)
-                                  (> (random-real) (/ udp-drop-percentage 100.)))
-                          (retrying-write self data udp-port)))))
-                  connections)))))
+        (iterate-table connections
+          (lambda (origin connection)
+            (let ((host (get-host connection))
+                  (port (get-port connection)))
+              (when (or (not (host=? host source-host))
+                        (not (service=? port source-port))
+                        (or audio-self? video-self?)
+                        @wait-channel-in-chunk (and (= kind udp-audio) audio-self?)
+                        @wait-channel-in-chunk (and (= kind udp-video) video-self?))
+                (udp-destination-set! host port udp-port)
+                (when (or (not udp-drop-percentage)
+                          (> (random-real) (/ udp-drop-percentage 100.)))
+                  (retrying-write self data udp-port))))))))))
 
 
 ;;;
@@ -248,4 +285,21 @@
   (method override (print self output readably)
     (print-unreadable self output
       (lambda (output)
-        (format output "{a} {a}" host port))))))
+        (format output "{a} {a}" host port)))))
+
+
+;;;
+;;;; Send Channel
+;;;
+
+
+(class UDP-Server-Send-Channel extends UDP-Send-Channel)
+
+
+
+;;;
+;;;; Receive Channel
+;;;
+
+
+(class UDP-Server-Receive-Channel extends UDP-Receive-Channel))
