@@ -18,7 +18,9 @@
 (import (jazz.io)
         (jazz.network)
         (jazz.presence)
+        (jazz.syntax (phase syntax))
         (world)
+        (world.configure)
         (world.context)
         (world.evolution)
         (world.player)
@@ -43,7 +45,7 @@
   
   
   (slot udp-port         initialize #f getter generate)
-  (slot udp-thread       initialize #f getter generate)
+  (slot udp-task         initialize #f getter generate)
   (slot udp-stopping?    initialize #f getter generate)
   (slot write-mutex      initialize #f getter generate)
   (slot send-channels    initialize #f getter generate)
@@ -63,10 +65,8 @@
                                local-address: local-host
                                address: host
                                port-number: service)))
-    (set! udp-thread (new-thread
-                       (lambda ()
-                         (process self))
-                       'udp))
+    (set! udp-task (new Task 'udp-receive (lambda (task)
+                                            (receive-loop self task))))
     (set! udp-stopping? #f)
     (set! write-mutex (make-mutex 'write))
     (set! send-channels (make-table))
@@ -82,15 +82,16 @@
                       0.
                       0.
                       0.)))
-    (thread-start! udp-thread))
+    (start-task udp-task)
+    (thread-base-priority-set! (get-thread udp-task) udp-priority))
 
   
   (method (disconnect self)
     (set! udp-stopping? #t)
     (close-port udp-port)
-    (thread-join! udp-thread)
+    (thread-join! (get-thread udp-task))
     (set! udp-port #f)
-    (set! udp-thread #f))
+    (set! udp-task #f))
   
   
   ;;;
@@ -198,19 +199,22 @@
   ;;;
   
   
-  (method (process self)
+  (method (receive-loop self task)
     (declare (proper-tail-calls))
-    (let (loop)
-      (let ((data (with-exception-filter
-                    (lambda (exc)
-                      udp-stopping?)
-                    (lambda (exc)
-                      #f)
-                    (lambda ()
-                      (read udp-port)))))
-        (when data
-          (receive-data self data)
-          (loop)))))
+    (with-task task
+      (lambda (exit)
+        (let (loop)
+          (let ((data (with-exception-filter
+                        (lambda (exc)
+                          udp-stopping?)
+                        (lambda (exc)
+                          (continuation-return exit #f))
+                        (lambda ()
+                          (read udp-port)))))
+            (when data
+              (site (udp-receive on?: #t)
+                (receive-data self data))
+              (loop)))))))
   
   
   (method (receive-data self data)
@@ -350,7 +354,7 @@
     (set-$r process-ring)
     (set! self.process-thread (new-thread
                                 (lambda ()
-                                  (process self))))
+                                  (process-loop self))))
     (thread-start! process-thread))
   
   
@@ -396,7 +400,7 @@
   ;;;
   
   
-  (method (process self)
+  (method (process-loop self)
     (declare (proper-tail-calls))
     (let (loop)
       (let ((lst (wait-data self)))
