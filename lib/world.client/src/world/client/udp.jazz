@@ -55,7 +55,8 @@
   (method (connect self client-no local-host host service)
     (define (send-connect)
       (mutex-lock! write-mutex)
-      (let ((data (make-u8vector 8)))
+      (let ((data (make-u8vector (+ 8 4 4))))
+        (write-udp-sent data (current-seconds))
         (write-udp-kind data udp-connect)
         (write-udp-origin data client-no)
         (write data udp-port))
@@ -77,12 +78,14 @@
                   0.
                   0.)
     (send-connect)
-    (let ((data (read udp-port)))
-      (assert (equal? data udp-connected)
-        (record-event udp-id-connected
-                      0.
-                      0.
-                      0.)))
+    (let ((reply (read udp-port)))
+      (let ((kind (read-udp-kind reply)))
+        (assert (= kind udp-connected)
+          (let ((round-trip (- (current-seconds) (read-udp-sent reply))))
+            (record-event udp-id-connected
+                          round-trip
+                          0.
+                          0.)))))
     (start-task udp-task))
 
   
@@ -110,7 +113,7 @@
   (method (require-receive-channel self origin media-kind)
     (let ((key (cons origin media-kind)))
       (or (table-ref receive-channels key #f)
-          (let ((channel (new UDP-Client-Receive-Channel origin media-kind self)))
+          (let ((channel (new UDP-Client-Receive-Channel origin media-kind)))
             (table-set! receive-channels key channel)
             channel))))
   
@@ -152,7 +155,7 @@
                 (duration (or duration 1))
                 (buffer (or buffer udp-media-off)))
             (set-last-timestamp channel timestamp)
-            (let ((header-size (+ 4 4 4 4 4 4 8 8 4))
+            (let ((header-size (+ 8 4 4 4 4 4 4 8 8 4))
                   (payload-size (u8vector-length buffer)))
               (let ((max-content-size (- udp-datagram-max header-size)))
                 (let ((total (fxceiling/ payload-size max-content-size)))
@@ -163,6 +166,7 @@
                               (content-size (min remain max-content-size)))
                           (let ((size (+ header-size content-size)))
                             (let ((data (make-u8vector size)))
+                              (write-udp-sent data (current-seconds))
                               (write-udp-kind data kind)
                               (write-udp-origin data origin)
                               (write-udp-sequence data sequence)
@@ -231,12 +235,14 @@
   
   
   (method (receive-ack self data)
-    (let ((media-kind (read-udp-media-kind data))
+    (let ((sent (read-udp-sent data))
+          (media-kind (read-udp-media-kind data))
           (sequence (read-udp-sequence data)))
-      (record-event udp-id-receive-ack
-                    (fixnum->flonum media-kind)
-                    (fixnum->flonum sequence)
-                    0.)))
+      (let ((round-trip (- (current-seconds) sent)))
+        (record-event udp-id-receive-ack
+                      (fixnum->flonum media-kind)
+                      (fixnum->flonum sequence)
+                      round-trip))))
   
   
   (method (receive-nack self data)
@@ -261,6 +267,12 @@
     (let ((origin (read-udp-origin data))
           (sequence (read-udp-sequence data)))
       (let ((channel (require-receive-channel self origin kind)))
+        (let ((next-ack (get-next-ack channel))
+              (now (current-seconds)))
+          (when (or (not next-ack)
+                    (>= now next-ack))
+            (send-ack self (read-udp-sent data) origin sequence kind)
+            (set-next-ack channel (+ now udp-ack-period))))
         (unless (member? sequence (get-nack-sequences channel))
           (let ((last-sequence (get-receive-last-sequence channel)))
             (when last-sequence
@@ -273,10 +285,11 @@
         (insert-media channel data))))
   
   
-  (method protected (send-ack self origin sequence media-kind)
+  (method (send-ack self sent origin sequence media-kind)
     (mutex-lock! write-mutex)
-    (let ((size (+ 4 4 4 4)))
+    (let ((size (+ 8 4 4 4 4)))
       (let ((data (make-u8vector size)))
+        (write-udp-sent data sent)
         (write-udp-kind data udp-ack)
         (write-udp-origin data origin)
         (write-udp-sequence data sequence)
@@ -289,8 +302,9 @@
     (when udp-debug-nack?
       (terminal remote-name (udp-name media-kind) 'send-nack sequence))
     (mutex-lock! write-mutex)
-    (let ((size (+ 4 4 4 4)))
+    (let ((size (+ 8 4 4 4 4)))
       (let ((data (make-u8vector size)))
+        (write-udp-sent data (current-seconds))
         (write-udp-kind data udp-nack)
         (write-udp-origin data origin)
         (write-udp-sequence data sequence)
@@ -337,15 +351,13 @@
 (class UDP-Client-Receive-Channel extends UDP-Receive-Channel
   
   
-  (slot client                getter generate)
   (slot process-last-sequence getter generate)
   (slot process-ring          getter generate)
   (slot process-task          getter generate)
   
   
-  (method override (initialize self origin media-kind client)
+  (method override (initialize self origin media-kind)
     (nextmethod self origin media-kind)
-    (set! self.client client)
     (set! self.process-last-sequence #f)
     ;; make it really big until time ring is a real ring
     (set! self.process-ring (new Time-Ring 40096 @w 512 @max-size: +inf.0 timestamp-proc: read-udp-timestamp now-proc: (~ now-timestamp self)))
@@ -475,9 +487,6 @@
           (receive-server-video (current-video) (player-no->id origin) #f #f #f)
         (receive-server-video (current-video) (player-no->id origin) buffer timestamp duration)))
     
-    ;; sending ack by frame seems a reasonable approach to
-    ;; complement nacks that get sent when parts are missing
-    (send-ack client origin sequence kind)
     (ecase kind
       ((udp-audio)
        (process-audio))
