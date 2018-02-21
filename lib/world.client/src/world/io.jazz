@@ -41,30 +41,17 @@
         (world.tier))
 
 
-;;;
-;;;; Default
-;;;
+(definition protected boot-restart
+  (make-parameter #f))
 
 
-(definition *world-directories*
-  '())
-
-(definition public (world-directories)
-  *world-directories*)
-
-(definition public (set-world-directories directories)
-  (set! *world-directories* directories))
-
-
-(definition public (find-world name)
-  (continuation-capture
-    (lambda (return)
-      (for-each (lambda (info)
-                  (bind (world-name . world-dir) info
-                    (when (filename=? world-name name)
-                      (continuation-return return world-dir))))
-                (world-directories))
-      #f)))
+(definition public (booting thunk)
+  (with-task-mutex
+    (lambda ()
+      (continuation-capture
+        (lambda (restart)
+          (parameterize ((boot-restart restart))
+            (thunk)))))))
 
 
 ;;;
@@ -72,98 +59,22 @@
 ;;;
 
 
-(definition protected boot-restart
-  (make-parameter #f))
+(definition *world-directory*
+  #f)
+
+(definition public (get-world-directory)
+  *world-directory*)
+
+(definition public (set-world-directory dir)
+  (set! *world-directory* dir))
 
 
-(definition public (boot-world kind start-world (start-zone: start-zone #f))
-  (with-task-mutex
-    (lambda ()
-      (continuation-capture
-        (lambda (restart)
-          (parameterize ((boot-restart restart))
-            (let ((dir (find-world start-world)))
-              (open-world kind (new-file dir ".world") start-zone: start-zone))))))))
-
-
-(definition public (open-world kind file (start-zone: start-zone #f))
-  (let ((form (convert-world (read-form file))))
-    (load-point 'world-form)
-    (make-world kind form start-zone: start-zone)))
-
-
-(definition public (make-world kind form (start-zone: start-zone #f))
-  (close-world)
-  (let ((world (instantiate form)))
-    (define (open-safe name (local? #f))
-      (define (open)
-        (let ((file (if (not name) ;; quick hack
-                        (if master-process ;; quick hack
-                            {File Settings "servers" "Local" ".server"}
-                          (get-server-file))
-                      (if local?
-                          (new-file {Directory Settings "servers" "Local" "zones"} (list name ".zone"))
-                        (find-tier name kind)))))
-          (if file
-              (if local?
-                  (open-local file)
-                (case kind
-                  ((standalone) (open-standalone file))
-                  ((client) (open-client-safe file))
-                  ((server) (open-server file))))
-            (report (format "Unable to find {a}: {a}" (or kind 'zone) name)))))
-      
-      (define (open-client-safe file)
-        (let ((obj (open-client file)))
-          (if (is? obj Zone)
-              obj
-            (report (if (string? obj)
-                        obj
-                      "Unable to connect to server")))))
-      
-      (define (report exception-message)
-        (cond ((using-debugger?)
-               (error "{a}" exception-message))
-              ((not (window?))
-               (snapshot-process exception: (new Error message: exception-message))
-               (quit))
-              (else
-               (let ((welcome (open-welcome-zone)))
-                 (report-exception welcome exception-message #f)
-                 welcome))))
-      
-      (if (and (window?) (process-copyright-changed? (current-application)))
-          (let ((zone (open-welcome-zone)))
-            (set-post-accept zone open))
-        (open)))
-    
-    (load-point 'world-instantiate)
-    (unless (get-title world)
-      (let ((origin (get-origin form)))
-        (when origin
-          (set-title world (get-name (get-parent origin))))))
-    (set-designer world (new Former form: form reference: world))
+(definition public (open-world)
+  (load-point 'world)
+  (let ((world (new World)))
     (setup-opengl world)
     (resize-scene world)
     (initialize-world world)
-    (load-point 'world-initialize)
-    (unless (eq? start-zone 'none)
-      (case kind
-        ((client)
-         (let ((client (command-argument "client")))
-           (if client
-               (open-safe client)
-             (let ((name (or start-zone (command-argument "zone") @fix-me-broken-since-local-server (world-setting 'world.last-zone #f))))
-               (if name
-                   (open-safe name #t)
-                 (set! kind 'standalone)
-                 (set-tier-kind 'standalone)
-                 (open-welcome-zone))))))
-        ((server)
-         (open-safe (command-argument "server")))
-        ((processor)
-         (open-processor)))
-      (update-title world))
     (load-point 'world-ready)
     world))
 
@@ -232,24 +143,50 @@
         (set-setting options-settings 'world.last-zone path)
         (save-content options-settings))))
   
-  @fix-me-broken-since-local-server
   (save-settings)
   (close-zone)
   (close-world))
 
 
-(definition (convert-world form)
-  (define (convert->1.1 form)
-    (set-version (get-data form) {Version 1 1})
-    form)
-  
-  (let ((version (or (get-version (get-data form)) {Version 1 0})))
-    (cond ((nu=? version {Version 1 0})
-           (convert->1.1 form))
-          ((nu=? version {Version 1 1})
-           form)
-          (else
-           (error "Unsupported world version: {a}" (present-string version))))))
+;;;
+;;;; Tier
+;;;
+
+
+(definition public (get-tiers-directory kind)
+  (case kind
+    ((standalone) (if (server?) (zones-dir (current-tier)) {Directory Settings "servers" "Local" "zones"}))
+    ((client) {Directory Settings "clients"})
+    ((server) {Directory Settings "servers"})))
+
+
+(definition public (find-tier name kind)
+  (let ((directory (get-tiers-directory kind)))
+    (continuation-capture
+      (lambda (return)
+        (when (exists? directory)
+          (iterate-directory directory
+            (lambda (path path-kind)
+              (let ((dir (new-directory directory path)))
+                (let ((file (tier-file dir kind)))
+                  (when (and (exists? file)
+                             (filename=? (filename-spine (join path "/")) name))
+                    (continuation-return return file)))))
+            full?: #f
+            files?: #f
+            directories?: #t))
+        #f))))
+
+
+(definition protected (tier-name file)
+  (get-name (get-parent file)))
+
+
+(definition protected (tier-file dir kind)
+  (new-file dir (case kind
+                   ((standalone) ".zone")
+                   ((client) ".client")
+                   ((server) ".server"))))
 
 
 ;;;
@@ -306,52 +243,48 @@
 ;;;
 
 
-(definition public common-names
-  '("Emma" "Lea" "Olivia" "Alice" "Florence" "Zoe" "Chloe" "Beatrice" "Charlotte" "Rosalie" "Eva" "Juliette" "Sofia" "Jade" "Camille" "Victoria" "Mia" "Charlie" "Romy" "Laurence" "Maeva" "Alicia" "Clara" "Annabelle" "Sarah" "Rose" "Raphaelle" "Livia" "Elizabeth" "Mila" "Anais" "Elodie" "Flavie" "Laurie" "Amelia" "Julia" "Leonie" "Maelie" "Gabrielle" "Sophia" "Adele" "Coralie" "Emy" "Noemie" "Aurelie" "Alexia" "Jeanne" "Emilie" "Eve" "Ophelie" "Thomas" "William" "Jacob" "Liam" "Felix" "Nathan" "Samuel" "Logan" "Alexis" "Noah" "Olivier" "Raphael" "Gabriel" "Emile" "Leo" "Charles" "Antoine" "Benjamin" "Adam" "Edouard" "Xavier" "Victor" "Zack" "Mathis" "Jayden" "Theo" "Elliot" "Zachary" "Louis" "James" "Anthony" "Alexandre" "Lucas" "Justin" "Arthur" "Tristan" "Loic" "Ethan" "Henri" "Nolan" "Nicolas" "Arnaud" "Jeremy" "Hugo" "Dylan" "Laurent" "Eli" "Vincent" "Isaac" "Etienne"))
-
-
-(definition protected (create-client-file client-name server-address server-port name avatar (script #f))
-  (let ((dir (new-directory {Directory Settings "clients"} client-name)))
-    (create-directories dir)
-    (let ((client-file (new-file dir ".client")))
-      (call-with-output-file (path-settings client-file)
-        (lambda (output)
-          (format output ";;;========={%}")
-          (format output ";;;  Yownu{%}")
-          (format output ";;;========={%}")
-          (format output ";;;{%}")
-          (format output ";;;; Client{%}")
-          (format output ";;;{%}")
-          (format output "{%}")
-          (format output "{%}")
-          (format output "(data jazz{%}")
-          (format output "{%}")
-          (format output "{%}")
-          (format output "(version {a}){%}" (present-string zone-version))
-          (format output "(import world.client){%}")
-          (format output "{%}")
-          (format output "{%}")
-          (format output "(form{%}")
-          (format output "  (<Client> server-host: {s} server-service: {s} character-name: {s} character-avatar: {s}"
-            (string->host server-address)
-            (string->port server-port)
-            name
-            avatar)
-          (when script
-            (format output " character-script: {s}" script))
-          (format output "))){%}")))
-      client-file)))
-
-
-(definition protected (create-client-files client-prefix count server-address server-port (script #f))
-  (let ((avatars (remove "character/dwarfmale" (world.interface.avatars:collect-avatar-models) test: equal?)))
-    (loop (for n from 1 to count)
-          (let ((client-name (format "{a}{a}" client-prefix n))
-                (name (random-element common-names))
-                (avatar (random-element avatars))
-                (script (or script "bot/player")))
-            (let ((fullname (format "{a} ({a})" name client-name)))
-              (create-client-file client-name server-address server-port fullname avatar script))))))
+(definition public (open-client-safe (start-zone: start-zone #f))
+  (define (open-safe name (local? #f))
+    (define (open)
+      (let ((file (if local?
+                      (new-file {Directory Settings "servers" "Local" "zones"} (list name ".zone"))
+                    (find-tier name 'client))))
+        (if file
+            (if local?
+                (open-local file)
+              (let ((obj (open-client file)))
+                (if (is? obj Zone)
+                    obj
+                  (report (if (string? obj)
+                              obj
+                            "Unable to connect to server")))))
+          (report (format "Unable to find client: {a}" name)))))
+    
+    (define (report exception-message)
+      (cond ((using-debugger?)
+             (error "{a}" exception-message))
+            ((not (window?))
+             (snapshot-process exception: (new Error message: exception-message))
+             (quit))
+            (else
+             (let ((welcome (open-welcome-zone)))
+               (report-exception welcome exception-message #f)
+               welcome))))
+    
+    (if (and (window?) (process-copyright-changed? (current-application)))
+        (let ((zone (open-welcome-zone)))
+          (set-post-accept zone open))
+      (open)))
+  
+  (unless (eq? start-zone 'none)
+    (let ((client (command-argument "client")))
+      (if client
+          (open-safe client)
+        (let ((name (or start-zone (command-argument "zone") (world-setting 'world.last-zone #f))))
+          (if name
+              (open-safe name #t)
+            (open-welcome-zone)))))
+    (load-point 'tier-ready)))
 
 
 (definition public (open-client client-file (local? #f))
@@ -380,36 +313,6 @@
 ;;;
 ;;;; Server
 ;;;
-
-
-(definition public (create-server-file server-name server-address server-port name avatar)
-  (let ((dir (new-directory {Directory Settings "servers"} server-name)))
-    (create-directories dir)
-    (let ((server-file (new-file dir ".server")))
-      (call-with-output-file (path-settings server-file)
-        (lambda (output)
-          (format output ";;;========={%}")
-          (format output ";;;  Yownu{%}")
-          (format output ";;;========={%}")
-          (format output ";;;{%}")
-          (format output ";;;; Server{%}")
-          (format output ";;;{%}")
-          (format output "{%}")
-          (format output "{%}")
-          (format output "(data jazz{%}")
-          (format output "{%}")
-          (format output "{%}")
-          (format output "(version {a}){%}" (present-string zone-version))
-          (format output "(import world.server){%}")
-          (format output "{%}")
-          (format output "{%}")
-          (format output "(form{%}")
-          (format output "  (<Server> host: {s} service: {s} character-name: {s} character-avatar: {s}))){%}"
-            (string->host server-address)
-            (string->port server-port)
-            name
-            avatar)))
-      server-file)))
 
 
 (definition public (open-server server-file)
@@ -476,7 +379,7 @@
             (launch-event world script))))
       (zone-update world)
       (player-update zone)
-      (update-title world)
+      (update-title zone)
       (when (get-sun-cycle? zone)
         (position-sun zone #f angle: (get-sun-angle zone)))
       (populate-zone zone)
@@ -513,31 +416,6 @@
       (set-current-tier #f))))
 
 
-(definition public (get-tiers-directory kind)
-  (case kind
-    ((standalone) (if (server?) (zones-dir (current-tier)) {Directory Settings "servers" "Local" "zones"}))
-    ((client) {Directory Settings "clients"})
-    ((server) {Directory Settings "servers"})))
-
-
-(definition public (find-tier name kind)
-  (let ((directory (get-tiers-directory kind)))
-    (continuation-capture
-      (lambda (return)
-        (when (exists? directory)
-          (iterate-directory directory
-            (lambda (path path-kind)
-              (let ((dir (new-directory directory path)))
-                (let ((file (tier-file dir kind)))
-                  (when (and (exists? file)
-                             (filename=? (filename-spine (join path "/")) name))
-                    (continuation-return return file)))))
-            full?: #f
-            files?: #f
-            directories?: #t))
-        #f))))
-
-
 (definition public (find-zone name kind)
   (let ((directory (get-tiers-directory kind)))
     (continuation-capture
@@ -554,17 +432,6 @@
             files?: #f
             directories?: #t))
         #f))))
-
-
-(definition protected (tier-name file)
-  (get-name (get-parent file)))
-
-
-(definition protected (tier-file dir kind)
-  (new-file dir (case kind
-                   ((standalone) ".zone")
-                   ((client) ".client")
-                   ((server) ".server"))))
 
 
 (definition protected (zone-file dir kind)
@@ -587,6 +454,11 @@
     (zone-file (new-directory directory path) kind)))
 
 
+;;;
+;;;; Template
+;;;
+
+
 (definition public (open-welcome-zone)
   (open-standalone (find-tier (copy-zone-template "welcome" 'standalone) 'standalone)))
 
@@ -596,17 +468,118 @@
 
 
 (definition public (copy-zone-template name kind (force-copy?: force-copy? #f))
-  (let ((world (current-world)))
-    (let ((from-dir (new-directory (new-directory (get-world-directory world) "templates") name))
-          (to-dir (get-parent (new-zone-file name kind))))
-      (when (or force-copy? (not (exists? to-dir)))
-        (duplicate from-dir to-dir))
-      name)))
+  (let ((from-dir (new-directory (new-directory (get-world-directory) "templates") name))
+        (to-dir (get-parent (new-zone-file name kind))))
+    (when (or force-copy? (not (exists? to-dir)))
+      (duplicate from-dir to-dir))
+    name))
 
 
 (definition public (tutorial-template?)
   (let ((zone (current-zone)))
     (equal? (zone-path zone 'standalone) "tutorial")))
+
+
+;;;
+;;;; Create
+;;;
+
+
+(definition public common-names
+  '("Emma" "Lea" "Olivia" "Alice" "Florence" "Zoe" "Chloe" "Beatrice" "Charlotte" "Rosalie" "Eva" "Juliette" "Sofia" "Jade" "Camille" "Victoria" "Mia" "Charlie" "Romy" "Laurence" "Maeva" "Alicia" "Clara" "Annabelle" "Sarah" "Rose" "Raphaelle" "Livia" "Elizabeth" "Mila" "Anais" "Elodie" "Flavie" "Laurie" "Amelia" "Julia" "Leonie" "Maelie" "Gabrielle" "Sophia" "Adele" "Coralie" "Emy" "Noemie" "Aurelie" "Alexia" "Jeanne" "Emilie" "Eve" "Ophelie" "Thomas" "William" "Jacob" "Liam" "Felix" "Nathan" "Samuel" "Logan" "Alexis" "Noah" "Olivier" "Raphael" "Gabriel" "Emile" "Leo" "Charles" "Antoine" "Benjamin" "Adam" "Edouard" "Xavier" "Victor" "Zack" "Mathis" "Jayden" "Theo" "Elliot" "Zachary" "Louis" "James" "Anthony" "Alexandre" "Lucas" "Justin" "Arthur" "Tristan" "Loic" "Ethan" "Henri" "Nolan" "Nicolas" "Arnaud" "Jeremy" "Hugo" "Dylan" "Laurent" "Eli" "Vincent" "Isaac" "Etienne"))
+
+
+(definition protected (create-client-file client-name server-address server-port name avatar (script #f))
+  (let ((dir (new-directory {Directory Settings "clients"} client-name)))
+    (create-directories dir)
+    (let ((client-file (new-file dir ".client")))
+      (call-with-output-file (path-settings client-file)
+        (lambda (output)
+          (format output ";;;========={%}")
+          (format output ";;;  Yownu{%}")
+          (format output ";;;========={%}")
+          (format output ";;;{%}")
+          (format output ";;;; Client{%}")
+          (format output ";;;{%}")
+          (format output "{%}")
+          (format output "{%}")
+          (format output "(data jazz{%}")
+          (format output "{%}")
+          (format output "{%}")
+          (format output "(version {a}){%}" (present-string zone-version))
+          (format output "(import world.client){%}")
+          (format output "{%}")
+          (format output "{%}")
+          (format output "(form{%}")
+          (format output "  (<Client> server-host: {s} server-service: {s} character-name: {s} character-avatar: {s}"
+            (string->host server-address)
+            (string->port server-port)
+            name
+            avatar)
+          (when script
+            (format output " character-script: {s}" script))
+          (format output "))){%}")))
+      client-file)))
+
+
+(definition protected (create-client-files client-prefix count server-address server-port (script #f))
+  (let ((avatars (remove "character/dwarfmale" (world.interface.avatars:collect-avatar-models) test: equal?)))
+    (loop (for n from 1 to count)
+          (let ((client-name (format "{a}{a}" client-prefix n))
+                (name (random-element common-names))
+                (avatar (random-element avatars))
+                (script (or script "bot/player")))
+            (let ((fullname (format "{a} ({a})" name client-name)))
+              (create-client-file client-name server-address server-port fullname avatar script))))))
+
+
+(definition public (create-server-file server-name server-address server-port name avatar)
+  (let ((dir (new-directory {Directory Settings "servers"} server-name)))
+    (create-directories dir)
+    (let ((server-file (new-file dir ".server")))
+      (call-with-output-file (path-settings server-file)
+        (lambda (output)
+          (format output ";;;========={%}")
+          (format output ";;;  Yownu{%}")
+          (format output ";;;========={%}")
+          (format output ";;;{%}")
+          (format output ";;;; Server{%}")
+          (format output ";;;{%}")
+          (format output "{%}")
+          (format output "{%}")
+          (format output "(data jazz{%}")
+          (format output "{%}")
+          (format output "{%}")
+          (format output "(version {a}){%}" (present-string zone-version))
+          (format output "(import world.server){%}")
+          (format output "{%}")
+          (format output "{%}")
+          (format output "(form{%}")
+          (format output "  (<Server> host: {s} service: {s} character-name: {s} character-avatar: {s}))){%}"
+            (string->host server-address)
+            (string->port server-port)
+            name
+            avatar)))
+      server-file)))
+
+
+;;;
+;;;; Convert
+;;;
+
+
+(definition (convert-world form)
+  (define (convert->1.1 form)
+    (set-version (get-data form) {Version 1 1})
+    form)
+  
+  (let ((version (or (get-version (get-data form)) {Version 1 0})))
+    (cond ((nu=? version {Version 1 0})
+           (convert->1.1 form))
+          ((nu=? version {Version 1 1})
+           form)
+          (else
+           (error "Unsupported world version: {a}" (present-string version))))))
 
 
 (definition (convert-zone form)
