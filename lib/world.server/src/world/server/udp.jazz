@@ -34,12 +34,11 @@
 (class UDP-Server extends Object
   
   
-  (slot udp-port         initialize #f getter generate)
-  (slot udp-task         initialize #f getter generate)
-  (slot udp-stopping?    initialize #f getter generate)
-  (slot connections      initialize #f getter generate)
-  (slot send-channels    initialize #f getter generate)
-  (slot receive-channels initialize #f getter generate)
+  (slot udp-port        initialize #f getter generate)
+  (slot udp-task        initialize #f getter generate)
+  (slot udp-stopping?   initialize #f getter generate)
+  (slot connections     initialize #f getter generate)
+  (slot server-channels initialize #f getter generate)
   
   
   (method (start self host service)
@@ -53,8 +52,7 @@
                         priority: udp-priority))
     (set! udp-stopping? #f)
     (set! connections (make-table))
-    (set! send-channels (make-table))
-    (set! receive-channels (make-table))
+    (set! server-channels (make-table))
     (start-task udp-task))
   
   
@@ -87,19 +85,11 @@
   ;;;
   
   
-  (method (require-send-channel self origin media-kind)
+  (method (require-server-channel self origin media-kind)
     (let ((key (cons origin media-kind)))
-      (or (table-ref send-channels key #f)
-          (let ((channel (new UDP-Server-Send-Channel origin media-kind)))
-            (table-set! send-channels key channel)
-            channel))))
-  
-  
-  (method (require-receive-channel self origin media-kind)
-    (let ((key (cons origin media-kind)))
-      (or (table-ref receive-channels key #f)
-          (let ((channel (new UDP-Server-Receive-Channel origin media-kind)))
-            (table-set! receive-channels key channel)
+      (or (table-ref server-channels key #f)
+          (let ((channel (new UDP-Server-Channel origin media-kind)))
+            (table-set! server-channels key channel)
             channel))))
   
   
@@ -172,21 +162,6 @@
             (write data udp-port))))))
   
   
-  ;; at the moment centro will return a network is unreachable
-  ;; or down error after about 10mn and then every minute or so
-  (method (retrying-write self data port)
-    (declare (proper-tail-calls))
-    (let (loop (n 0))
-      (with-exception-filter
-        (lambda (exc)
-          (< n 100))
-        (lambda (exc)
-          (sleep .01)
-          (loop (+ n 1)))
-        (lambda ()
-          (write data port)))))
-  
-  
   (method (receive-ack self data)
     (let ((origin (read-udp-origin data))
           (media-kind (read-udp-media-kind data))
@@ -207,10 +182,10 @@
     (let ((origin (read-udp-origin data))
           (media-kind (read-udp-media-kind data))
           (sequence (read-udp-sequence data)))
-      ;; we already nacked the source and will broacast
-      ;; when we receive the resent so ignore this nack
-      (unless (member? sequence (get-nack-sequences (require-receive-channel self origin media-kind)))
-        (let ((channel (require-send-channel self origin media-kind)))
+      (let ((channel (require-server-channel self origin media-kind)))
+        ;; we already nacked the source and will broacast
+        ;; when we receive the resent so ignore this nack
+        (unless (member? sequence (get-nack-sequences channel))
           (let ((ring (get-retain-ring channel)))
             (let ((found (locate ring (lambda (data)
                                         (= (read-udp-sequence data) sequence)))))
@@ -228,7 +203,7 @@
   (method (receive-media self kind data)
     (let ((origin (read-udp-origin data))
           (sequence (read-udp-sequence data)))
-      (let ((channel (require-receive-channel self origin kind)))
+      (let ((channel (require-server-channel self origin kind)))
         (unless (member? sequence (get-nack-sequences channel))
           (let ((last-sequence (get-last-sequence channel)))
             (when last-sequence
@@ -244,7 +219,23 @@
           (set-last-sequence channel sequence))
         (when (and udp-debug-nack? (member? sequence (get-nack-sequences channel)))
           (terminal remote-name (udp-name kind) '***resent-received-early*** sequence))
-        (broadcast-media self kind data))))
+        (retain channel data)
+        (broadcast-data self kind data))))
+  
+  
+  ;; at the moment centro will return a network is unreachable
+  ;; or down error after about 10mn and then every minute or so
+  (method (retrying-write self data port)
+    (declare (proper-tail-calls))
+    (let (loop (n 0))
+      (with-exception-filter
+        (lambda (exc)
+          (< n 100))
+        (lambda (exc)
+          (sleep .01)
+          (loop (+ n 1)))
+        (lambda ()
+          (write data port)))))
   
   
   (method (send-nack self origin sequence media-kind)
@@ -258,13 +249,6 @@
         (write-udp-sequence data sequence)
         (write-udp-media-kind data media-kind)
         (retrying-write self data udp-port))))
-  
-  
-  (method (broadcast-media self kind data)
-    (let ((origin (read-udp-origin data)))
-      (let ((channel (require-send-channel self origin kind)))
-        (retain channel data)
-        (broadcast-data self kind data))))
   
   
   (method (broadcast-data self kind data)
@@ -358,16 +342,45 @@
 
 
 ;;;
-;;;; Send Channel
+;;;; Server Channel
 ;;;
 
 
-(class UDP-Server-Send-Channel extends UDP-Send-Channel)
-
-
-;;;
-;;;; Receive Channel
-;;;
-
-
-(class UDP-Server-Receive-Channel extends UDP-Receive-Channel))
+(class UDP-Server-Channel extends UDP-Channel
+  
+  
+  (slot last-sequence  accessors generate)
+  (slot nack-sequences accessors generate)
+  (slot retain-ring    getter generate)
+  (slot release-task   getter generate)
+  
+  
+  (method override (initialize self origin media-kind)
+    (nextmethod self origin media-kind)
+    (set! self.last-sequence #f)
+    (set! self.nack-sequences '())
+    ;; make it really big until time ring is a real ring
+    (set! self.retain-ring (new Time-Ring 400096 @w 512 @max-size: +inf.0 now-proc: (~ now-timestamp self)))
+    ;; development
+    (set-$s retain-ring)
+    (set! self.release-task (new Task 'udp-release (lambda (task)
+                                                     (release-loop self task))
+                                 priority: udp-priority))
+    (start-task release-task))
+  
+  
+  (method protected (retain self data)
+    (update-time self data)
+    (insert retain-ring (read-udp-seconds data) data))
+  
+  
+  (method protected (release-loop self task)
+    (declare (proper-tail-calls))
+    (with-task task
+      (lambda (exit)
+        (let (loop)
+          (wait retain-ring)
+          (site (udp-release on?: #f)
+            ;; nothing to do
+            #f)
+          (loop)))))))

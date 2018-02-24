@@ -106,7 +106,7 @@
   (method (require-send-channel self origin media-kind)
     (let ((key (cons origin media-kind)))
       (or (table-ref send-channels key #f)
-          (let ((channel (new UDP-Client-Send-Channel origin media-kind)))
+          (let ((channel (new UDP-Send-Channel origin media-kind)))
             (table-set! send-channels key channel)
             channel))))
   
@@ -114,7 +114,7 @@
   (method (require-receive-channel self origin media-kind)
     (let ((key (cons origin media-kind)))
       (or (table-ref receive-channels key #f)
-          (let ((channel (new UDP-Client-Receive-Channel origin media-kind)))
+          (let ((channel (new UDP-Receive-Channel origin media-kind)))
             (table-set! receive-channels key channel)
             channel))))
   
@@ -319,19 +319,29 @@
 ;;;
 
 
-(class UDP-Client-Send-Channel extends UDP-Send-Channel
+(class UDP-Send-Channel extends UDP-Channel
   
   
   (slot data-sequence  accessors generate)
   (slot frame-sequence accessors generate)
   (slot last-timestamp accessors generate)
+  (slot retain-ring    getter generate)
+  (slot release-task   getter generate)
   
   
   (method override (initialize self origin media-kind)
     (nextmethod self origin media-kind)
     (set! self.data-sequence 0)
     (set! self.frame-sequence 0)
-    (set! self.last-timestamp #f))
+    (set! self.last-timestamp #f)
+    ;; make it really big until time ring is a real ring
+    (set! self.retain-ring (new Time-Ring 400096 @w 512 @max-size: +inf.0 now-proc: (~ now-timestamp self)))
+    ;; development
+    (set-$s retain-ring)
+    (set! self.release-task (new Task 'udp-release (lambda (task)
+                                                     (release-loop self task))
+                                 priority: udp-priority))
+    (start-task release-task))
   
   
   (method protected (next-data-sequence! self)
@@ -341,7 +351,24 @@
   
   (method protected (next-frame-sequence! self)
     (prog1 frame-sequence
-      (increase! frame-sequence))))
+      (increase! frame-sequence)))
+  
+  
+  (method protected (retain self data)
+    (update-time self data)
+    (insert retain-ring (read-udp-seconds data) data))
+  
+  
+  (method protected (release-loop self task)
+    (declare (proper-tail-calls))
+    (with-task task
+      (lambda (exit)
+        (let (loop)
+          (wait retain-ring)
+          (site (udp-release on?: #f)
+            ;; nothing to do
+            #f)
+          (loop))))))
 
 
 ;;;
@@ -349,9 +376,12 @@
 ;;;
 
 
-(class UDP-Client-Receive-Channel extends UDP-Receive-Channel
+(class UDP-Receive-Channel extends UDP-Channel
   
   
+  (slot last-sequence         accessors generate)
+  (slot next-ack              accessors generate)
+  (slot nack-sequences        accessors generate)
   (slot process-last-sequence getter generate)
   (slot process-ring          getter generate)
   (slot process-task          getter generate)
@@ -359,6 +389,9 @@
   
   (method override (initialize self origin media-kind)
     (nextmethod self origin media-kind)
+    (set! self.last-sequence #f)
+    (set! self.next-ack #f)
+    (set! self.nack-sequences '())
     (set! self.process-last-sequence #f)
     ;; make it really big until time ring is a real ring
     (set! self.process-ring (new Time-Ring 40096 @w 512 @max-size: +inf.0 now-proc: (~ now-timestamp self)))
