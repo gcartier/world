@@ -34,11 +34,12 @@
 (class UDP-Server extends Object
   
   
-  (slot udp-port        initialize #f getter generate)
-  (slot udp-task        initialize #f getter generate)
-  (slot udp-stopping?   initialize #f getter generate)
-  (slot connections     initialize #f getter generate)
-  (slot server-channels initialize #f getter generate)
+  (slot udp-port              initialize #f getter generate)
+  (slot udp-task              initialize #f getter generate)
+  (slot udp-stopping?         initialize #f getter generate)
+  (slot origin-connections    initialize #f getter generate)
+  (slot host/port-connections initialize #f getter generate)
+  (slot server-channels       initialize #f getter generate)
   
   
   (method (start self host service)
@@ -51,7 +52,8 @@
                                             (receive-loop self task))
                         priority: udp-priority))
     (set! udp-stopping? #f)
-    (set! connections (make-table))
+    (set! origin-connections (make-table))
+    (set! host/port-connections (make-table))
     (set! server-channels (make-table))
     (start-task udp-task))
   
@@ -69,15 +71,22 @@
   ;;;
   
   
-  (method (register-connection self origin connection)
-    (table-set! connections origin connection))
-  
-  (method (unregister-connection self origin)
-    (table-clear connections origin))
+  (method (register-connection self origin host port connection)
+    (table-set! origin-connections origin connection)
+    (table-set! host/port-connections (cons host port) connection))
   
   
-  (method (find-connection self origin)
-    (table-ref connections origin #f))
+  (method (unregister-connection self origin host port)
+    (table-clear origin-connections origin)
+    (table-clear host/port-connections (cons host port)))
+  
+  
+  (method (origin->connection self origin)
+    (table-ref origin-connections origin #f))
+  
+  
+  (method (host/port->connection self host port)
+    (table-ref host/port-connections (cons host port) #f))
   
   
   ;;;
@@ -138,22 +147,24 @@
           (lag (read-udp-lag data))
           (drop (read-udp-drop data))
           (source-info (udp-source-socket-info udp-port)))
-      (define (simulator)
+      (define (udp-simulator)
         (let ((latency (and (/= latency -1.) latency))
               (lag (and (/= lag -1.) lag))
               (drop (and (/= drop -1.) drop)))
           (if (or latency lag drop)
               (new UDP-Simulator latency lag drop
-                   (lambda (data)
-                     (retrying-write self data udp-port)))
+                   (lambda (info)
+                     (bind (connection . data) info
+                       (udp-destination-set! (get-host connection) (get-port connection) udp-port)
+                       (retrying-write self data udp-port))))
             #f)))
       
       (let ((source-host (socket-info-address source-info))
             (source-port (socket-info-port-number source-info)))
         (when udp-debug?
           (terminal remote-name 'connect source-host source-port))
-        (let ((connection (new UDP-Connection source-host source-port (simulator))))
-          (register-connection self origin connection))
+        (let ((connection (new UDP-Connection source-host source-port (udp-simulator))))
+          (register-connection self origin source-host source-port connection))
         (udp-destination-set! source-host source-port udp-port)
         (let ((size (+ 8 4)))
           (let ((data (make-u8vector size)))
@@ -166,16 +177,13 @@
     (let ((origin (read-udp-origin data))
           (media-kind (read-udp-media-kind data))
           (sequence (read-udp-sequence data)))
-      (let ((connection (find-connection self origin)))
+      (let ((connection (origin->connection self origin)))
         (when connection
           (relay-ack self connection data)))))
   
   
   (method (relay-ack self connection data)
-    (let ((host (get-host connection))
-          (port (get-port connection)))
-      (udp-destination-set! host port udp-port)
-      (retrying-write self data udp-port)))
+    (send-data self connection data))
   
   
   (method (receive-nack self data)
@@ -193,10 +201,10 @@
                   (let ((source-info (udp-source-socket-info udp-port)))
                     (let ((source-host (socket-info-address source-info))
                           (source-port (socket-info-port-number source-info)))
-                      (udp-destination-set! source-host source-port udp-port)
-                      (when udp-debug-nack?
-                        (terminal remote-name (udp-name media-kind) '***nack-found-on-server*** sequence))
-                      (retrying-write self found udp-port)))
+                      (let ((connection (host/port->connection self source-host source-port)))
+                        (when udp-debug-nack?
+                          (terminal remote-name (udp-name media-kind) '***nack-found-on-server*** sequence))
+                        (send-data self connection found))))
                 (broadcast-data self media-kind data))))))))
   
   
@@ -212,15 +220,59 @@
                   (let ((source-info (udp-source-socket-info udp-port)))
                     (let ((source-host (socket-info-address source-info))
                           (source-port (socket-info-port-number source-info)))
-                      (udp-destination-set! source-host source-port udp-port)
-                      (loop (for seq from expected below sequence)
-                            (send-nack self origin seq kind)
-                            (set-nack-sequences channel (cons seq (get-nack-sequences channel))))))))))
+                      (let ((connection (host/port->connection self source-host source-port)))
+                        (loop (for seq from expected below sequence)
+                              (send-nack self connection origin seq kind)
+                              (set-nack-sequences channel (cons seq (get-nack-sequences channel)))))))))))
           (set-last-sequence channel sequence))
         (when (and udp-debug-nack? (member? sequence (get-nack-sequences channel)))
           (terminal remote-name (udp-name kind) '***resent-received-early*** sequence))
         (retain channel data)
         (broadcast-data self kind data))))
+  
+  
+  ;;;
+  ;;;; Send
+  ;;;
+  
+  
+  (method (send-nack self connection origin sequence media-kind)
+    (when udp-debug-nack?
+      (terminal remote-name (udp-name media-kind) 'send-nack sequence))
+    (let ((size (+ 8 4 4 4 4)))
+      (let ((data (make-u8vector size)))
+        (write-udp-sent data (current-seconds))
+        (write-udp-kind data udp-nack)
+        (write-udp-origin data origin)
+        (write-udp-sequence data sequence)
+        (write-udp-media-kind data media-kind)
+        (send-data self connection data))))
+  
+  
+  (method (broadcast-data self kind data)
+    (let ((source-info (udp-source-socket-info udp-port)))
+      (let ((source-host (socket-info-address source-info))
+            (source-port (socket-info-port-number source-info)))
+        (when udp-debug?
+          (terminal remote-name 'broadcast source-host source-port (udp-name kind) (u8vector-length data)))
+        (iterate-table origin-connections
+          (lambda (origin connection)
+            (let ((host (get-host connection))
+                  (port (get-port connection)))
+              (when (or (not (host=? host source-host))
+                        (not (service=? port source-port))
+                        (or audio-self? video-self?)
+                        @wait-channel-in-chunk (and (= kind udp-audio) audio-self?)
+                        @wait-channel-in-chunk (and (= kind udp-video) video-self?))
+                (send-data self connection data))))))))
+  
+  
+  (method (send-data self connection data)
+    (let ((simulator (get-simulator connection)))
+      (if simulator
+          (send simulator (cons connection data))
+        (udp-destination-set! (get-host connection) (get-port connection) udp-port)
+        (retrying-write self data udp-port))))
   
   
   ;; at the moment centro will return a network is unreachable
@@ -235,41 +287,7 @@
           (sleep .01)
           (loop (+ n 1)))
         (lambda ()
-          (write data port)))))
-  
-  
-  (method (send-nack self origin sequence media-kind)
-    (when udp-debug-nack?
-      (terminal remote-name (udp-name media-kind) 'send-nack sequence))
-    (let ((size (+ 8 4 4 4 4)))
-      (let ((data (make-u8vector size)))
-        (write-udp-sent data (current-seconds))
-        (write-udp-kind data udp-nack)
-        (write-udp-origin data origin)
-        (write-udp-sequence data sequence)
-        (write-udp-media-kind data media-kind)
-        (retrying-write self data udp-port))))
-  
-  
-  (method (broadcast-data self kind data)
-    (let ((source-info (udp-source-socket-info udp-port)))
-      (let ((source-host (socket-info-address source-info))
-            (source-port (socket-info-port-number source-info)))
-        (when udp-debug?
-          (terminal remote-name 'broadcast source-host source-port (udp-name kind) (u8vector-length data)))
-        (iterate-table connections
-          (lambda (origin connection)
-            (let ((host (get-host connection))
-                  (port (get-port connection)))
-              (when (or (not (host=? host source-host))
-                        (not (service=? port source-port))
-                        (or audio-self? video-self?)
-                        @wait-channel-in-chunk (and (= kind udp-audio) audio-self?)
-                        @wait-channel-in-chunk (and (= kind udp-video) video-self?))
-                (udp-destination-set! host port udp-port)
-                (when (or (not udp-drop)
-                          (> (random-real) (/ udp-drop 100.)))
-                  (retrying-write self data udp-port))))))))))
+          (write data port))))))
 
 
 ;;;
@@ -296,49 +314,6 @@
     (print-unreadable self output
       (lambda (output)
         (format output "{a} {a}" host port)))))
-
-
-;;;
-;;;; Simulator
-;;;
-
-
-(class UDP-Simulator extends Object
-  
-  
-  (slot latency getter generate)
-  (slot lag     getter generate)
-  (slot drop    getter generate)
-  (slot writer  getter generate)
-  (slot ring    getter generate)
-  (slot thread  getter generate)
-  
-  
-  (method override (initialize self latency lag drop writer)
-    (nextmethod self)
-    (set! self.latency (or latency 0.))
-    (set! self.lag (or lag 0.))
-    (set! self.drop (or drop 0.))
-    (set! self.writer writer)
-    ;; make it really big until time ring is a real ring
-    (set! self.ring (new Time-Ring 40096 @w 512 @max-size: +inf.0))
-    (set! self.thread (new-thread
-                        (lambda ()
-                          (send-loop self))
-                        'simulator))
-    (thread-start! thread))
-  
-  
-  (method protected (send self connection data)
-    (insert ring (+ (current-seconds) latency) data))
-  
-  
-  (method (send-loop self)
-    (declare (proper-tail-calls))
-    (let (loop)
-      (let ((data (wait ring)))
-        (writer data))
-      (loop))))
 
 
 ;;;
