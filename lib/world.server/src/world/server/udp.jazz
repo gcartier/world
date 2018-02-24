@@ -20,6 +20,7 @@
         (jazz.syntax (phase syntax))
         (world)
         (world.configure)
+        (world.ring)
         (world.settings)
         (world.support)
         (world.task)
@@ -143,12 +144,25 @@
   (method (connect-source self data)
     (let ((sent (read-udp-sent data))
           (origin (read-udp-origin data))
+          (latency (read-udp-latency data))
+          (lag (read-udp-lag data))
+          (drop (read-udp-drop data))
           (source-info (udp-source-socket-info udp-port)))
+      (define (simulator)
+        (let ((latency (and (/= latency -1.) latency))
+              (lag (and (/= lag -1.) lag))
+              (drop (and (/= drop -1.) drop)))
+          (if (or latency lag drop)
+              (new UDP-Simulator latency lag drop
+                   (lambda (data)
+                     (retrying-write self data udp-port)))
+            #f)))
+      
       (let ((source-host (socket-info-address source-info))
             (source-port (socket-info-port-number source-info)))
         (when udp-debug?
           (terminal remote-name 'connect source-host source-port))
-        (let ((connection (new UDP-Connection source-host source-port)))
+        (let ((connection (new UDP-Connection source-host source-port (simulator))))
           (register-connection self origin connection))
         (udp-destination-set! source-host source-port udp-port)
         (let ((size (+ 8 4)))
@@ -269,8 +283,8 @@
                         @wait-channel-in-chunk (and (= kind udp-audio) audio-self?)
                         @wait-channel-in-chunk (and (= kind udp-video) video-self?))
                 (udp-destination-set! host port udp-port)
-                (when (or (not udp-drop-percentage)
-                          (> (random-real) (/ udp-drop-percentage 100.)))
+                (when (or (not udp-drop)
+                          (> (random-real) (/ udp-drop 100.)))
                   (retrying-write self data udp-port))))))))))
 
 
@@ -282,20 +296,65 @@
 (class UDP-Connection extends Object
   
   
-  (slot host getter generate)
-  (slot port getter generate)
+  (slot host      getter generate)
+  (slot port      getter generate)
+  (slot simulator getter generate)
   
   
-  (method override (initialize self host port)
+  (method override (initialize self host port simulator)
     (nextmethod self)
     (set! self.host host)
-    (set! self.port port))
+    (set! self.port port)
+    (set! self.simulator simulator))
   
   
   (method override (print self output readably)
     (print-unreadable self output
       (lambda (output)
         (format output "{a} {a}" host port)))))
+
+
+;;;
+;;;; Simulator
+;;;
+
+
+(class UDP-Simulator extends Object
+  
+  
+  (slot latency getter generate)
+  (slot lag     getter generate)
+  (slot drop    getter generate)
+  (slot writer  getter generate)
+  (slot ring    getter generate)
+  (slot thread  getter generate)
+  
+  
+  (method override (initialize self latency lag drop writer)
+    (nextmethod self)
+    (set! self.latency (or latency 0.))
+    (set! self.lag (or lag 0.))
+    (set! self.drop (or drop 0.))
+    (set! self.writer writer)
+    ;; make it really big until time ring is a real ring
+    (set! self.ring (new Time-Ring 40096 @w 512 @max-size: +inf.0))
+    (set! self.thread (new-thread
+                        (lambda ()
+                          (send-loop self))
+                        'simulator))
+    (thread-start! thread))
+  
+  
+  (method protected (send self connection data)
+    (insert ring (+ (current-seconds) latency) data))
+  
+  
+  (method (send-loop self)
+    (declare (proper-tail-calls))
+    (let (loop)
+      (let ((data (wait ring)))
+        (writer data))
+      (loop))))
 
 
 ;;;
