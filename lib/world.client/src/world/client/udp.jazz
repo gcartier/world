@@ -83,6 +83,7 @@
     (record-event udp-id-connect
                   0.
                   0.
+                  0.
                   0.)
     (send-connect)
     (let ((reply (read udp-port)))
@@ -91,6 +92,7 @@
           (let ((round-trip (- (current-seconds) (read-udp-sent reply))))
             (record-event udp-id-connected
                           round-trip
+                          0.
                           0.
                           0.)))))
     (start-task udp-task))
@@ -198,7 +200,8 @@
                               (record-event udp-id-send-media
                                             (fixnum->flonum kind)
                                             (fixnum->flonum sequence)
-                                            (if off? 0. 1.))
+                                            (if off? 0. 1.)
+                                            0.)
                               (loop (+ part 1) (+ pos content-size)))))))))))))))
     (mutex-unlock! write-mutex))
   
@@ -253,7 +256,8 @@
         (record-event udp-id-receive-ack
                       (fixnum->flonum media-kind)
                       (fixnum->flonum sequence)
-                      round-trip))))
+                      round-trip
+                      0.))))
   
   
   (method (receive-nack self data)
@@ -267,7 +271,8 @@
             (record-event udp-id-receive-nack
                           (fixnum->flonum media-kind)
                           (fixnum->flonum sequence)
-                          (if found 1. 0.))
+                          (if found 1. 0.)
+                          0.)
             (if found
                 (send-data self found)
               (when udp-debug-nack?
@@ -395,6 +400,8 @@
   (slot process-last-sequence getter generate)
   (slot process-ring          getter generate)
   (slot process-task          getter generate)
+  (slot processed             getter generate)
+  (slot missing               getter generate)
   
   
   (method override (initialize self origin media-kind)
@@ -411,6 +418,8 @@
     (set! self.process-task (new Task 'udp-process (lambda (task)
                                                      (process-loop self task))
                                  priority: udp-priority))
+    (set! self.processed 0)
+    (set! self.missing 0)
     (start-task process-task))
   
   
@@ -442,6 +451,7 @@
                 (record-event udp-id-discard-resent
                               (fixnum->flonum media-kind)
                               (fixnum->flonum sequence)
+                              0.
                               0.))
               (let ((label (if nack? '***discard-resent*** '***discard***)))
                 (format :terminal "{s} {s} {s} {s}{%}" remote-name (udp-name kind) label sequence))))))))
@@ -480,11 +490,13 @@
                         (when (/= sequence expected)
                           (loop (for seq from expected below sequence)
                                 (let ((nack? (member? seq nack-sequences)))
+                                  (increase! missing)
                                   (when nack?
                                     (record-event udp-id-missing-resent
                                                   (fixnum->flonum media-kind)
                                                   (fixnum->flonum seq)
-                                                  0.))
+                                                  (fixnum->flonum missing)
+                                                  (fixnum->flonum processed)))
                                   (let ((label (if nack? '***missing-resent*** '***missing***)))
                                     (format :terminal "{s} {s} {s} {s}{%}" remote-name (udp-name media-kind) label seq)))))))
                     (set! process-last-sequence sequence)))
@@ -492,8 +504,9 @@
   
   
   (method (process-frame self datas)
-    (let ((received (length datas))
+    (let ((count (length datas))
           (first (car datas)))
+      (increase! processed count)
       (let ((kind (read-udp-kind first))
             (origin (read-udp-origin first))
             (sequence (read-udp-sequence first))
@@ -502,7 +515,7 @@
             (total (read-udp-total first))
             (timestamp (read-udp-timestamp first))
             (duration (read-udp-duration first)))
-        (if (= total received)
+        (if (= total count)
             (if (= total 1)
                 (process-data self kind origin sequence frame timestamp duration (read-udp-payload first))
               (let ((chunks (map read-udp-payload datas)))
