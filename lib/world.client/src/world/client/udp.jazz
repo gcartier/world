@@ -58,9 +58,9 @@
         (write-udp-sent data (current-seconds))
         (write-udp-kind data udp-connect)
         (write-udp-origin data client-no)
-        (write-udp-latency data (or udp-latency -1.))
-        (write-udp-lag data (or udp-lag -1.))
-        (write-udp-drop data (or udp-drop -1.))
+        (write-udp-connect-latency data (or udp-latency -1.))
+        (write-udp-connect-lag data (or udp-lag -1.))
+        (write-udp-connect-drop data (or udp-drop -1.))
         (write data udp-port))
       (mutex-unlock! write-mutex))
     
@@ -250,33 +250,24 @@
   
   (method (receive-ack self data)
     (let ((sent (read-udp-sent data))
-          (media-kind (read-udp-media-kind data))
-          (sequence (read-udp-sequence data)))
+          (origin (read-udp-origin data))
+          (sequence (read-udp-sequence data))
+          (media-kind (read-udp-ack-media-kind data))
+          (missing (u8vector->object (read-udp-ack-latest-missing data))))
       (let ((round-trip (- (current-seconds) sent)))
         (record-event udp-id-receive-ack
                       (fixnum->flonum media-kind)
                       (fixnum->flonum sequence)
                       round-trip
-                      0.))))
+                      0.))
+      (send-missing self origin media-kind missing)))
   
   
   (method (receive-nack self data)
     (let ((origin (read-udp-origin data))
-          (media-kind (read-udp-media-kind data))
-          (sequence (read-udp-sequence data)))
-      (let ((channel (require-send-channel self origin media-kind)))
-        (let ((ring (get-retain-ring channel)))
-          (let ((found (locate ring (lambda (data)
-                                      (= (read-udp-sequence data) sequence)))))
-            (record-event udp-id-receive-nack
-                          (fixnum->flonum media-kind)
-                          (fixnum->flonum sequence)
-                          (if found 1. 0.)
-                          0.)
-            (if found
-                (send-data self found)
-              (when udp-debug-nack?
-                (terminal remote-name (udp-name media-kind) '***nack-missing*** sequence))))))))
+          (media-kind (read-udp-nack-media-kind data))
+          (missing (u8vector->object (read-udp-nack-latest-missing data))))
+      (send-missing self origin media-kind missing)))
   
   
   (method (receive-media self kind data)
@@ -288,48 +279,70 @@
               (now (current-seconds)))
           (when (or (not next-ack)
                     (>= now next-ack))
-            (send-ack self (read-udp-sent data) origin sequence kind)
+            (send-ack self (read-udp-sent data) origin sequence kind (get-latest-nacks channel))
             (set-next-ack channel (+ now udp-ack-period))))
         (let ((last-sequence (get-last-sequence channel)))
           (let ((in-order? (or (not last-sequence)
                                (> sequence last-sequence))))
-            (when in-order?
+            (if (not in-order?)
+                (remove-nack channel sequence)
               ;; send nacks to server
               (when last-sequence
                 (let ((expected (+ last-sequence 1)))
                   (when (> sequence expected)
                     (loop (for seq from expected below sequence)
-                          (send-nack self origin seq kind)))))
+                          (send-nack self origin kind (add-nack channel seq))))))
               ;; remember last sequence
               (set-last-sequence channel sequence))
             (insert-media channel data in-order?))))))
   
   
-  (method (send-ack self sent origin sequence media-kind)
+  (method (send-missing self origin media-kind missing)
+    (let ((channel (require-send-channel self origin media-kind)))
+      (let ((ring (get-retain-ring channel)))
+        (for-each (lambda (sequence)
+                    (let ((found (locate ring (lambda (data)
+                                                (= (read-udp-sequence data) sequence)))))
+                      (record-event udp-id-receive-nack
+                                    (fixnum->flonum media-kind)
+                                    (fixnum->flonum sequence)
+                                    (if found 1. 0.)
+                                    0.)
+                      (if found
+                          (send-data self found)
+                        (when udp-debug-nack?
+                          (terminal remote-name (udp-name media-kind) '***nack-missing*** sequence)))))
+                  missing))))
+  
+  
+  (method (send-ack self sent origin sequence media-kind latest-missing)
     (mutex-lock! write-mutex)
-    (let ((size (+ 8 4 4 4 4)))
-      (let ((data (make-u8vector size)))
-        (write-udp-sent data sent)
-        (write-udp-kind data udp-ack)
-        (write-udp-origin data origin)
-        (write-udp-sequence data sequence)
-        (write-udp-media-kind data media-kind)
-        (send-data self data)))
+    (let ((missing (object->u8vector latest-missing)))
+      (let ((size (+ 8 4 4 4 4 4 (u8vector-length missing))))
+        (let ((data (make-u8vector size)))
+          (write-udp-sent data sent)
+          (write-udp-kind data udp-ack)
+          (write-udp-origin data origin)
+          (write-udp-sequence data sequence)
+          (write-udp-ack-media-kind data media-kind)
+          (write-udp-ack-latest-missing data missing)
+          (send-data self data))))
     (mutex-unlock! write-mutex))
   
   
-  (method (send-nack self origin sequence media-kind)
+  (method (send-nack self origin media-kind latest-missing)
     (when udp-debug-nack?
-      (terminal remote-name (udp-name media-kind) 'send-nack sequence))
+      (terminal remote-name (udp-name media-kind) 'send-nack latest-missing))
     (mutex-lock! write-mutex)
-    (let ((size (+ 8 4 4 4 4)))
-      (let ((data (make-u8vector size)))
-        (write-udp-sent data (current-seconds))
-        (write-udp-kind data udp-nack)
-        (write-udp-origin data origin)
-        (write-udp-sequence data sequence)
-        (write-udp-media-kind data media-kind)
-        (send-data self data)))
+    (let ((missing (object->u8vector latest-missing)))
+      (let ((size (+ 8 4 4 4 4 (u8vector-length missing))))
+        (let ((data (make-u8vector size)))
+          (write-udp-sent data (current-seconds))
+          (write-udp-kind data udp-nack)
+          (write-udp-origin data origin)
+          (write-udp-nack-media-kind data media-kind)
+          (write-udp-nack-latest-missing data missing)
+          (send-data self data))))
     (mutex-unlock! write-mutex)))
 
 
@@ -399,6 +412,7 @@
   
   
   (slot last-sequence         accessors generate)
+  (slot latest-nacks          accessors generate)
   (slot next-ack              accessors generate)
   (slot process-last-sequence getter generate)
   (slot process-ring          getter generate)
@@ -410,6 +424,7 @@
   (method override (initialize self origin media-kind)
     (nextmethod self origin media-kind)
     (set! self.last-sequence #f)
+    (set! self.latest-nacks '())
     (set! self.next-ack #f)
     (set! self.process-last-sequence #f)
     ;; make it really big until time ring is a real ring
@@ -423,6 +438,18 @@
     (set! self.processed 0)
     (set! self.missing 0)
     (start-task process-task))
+  
+  
+  (method protected (add-nack self sequence)
+    (set! latest-nacks (cons sequence latest-nacks))
+    ;; trim when more than udp-latest-nacks
+    (when (> (length latest-nacks) udp-latest-nacks)
+      (set-cdr! (tail latest-nacks (- udp-latest-nacks 1)) '()))
+    latest-nacks)
+  
+  
+  (method protected (remove-nack self sequence)
+    (set! latest-nacks (remove! sequence latest-nacks)))
   
   
   ;;;

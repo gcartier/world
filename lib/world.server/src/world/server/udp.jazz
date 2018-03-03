@@ -143,9 +143,9 @@
   (method (connect-source self data)
     (let ((sent (read-udp-sent data))
           (origin (read-udp-origin data))
-          (latency (read-udp-latency data))
-          (lag (read-udp-lag data))
-          (drop (read-udp-drop data))
+          (latency (read-udp-connect-latency data))
+          (lag (read-udp-connect-lag data))
+          (drop (read-udp-connect-drop data))
           (source-info (udp-source-socket-info udp-port)))
       (define (udp-simulator)
         (let ((latency (and (/= latency -1.) latency))
@@ -175,11 +175,12 @@
   
   (method (receive-ack self data)
     (let ((origin (read-udp-origin data))
-          (media-kind (read-udp-media-kind data))
-          (sequence (read-udp-sequence data)))
+          (media-kind (read-udp-ack-media-kind data))
+          (missing (u8vector->object (read-udp-ack-latest-missing data))))
       (let ((connection (origin->connection self origin)))
         (when connection
-          (relay-ack self connection data)))))
+          (relay-ack self connection data)))
+      (send-missing self origin media-kind missing)))
   
   
   (method (relay-ack self connection data)
@@ -188,23 +189,9 @@
   
   (method (receive-nack self data)
     (let ((origin (read-udp-origin data))
-          (media-kind (read-udp-media-kind data))
-          (sequence (read-udp-sequence data)))
-      (let ((channel (require-server-channel self origin media-kind)))
-        (let ((ring (get-retain-ring channel)))
-          (let ((found (locate ring (lambda (data)
-                                      (= (read-udp-sequence data) sequence)))))
-            (if found
-                (let ((source-info (udp-source-socket-info udp-port)))
-                  (let ((source-host (socket-info-address source-info))
-                        (source-port (socket-info-port-number source-info)))
-                    (let ((connection (host/port->connection self source-host source-port)))
-                      (when udp-debug-nack?
-                        (terminal remote-name (udp-name media-kind) '***nack-found-on-server*** sequence))
-                      (send-data self connection found))))
-              ;; we already nacked the source early and will broadcast
-              ;; when we receive the resent so we can ignore this nack
-              ))))))
+          (media-kind (read-udp-nack-media-kind data))
+          (missing (u8vector->object (read-udp-nack-latest-missing data))))
+      (send-missing self origin media-kind missing)))
   
   
   (method (receive-media self kind data)
@@ -214,7 +201,8 @@
         (let ((last-sequence (get-last-sequence channel)))
           (let ((in-order? (or (not last-sequence)
                                (> sequence last-sequence))))
-            (when in-order?
+            (if (not in-order?)
+                (remove-nack channel sequence)
               ;; send early nacks to source
               (when last-sequence
                 (let ((expected (+ last-sequence 1)))
@@ -224,29 +212,45 @@
                             (source-port (socket-info-port-number source-info)))
                         (let ((connection (host/port->connection self source-host source-port)))
                           (loop (for seq from expected below sequence)
-                                (send-nack self connection origin seq kind))))))))
+                                (send-nack self connection origin kind (add-nack channel seq)))))))))
               ;; remember last sequence
               (set-last-sequence channel sequence))))
         (retain channel data)
         (broadcast-data self kind data))))
   
   
-  ;;;
-  ;;;; Send
-  ;;;
+  (method (send-missing self origin media-kind missing)
+    (let ((channel (require-server-channel self origin media-kind)))
+      (let ((ring (get-retain-ring channel)))
+        (for-each (lambda (sequence)
+                    (let ((found (locate ring (lambda (data)
+                                                (= (read-udp-sequence data) sequence)))))
+                      (if found
+                          (let ((source-info (udp-source-socket-info udp-port)))
+                            (let ((source-host (socket-info-address source-info))
+                                  (source-port (socket-info-port-number source-info)))
+                              (let ((connection (host/port->connection self source-host source-port)))
+                                (when udp-debug-nack?
+                                  (terminal remote-name (udp-name media-kind) '***nack-found-on-server*** sequence))
+                                (send-data self connection found))))
+                        ;; we already nacked the source early and will broadcast
+                        ;; when we receive the resent so we can ignore this nack
+                        )))
+                  missing))))
   
   
-  (method (send-nack self connection origin sequence media-kind)
+  (method (send-nack self connection origin media-kind latest-missing)
     (when udp-debug-nack?
-      (terminal remote-name (udp-name media-kind) 'send-nack sequence))
-    (let ((size (+ 8 4 4 4 4)))
-      (let ((data (make-u8vector size)))
-        (write-udp-sent data (current-seconds))
-        (write-udp-kind data udp-nack)
-        (write-udp-origin data origin)
-        (write-udp-sequence data sequence)
-        (write-udp-media-kind data media-kind)
-        (send-data self connection data))))
+      (terminal remote-name (udp-name media-kind) 'send-nack latest-missing))
+    (let ((missing (object->u8vector latest-missing)))
+      (let ((size (+ 8 4 4 4 4 (u8vector-length missing))))
+        (let ((data (make-u8vector size)))
+          (write-udp-sent data (current-seconds))
+          (write-udp-kind data udp-nack)
+          (write-udp-origin data origin)
+          (write-udp-nack-media-kind data media-kind)
+          (write-udp-nack-latest-missing data missing)
+          (send-data self connection data)))))
   
   
   (method (broadcast-data self kind data)
@@ -325,6 +329,7 @@
   
   
   (slot last-sequence accessors generate)
+  (slot latest-nacks  accessors generate)
   (slot retain-ring   getter generate)
   (slot release-task  getter generate)
   
@@ -332,6 +337,7 @@
   (method override (initialize self origin media-kind)
     (nextmethod self origin media-kind)
     (set! self.last-sequence #f)
+    (set! self.latest-nacks '())
     ;; make it really big until time ring is a real ring
     (set! self.retain-ring (new Time-Ring 400096 @w 512 @max-size: +inf.0 now-proc: (~ now-timestamp self)))
     ;; development
@@ -340,6 +346,18 @@
                                                      (release-loop self task))
                                  priority: udp-priority))
     (start-task release-task))
+  
+  
+  (method protected (add-nack self sequence)
+    (set! latest-nacks (cons sequence latest-nacks))
+    ;; trim when more than udp-latest-nacks
+    (when (> (length latest-nacks) udp-latest-nacks)
+      (set-cdr! (tail latest-nacks (- udp-latest-nacks 1)) '()))
+    latest-nacks)
+  
+  
+  (method protected (remove-nack self sequence)
+    (set! latest-nacks (remove! sequence latest-nacks)))
   
   
   (method protected (retain self data)
