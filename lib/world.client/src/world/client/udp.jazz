@@ -283,22 +283,26 @@
     (let ((origin (read-udp-origin data))
           (sequence (read-udp-sequence data)))
       (let ((channel (require-receive-channel self origin kind)))
+        ;; send ack
         (let ((next-ack (get-next-ack channel))
               (now (current-seconds)))
           (when (or (not next-ack)
                     (>= now next-ack))
             (send-ack self (read-udp-sent data) origin sequence kind)
             (set-next-ack channel (+ now udp-ack-period))))
-        (unless (member? sequence (get-nack-sequences channel))
-          (let ((last-sequence (get-last-sequence channel)))
-            (when last-sequence
-              (let ((expected (+ last-sequence 1)))
-                (when (> sequence expected)
-                  (loop (for seq from expected below sequence)
-                        (send-nack self origin seq kind)
-                        (set-nack-sequences channel (cons seq (get-nack-sequences channel))))))))
-          (set-last-sequence channel sequence))
-        (insert-media channel data))))
+        (let ((last-sequence (get-last-sequence channel)))
+          (let ((in-order? (or (not last-sequence)
+                               (> sequence last-sequence))))
+            (when in-order?
+              ;; send nacks to server
+              (when last-sequence
+                (let ((expected (+ last-sequence 1)))
+                  (when (> sequence expected)
+                    (loop (for seq from expected below sequence)
+                          (send-nack self origin seq kind)))))
+              ;; remember last sequence
+              (set-last-sequence channel sequence))
+            (insert-media channel data in-order?))))))
   
   
   (method (send-ack self sent origin sequence media-kind)
@@ -396,7 +400,6 @@
   
   (slot last-sequence         accessors generate)
   (slot next-ack              accessors generate)
-  (slot nack-sequences        accessors generate)
   (slot process-last-sequence getter generate)
   (slot process-ring          getter generate)
   (slot process-task          getter generate)
@@ -408,7 +411,6 @@
     (nextmethod self origin media-kind)
     (set! self.last-sequence #f)
     (set! self.next-ack #f)
-    (set! self.nack-sequences '())
     (set! self.process-last-sequence #f)
     ;; make it really big until time ring is a real ring
     (set! self.process-ring (new Time-Ring 40096 @w 512 @max-size: +inf.0 now-proc: (~ now-timestamp self)))
@@ -432,29 +434,20 @@
     )
   
   
-  (method protected (insert-media self data)
-    (insert-data self data))
-  
-  
-  (method protected (insert-data self data)
+  (method protected (insert-media self data in-order?)
     (let ((sequence (read-udp-sequence data)))
-      (let ((nack? (member? sequence nack-sequences)))
-        (when (and udp-debug-nack? nack?)
-          (terminal remote-name (udp-name media-kind) 'insert-resent sequence))
-        (unless nack?
-          (update-time self data))
-        (let ((inserted? (insert process-ring (read-udp-seconds data) data)))
-          (when (and udp-show-discard? (not inserted?))
-            (let ((kind (read-udp-kind data))
-                  (sequence (read-udp-sequence data)))
-              (when nack?
-                (record-event udp-id-discard-resent
-                              (fixnum->flonum media-kind)
-                              (fixnum->flonum sequence)
-                              0.
-                              0.))
-              (let ((label (if nack? '***discard-resent*** '***discard***)))
-                (format :terminal "{s} {s} {s} {s}{%}" remote-name (udp-name kind) label sequence))))))))
+      (when in-order?
+        (update-time self data))
+      (let ((inserted? (insert process-ring (read-udp-seconds data) data)))
+        (when (and udp-show-discard? (not inserted?))
+          (let ((kind (read-udp-kind data))
+                (sequence (read-udp-sequence data)))
+            (record-event udp-id-discard
+                          (fixnum->flonum media-kind)
+                          (fixnum->flonum sequence)
+                          0.
+                          0.)
+            (format :terminal "{s} {s} {s} {s}{%}" remote-name (udp-name kind) '***discard*** sequence))))))
   
   
   ;;;
@@ -489,16 +482,13 @@
                       (let ((expected (+ process-last-sequence 1)))
                         (when (/= sequence expected)
                           (loop (for seq from expected below sequence)
-                                (let ((nack? (member? seq nack-sequences)))
-                                  (increase! missing)
-                                  (when nack?
-                                    (record-event udp-id-missing-resent
-                                                  (fixnum->flonum media-kind)
-                                                  (fixnum->flonum seq)
-                                                  (fixnum->flonum missing)
-                                                  (fixnum->flonum processed)))
-                                  (let ((label (if nack? '***missing-resent*** '***missing***)))
-                                    (format :terminal "{s} {s} {s} {s}{%}" remote-name (udp-name media-kind) label seq)))))))
+                                (increase! missing)
+                                (record-event udp-id-missing
+                                              (fixnum->flonum media-kind)
+                                              (fixnum->flonum seq)
+                                              (fixnum->flonum missing)
+                                              (fixnum->flonum processed))
+                                (format :terminal "{s} {s} {s} {s}{%}" remote-name (udp-name media-kind) '***missing*** seq)))))
                     (set! process-last-sequence sequence)))
                 sorted)))
   
