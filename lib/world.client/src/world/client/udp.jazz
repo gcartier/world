@@ -45,9 +45,14 @@
   (slot udp-port         initialize #f getter generate)
   (slot udp-task         initialize #f getter generate)
   (slot udp-stopping?    initialize #f getter generate)
+  (slot server-host      initialize #f getter generate)
+  (slot server-port      initialize #f getter generate)
   (slot write-mutex      initialize #f getter generate)
   (slot send-channels    initialize #f getter generate)
   (slot receive-channels initialize #f getter generate)
+  (slot topology         initialize #f getter generate)
+  (slot peers            initialize #f getter generate)
+  (slot peers-mutex      initialize #f getter generate)
   (slot simulator        initialize #f getter generate)
   
   
@@ -81,13 +86,18 @@
                                             (receive-loop self task))
                         priority: udp-priority))
     (set! udp-stopping? #f)
+    (set! server-host #f)
+    (set! server-port #f)
     (set! write-mutex (make-mutex 'write))
     (set! send-channels (make-table))
     (set! receive-channels (make-table))
+    (set! topology (world-setting 'world.udp-topology 'server))
+    (set! peers (make-table))
+    (set! peers-mutex (make-mutex 'peers))
     (set! simulator (if (or udp-latency udp-lag udp-drop)
                         (new UDP-Simulator udp-latency udp-lag udp-drop
                              (lambda (data)
-                               (write data udp-port)))
+                               (send-topology self data)))
                       #f))
     (record-event udp-id-connect
                   0.
@@ -98,6 +108,9 @@
     (let ((reply (read udp-port)))
       (let ((kind (read-udp-kind reply)))
         (assert (= kind udp-connected)
+          (let ((source-info (udp-source-socket-info udp-port)))
+            (set! server-host (socket-info-address source-info))
+            (set! server-port (socket-info-port-number source-info)))
           (let ((round-trip (- (current-seconds) (read-udp-sent reply))))
             (record-event udp-id-connected
                           round-trip
@@ -113,6 +126,51 @@
     (thread-join! (get-thread udp-task))
     (set! udp-port #f)
     (set! udp-task #f))
+  
+  
+  ;;;
+  ;;;; Topology
+  ;;;
+  
+  
+  (method protected (peers-update self peers-info)
+    (mutex-lock! peers-mutex)
+    (let ((client-no (get-client-no (current-tier)))
+          (p (make-table)))
+      (for-each (lambda (info)
+                  (bind (origin host port local) info
+                    (unless (= origin client-no)
+                      @test
+                      (unless (table-ref p origin #f)
+                        (thread-start!
+                          (new-thread
+                            (lambda ()
+                              (declare (proper-tail-calls))
+                              (let (loop)
+                                (let ((data (make-u8vector (+ 8 4 4))))
+                                  (write-udp-sent data (current-seconds))
+                                  (write-udp-kind data udp-test)
+                                  (write-udp-origin data client-no)
+                                  (udp-destination-set! host port udp-port)
+                                  (write data udp-port))
+                                (sleep .5)
+                                (loop)))
+                            'test)))
+                      (table-set! p origin (new UDP-Peer host port local)))))
+                  peers-info)
+      (set! peers p))
+    (mutex-unlock! peers-mutex))
+  
+  
+  (method protected (cycle-topologies self)
+    (let ((world (current-world)))
+      (case topology
+        ((server)
+         (set! topology 'peer)
+         (display-message world "Peer to peer"))
+        ((peer)
+         (set! topology 'server)
+         (display-message world "Server based")))))
   
   
   ;;;
@@ -218,7 +276,21 @@
   (method (send-data self data)
     (if simulator
         (send simulator data)
-      (write data udp-port)))
+      (send-topology self data)))
+  
+  
+  (method (send-topology self data)
+    (case topology
+      ((server)
+       (udp-destination-set! server-host server-port udp-port)
+       (write data udp-port))
+      ((peer)
+       (iterate-table peers
+         (lambda (origin peer)
+           (let ((host (get-host peer))
+                 (port (get-port peer)))
+             (udp-destination-set! host port udp-port)
+             (write data udp-port)))))))
   
   
   ;;;
@@ -353,6 +425,32 @@
           (write-udp-nack-latest-missing data missing)
           (send-data self data))))
     (mutex-unlock! write-mutex)))
+
+
+;;;
+;;;; UDP Peer
+;;;
+
+
+(class UDP-Peer extends Object
+  
+  
+  (slot host  getter generate)
+  (slot port  getter generate)
+  (slot local getter generate)
+  
+  
+  (method override (initialize self host port local)
+    (nextmethod self)
+    (set! self.host host)
+    (set! self.port port)
+    (set! self.local local))
+  
+  
+  (method override (print self output readably)
+    (print-unreadable self output
+      (lambda (output)
+        (format output "{a} {a}" host port)))))
 
 
 ;;;
