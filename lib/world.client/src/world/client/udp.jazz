@@ -45,6 +45,8 @@
   (slot udp-port         initialize #f getter generate)
   (slot udp-task         initialize #f getter generate)
   (slot udp-stopping?    initialize #f getter generate)
+  (slot local-host       initialize #f getter generate)
+  (slot local-port       initialize #f getter generate)
   (slot server-host      initialize #f getter generate)
   (slot server-port      initialize #f getter generate)
   (slot write-mutex      initialize #f getter generate)
@@ -57,26 +59,15 @@
   
   
   (method (connect self client-no local-host host service)
-    (define (send-connect)
-      (mutex-lock! write-mutex)
-      (let ((data (make-u8vector (+ 8 4 4 4 4 4 4))))
-        (write-udp-sent data (current-seconds))
-        (write-udp-kind data udp-connect)
-        (write-udp-origin data client-no)
-        (write-udp-connect-local data (local-address))
-        (write-udp-connect-latency data (or udp-latency -1.))
-        (write-udp-connect-lag data (or udp-lag -1.))
-        (write-udp-connect-drop data (or udp-drop -1.))
-        (write data udp-port))
-      (mutex-unlock! write-mutex))
-    
     ;; quick heuristic
-    (define (local-address)
-      (let ((info (host-info (host-name))))
-        (let ((addresses (host-info-addresses info)))
-          (if (= 1 (length addresses))
-              (car addresses)
-            #u8(0 0 0 0)))))
+    (define (determine-local-address)
+      (if local?
+          #u8(127 0 0 1)
+        (let ((info (host-info (host-name))))
+          (let ((addresses (host-info-addresses info)))
+            (if (= 1 (length addresses))
+                (car addresses)
+              #u8(0 0 0 0))))))
     
     (set! udp-port (open-udp (list
                                local-address: local-host
@@ -86,38 +77,56 @@
                                             (receive-loop self task))
                         priority: udp-priority))
     (set! udp-stopping? #f)
-    (set! server-host #f)
-    (set! server-port #f)
-    (set! write-mutex (make-mutex 'write))
-    (set! send-channels (make-table))
-    (set! receive-channels (make-table))
-    (set! topology (world-setting 'world.udp-topology 'server))
-    (set! peers (make-table))
-    (set! peers-mutex (make-mutex 'peers))
-    (set! simulator (if (or udp-latency udp-lag udp-drop)
-                        (new UDP-Simulator udp-latency udp-lag udp-drop
-                             (lambda (data)
-                               (send-topology self data)))
-                      #f))
-    (record-event udp-id-connect
-                  0.
-                  0.
-                  0.
-                  0.)
-    (send-connect)
-    (let ((reply (read udp-port)))
-      (let ((kind (read-udp-kind reply)))
-        (assert (= kind udp-connected)
-          (let ((source-info (udp-source-socket-info udp-port)))
-            (set! server-host (socket-info-address source-info))
-            (set! server-port (socket-info-port-number source-info)))
-          (let ((round-trip (- (current-seconds) (read-udp-sent reply))))
-            (record-event udp-id-connected
-                          round-trip
-                          0.
-                          0.
-                          0.)))))
-    (start-task udp-task))
+    (let ((local-host (determine-local-address))
+          (local-port (socket-info-port-number (udp-local-socket-info udp-port))))
+      (define (send-connect)
+        (mutex-lock! write-mutex)
+        (let ((data (make-u8vector (+ 8 4 4 4 4 4 4 4))))
+          (write-udp-sent data (current-seconds))
+          (write-udp-kind data udp-connect)
+          (write-udp-origin data client-no)
+          (write-udp-connect-local-host data local-host)
+          (write-udp-connect-local-port data local-port)
+          (write-udp-connect-latency data (or udp-latency -1.))
+          (write-udp-connect-lag data (or udp-lag -1.))
+          (write-udp-connect-drop data (or udp-drop -1.))
+          (write data udp-port))
+        (mutex-unlock! write-mutex))
+      
+      (set! self.local-host local-host)
+      (set! self.local-port local-port)
+      (set! server-host #f)
+      (set! server-port #f)
+      (set! write-mutex (make-mutex 'write))
+      (set! send-channels (make-table))
+      (set! receive-channels (make-table))
+      (set! topology (world-setting 'world.udp-topology 'server))
+      (set! peers (make-table))
+      (set! peers-mutex (make-mutex 'peers))
+      (set! simulator (if (or udp-latency udp-lag udp-drop)
+                          (new UDP-Simulator udp-latency udp-lag udp-drop
+                               (lambda (data)
+                                 (send-topology self data)))
+                        #f))
+      (record-event udp-id-connect
+                    0.
+                    0.
+                    0.
+                    0.)
+      (send-connect)
+      (let ((reply (read udp-port)))
+        (let ((kind (read-udp-kind reply)))
+          (assert (= kind udp-connected)
+            (let ((source-info (udp-source-socket-info udp-port)))
+              (set! server-host (socket-info-address source-info))
+              (set! server-port (socket-info-port-number source-info)))
+            (let ((round-trip (- (current-seconds) (read-udp-sent reply))))
+              (record-event udp-id-connected
+                            round-trip
+                            0.
+                            0.
+                            0.)))))
+      (start-task udp-task)))
 
   
   (method (disconnect self)
@@ -137,28 +146,19 @@
     (mutex-lock! peers-mutex)
     (let ((client-no (get-client-no (current-tier)))
           (p (make-table)))
-      (for-each (lambda (info)
-                  (bind (origin host port local) info
-                    (unless (= origin client-no)
-                      @test
-                      (unless (table-ref p origin #f)
-                        (thread-start!
-                          (new-thread
-                            (lambda ()
-                              (declare (proper-tail-calls))
-                              (let (loop)
-                                (let ((data (make-u8vector (+ 8 4 4))))
-                                  (write-udp-sent data (current-seconds))
-                                  (write-udp-kind data udp-test)
-                                  (write-udp-origin data client-no)
-                                  (udp-destination-set! host port udp-port)
-                                  (write data udp-port))
-                                (sleep .5)
-                                (loop)))
-                            'test)))
-                      (table-set! p origin (new UDP-Peer host port local)))))
-                  peers-info)
-      (set! peers p))
+      (let ((my-info (cdr (assv client-no peers-info))))
+        (bind (my-host my-port my-local) my-info
+          (for-each (lambda (info)
+                      (bind (origin host port local-host local-port) info
+                        (when (or (/= origin client-no)
+                                  audio-self?
+                                  video-self?)
+                          ;; same intranet heuristic
+                          (if (equal? host my-host)
+                              (table-set! p origin (new UDP-Peer local-host local-port))
+                            (table-set! p origin (new UDP-Peer host port))))))
+                    peers-info)
+          (set! peers p))))
     (mutex-unlock! peers-mutex))
   
   
@@ -435,16 +435,14 @@
 (class UDP-Peer extends Object
   
   
-  (slot host  getter generate)
-  (slot port  getter generate)
-  (slot local getter generate)
+  (slot host getter generate)
+  (slot port getter generate)
   
   
-  (method override (initialize self host port local)
+  (method override (initialize self host port)
     (nextmethod self)
     (set! self.host host)
-    (set! self.port port)
-    (set! self.local local))
+    (set! self.port port))
   
   
   (method override (print self output readably)
