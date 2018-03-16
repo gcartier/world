@@ -596,19 +596,21 @@
   (slot bitrate                initialize #f accessors generate)
   (slot codec                  initialize #f accessors generate)
   (slot pipeline               initialize #f accessors generate)
+  (slot audio?                 initialize #t accessors generate)
   (slot audio-sink             initialize #f accessors generate)
   (slot audio-appsink          initialize #f accessors generate)
   (slot audio-data <u8vector>  initialize #f accessors generate)
   (slot audio-info <u64vector> initialize #f accessors generate)
   
   
-  (method override (initialize self location (resolution: resolution #f) (framerate: framerate #f) (bitrate: bitrate #f) (codec: codec #f))
+  (method override (initialize self location (resolution: resolution #f) (framerate: framerate #f) (bitrate: bitrate #f) (codec: codec #f) (audio?: audio? #t))
     (nextmethod self)
     (set! self.location location)
     (set! self.resolution resolution)
     (set! self.framerate framerate)
     (set! self.bitrate bitrate)
-    (set! self.codec codec))
+    (set! self.codec codec)
+    (set! self.audio? audio?))
   
   
   (method override (setup-element self)
@@ -617,34 +619,36 @@
           (height (get-height resolution)))
       (let ((pipeline (gst-launch (tie "filesrc name=filesrc")
                                   "decodebin name=decoder"
-                                  (list "decoder."
-                                        "queue"
-                                        "audioconvert"
-                                        "audioresample"
-                                        "audio/x-raw, format=F32LE, layout=interleaved, rate=80000, channels=2"
-                                        "appsink name=audioappsink")
+                                  (and audio?
+                                       (list "decoder."
+                                             "queue"
+                                             "audioconvert"
+                                             "audioresample"
+                                             "audio/x-raw, format=F32LE, layout=interleaved, rate=80000, channels=2"
+                                             "appsink name=audioappsink"))
                                   (list "decoder."
                                         "videoscale"
                                         "videoconvert"
-                                        (tie "video/x-raw, format=I420, width={width}, height={height}")
+                                        (tie "video/x-raw, format=I420, width={width}, height={height}, pixel-aspect-ratio=(fraction)1/1")
                                         "appsink name=appsink"))))
         (gst_object_set_name pipeline "file")
         (let ((filesrc (gst_bin_get_by_name pipeline "filesrc"))
               (appsink (gst_bin_get_by_name pipeline "appsink"))
               (data (make-u8vector (* width height 4)))
               (info (make-u64vector 2))
-              (audio-appsink (gst_bin_get_by_name pipeline "audioappsink"))
-              (audio-data (make-u8vector (* width height 4)))
-              (audio-info (make-u64vector 2)))
+              (audio-appsink (and audio? (gst_bin_get_by_name pipeline "audioappsink")))
+              (audio-data (and audio? (make-u8vector (* width height 4))))
+              (audio-info (and audio? (make-u64vector 2))))
           (g_object_set_string filesrc "location" location)
           (gst_element_set_state pipeline GST_STATE_READY)
           (set! self.data data)
           (set! self.info info)
           (set! self.pipeline pipeline)
           (set! self.appsink appsink)
-          (set! self.audio-appsink audio-appsink)
-          (set! self.audio-data audio-data)
-          (set! self.audio-info audio-info)))))
+          (when audio?
+            (set! self.audio-appsink audio-appsink)
+            (set! self.audio-data audio-data)
+            (set! self.audio-info audio-info))))))
   
   
   (method override (start-element self)
@@ -677,12 +681,13 @@
   
   (method override (process self)
     (nextmethod self)
-    (let ((size (gst_app_sink_read audio-appsink audio-data audio-info)))
-      (when (and (/= size -1) audio-sink)
-        (let ((buffer (subu8vector audio-data 0 size))
-              (timestamp (u64vector-ref audio-info 0))
-              (duration (u64vector-ref audio-info 1)))
-          (consume audio-sink buffer timestamp duration))))))
+    (when audio-sink
+      (let ((size (gst_app_sink_read audio-appsink audio-data audio-info)))
+        (when (/= size -1)
+          (let ((buffer (subu8vector audio-data 0 size))
+                (timestamp (u64vector-ref audio-info 0))
+                (duration (u64vector-ref audio-info 1)))
+            (consume audio-sink buffer timestamp duration)))))))
 
 
 ;;;
@@ -1231,7 +1236,7 @@
   0)
 
 
-(definition (make-texture-pipeline name size resolution framerate codec video-src matrix . extras)
+(definition (make-texture-pipeline name size resolution framerate codec video-src matrix (audio-sink #f))
   (let ((video (current-video)))
     (let ((bitrate video-bitrate))
       (let ((video-sink (new Texture-Video-Sink
@@ -1244,7 +1249,8 @@
                           flip: 'vert)))
         (let ((pipeline (pipeline video-src video-sink)))
           ;; quick first solution
-          (set-elements pipeline (append (get-elements pipeline) extras))
+          (when audio-sink
+            (set-elements pipeline (append (get-elements pipeline) (list audio-sink))))
           (register-input video name video-src)
           (register-output video name video-sink)
           (start pipeline)
@@ -1268,7 +1274,7 @@
                                      (make-rotation-matrix (vertex 0. 1. 0.) PI/4))))))
 
 
-(definition protected (make-file-video (file: file #f) (resolution: resolution #f) (position: position #f) (volume: volume #f))
+(definition protected (make-file-video (file: file #f) (resolution: resolution #f) (position: position #f) (audio?: audio? #t) (volume: volume #f))
   (let ((size #f)
         (resolution (or resolution {Dimension 1280 720}))
         (framerate 30)
@@ -1279,11 +1285,14 @@
                       resolution: resolution
                       framerate: framerate
                       bitrate: bitrate
-                      codec: codec))
-          (audio-sink (new world.audio:Audio-Sink
-                        codec: 'none
-                        volume: volume)))
-      (set-audio-sink file-src audio-sink)
+                      codec: codec
+                      audio?: audio?))
+          (audio-sink (and audio?
+                           (new world.audio:Audio-Sink
+                             codec: 'none
+                             volume: volume))))
+      (when audio?
+        (set-audio-sink file-src audio-sink))
       (make-texture-pipeline 'file size resolution framerate codec
         file-src
         (copy-matrix (matrix-multiply& (make-translation-matrix (or position (vertex 0. 7. 0.)))
