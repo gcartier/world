@@ -140,8 +140,8 @@
   ())
 
 
-(define (jazz:new-%%syntax-declaration name type access compatibility attributes parent signature syntax-form)
-  (let ((new-declaration (jazz:allocate-%%syntax-declaration name type #f access compatibility attributes #f parent #f #f #f signature #f)))
+(define (jazz:new-%%syntax-declaration name type access compatibility modifiers attributes parent signature syntax-form)
+  (let ((new-declaration (jazz:allocate-%%syntax-declaration name type #f access compatibility modifiers attributes #f parent #f #f #f signature #f)))
     (jazz:setup-declaration new-declaration)
     new-declaration))
 
@@ -151,10 +151,10 @@
 
 
 (define (jazz:walk-%%syntax-declaration walker resume declaration environment form-src)
-  (receive (access compatibility rest) (jazz:parse-modifiers walker resume declaration jazz:syntax-modifiers (%%cdr (jazz:source-code form-src)))
+  (receive (access compatibility modifiers rest) (jazz:parse-modifiers walker resume declaration jazz:syntax-modifiers (%%cdr (jazz:source-code form-src)))
     (let ((name (jazz:source-code (%%car rest))))
       (let ((new-declaration (or (jazz:find-declaration-child declaration name)
-                                 (jazz:new-%%syntax-declaration name jazz:Any access compatibility '() declaration #f #f))))
+                                 (jazz:new-%%syntax-declaration name jazz:Any access compatibility modifiers '() declaration #f #f))))
         (jazz:set-declaration-source new-declaration form-src)
         (let ((effective-declaration (jazz:add-declaration-child walker resume declaration new-declaration)))
           effective-declaration)))))
