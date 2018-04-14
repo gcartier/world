@@ -1,0 +1,674 @@
+;;;===============
+;;;  WorldScheme
+;;;===============
+;;;
+;;;; Together Tier
+;;;
+;;;  The Initial Developer of the Original Code is Guillaume Cartier.
+;;;  Portions created by the Initial Developer are Copyright (C) 2012-2018
+;;;  the Initial Developer. All Rights Reserved.
+;;;
+;;;  Contributor(s):
+
+
+(module world.together.tier jazz
+
+
+(import (world)
+        (world.audio)
+        (world.tier)
+        (world.video))
+
+
+(class Together-Tier extends Tier)
+
+
+@w
+(class Together-Tier extends Tier
+  
+  
+  (slot configuration                   getter generate)
+  (slot state             initialize #f getter generate)
+  (slot client-id         initialize #f getter generate)
+  (slot client-no         initialize #f getter generate)
+  (slot welcome           initialize #f getter generate)
+  (slot welcomed?         initialize #f accessors generate)
+  (slot mutex                           getter generate)
+  (slot form              initialize #f getter generate)
+  (slot spawnpoint        initialize #f getter generate)
+  (slot player-spawnpoint initialize #f getter generate)
+  (slot character-name    initialize #f getter generate)
+  (slot character-avatar  initialize #f getter generate)
+  (slot character-script  initialize #f getter generate)
+  (slot player-id         initialize #f getter generate)
+  (slot player-no         initialize #f getter generate)
+  (slot player-position   initialize #f getter generate)
+  (slot player-lookat     initialize #f getter generate)
+  (slot other-players     initialize #f getter generate)
+  (slot remote-client     initialize #f getter generate)
+  (slot remote-server     initialize #f getter generate)
+  (slot remote-processor  initialize #f getter generate)
+  (slot udp-client        initialize #f getter generate)
+  (slot players-cache                   getter generate)
+  
+  
+  (method override (initialize self dir)
+    (nextmethod self dir)
+    (set! configuration (if local?
+                            (get-client-configuration)
+                          (instantiate (read-form (new-file dir ".client")))))
+    (set! mutex (make-mutex 'client))
+    (set! assets (make-assets self directory))
+    (set! players-cache (make-table test: eqv?))
+    ;; aec quicky
+    (set-remote-problem-handler #f)
+    (start-remote-switchboard)
+    (connect-to-server self)
+    (connect-to-udp-server self)
+    (set-client-id/no client-id client-no))
+  
+  
+  (method override (enter self)
+    (let ((zone (current-zone))
+          (me (current-me)))
+      (set-spawnpoint zone spawnpoint)
+      (set-player-spawnpoint zone player-spawnpoint)
+      (set-name me character-name)
+      (set-avatar me character-avatar)
+      (register-id me player-id)
+      (register-no me player-no)
+      (set-position me player-position)
+      (set-lookat me player-lookat)
+      ;; quick hack around server not having camera info
+      (set-position (player-camera me) player-position)
+      (set-lookat (player-camera me) player-lookat)
+      (for-each (lambda (info)
+                  (bind (character-name character-avatar player-id player-no player-position player-lookat player-script) info
+                    (add-player self character-name character-avatar player-id player-no player-position (make-standard-lookat) @why-is-it-corrupted??? player-lookat player-script)))
+                other-players)
+      (autostart (current-audio))
+      (autostart (current-video))))
+  
+  
+  (method override (shutdown self)
+    (stop-to-server self)
+    (stop (current-audio))
+    (stop (current-video))
+    (disconnect-from-udp-server self)
+    (disconnect-from-server self)
+    (when (and (not (get-server-host configuration))
+               (not (get-server-service configuration)))
+      (set-local-server #f)))
+  
+  
+  (method package (with-mutex self thunk)
+    (mutex-lock! mutex)
+    (prog1 (thunk)
+      (mutex-unlock! mutex)))
+  
+  
+  ;;;
+  ;;;; Events
+  ;;;
+  
+  
+  (method (on-cycle-topologies self evt)
+    (cycle-topologies udp-client))
+  
+  
+  ;;;
+  ;;;; Register
+  ;;;
+  
+  
+  (method override (tier-literal->id self literal)
+    (when (effective-show-blocking?)
+      (debug 'register-literal literal))
+    (calling-server self
+      (lambda ()
+        (register-literal remote-server literal))))
+  
+  
+  (method override (tier-id->literal self id)
+    (let ((literal
+            (calling-server self
+              (lambda ()
+                (registered-id remote-server id)))))
+      (when (effective-show-blocking?)
+        (debug 'registered-id id '-> literal))
+      literal))
+  
+  
+  ;;;
+  ;;;; Player
+  ;;;
+  
+  
+  ;; player info will be given by server
+  (method override (setup-me self)
+    (let ((world (current-world))
+          (zone (current-zone)))
+      (let ((player (new Player)))
+        (new Camera parent: player)
+        (set-current-me player)
+        (when character-script
+          (let ((script (new Script parent: player text: (load-asset-text (find-script world character-script)))))
+            (run-task player script))))))
+  
+  
+  ;;;
+  ;;;; Remote
+  ;;;
+  
+  
+  (method override (unimplemented-connected self)
+    (let ((world (current-world)))
+      (unless (world-setting 'world.allow-connected? #f)
+        (display-cancel world "Unimplemented when connected"))))
+
+
+  ;;;
+  ;;;; Server
+  ;;;
+
+
+  (method (connect-to-server self)
+    (define (connect)
+      (if local?
+          local-server
+        (let ((host (get-server-host configuration))
+              (port (get-server-service configuration)))
+          (assert (and host port)
+            (start-remote-presence)
+            (let ((remote-register (connect-remote-register host port)))
+              (load-object remote-register 'world.server.remote 'world-remote-server))))))
+    
+    (set! character-name (get-character-name configuration))
+    (set! character-avatar (get-character-avatar configuration))
+    (set! character-script (get-character-script configuration))
+    (let ((server (connect))
+          (client (load-object (get-local-register) 'world.client.remote 'world-remote-client))
+          (character-zone (and local? (get-character-zone configuration))))
+      (let ((info
+              (calling-server self
+                (lambda ()
+                  ;; quick hack until changing instance is asynchronous as client-connect might spawn an instance
+                  (parameterize ((receive-timeout 60))
+                    (client-connect server client character-name character-avatar character-script character-zone))))))
+        (if (string? info)
+            (begin
+              (close-remote-proxy server)
+              (throw info))
+          (set! remote-client client)
+          (set! remote-server server)
+          (add-exit-job! (~ disconnect-from-server self))
+          (bind (client-id client-no assets processor welcome form spawnpoint player-spawnpoint player-id player-no player-position player-lookat other-players) info
+            (set! self.client-id client-id)
+            (set! self.client-no client-no)
+            (reset-last-forward)
+            (set! self.remote-processor (connect-remote-proxy processor))
+            (set! self.welcome welcome)
+            ;; open test quicky to send form as a string
+            (set! self.form (call-with-input-string (list init: form readtable: jazz-readtable) read-form-from))
+            (set! self.spawnpoint spawnpoint)
+            (set! self.player-spawnpoint player-spawnpoint)
+            (set! self.player-id player-id)
+            (set! self.player-no player-no)
+            (set! self.player-position player-position)
+            (set! self.player-lookat player-lookat)
+            (set! self.other-players other-players)
+            (set! self.state 'connected)
+            (load-point 'connected))))))
+  
+  
+  (method (connect-to-udp-server self)
+    (define (determine-parameters)
+      (if local-server
+          (values "localhost" "localhost" (get-service (remote-proxy->connection local-server)))
+        (values "*" (get-server-host configuration) (get-server-service configuration))))
+    
+    (receive (local-host host service) (determine-parameters)
+      (let ((client (new UDP-Client)))
+        (connect client client-no local-host host service)
+        (set! udp-client client))))
+  
+  
+  (method (start-to-server self)
+    (when remote-server
+      (calling-server self
+        (lambda ()
+          (client-start remote-server remote-client)))
+      (set! state 'started)))
+  
+  
+  (method (stop-to-server self)
+    (when remote-server
+      (calling-server self
+        (lambda ()
+          (client-stop remote-server remote-client)))
+      (set! state 'stopped)))
+  
+  
+  (method (disconnect-from-udp-server self)
+    (when udp-client
+      (disconnect udp-client)
+      (set! udp-client #f)))
+  
+  
+  (method (disconnect-from-server self)
+    (when remote-server
+      (calling-server self
+        (lambda ()
+          (client-disconnect remote-server remote-client character-name)))
+      (detach-from-server self)
+      (set! state 'disconnected)))
+  
+  
+  (method (detach-from-server self)
+    (request-shutdown)
+    (with-mutex self
+      (lambda ()
+        (when remote-server
+          (close-remote-proxy remote-server)
+          (set! remote-server #f)
+          (set! remote-processor #f)
+          (set! remote-client #f)))))
+  
+  
+  (method package (detach-client self)
+    (detach-from-server self)
+    (if (window?)
+        (let ((world (current-world)))
+          (open-welcome world)
+          (report-exception (current-zone) "Disconnected from server" #f))
+      (quit)))
+  
+  
+  (method (bailout-client self exc)
+    (detach-from-server self)
+    (if (window?)
+        (unless (welcome? (current-zone))
+          (let ((world (current-world)))
+            (open-welcome world)
+            (report-exception (current-zone) "Disconnected from server" exc)))
+      ;; too much for bots
+      (unless bot?
+        (snapshot-process exception: exc))
+      (quit)))
+  
+  
+  (method package (send-client-alive self)
+    (with-mutex self
+      (lambda ()
+        ;; we have to test because as we don't acquire the
+        ;; task mutex a detach client is asynchronous for us
+        (when remote-server
+          (calling-server self
+            (lambda ()
+              (client-alive remote-server remote-client)))))))
+  
+  
+  (method package (send-client-audio self buffer timestamp duration)
+    (with-mutex self
+      (lambda ()
+        (when udp-client
+          (send-audio udp-client buffer timestamp duration)))))
+  
+  
+  (method package (send-client-video self buffer timestamp duration)
+    (with-mutex self
+      (lambda ()
+        (when udp-client
+          (send-video udp-client buffer timestamp duration)))))
+  
+  
+  (method package (send-client-update self changes)
+    (with-mutex self
+      (lambda ()
+        ;; we have to test because as we don't acquire the
+        ;; task mutex a detach client is asynchronous for us
+        (when remote-processor
+          (calling-processor self
+            (lambda ()
+              (client-update remote-processor remote-client (current-seconds) changes)))))))
+  
+  
+  (method override (connected-player self no)
+    (or (table-ref players-cache no #f)
+        (let ((player (calling-server self
+                        (lambda ()
+                          (client-connected-player remote-server remote-client no)))))
+          (table-set! players-cache no player)
+          player)))
+  
+  
+  (method override (connected-players self)
+    (calling-server self
+      (lambda ()
+        (client-connected-players remote-server remote-client))))
+  
+  
+  (method override (available-templates self)
+    (calling-server self
+      (lambda ()
+        (client-available-templates remote-server remote-client))))
+  
+  
+  (method override (available-zone-base self from)
+    (calling-server self
+      (lambda ()
+        (client-available-zone-base remote-server remote-client from))))
+  
+  
+  (method override (available-zone-base? self base)
+    (calling-server self
+      (lambda ()
+        (client-available-zone-base? remote-server remote-client base))))
+  
+  
+  (method override (create-zone self from base)
+    (let ((zone (calling-server self
+                  (lambda ()
+                    (client-create-zone remote-server remote-client from base)))))
+      (when zone
+        (change-zone self zone))))
+  
+  
+  (method override (available-zones self)
+    (calling-server self
+      (lambda ()
+        (client-available-zones remote-server remote-client))))
+  
+  
+  (method override (change-zone self zone)
+    (let ((info (calling-server self
+                  (lambda ()
+                    ;; quick hack until changing zone is asynchronous
+                    (parameterize ((receive-timeout 60))
+                      (client-change-zone remote-server remote-client zone))))))
+      (bind (processor form spawnpoint player-spawnpoint player-id player-no player-position player-lookat other-players) info
+        (reset-last-forward)
+        (set! self.remote-processor (connect-remote-proxy processor))
+        ;; open test quicky to send form as a string
+        (let ((form (call-with-input-string (list init: form readtable: jazz-readtable) read-form-from)))
+          (set! self.form form)
+          (set! self.spawnpoint spawnpoint)
+          (set! self.player-spawnpoint player-spawnpoint)
+          (set! self.player-id player-id)
+          (set! self.player-no player-no)
+          (set! self.player-position player-position)
+          (set! self.player-lookat player-lookat)
+          (set! self.other-players other-players)
+          (close (current-zone))
+          ;; quicky
+          (let ((file (zone-file directory 'client)))
+            (set-origin form file)
+            (open-zone file form: form))))))
+  
+  
+  (method package (retrieve-asset self path)
+    (calling-server self
+      (lambda ()
+        (retrieve-asset remote-server path))))
+  
+  
+  (method override (retrieve-entity self id)
+    (or (find-entity id)
+        (let ((class-name+info (calling-processor self
+                                 (lambda ()
+                                   (retrieve-entity remote-processor id)))))
+          (bind (class-name . info) class-name+info
+            (when (effective-show-blocking?)
+              (debug 'retrieve-entity id '-> class-name))
+            (let ((class (class-name->class (current-world) class-name)))
+              (let ((entity (unpackage class info)))
+                (when (or (eq? (get-name entity) 'NOT-FOUND)
+                          (eq? (get-name entity) 'PLAYER))
+                  (debug (get-name entity) entity))
+                entity))))))
+  
+  
+  ;;;
+  ;;;; Outgoing
+  ;;;
+  
+  
+  (method package (retrieve-region self region-index)
+    (when (effective-show-blocking?)
+      (debug 'retrieve-region region-index))
+    (calling-processor self
+      (lambda ()
+        (retrieve-region remote-processor region-index))))
+  
+  
+  (method package (retrieve-chunk self region-index chunk-index chunk-digest)
+    (when (effective-show-blocking?)
+      (debug 'retrieve-chunk region-index chunk-index))
+    (calling-processor self
+      (lambda ()
+        (retrieve-chunk remote-processor region-index chunk-index chunk-digest))))
+  
+  
+  (method package (pause-processor self)
+    (calling-processor self
+      (lambda ()
+        (pause remote-processor))))
+  
+  
+  (method package (unpause-processor self)
+    (calling-processor self
+      (lambda ()
+        (unpause remote-processor))))
+  
+  
+  (method package (client-message self kind recipient message)
+    (calling-server self
+      (lambda ()
+        (client-message remote-server remote-client kind recipient message))))
+  
+  
+  (method (calling-server self thunk)
+    (calling-processing self thunk))
+  
+  
+  (method (calling-processor self thunk)
+    (calling-processing self thunk))
+  
+  
+  (method (calling-processing self thunk)
+    ;; longer timeout while in development
+    ;; as we might be running under a debugger
+    (parameterize ((receive-timeout 60))
+      (parameterize ((post-problem-handler
+                       (lambda (exc)
+                         (delay-bailout-client self exc))))
+        (let ((exit (current-exit)))
+          (define (bailout exc)
+            (if (not exit)
+                (let ((restart (or (boot-restart) (event-restart))))
+                  (if restart
+                      (continuation-graft restart
+                        (lambda ()
+                          (with-maybe-task-mutex
+                            (lambda ()
+                              (bailout-client self exc)))))
+                    (snapshot-process exception: (new Error message: "No exit"))
+                    (quit)))
+              (continuation-graft exit
+                (lambda ()
+                  (delay-bailout-client self exc)))))
+          
+          (catch (connection-exception? exc
+                   (bailout exc))
+            (let ((result (thunk)))
+              (if (eq? result disconnect-marker)
+                  (bailout (new Error message: "Received disconnect marker"))
+                result)))))))
+  
+  
+  (method (delay-bailout-client self exc)
+    (delay-event
+      (lambda ()
+        (with-maybe-task-mutex
+          (lambda ()
+            (bailout-client self exc))))))
+  
+  
+  ;;;
+  ;;;; Incoming
+  ;;;
+  
+  
+  (method (add-player self character-name character-avatar player-id player-no player-position player-lookat player-script)
+    (let ((zone (current-zone)))
+      (let ((player (new Player name: character-name me?: #f avatar: character-avatar position: player-position lookat: player-lookat)))
+        (register-id player player-id)
+        (register-no player player-no)
+        (set-name-pane player character-name color: (if player-script {Color World-Yellow} {Color World-Purple}))
+        (add-element zone player))))
+  
+  
+  (method (remove-player self character-name)
+    (let ((zone (current-zone)))
+      (let ((player (find-player zone character-name)))
+        ;; sejour quicky
+        (when player
+          (remove-element zone player)))))
+  
+  
+  (method package (processor-entered self client-id client-no character-name character-avatar character-script player-id player-no player-position player-lookat player-script)
+    (let ((world (current-world)))
+      (add-player self character-name character-avatar player-id player-no player-position player-lookat player-script)
+      (display-message world (format "{a} entered world" character-name))))
+  
+  
+  (method package (processor-exited self character-name)
+    (let ((world (current-world)))
+      (remove-player self character-name)
+      (display-message world (format "{a} exited world" character-name))))
+  
+  
+  (method package (processor-update self sent changes)
+    ;; should probably be applied by a task
+    (forward-changes sent (current-seconds) changes))
+  
+  
+  (method package (processor-draw self id color alpha timestamp duration background slide?)
+    (receive-processor-draw (current-video) id color alpha timestamp duration background slide?))
+  
+  
+  (method package (server-message self sender kind message)
+    (post-event
+      (lambda ()
+        (let ((interface (current-interface)))
+          (let ((chat (child interface 'chat)))
+            (show-message chat sender kind message)
+            (play-ambient-sound "sound/user/MapPing"))))))
+  
+  
+  (method package (server-protocol self protocol)
+    @convert-to-presence
+    (let ((uuid (get-uuid (get-ior remote-server))))
+      (let ((connection (require-remote-connection uuid)))
+        (set-protocol connection protocol))))
+  
+  
+  (method package (peers-update self peers)
+    (peers-update udp-client peers))
+  
+  
+  (method package (pause-client self)
+    (post-event
+      (lambda ()
+        (let ((world (current-world)))
+          (with-task-mutex
+            (lambda ()
+              (pause-world world)))))))
+  
+  
+  (method package (unpause-client self)
+    (post-event
+      (lambda ()
+        (let ((world (current-world)))
+          (with-task-mutex
+            (lambda ()
+              (unpause-world world)))))))
+  
+  
+  (method package (goto-client self time)
+    (post-event
+      (lambda ()
+        (let ((history (current-history)))
+          (with-task-mutex
+            (lambda ()
+              (goto-time history time)))))))
+  
+  
+  (method package (camera-client self pos lookat)
+    (post-event
+      (lambda ()
+        (let ((camera (current-camera)))
+          (with-task-mutex
+            (lambda ()
+              (camera-init camera pos lookat)))))))
+  
+  
+  (method package (protocol-client self simulate?)
+    (post-event
+      (lambda ()
+        (let ((world (current-world)))
+          (with-task-mutex
+            (lambda ()
+              (set-simulate-protocol? simulate?)
+              (if simulate-protocol?
+                  (lock-history-tooltip world)
+                (unlock-history-tooltip world))))))))
+  
+  
+  (method package (position-client self rect)
+    (post-event
+      (lambda ()
+        (with-task-mutex
+          (lambda ()
+            (world.window:position-client-window rect))))))
+  
+  
+  (method package (restore-client self)
+    (post-event
+      (lambda ()
+        (with-task-mutex
+          (lambda ()
+            (world.window:restore-client-window))))))
+  
+  
+  ;;;
+  ;;;; Tile
+  ;;;
+  
+  
+  (method override (tile self)
+    (post-event
+      (lambda ()
+        (calling-server self
+          (lambda ()
+            (tile-server remote-server))))))
+  
+  
+  (method override (restore self)
+    (post-event
+      (lambda ()
+        (calling-server self
+          (lambda ()
+            (restore-server remote-server))))))
+  
+  
+  ;;;
+  ;;;; Log
+  ;;;
+  
+  
+  (method override (log-if self message)
+    (when log?
+      (calling-server self
+        (lambda ()
+          (client-log remote-server remote-client (current-seconds) message)))))))
