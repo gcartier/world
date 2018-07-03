@@ -125,9 +125,9 @@
                                    (send-client-video (current-client) buffer timestamp duration))))
         (self-sink (new Stream-Sink
                      consumer: (lambda (buffer timestamp duration)
-                                 (let ((video (current-video))
-                                       (id (get-id (current-me))))
-                                   (let ((sink (player-output video id)))
+                                 (let ((video (current-video)))
+                                   ;; the player: is a quick hack to test self video
+                                   (let ((sink (player-output video #f player: (current-me))))
                                      (draw sink buffer #f timestamp duration)
                                      (set-drawn? sink #t)))))))
     (new World-Video input: (pipeline camera-src (list server-sink self-sink)))))
@@ -139,8 +139,8 @@
   (slot input             getter generate)
   (slot inputs            getter generate)
   (slot outputs           getter generate)
-  (slot player-outputs    getter generate)
-  (slot player-fullscreen getter generate)
+  (slot ordered-outputs   getter generate)
+  (slot fullscreen-output getter generate)
   (slot receive-hook      accessors generate)
   (slot render-hook       accessors generate)
   
@@ -150,8 +150,8 @@
     (set! self.input input)
     (set! self.inputs (make-table test: equal?))
     (set! self.outputs (make-table test: equal?))
-    (set! player-outputs '())
-    (set! player-fullscreen #f)
+    (set! ordered-outputs '())
+    (set! fullscreen-output #f)
     (set! receive-hook #f)
     (set! render-hook #f))
   
@@ -206,6 +206,9 @@
     (when (client?)
       (let ((world (current-world)))
         (stop self)
+        (let ((self-output (table-ref outputs #f #f)))
+          (when self-output
+            (close-output self #f self-output)))
         (update-parameter world 'video)
         (when feedback?
           (display-on/off world "Video" (playing? input))))))
@@ -260,20 +263,23 @@
             output))))
   
   
-  (method package (player-output self id (position: position #f) (size: size #f) (resolution: resolution #f) (layout: layout #f) (codec: codec #f))
+  (method package (player-output self id (player: player #f) (position: position #f) (size: size #f) (resolution: resolution #f) (layout: layout #f) (codec: codec #f))
     (or (table-ref outputs id #f)
-        (let ((player (find-entity id)))
+        ;; the or is a quick hack to test self video
+        (let ((player (or player (find-entity id))))
           (let ((output (case (or layout video-layout)
                           ((overhead)
-                           (new Camera-Video-Sink player
-                                resolution: (or resolution video-resolution)
-                                framerate: video-framerate
-                                bitrate: video-bitrate
-                                codec: (or codec video-codec)
-                                alpha-overlay: video-alpha
-                                overlay?: video-overlay?))
+                           (new Camera-Video-Sink
+                             player
+                             resolution: (or resolution video-resolution)
+                             framerate: video-framerate
+                             bitrate: video-bitrate
+                             codec: (or codec video-codec)
+                             alpha-overlay: video-alpha
+                             overlay?: video-overlay?))
                           (else
                            (new Sheet-Video-Sink
+                             player
                              position: position
                              size: size
                              resolution: (or resolution video-resolution)
@@ -283,8 +289,8 @@
                              alpha-overlay: video-alpha
                              overlay?: video-overlay?)))))
             (table-set! outputs id output)
-            (set! player-outputs (append! player-outputs (list output)))
-            (layout-outputs self)
+            (set! ordered-outputs (append! ordered-outputs (list output)))
+            (update-layouts self)
             (setup output)
             (start output)
             output))))
@@ -292,8 +298,9 @@
   
   (method package (close-output self id output)
     (table-clear outputs id)
-    (set! player-outputs (remove! output player-outputs))
-    (release output))
+    (set! ordered-outputs (remove! output ordered-outputs))
+    (release output)
+    (update-layouts self))
   
   
   (method package (receive-server-video self id buffer timestamp duration)
@@ -325,11 +332,14 @@
   (method package (render-scene self)
     (unless (and render-hook
                  (render-hook self))
-      @order-is-important-in-fullscreen-layout
-      (iterate-table outputs
-        (lambda (id output)
-          (render output)))
-      (for-each render player-outputs)))
+      (let ((self-output (table-ref outputs #f #f)))
+        (iterate-table outputs
+          (lambda (id output)
+            (unless (eq? output self-output)
+              (render output))))
+        ;; render self output last for fullscreen
+        (when self-output
+          (render self-output)))))
   
   
   ;;;
@@ -344,35 +354,83 @@
   
   
   (method (cycle-layouts self)
+    (case video-layout
+      ((overhead)
+       (sidebar-layout self))
+      ((sidebar)
+       (gallery-layout self))
+      ((gallery)
+       (fullscreen-layout self))
+      ((fullscreen)
+       (overhead-layout self))))
+  
+  
+  (method (update-layouts self)
+    (case video-layout
+      ((overhead)
+       (overhead-layout self))
+      ((sidebar)
+       (sidebar-layout self))
+      ((gallery)
+       (gallery-layout self))
+      ((fullscreen)
+       (fullscreen-layout self))))
+  
+  
+  (method (stop-renders self)
     (let ((zone (current-zone)))
-      (case video-layout
-        ((overhead)
-         (for-each (lambda (player)
-                     (let ((elem (get-camera-pane player)))
-                       (when elem
-                         (set-render? elem #f))))
-                   (get-players zone))
-         (set! video-layout 'sidebar)
-         (layout-outputs self))
-        ((sidebar)
-         (set! video-layout 'gallery)
-         (layout-outputs self))
-        ((gallery)
-         (set! video-layout 'sidebar @w 'fullscreen)
-         (layout-outputs self))
-        ((fullscreen)
-         (set! video-layout 'sidebar @w 'overhead)
-         (layout-outputs self)))))
+      (for-each (lambda (player)
+                  (let ((elem (get-camera-pane player)))
+                    (when elem
+                      (set-render? elem #f))))
+                (get-players zone))))
+  
+  
+  (method package (overhead-layout self)
+    (stop-renders self)
+    (set! video-layout 'overhead)
+    (layout-outputs self))
+  
+  
+  (method package (sidebar-layout self)
+    (stop-renders self)
+    (set! video-layout 'sidebar)
+    (layout-outputs self))
+  
+  
+  (method package (gallery-layout self)
+    (set! video-layout 'gallery)
+    (layout-outputs self))
+  
+  
+  (method package (fullscreen-layout self)
+    (unless (and fullscreen-output
+                 (table-find outputs fullscreen-output))
+      (let ((output (find-if (lambda (output)
+                               (let ((id (table-find outputs output)))
+                                 id))
+                             ordered-outputs)))
+        (set! fullscreen-output output)))
+    (set! video-layout 'fullscreen)
+    (layout-outputs self))
   
   
   (method package (layout-outputs self)
-    (when (not-null? player-outputs)
-      (let ((player-rectangles (layout self (length player-outputs))))
-        (when player-rectangles
+    (when (not-null? ordered-outputs)
+      (let ((rectangles (layout self (length ordered-outputs))))
+        (when rectangles
           (for-each (lambda (output rect)
-                      (move output rect))
-                    player-outputs
-                    player-rectangles)))))
+                      ;; quick hacks to test self video
+                      (let ((player (get-player output)))
+                        (let ((elem (get-camera-pane player)))
+                          (if (not rect)
+                              (when elem
+                                (set-render? elem #f))
+                            (when elem
+                              (set-render? elem #t))
+                            (move output rect)))))
+                    ordered-outputs
+                    rectangles)))))
   
   
   (method package (layout self num-players)
@@ -391,6 +449,17 @@
                  (list bounds)
                (layout-tiles num-players bounds)))
             ((fullscreen)
+             (let ((full bounds)
+                   (mini (car (layout-tiles 1 (new Rect (- r 200) 500 r b) vertical-justification: 'tail))))
+               (map (lambda (output)
+                      (if (eq? output fullscreen-output)
+                          full
+                        (let ((id (table-find outputs output)))
+                          (if (not id)
+                              mini
+                            #f))))
+                    ordered-outputs))
+             @display-everyone-that-is-not-fullscreen
              (cons bounds (layout-tiles (- num-players 1) (new Rect (- r 200) 500 r b) vertical-justification: 'tail)))
             (else
              #f)))))))
@@ -1305,11 +1374,12 @@
 (class Sheet-Video-Sink extends Video-Sink
   
   
-  (slot size  initialize #f accessors generate)
-  (slot sheet initialize #f accessors generate)
+  (slot player initialize #f accessors generate)
+  (slot size   initialize #f accessors generate)
+  (slot sheet  initialize #f accessors generate)
   
   
-  (method override (initialize self . rest)
+  (method override (initialize self entity . rest)
     (bind-keywords ((position #f) (size #f) . others) rest
       (apply nextmethod self others)
       (let ((world (current-world)))
@@ -1319,6 +1389,7 @@
             (make-orthographic-matrix! (get-projection-matrix s) 0. (get-width world) 0. (get-height world) 0. 10.)
             (set-position s pos)
             (set-size s size)
+            (set! player entity)
             (set! sheet s))))))
   
   
@@ -1496,7 +1567,7 @@
   (let ((world (current-world))
         (video (current-video)))
     (define (layout-player)
-      (let ((current-count (length (get-player-outputs video))))
+      (let ((current-count (length (get-ordered-outputs video))))
         (let ((new-count (+ current-count 1)))
           (let ((rectangles (layout video new-count)))
             (and rectangles
@@ -1538,7 +1609,7 @@
               (setup pipeline)
               (start pipeline)
               (sleep .25) ; flicker heuristic. should wait until every new output has drawn
-              (layout-outputs video)
+              (update-layouts video)
               (display-message world (format "{a} joined" name))
               pipeline)))))))
 
@@ -1546,17 +1617,17 @@
 (definition protected (remove-player)
   (let ((world (current-world))
         (video (current-video)))
-    (let ((player-outputs (get-player-outputs video)))
-      (if (null? player-outputs)
+    (let ((ordered-outputs (get-ordered-outputs video)))
+      (if (null? ordered-outputs)
           (bell)
-        (let ((output (random-element player-outputs)))
+        (let ((output (random-element ordered-outputs)))
           (let ((name (table-find (get-outputs video) output)))
             (let ((input (find-input video name)))
               (stop input)
               (stop output)
               (close-input video name input)
               (close-output video name output)
-              (layout-outputs video)
+              (update-layouts video)
               (display-message world (format "{a} left" name)))))))))
 
 
