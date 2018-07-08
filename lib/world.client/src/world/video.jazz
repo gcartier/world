@@ -122,7 +122,8 @@
                       codec: video-codec))
         (server-sink (new Stream-Sink
                        consumer: (lambda (buffer timestamp duration)
-                                   (send-client-video (current-client) buffer timestamp duration))))
+                                 (let ((video (current-video)))
+                                   (send-camera-video video buffer timestamp duration)))))
         (self-sink (new Stream-Sink
                      consumer: (lambda (buffer timestamp duration)
                                  (let ((video (current-video)))
@@ -133,6 +134,11 @@
     (new World-Video input: (pipeline camera-src (list server-sink self-sink)))))
 
 
+(definition protected (video-buffer-header? buffer)
+  (and (>= (u8vector-length buffer) 5)
+       (= (u8vector-ref buffer 5) 16)))
+
+
 (class World-Video extends Object
   
   
@@ -141,6 +147,7 @@
   (slot outputs           getter generate)
   (slot ordered-outputs   getter generate)
   (slot fullscreen-output getter generate)
+  (slot camera-mutex      getter generate)
   (slot receive-hook      accessors generate)
   (slot render-hook       accessors generate)
   
@@ -152,6 +159,7 @@
     (set! self.outputs (make-table test: equal?))
     (set! ordered-outputs '())
     (set! fullscreen-output #f)
+    (set! camera-mutex (make-mutex 'camera))
     (set! receive-hook #f)
     (set! render-hook #f))
   
@@ -169,16 +177,34 @@
     (release input))
   
   
-  (method package (reset self)
-    (let ((camera (car (get-elements input))))
-      (let ((pipeline (get-pipeline camera)))
-        (when pipeline
-          (let ((valve (gst_bin_get_by_name pipeline "valve"))
-                (encoder (gst_bin_get_by_name pipeline "enc")))
-            (g_object_set valve "drop" (g_value_int 1))
-            (gst_element_set_state encoder GST_STATE_READY)
-            (gst_element_set_state encoder GST_STATE_PLAYING)
-            (g_object_set valve "drop" (g_value_int 0)))))))
+  (method (with-camera-mutex self thunk)
+    (mutex-lock! camera-mutex)
+    (prog1 (thunk)
+      (mutex-unlock! camera-mutex)))
+  
+  
+  (method package (send-camera-video self buffer timestamp duration)
+    (with-camera-mutex self
+      (lambda ()
+        (let ((tier (current-client)))
+          (send-client-video tier buffer timestamp duration)))))
+  
+  
+  (method package (reset-camera self)
+    (with-camera-mutex self
+      (lambda ()
+        (let ((tier (current-client)))
+          (let ((next-data-sequence (read-video-data-sequence tier)))
+            (let ((camera (car (get-elements input))))
+              (let ((pipeline (get-pipeline camera)))
+                (and pipeline
+                     (let ((valve (gst_bin_get_by_name pipeline "valve"))
+                           (encoder (gst_bin_get_by_name pipeline "enc")))
+                       (g_object_set valve "drop" (g_value_int 1))
+                       (gst_element_set_state encoder GST_STATE_READY)
+                       (gst_element_set_state encoder GST_STATE_PLAYING)
+                       (g_object_set valve "drop" (g_value_int 0))
+                       next-data-sequence)))))))))
   
   
   (method package (resize self)
@@ -545,27 +571,23 @@
               (timestamp (u64vector-ref info 0))
               (duration (u64vector-ref info 1)))
           (when (and video-show
-                     (or (eq? video-show #t)
+                     (or (eq? video-show 'all)
+                         (eq? video-show 'header)
                          (>= size video-show)))
             ;; h264 specific
-            (let ((type (if (= (u8vector-ref buffer 5) 16)
-                            '***full***
+            (let ((type (if (video-buffer-header? buffer)
+                            '***header***
                           'delta)))
-              (terminal size type)))
+              (if (eq? video-show 'header)
+                  (when (eq? type '***header***)
+                    (terminal size type))
+                (terminal size type))))
           (consume sink buffer timestamp duration))))
     (let ((size (gst_app_sink_read appsink2 data info)))
       (when (/= size -1)
         (let ((buffer (subu8vector data 0 size))
               (timestamp (u64vector-ref info 0))
               (duration (u64vector-ref info 1)))
-          (when (and video-show
-                     (or (eq? video-show #t)
-                         (>= size video-show)))
-            ;; h264 specific
-            (let ((type (if (= (u8vector-ref buffer 5) 16)
-                            '***full***
-                          'delta)))
-              (terminal size type)))
           (consume sink2 buffer timestamp duration))))))
 
 

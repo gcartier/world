@@ -26,7 +26,8 @@
         (world.settings)
         (world.support)
         (world.task)
-        (world.udp))
+        (world.udp)
+        (world.video))
 
 
 (definition record-output?
@@ -197,7 +198,7 @@
   ;;;
   
   
-  (method (require-send-channel self origin media-kind)
+  (method package (require-send-channel self origin media-kind)
     (let ((key (cons origin media-kind)))
       (or (table-ref send-channels key #f)
           (let ((channel (new UDP-Send-Channel origin media-kind)))
@@ -205,7 +206,7 @@
             channel))))
   
   
-  (method (require-receive-channel self origin media-kind)
+  (method package (require-receive-channel self origin media-kind)
     (let ((key (cons origin media-kind)))
       (or (table-ref receive-channels key #f)
           (let ((channel (new UDP-Receive-Channel origin media-kind)))
@@ -536,13 +537,14 @@
 (class UDP-Receive-Channel extends UDP-Channel
   
   
-  (slot latest-nacks          accessors generate)
-  (slot next-ack              accessors generate)
-  (slot process-last-sequence getter generate)
-  (slot process-ring          getter generate)
-  (slot process-task          getter generate)
-  (slot processed             getter generate)
-  (slot missing               getter generate)
+  (slot latest-nacks             accessors generate)
+  (slot next-ack                 accessors generate)
+  (slot process-last-sequence    getter generate)
+  (slot expected-header-sequence getter generate)
+  (slot process-ring             getter generate)
+  (slot process-task             getter generate)
+  (slot processed                getter generate)
+  (slot missing                  getter generate)
   
   
   (method override (initialize self origin media-kind)
@@ -550,6 +552,7 @@
     (set! self.latest-nacks '())
     (set! self.next-ack #f)
     (set! self.process-last-sequence #f)
+    (set! self.expected-header-sequence #f)
     ;; make it really big until time ring is a real ring
     (set! self.process-ring (new Time-Ring 40096 @w 512 @max-size: +inf.0 now-proc: (~ now-timestamp self)))
     ;; development
@@ -623,7 +626,8 @@
   
   
   (method (process-missing self lst)
-    (let ((sorted (sort < lst key: read-udp-sequence)))
+    (let ((sorted (sort < lst key: read-udp-sequence))
+          (highest-missing #f))
       (for-each (lambda (data)
                   (let ((sequence (read-udp-sequence data)))
                     (when (and udp-show-missing? process-last-sequence)
@@ -636,9 +640,20 @@
                                               (fixnum->flonum seq)
                                               (fixnum->flonum missing)
                                               (fixnum->flonum processed))
-                                (format :terminal "{s} {s} {s} {s}{%}" remote-name (udp-name media-kind) '***missing*** seq)))))
+                                (format :terminal "{s} {s} {s} {s}{%}" remote-name (udp-name media-kind) '***missing*** seq))
+                          (set! highest-missing sequence))))
                     (set! process-last-sequence sequence)))
-                sorted)))
+                sorted)
+      (when (and highest-missing
+                 ;; audio doesn't need a reset
+                 (= media-kind udp-video))
+        @w(terminal 'REQUEST_RESET origin media-kind highest-missing)
+        (let ((expected (request-reset (current-client) origin media-kind highest-missing)))
+          (if expected
+              (set! expected-header-sequence expected)
+            ;; something went wrong
+            ))
+        @w(terminal 'EXPECTING expected-header-sequence))))
   
   
   (method (process-frame self datas)
@@ -680,7 +695,14 @@
           (define (process-video)
             (if (equal? buffer udp-media-off)
                 (receive-server-video (current-video) id #f #f #f)
-              (receive-server-video (current-video) id buffer timestamp duration)))
+              @w(when (video-buffer-header? buffer)
+                (terminal 'GOT 'AN 'I-FRAME 'YAY!!! sequence))
+              (cond ((not expected-header-sequence)
+                     (receive-server-video (current-video) id buffer timestamp duration))
+                    (else
+                     (when (video-buffer-header? buffer)
+                       (receive-server-video (current-video) id buffer timestamp duration)
+                       (set! expected-header-sequence #f))))))
           
           (ecase kind
             ((udp-audio)
