@@ -84,6 +84,10 @@
   (world-setting 'world.video-debug? #f))
 
 
+(definition self-video?
+  (world-setting 'together.self-video? #t))
+
+
 (definition slide-duration
   (world-setting 'world.slide-duration .2))
 
@@ -124,14 +128,17 @@
                        consumer: (lambda (buffer timestamp duration)
                                  (let ((video (current-video)))
                                    (send-camera-video video buffer timestamp duration)))))
-        (self-sink (new Stream-Sink
-                     consumer: (lambda (buffer timestamp duration)
-                                 (let ((video (current-video)))
-                                   ;; the player: is a quick hack to test self video
-                                   (let ((sink (player-output video #f player: (current-me))))
-                                     (draw sink buffer #f timestamp duration)
-                                     (set-drawn? sink #t)))))))
-    (new World-Video input: (pipeline camera-src (list server-sink self-sink)))))
+        (self-sink (and self-video?
+                        (new Stream-Sink
+                          consumer: (lambda (buffer timestamp duration)
+                                      (let ((video (current-video)))
+                                        ;; the player: is a quick hack to test self video
+                                        (let ((sink (player-output video #f player: (current-me))))
+                                          (draw sink buffer #f timestamp duration)
+                                          (set-drawn? sink #t))))))))
+    (new World-Video input: (pipeline camera-src (if self-sink
+                                                     (list server-sink self-sink)
+                                                   server-sink)))))
 
 
 (definition protected (video-buffer-header? buffer)
@@ -583,12 +590,13 @@
                     (terminal size type))
                 (terminal size type))))
           (consume sink buffer timestamp duration))))
-    (let ((size (gst_app_sink_read appsink2 data info)))
-      (when (/= size -1)
-        (let ((buffer (subu8vector data 0 size))
-              (timestamp (u64vector-ref info 0))
-              (duration (u64vector-ref info 1)))
-          (consume sink2 buffer timestamp duration))))))
+    (when self-video?
+      (let ((size (gst_app_sink_read appsink2 data info)))
+        (when (/= size -1)
+          (let ((buffer (subu8vector data 0 size))
+                (timestamp (u64vector-ref info 0))
+                (duration (u64vector-ref info 1)))
+            (consume sink2 buffer timestamp duration)))))))
 
 
 ;;;
@@ -618,51 +626,84 @@
     (nextmethod self)
     (let ((width (get-width resolution))
           (height (get-height resolution)))
-      (let ((pipeline (gst-launch (cond-expand
-                                    (mac "avfvideosrc")
-                                    (windows "ksvideosrc")
-                                    (else "v4l2src"))
-                                  "tee name=tee"
-                                  (list
-                                    "tee."
-                                    "queue"
-                                    "videoscale"
-                                    "videoconvert"
-                                    (tie "video/x-raw, format=I420, width={width}, height={height}, pixel-aspect-ratio=(fraction)1/1, framerate={framerate}/1")
-                                    "valve name=valve"
-                                    (and (eq? codec 'h264)
-                                         (let ((key-int-max (and video-key-period (fxround (* (cast <fl> framerate) video-key-period))))
-                                               (pass video-pass)
-                                               (psy-tune #f)
-                                               (quantizer #f)
-                                               (bitrate bitrate)
-                                               (tune "zerolatency")
-                                               (speed-preset "superfast"))
-                                           (let ((elem
-                                                   (gst-element "x264enc"
-                                                                key-int-max: key-int-max
-                                                                pass: pass
-                                                                psy-tune: psy-tune
-                                                                quantizer: quantizer
-                                                                bitrate: bitrate
-                                                                tune: tune
-                                                                speed-preset: speed-preset
-                                                                name: "enc")))
-                                             @w (format :terminal "size={a}x{a} framerate={a}{%}" width height framerate)
-                                             @w (format :terminal "{a}{%}" elem)
-                                             elem)))
-                                    "appsink name=sink")
-                                  (list
-                                    "tee."
-                                    "queue"
-                                    "videoscale"
-                                    "videoconvert"
-                                    "videoflip video-direction=horiz"
-                                    (tie "video/x-raw, format=BGRA, width={width}, height={height}, pixel-aspect-ratio=(fraction)1/1, framerate={framerate}/1")
-                                    "appsink name=sink2"))))
+      (let ((pipeline (if (not self-video?)
+                          (gst-launch (cond-expand
+                                        (mac "avfvideosrc")
+                                        (windows "ksvideosrc")
+                                        (else "v4l2src"))
+                                      "videoscale"
+                                      "videoconvert"
+                                      (tie "video/x-raw, format=I420, width={width}, height={height}, pixel-aspect-ratio=(fraction)1/1, framerate={framerate}/1")
+                                      "valve name=valve"
+                                      (and (eq? codec 'h264)
+                                           (let ((key-int-max (and video-key-period (fxround (* (cast <fl> framerate) video-key-period))))
+                                                 (pass video-pass)
+                                                 (psy-tune #f)
+                                                 (quantizer #f)
+                                                 (bitrate bitrate)
+                                                 (tune "zerolatency")
+                                                 (speed-preset "superfast"))
+                                             (let ((elem
+                                                     (gst-element "x264enc"
+                                                                  key-int-max: key-int-max
+                                                                  pass: pass
+                                                                  psy-tune: psy-tune
+                                                                  quantizer: quantizer
+                                                                  bitrate: bitrate
+                                                                  tune: tune
+                                                                  speed-preset: speed-preset
+                                                                  name: "enc")))
+                                               @w (format :terminal "size={a}x{a} framerate={a}{%}" width height framerate)
+                                               @w (format :terminal "{a}{%}" elem)
+                                               elem)))
+                                      "appsink name=sink")
+                        (gst-launch (cond-expand
+                                      (mac "avfvideosrc")
+                                      (windows "ksvideosrc")
+                                      (else "v4l2src"))
+                                    "tee name=tee"
+                                    (list
+                                      "tee."
+                                      "queue"
+                                      "videoscale"
+                                      "videoconvert"
+                                      (tie "video/x-raw, format=I420, width={width}, height={height}, pixel-aspect-ratio=(fraction)1/1, framerate={framerate}/1")
+                                      "valve name=valve"
+                                      (and (eq? codec 'h264)
+                                           (let ((key-int-max (and video-key-period (fxround (* (cast <fl> framerate) video-key-period))))
+                                                 (pass video-pass)
+                                                 (psy-tune #f)
+                                                 (quantizer #f)
+                                                 (bitrate bitrate)
+                                                 (tune "zerolatency")
+                                                 (speed-preset "superfast"))
+                                             (let ((elem
+                                                     (gst-element "x264enc"
+                                                                  key-int-max: key-int-max
+                                                                  pass: pass
+                                                                  psy-tune: psy-tune
+                                                                  quantizer: quantizer
+                                                                  bitrate: bitrate
+                                                                  tune: tune
+                                                                  speed-preset: speed-preset
+                                                                  name: "enc")))
+                                               @w (format :terminal "size={a}x{a} framerate={a}{%}" width height framerate)
+                                               @w (format :terminal "{a}{%}" elem)
+                                               elem)))
+                                      "appsink name=sink")
+                                    (list
+                                      "tee."
+                                      "queue"
+                                      (let ((drop (if self-video? "false" "true")))
+                                        (tie "valve drop={drop} name=selfvalve"))
+                                      "videoscale"
+                                      "videoconvert"
+                                      "videoflip video-direction=horiz"
+                                      (tie "video/x-raw, format=BGRA, width={width}, height={height}, pixel-aspect-ratio=(fraction)1/1, framerate={framerate}/1")
+                                      "appsink name=sink2")))))
         (gst_object_set_name pipeline "camera")
         (let ((appsink (gst_bin_get_by_name pipeline "sink"))
-              (appsink2 (gst_bin_get_by_name pipeline "sink2"))
+              (appsink2 (and self-video? (gst_bin_get_by_name pipeline "sink2")))
               (data (make-u8vector (* width height 4)))
               (info (make-u64vector 2)))
           (gst_element_set_state pipeline GST_STATE_READY)
