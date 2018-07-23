@@ -32,33 +32,33 @@
   
   
   (slot udp-port              initialize #f getter generate)
-  (slot udp-task              initialize #f getter generate)
   (slot udp-stopping?         initialize #f getter generate)
   (slot origin-connections    initialize #f getter generate)
   (slot host/port-connections initialize #f getter generate)
   (slot server-channels       initialize #f getter generate)
+  (slot receive-task          initialize #f getter generate)
   
   
   (method (start self host service)
     (set! udp-port (open-udp (list
                                local-address: host
                                local-port-number: service)))
-    (set! udp-task (new Task 'udp-receive (lambda (task)
-                                            (receive-loop self task))
-                        priority: udp-priority))
     (set! udp-stopping? #f)
     (set! origin-connections (make-table))
     (set! host/port-connections (make-table))
     (set! server-channels (make-table))
-    (start-task udp-task))
+    (set! receive-task (new Task 'udp-receive (lambda (task)
+                                                (receive-loop self task))
+                            priority: udp-priority))
+    (start-task receive-task))
   
   
   (method (stop self)
     (set! udp-stopping? #t)
     (close-port udp-port)
-    (thread-join! (get-thread udp-task))
+    (thread-join! (get-thread receive-task))
     (set! udp-port #f)
-    (set! udp-task #f))
+    (set! receive-task #f))
   
   
   ;;;
@@ -169,17 +169,9 @@
   
   
   (method (receive-ack self data)
-    (let ((origin (read-udp-origin data))
-          (media-kind (read-udp-ack-media-kind data))
-          (missing (u8vector->object (read-udp-ack-latest-missing data))))
-      (let ((connection (origin->connection self origin)))
-        (when connection
-          (relay-ack self connection data)))
-      (send-missing self origin media-kind missing)))
-  
-  
-  (method (relay-ack self connection data)
-    (send-data self connection data))
+    (let ((origin (read-udp-origin data)))
+      ;; video is a hack for audio/video-self?
+      (broadcast-group self #f origin data)))
   
   
   (method (receive-nack self data)
@@ -207,11 +199,12 @@
                             (source-port (socket-info-port-number source-info)))
                         (let ((connection (host/port->connection self source-host source-port)))
                           (loop (for seq from expected below sequence)
-                                (send-nack self connection origin kind (add-nack channel seq)))))))))
+                                (add-nack channel seq))
+                          (send-nack self connection origin kind (get-latest-nacks channel))))))))
               ;; remember time information
               (update-time channel sequence data (get-retain-ring channel)))))
         (retain channel data)
-        (broadcast-data self kind data))))
+        (broadcast-group self kind origin data))))
   
   
   (method (send-missing self origin media-kind missing)
@@ -248,6 +241,23 @@
           (send-data self connection data)))))
   
   
+  (method (broadcast-group self kind origin data)
+    (let ((delegate (find-delegate-by-no (current-server) origin)))
+      (when delegate
+        (let ((group (get-group delegate)))
+          (when group
+            (for-each (lambda (member)
+                        (when (or (neq? member delegate)
+                                  (and audio-self? (or (not kind) (= kind udp-audio)))
+                                  (and video-self? (or (not kind) (= kind udp-video))))
+                          (let ((no (get-no member)))
+                            (let ((connection (table-ref origin-connections no #f)))
+                              (when connection
+                                (send-data self connection data))))))
+                      (get-members group)))))))
+  
+  
+  ;; not used anymore replaced by broadcast-group
   (method (broadcast-data self kind data)
     (let ((source-info (udp-source-socket-info udp-port)))
       (let ((source-host (socket-info-address source-info))
@@ -258,8 +268,8 @@
                   (port (get-port connection)))
               (when (or (not (host=? host source-host))
                         (not (service=? port source-port))
-                        (and (= kind udp-audio) audio-self?)
-                        (and (= kind udp-video) video-self?))
+                        (and audio-self? (or (not kind) (= kind udp-audio)))
+                        (and video-self? (or (not kind) (= kind udp-video))))
                 (send-data self connection data))))))))
   
   

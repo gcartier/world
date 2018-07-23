@@ -50,10 +50,11 @@
     (new World-Audio input: (pipeline mic-src server-sink))))
 
 
-(definition protected (audio-buffer-header? buffer)
+(definition protected (audio-buffer-header? buffer (offset 0))
   (let ((size (u8vector-length buffer)))
-    (and (>= size 7)
-         (equal? (subu8vector buffer 1 7) #u8(118 111 114 98 105 115)))))
+    (and (>= size (+ offset 7))
+         (equal? (subu8vector buffer (+ offset 1) (+ offset 7))
+                 #u8(118 111 114 98 105 115)))))
 
 
 (class World-Audio extends Object
@@ -82,6 +83,16 @@
     (release input))
   
   
+  (method package (resend-mic-headers self)
+    (let ((tier (current-client)))
+      (let ((mic (car (get-elements input))))
+        (for-each (lambda (info)
+                    (bind (buffer timestamp duration) info
+                      (send-client-audio tier buffer timestamp duration)))
+                  (get-headers mic)))))
+  
+  
+  @not-needed-it-would-seems
   (method package (reset-mic self)
     (let ((mic (car (get-elements input))))
       (let ((pipeline (get-pipeline mic)))
@@ -186,11 +197,12 @@
 (class Mic-Audio-Src extends Audio-Src
   
   
-  (slot pipeline              initialize #f accessors generate)
-  (slot appsink               initialize #f accessors generate)
-  (slot data     <u8vector+>  initialize #f accessors generate)
-  (slot info     <u64vector+> initialize #f accessors generate)
-  (slot task                  initialize #f accessors generate)
+  (slot headers               initialize '() accessors generate)
+  (slot pipeline              initialize #f  accessors generate)
+  (slot appsink               initialize #f  accessors generate)
+  (slot data     <u8vector+>  initialize #f  accessors generate)
+  (slot info     <u64vector+> initialize #f  accessors generate)
+  (slot task                  initialize #f  accessors generate)
   
   
   (method override (setup-element self)
@@ -244,6 +256,7 @@
     (set! data #f)
     (set! pipeline #f)
     (set! appsink #f)
+    (set! headers #f)
     (consume sink #f #f #f))
   
   
@@ -269,25 +282,21 @@
             (iter time))))))
   
   
-  (definition ccc 0)
-  (definition stt #f)
   (method override (process self)
     (let ((size (gst_app_sink_read appsink data info)))
       (when (/= size -1)
         (let ((buffer (subu8vector data 0 size))
               (timestamp (u64vector-ref info 0))
               (duration (u64vector-ref info 1)))
-          (when audio-show
-            (when (not stt)
-              (set! stt (current-seconds)))
-            (increase! ccc)
-            (let ((elapse (- (current-seconds) stt)))
-              (let ((frequency (and (/= elapse 0.) (/ ccc elapse))))
-                ;; vorbis specific
-                (let ((type (if (audio-buffer-header? buffer)
-                                '***header***
-                              'audio)))
-                  (terminal frequency size type)))))
+          (let ((header? (audio-buffer-header? buffer)))
+            (when audio-show
+              ;; vorbis specific
+              (let ((type (if header?
+                              '***header***
+                            'audio)))
+                (terminal size type)))
+            (when header?
+              (set! headers (append! headers (list (list buffer timestamp duration))))))
           (consume sink buffer timestamp duration))))))
 
 
@@ -323,9 +332,8 @@
     (let ((pipeline (gst-launch (tie "appsrc name=src")
                                 (and (eq? codec 'opus) "avdec_opus name=dec")
                                 (and (eq? codec 'vorbis) "vorbisdec name=dec")
-                                (let ((volume (or volume 1))
-                                      (mute (if (mute-audio? (current-zone)) "true" "false")))
-                                  (tie "volume name=volume volume={volume} mute={mute}"))
+                                (let ((volume (or volume 1)))
+                                  (tie "volume name=volume volume={volume}"))
                                 "audiopanorama name=panorama"
                                 (cond-expand
                                   (windows "directsoundsink name=sink buffer-time=200000 latency-time=100000")
