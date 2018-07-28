@@ -22,26 +22,30 @@
         (world.context)
         (world.interface)
         (world.settings)
+        (world.support)
         (world.task))
 
 
-(definition protected audio-denoise?
-  (world-setting 'world.audio-denoise? #f))
-
-(definition protected (set-audio-denoise? flag)
-  (set! audio-denoise? flag))
-
-
 (definition protected audio-codec
-  (world-setting 'world.audio-codec 'vorbis))
+  (world-setting 'world.audio-codec 'opus))
 
 
 (definition audio-show
   (world-setting 'world.audio-show #f))
 
 
-(definition audio-debug?
-  (world-setting 'world.audio-debug? #f))
+(definition protected audio-denoise?
+  (world-setting 'world.audio-denoise? #t))
+
+(definition protected (set-audio-denoise? flag)
+  (set! audio-denoise? flag))
+
+
+(definition protected audio-properties
+  (world-setting 'world.audio-properties "audio-type=2048"))
+
+(definition protected (set-audio-properties properties)
+  (set! audio-properties properties))
 
 
 ;;;
@@ -55,13 +59,6 @@
                        consumer: (lambda (buffer timestamp duration)
                                    (send-client-audio (current-client) buffer timestamp duration)))))
     (new World-Audio input: (pipeline mic-src server-sink))))
-
-
-(definition protected (audio-buffer-header? buffer (offset 0))
-  (let ((size (u8vector-length buffer)))
-    (and (>= size (+ offset 7))
-         (equal? (subu8vector buffer (+ offset 1) (+ offset 7))
-                 #u8(118 111 114 98 105 115)))))
 
 
 (class World-Audio extends Object
@@ -90,25 +87,6 @@
     (release input))
   
   
-  (method package (resend-mic-headers self)
-    (let ((tier (current-client)))
-      (let ((mic (car (get-elements input))))
-        (for-each (lambda (info)
-                    (bind (buffer timestamp duration) info
-                      (send-client-audio tier buffer timestamp duration)))
-                  (get-mic-headers mic)))))
-  
-  
-  @not-needed-it-would-seems
-  (method package (reset-mic self)
-    (let ((mic (car (get-elements input))))
-      (let ((pipeline (get-pipeline mic)))
-        (and pipeline
-             (begin
-               (gst_element_set_state pipeline GST_STATE_READY)
-               (gst_element_set_state pipeline GST_STATE_PLAYING))))))
-  
-  
   ;;;
   ;;;; Input
   ;;;
@@ -128,6 +106,9 @@
   (method package (start-audio self (feedback?: feedback? #t))
     (when (client?)
       (let ((world (current-world)))
+        (when audio-self?
+          (let ((id (get-id (current-me))))
+            (player-output self id)))
         (start self)
         (update-parameter world 'audio)
         (when feedback?
@@ -138,6 +119,11 @@
     (when (client?)
       (let ((world (current-world)))
         (stop self)
+        (when audio-self?
+          (let ((id (get-id (current-me))))
+            (let ((output (find-output self id)))
+              (when output
+                (close-output self id output)))))
         (update-parameter world 'audio)
         (when feedback?
           (display-on/off world "Audio" (playing? input))))))
@@ -204,7 +190,6 @@
 (class Mic-Audio-Src extends Audio-Src
   
   
-  (slot mic-headers                 initialize '() accessors generate)
   (slot mic-pipeline                initialize #f  accessors generate)
   (slot mic-sink                    initialize #f  accessors generate)
   (slot mic-data       <u8vector+>  initialize #f  accessors generate)
@@ -220,66 +205,56 @@
   
   (method override (setup-element self)
     (nextmethod self)
-    (let ((codec audio-codec))
-      (let ((pipeline (gst-launch (cond-expand
-                                    (windows "autoaudiosrc format=S16LE layout=interleaved rate=80000 channels=2 name=src")
-                                    (mac "osxaudiosrc name=src")
-                                    (else "autoaudiosrc format=F32LE layout=interleaved rate=80000 channels=2 name=src"))
-                                  (cond-expand
-                                    (mac "audioresample")
-                                    (else #f))
-                                  (cond-expand
-                                    (mac "audio/x-raw, format=S16LE, layout=interleaved, rate=48000, channels=1")
-                                    (else #f))
-                                  "appsink name=sink")))
-        (gst_object_set_name pipeline "mic")
-        (let ((appsink (gst_bin_get_by_name pipeline "sink"))
-              (data (make-u8vector 4096))
-              (info (make-u64vector 2)))
-          (gst_element_set_state pipeline GST_STATE_READY)
-          (set! self.mic-data data)
-          (set! self.mic-info info)
-          (set! self.mic-pipeline pipeline)
-          (set! self.mic-sink appsink)))
-      (let ((pipeline (gst-launch "appsrc name=src"
-                                  "audioconvert"
-                                  "audioresample"
-                                  "audio/x-raw, format=F32LE, layout=interleaved, rate=48000, channels=1"
-                                  (and (eq? codec 'opus) (tie "avenc_opus name=enc"))
-                                  (and (eq? codec 'vorbis) (tie "vorbisenc name=enc"))
-                                  "appsink name=sink")))
-        (gst_object_set_name pipeline "codec")
-        (let ((appsrc (gst_bin_get_by_name pipeline "src"))
-              (appsink (gst_bin_get_by_name pipeline "sink"))
-              (data (make-u8vector 4096))
-              (info (make-u64vector 2)))
-          (gst_app_src_set_caps appsrc
-             (gst_caps "audio/x-raw"
-               "format"   (g_value_string "S16LE")
-               "layout"   (g_value_string "interleaved")
-               "rate"     (g_value_int 48000)
-               "channels" (g_value_int 1)))
-          (gst_element_set_state pipeline GST_STATE_READY)
-          (set! self.codec-data data)
-          (set! self.codec-info info)
-          (set! self.codec-pipeline pipeline)
-          (set! self.codec-src appsrc)
-          (set! self.codec-sink appsink)))))
+    ;; mic
+    (let ((pipeline (gst-launch "autoaudiosrc format=S16LE layout=interleaved rate=48000 channels=1 name=src"
+                                "audioresample"
+                                "audio/x-raw, format=S16LE, layout=interleaved, rate=48000, channels=1"
+                                "appsink name=sink")))
+      (gst_object_set_name pipeline "mic")
+      (let ((appsink (gst_bin_get_by_name pipeline "sink"))
+            (data (make-u8vector 4096))
+            (info (make-u64vector 2)))
+        (gst_element_set_state pipeline GST_STATE_READY)
+        (set! self.mic-data data)
+        (set! self.mic-info info)
+        (set! self.mic-pipeline pipeline)
+        (set! self.mic-sink appsink)))
+    ;; codec
+    (let ((pipeline (gst-launch "appsrc name=src"
+                                (tie "opusenc {audio-properties} name=enc")
+                                "appsink name=sink")))
+      (gst_object_set_name pipeline "codec")
+      (let ((appsrc (gst_bin_get_by_name pipeline "src"))
+            (appsink (gst_bin_get_by_name pipeline "sink"))
+            (data (make-u8vector 4096))
+            (info (make-u64vector 2)))
+        (gst_app_src_set_caps appsrc
+                              (gst_caps "audio/x-raw"
+                                        "format"   (g_value_string "S16LE")
+                                        "layout"   (g_value_string "interleaved")
+                                        "rate"     (g_value_int 48000)
+                                        "channels" (g_value_int 1)))
+        (gst_element_set_state pipeline GST_STATE_READY)
+        (set! self.codec-data data)
+        (set! self.codec-info info)
+        (set! self.codec-pipeline pipeline)
+        (set! self.codec-src appsrc)
+        (set! self.codec-sink appsink))))
   
   
   (method override (start-element self)
     (define (mic-start)
       (let ((procedure
               (lambda (task)
-                (mic-taskwhatever self task))))
-        (let ((task (new Task 'denoise procedure priority: audio-priority)))
+                (mic-loop self task))))
+        (let ((task (new Task 'mic procedure priority: audio-priority)))
           (start-task task)
           (set! self.mic-task task))))
     
     (define (codec-start)
       (let ((procedure
               (lambda (task)
-                (codec-taskwhatever self task))))
+                (codec-loop self task))))
         (let ((task (new Task 'codec procedure priority: audio-priority)))
           (start-task task)
           (set! self.codec-task task))))
@@ -314,17 +289,20 @@
     (set! mic-data #f)
     (set! mic-pipeline #f)
     (set! mic-sink #f)
-    (set! mic-headers #f)
     (consume sink #f #f #f)
     (gst_element_release codec-pipeline)
     (set! codec-info #f)
     (set! codec-data #f)
     (set! codec-pipeline #f)
     (set! codec-src #f)
-    (set! codec-sink #f))
+    (set! codec-sink #f)
+    (cond-expand
+      (mac
+       (gst_denoise_off))
+      (else)))
   
   
-  (method (mic-taskwhatever self task)
+  (method (mic-loop self task)
     (declare (proper-tail-calls))
     (with-task task
       (lambda (exit)
@@ -340,13 +318,13 @@
                   (unless (> elapse max-elapse)
                     (let ((history (current-history)))
                       (unless (get-paused? history)
-                        (denoise self)))))))
+                        (mic-process self)))))))
             (let ((duration (- (current-seconds) time)))
               (task-sleep task audio-period duration exit))
             (iter time))))))
   
   
-  (method (denoise self)
+  (method (mic-process self)
     (let ((size (gst_app_sink_read mic-sink mic-data mic-info)))
       (when (/= size -1)
         (let ((buffer (subu8vector mic-data 0 size))
@@ -354,13 +332,13 @@
               (duration (u64vector-ref mic-info 1)))
           (cond-expand
             (mac
-          (when audio-denoise?
-            (gst_denoise buffer size)))
+             (when audio-denoise?
+               (gst_denoise buffer size)))
             (else))
           (gst_app_src_write codec-src buffer size timestamp duration)))))
   
   
-  (method (codec-taskwhatever self task)
+  (method (codec-loop self task)
     (declare (proper-tail-calls))
     (with-task task
       (lambda (exit)
@@ -388,15 +366,8 @@
         (let ((buffer (subu8vector codec-data 0 size))
               (timestamp (u64vector-ref codec-info 0))
               (duration (u64vector-ref codec-info 1)))
-          (let ((header? (audio-buffer-header? buffer)))
-            (when audio-show
-              ;; vorbis specific
-              (let ((type (if header?
-                              '***header***
-                            'audio)))
-                (terminal size type)))
-            (when header?
-              (set! mic-headers (append! mic-headers (list (list buffer timestamp duration))))))
+          (when audio-show
+            (terminal 'audio size))
           (consume sink buffer timestamp duration))))))
 
 
@@ -430,8 +401,7 @@
   (method override (setup-element self)
     (nextmethod self)
     (let ((pipeline (gst-launch (tie "appsrc name=src")
-                                (and (eq? codec 'opus) "avdec_opus name=dec")
-                                (and (eq? codec 'vorbis) "vorbisdec name=dec")
+                                "opusdec name=dec"
                                 (let ((volume (or volume 1)))
                                   (tie "volume name=volume volume={volume}"))
                                 "audiopanorama name=panorama"
@@ -440,19 +410,9 @@
                                   (else "autoaudiosink name=sink")))))
       (gst_object_set_name pipeline "output")
       (let ((appsrc (gst_bin_get_by_name pipeline "src")))
-        (case codec
-          ((vorbis)
-           (gst_app_src_set_caps appsrc
-             (gst_caps "audio/x-vorbis")))
-          (else
-           (gst_app_src_set_caps appsrc
-             (gst_caps "audio/x-raw"
-               "format"   (g_value_string (cond-expand
-                                            (windows "S16LE")
-                                            (else "F32LE")))
-               "layout"   (g_value_string "interleaved")
-               "rate"     (g_value_int 80000)
-               "channels" (g_value_int 2)))))
+        (gst_app_src_set_caps appsrc
+                              (gst_caps "audio/x-opus"
+                                        "channel-mapping-family" (g_value_int 0)))
         (g_object_set appsrc
           "is-live"     (g_value_boolean #t)
           "stream-type" (g_value_int GST_APP_STREAM_TYPE_STREAM)
