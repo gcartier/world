@@ -434,6 +434,7 @@
               (when last-sequence
                 (let ((expected (+ last-sequence 1)))
                   (when (> sequence expected)
+                    ;; zanzaa braindead if gap is huge
                     (loop (for seq from expected below sequence)
                           (add-nack channel seq))
                     (send-nack self origin kind (get-latest-nacks channel)))))
@@ -699,63 +700,55 @@
   
   
   (method (process-frame self datas)
-    (let ((count (length datas))
-          (first (car datas)))
-      (increase! processed count)
-      (let ((kind (read-udp-kind first))
-            (origin (read-udp-origin first))
-            (sequence (read-udp-sequence first))
-            (frame (read-udp-frame first))
-            (part (read-udp-part first))
-            (total (read-udp-total first))
-            (timestamp (read-udp-timestamp first))
-            (duration (read-udp-duration first)))
-        ;; there is a gap in the frames
-        (when (and process-last-frame (> frame (+ process-last-frame 1)))
-          ;; audio has no problem with gaps
-          (when (= kind udp-video)
-            (process-state-waiting self kind)))
-        (if (= total count)
-            ;; complete frame
-            (let ((last-sequence (+ sequence total -1)))
-              (if (= total 1)
-                  (process-media self kind origin sequence last-sequence frame timestamp duration (read-udp-payload first))
-                (let ((chunks (map read-udp-payload datas)))
-                  (let ((data (apply u8vector-append chunks)))
-                    (process-media self kind origin sequence last-sequence frame timestamp duration data)))))
-          ;; incomplete frame
-          ;; audio has no problem with drops
-          (when (= kind udp-video)
-            (process-state-waiting self kind))
-          @reported-by-process-missing
-          (let ((missing (difference (naturals sequence (+ sequence total)) (map read-udp-sequence datas))))
-            (format :terminal "{s} {s} {s} {s} {l}{%}" remote-name (udp-name kind) '***partial-frame*** 'missing missing))))))
-  
-  
-  (method (process-media self kind origin sequence last-sequence frame timestamp duration buffer)
     (let ((player (find-player-by-no origin)))
-      ;; togetherimprove
       ;; quick solution for when logging in and starting receiving
       ;; someone's media before the client is actually registered
       ;; need to revisit this code for a cleaner solution
       (when player
         (let ((id (get-id player)))
-          (define (process-audio)
-            (if (equal? buffer udp-media-off)
-                (receive-server-audio (current-audio) id #f #f #f)
-              (receive-server-audio (current-audio) id buffer timestamp duration)))
-          
-          (define (process-video)
-            (if (equal? buffer udp-media-off)
-                (receive-server-video (current-video) id #f #f #f)
-              (if (eq? process-state 'ok)
-                  (receive-server-video (current-video) id buffer timestamp duration)
-                (when (video-buffer-header? buffer)
-                  (process-state-ok self kind)
-                  (receive-server-video (current-video) id buffer timestamp duration)))))
-          
-          (ecase kind
-            ((udp-audio)
-             (process-audio))
-            ((udp-video)
-             (process-video)))))))))
+          (let ((count (length datas))
+                (first (car datas)))
+            (increase! processed count)
+            (let ((kind (read-udp-kind first))
+                  (origin (read-udp-origin first))
+                  (sequence (read-udp-sequence first))
+                  (frame (read-udp-frame first))
+                  (part (read-udp-part first))
+                  (total (read-udp-total first))
+                  (timestamp (read-udp-timestamp first))
+                  (duration (read-udp-duration first)))
+              (define (process-audio)
+                (let ((complete-buffer (assemble-chunks)))
+                  ;; audio has no problem with gaps
+                  (when complete-buffer
+                    (if (equal? complete-buffer udp-media-off)
+                        (receive-server-audio (current-audio) id #f #f #f)
+                      (receive-server-audio (current-audio) id complete-buffer timestamp duration)))))
+              
+              (define (process-video)
+                (let ((complete-buffer (assemble-chunks)))
+                  (if complete-buffer
+                      (if (equal? complete-buffer udp-media-off)
+                          (receive-server-video (current-video) id #f #f #f)
+                        (let ((no-gap? (or (not process-last-frame) (= frame (+ process-last-frame 1)))))
+                          (if (or (and no-gap? (eq? process-state 'ok))
+                                  (video-buffer-header? complete-buffer))
+                              (begin
+                                (process-state-ok self kind)
+                                (set! process-last-frame frame)
+                                (receive-server-video (current-video) id complete-buffer timestamp duration))
+                            (process-state-waiting self kind))))
+                    (process-state-waiting self kind))))
+              
+              (define (assemble-chunks)
+                (and (= total count)
+                     (if (= total 1)
+                         (read-udp-payload first)
+                       (let ((chunks (map read-udp-payload datas)))
+                         (apply u8vector-append chunks)))))
+              
+              (ecase kind
+                ((udp-audio)
+                 (process-audio))
+                ((udp-video)
+                 (process-video)))))))))))
