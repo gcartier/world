@@ -162,7 +162,8 @@
   (slot inputs            getter generate)
   (slot outputs           getter generate)
   (slot ordered-outputs   getter generate)
-  (slot fullscreen-output getter generate)
+  (slot fullscreen-output accessors generate)
+  (slot self-output       getter generate)
   (slot camera-mutex      getter generate)
   (slot render-hook       accessors generate)
   
@@ -174,6 +175,7 @@
     (set! self.outputs (make-table test: equal?))
     (set! ordered-outputs '())
     (set! fullscreen-output #f)
+    (set! self-output #f)
     (set! camera-mutex (make-mutex 'camera))
     (set! render-hook #f))
   
@@ -260,9 +262,8 @@
     (when (client?)
       (let ((world (current-world)))
         (stop self)
-        (let ((self-output (table-ref outputs #f #f)))
-          (when self-output
-            (set-stream-state self-output 'off)))
+        (when self-output
+          (set-stream-state self-output 'off))
         (update-parameter world 'video)
         (when feedback?
           (display-on/off world "Video" (playing? input))))))
@@ -318,6 +319,12 @@
   
   
   (method package (player-output self id (player: player #f) (position: position #f) (size: size #f) (resolution: resolution #f) (layout: layout #f) (codec: codec #f))
+    (define (add-output output)
+      (if (and self-output (neq? output self-output))
+          ;; reposition so self output is always last
+          (set! ordered-outputs (append! (remove! self-output ordered-outputs) (list output self-output)))
+        (set! ordered-outputs (append! ordered-outputs (list output)))))
+    
     (or (table-ref outputs id #f)
         ;; the or is a quick hack to test self video
         (let ((player (or player (find-entity id))))
@@ -343,7 +350,9 @@
                              alpha-overlay: video-alpha
                              overlay?: video-overlay?)))))
             (table-set! outputs id output)
-            (set! ordered-outputs (append! ordered-outputs (list output)))
+            (when (not id)
+              (set! self-output output))
+            (add-output output)
             (update-layouts self)
             (setup output)
             (start output)
@@ -353,8 +362,18 @@
   (method package (close-output self id output)
     (table-clear outputs id)
     (set! ordered-outputs (remove! output ordered-outputs))
+    (when (eq? output self-output)
+      (set! self-output #f))
+    (when (eq? output fullscreen-output)
+      (set! fullscreen-output #f))
     (release output)
     (update-layouts self))
+  
+  
+  (method package (effective-fullscreen-output self)
+    (or fullscreen-output
+        (and (not-null? ordered-outputs)
+             (car ordered-outputs))))
   
   
   (method package (receive-server-video self id buffer timestamp duration)
@@ -385,21 +404,23 @@
   (method package (render-outputs self)
     (unless (and render-hook
                  (render-hook self))
-      (let ((self-output (table-ref outputs #f #f)))
+      (if (eq? video-layout 'fullscreen)
+          (let ((fullscreen-output (effective-fullscreen-output self)))
+            (when fullscreen-output
+              (render fullscreen-output)))
         ;; use ordered-outputs so order is stable
-        (for-each (lambda (output)
-                    (unless (eq? output self-output)
-                      (render output)))
-                  ordered-outputs))))
+        (for-each render ordered-outputs))))
   
   
-  (method package (render-self self)
+  (method package (render-minis self)
     (unless (and render-hook
                  (render-hook self))
-      (let ((self-output (table-ref outputs #f #f)))
-        ;; render self output last for fullscreen
-        (when self-output
-          (render self-output)))))
+      (when (eq? video-layout 'fullscreen)
+        (let ((fullscreen-output (effective-fullscreen-output self)))
+          (for-each (lambda (output)
+                      (unless (eq? output fullscreen-output)
+                        (render output)))
+                    ordered-outputs)))))
   
   
   ;;;
@@ -464,13 +485,6 @@
   
   
   (method package (fullscreen-layout self)
-    (unless (and fullscreen-output
-                 (table-find outputs fullscreen-output))
-      (let ((output (find-if (lambda (output)
-                               (let ((id (table-find outputs output)))
-                                 id))
-                             ordered-outputs)))
-        (set! fullscreen-output output)))
     (set! video-layout 'fullscreen)
     (layout-outputs self))
   
@@ -503,7 +517,7 @@
           (define (adjust-fullscreen rect)
             (if (eq? video-mode 'fit)
                 rect
-              ;; quick test for fill
+              ;; fill mode
               (let ((ratio (fit-rects rect bounds 'fill)))
                 (let ((new-width (fxround (* (cast <fl> (rect-width rect)) ratio)))
                       (new-height (fxround (* (cast <fl> (rect-height rect)) ratio))))
@@ -518,34 +532,20 @@
             ((gallery)
              (if (= num-players 1)
                  (list (adjust-fullscreen (car (layout-tiles 1 bounds))))
-               ;; quicky so self is botton in a 2 call
-               (if (= num-players 2)
-                   (let ((self-output (find-output self #f)))
-                     (if self-output
-                         (let ((rectangles (layout-tiles num-players bounds)))
-                           (if (eq? (car ordered-outputs) self-output)
-                               rectangles
-                             (reverse rectangles)))
-                       (layout-tiles num-players bounds)))
-                 (layout-tiles num-players bounds))))
+               (reverse (layout-tiles num-players bounds))))
             ((fullscreen)
              (let ((width (if (> num-players 2) 224 288))
                    (height (if (> num-players 2) 126 162)))
                (let ((full (car (layout-tiles 1 bounds)))
-                     (mini (new Rect (- r width) (- b height) r b))
                      (border 0))
-                 (let ((l (- (get-left mini) border)))
+                 (let ((r (- r border))
+                       (fullscreen-output (effective-fullscreen-output self)))
                    (map (lambda (output)
                           (if (eq? output fullscreen-output)
                               (adjust-fullscreen full)
-                            (let ((id (table-find outputs output)))
-                              (if (not id)
-                                  mini
-                                (prog1 (new Rect (- l width) (- b height) l b)
-                                  (decrease! l (+ width border)))))))
-                        ordered-outputs))))
-             @display-everyone-that-is-not-fullscreen
-             (cons bounds (layout-tiles (- num-players 1) (new Rect (- r 200) 500 r b) vertical-justification: 'tail)))
+                            (prog1 (new Rect (- r width) (- b height) r b)
+                              (decrease! r (+ width border)))))
+                        ordered-outputs)))))
             (else
              #f)))))))
 
