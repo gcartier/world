@@ -170,8 +170,16 @@
   
   (method (receive-ack self data)
     (let ((origin (read-udp-origin data)))
-      ;; video is a hack for audio/video-self?
-      (broadcast-group self #f origin data)))
+      ;; throttling
+      (let ((connection (origin->connection self origin)))
+        (when connection
+          (set-last-received-ack connection (current-seconds))
+          (when (get-throttle-media? connection)
+            (set-throttle-media? connection #f)
+            (when udp-show-throttle?
+              (format :terminal "{s} {s} {s} {s}{%}" remote-name 'THROTTLE origin 'OFF)))))
+      ;; kind #f is a hack for audio/video-self?
+      (broadcast-ack self #f origin data)))
   
   
   (method (receive-nack self data)
@@ -209,7 +217,7 @@
                 (let ((connection (host/port->connection self source-host source-port)))
                   (send-nack self connection origin kind latest-missing))))))
         (retain channel data)
-        (broadcast-group self kind origin data))))
+        (broadcast-media self kind origin data))))
   
   
   (method (send-missing self origin media-kind missing)
@@ -246,7 +254,7 @@
           (send-data self connection data)))))
   
   
-  (method (broadcast-group self kind origin data)
+  (method (broadcast-ack self kind origin data)
     (let ((delegate (find-delegate-by-no (current-server) origin)))
       (when delegate
         (let ((group (get-group delegate)))
@@ -259,6 +267,32 @@
                             (let ((connection (table-ref origin-connections no #f)))
                               (when connection
                                 (send-data self connection data))))))
+                      (get-members group)))))))
+  
+  
+  (method (broadcast-media self kind origin data)
+    (let ((delegate (find-delegate-by-no (current-server) origin)))
+      (when delegate
+        (let ((group (get-group delegate)))
+          (when group
+            (for-each (lambda (member)
+                        (when (or (neq? member delegate)
+                                  (and audio-self? (or (not kind) (= kind udp-audio)))
+                                  (and video-self? (or (not kind) (= kind udp-video))))
+                          (let ((no (get-no member)))
+                            (let ((connection (table-ref origin-connections no #f)))
+                              (when connection
+                                (let ((last-received-ack (get-last-received-ack connection)))
+                                  (when last-received-ack
+                                    (unless (get-throttle-media? connection)
+                                      (let ((now (current-seconds))
+                                            (throttle (if (= kind udp-audio) udp-audio-throttle udp-video-throttle)))
+                                        (if (> (- now last-received-ack) throttle)
+                                            (begin
+                                              (set-throttle-media? connection #t)
+                                              (when udp-show-throttle?
+                                                (format :terminal "{s} {s} {s} {s}{%}" remote-name 'THROTTLE no 'ON)))
+                                          (send-data self connection data)))))))))))
                       (get-members group)))))))
   
   
@@ -294,11 +328,13 @@
 (class UDP-Connection extends Object
   
   
-  (slot host       getter generate)
-  (slot port       getter generate)
-  (slot local-host getter generate)
-  (slot local-port getter generate)
-  (slot simulator  getter generate)
+  (slot host                            getter generate)
+  (slot port                            getter generate)
+  (slot local-host                      getter generate)
+  (slot local-port                      getter generate)
+  (slot simulator                       getter generate)
+  (slot last-received-ack initialize #f accessors generate)
+  (slot throttle-media?   initialize #f accessors generate)
   
   
   (method override (initialize self host port local-host local-port simulator)
