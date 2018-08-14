@@ -52,23 +52,25 @@
 (class UDP-Client extends Object
   
   
-  (slot udp-port         initialize #f getter generate)
-  (slot udp-stopping?    initialize #f getter generate)
-  (slot local-host       initialize #f getter generate)
-  (slot local-port       initialize #f getter generate)
-  (slot server-host      initialize #f getter generate)
-  (slot server-port      initialize #f getter generate)
-  (slot write-mutex      initialize #f getter generate)
-  (slot send-channels    initialize #f getter generate)
-  (slot receive-channels initialize #f getter generate)
-  (slot receive-task     initialize #f getter generate)
-  (slot ack-task         initialize #f getter generate)
-  (slot started?         initialize #f getter generate)
-  (slot camera-resetting initialize #f getter generate)
-  (slot topology         initialize #f getter generate)
-  (slot peers            initialize #f getter generate)
-  (slot peers-mutex      initialize #f getter generate)
-  (slot simulator        initialize #f getter generate)
+  (slot udp-port          initialize #f getter generate)
+  (slot udp-stopping?     initialize #f getter generate)
+  (slot local-host        initialize #f getter generate)
+  (slot local-port        initialize #f getter generate)
+  (slot server-host       initialize #f getter generate)
+  (slot server-port       initialize #f getter generate)
+  (slot write-mutex       initialize #f getter generate)
+  (slot send-channels     initialize #f getter generate)
+  (slot receive-channels  initialize #f getter generate)
+  (slot receive-task      initialize #f getter generate)
+  (slot ack-task          initialize #f getter generate)
+  (slot started?          initialize #f getter generate)
+  (slot last-received-ack initialize #f getter generate)
+  (slot throttle-media?   initialize #f getter generate)
+  (slot camera-resetting  initialize #f getter generate)
+  (slot topology          initialize #f getter generate)
+  (slot peers             initialize #f getter generate)
+  (slot peers-mutex       initialize #f getter generate)
+  (slot simulator         initialize #f getter generate)
   
   
   (method (connect self client-no local-host host service)
@@ -346,18 +348,17 @@
                                                 0.)
                                   (loop (+ part 1) (+ pos content-size))))))))))))))
           
-          (let ((last-received-ack (get-last-received-ack channel)))
-            (when last-received-ack
-              (if (get-throttle-media? channel)
-                  (next-frame-sequence! channel)
-                (let ((now (current-seconds))
-                      (throttle (if (= kind udp-audio) udp-audio-throttle udp-video-throttle)))
-                  (if (> (- now last-received-ack) throttle)
-                      (begin
-                        (set-throttle-media? channel #t)
-                        (when udp-show-throttle?
-                          (format :terminal "{s} {s} {s} {s}{%}" remote-name 'THROTTLE (present-media-kind kind) 'ON)))
-                    (send)))))))))
+          (when last-received-ack
+            (if throttle-media?
+                (next-frame-sequence! channel)
+              (let ((now (current-seconds))
+                    (throttle (if (= kind udp-audio) udp-audio-throttle udp-video-throttle)))
+                (if (> (- now last-received-ack) throttle)
+                    (begin
+                      (set! throttle-media? #t)
+                      (when udp-show-throttle?
+                        (format :terminal "{s} {s} {s} {s}{%}" remote-name 'THROTTLE (present-media-kind kind) 'ON)))
+                  (send))))))))
     (mutex-unlock! write-mutex))
   
   
@@ -449,19 +450,19 @@
         (for-each (lambda (info)
                     (bind (origin media-kind client-state) info
                       (when (= origin client-no)
-                        (let ((channel (find-send-channel self media-kind)))
-                          (when channel
-                            ;; throttling
-                            (set-last-received-ack channel (current-seconds))
-                            (when (get-throttle-media? channel)
-                              (set-throttle-media? channel #f)
-                              ;; force camera reset in the code below
-                              (set! client-state 'waiting)
-                              (when udp-show-throttle?
-                                (format :terminal "{s} {s} {s} {s}{%}" remote-name 'THROTTLE (present-media-kind media-kind) 'OFF)))
-                            ;; camera reset
-                            (when (= media-kind udp-video)
-                              (when (eq? client-state 'waiting)
+                        ;; throttling
+                        (set! last-received-ack (current-seconds))
+                        (when throttle-media?
+                          (set! throttle-media? #f)
+                          ;; force camera reset in the code below
+                          (set! client-state 'waiting)
+                          (when udp-show-throttle?
+                            (format :terminal "{s} {s} {s} {s}{%}" remote-name 'THROTTLE (present-media-kind media-kind) 'OFF)))
+                        ;; camera reset
+                        (when (= media-kind udp-video)
+                          (when (eq? client-state 'waiting)
+                            (let ((channel (find-send-channel self media-kind)))
+                              (when channel
                                 (if (and camera-resetting
                                          (= camera-resetting (get-data-sequence channel)))
                                     (when udp-show-resets?
@@ -605,13 +606,11 @@
 (class UDP-Send-Channel extends UDP-Channel
   
   
-  (slot data-sequence     accessors generate)
-  (slot frame-sequence    accessors generate)
-  (slot last-timestamp    accessors generate)
-  (slot last-received-ack accessors generate)
-  (slot throttle-media?   accessors generate)
-  (slot retain-ring       getter generate)
-  (slot release-task      getter generate)
+  (slot data-sequence  accessors generate)
+  (slot frame-sequence accessors generate)
+  (slot last-timestamp accessors generate)
+  (slot retain-ring    getter generate)
+  (slot release-task   getter generate)
   
   
   (method override (initialize self media-kind)
@@ -619,8 +618,6 @@
     (set! self.data-sequence 0)
     (set! self.frame-sequence 0)
     (set! self.last-timestamp #f)
-    (set! self.last-received-ack #f)
-    (set! self.throttle-media? #f)
     ;; make it really big until time ring is a real ring
     (set! self.retain-ring (new Time-Ring 40096 @w 512 @max-size: +inf.0 now-proc: (lambda () (now-timestamp self udp-retain-window))))
     (set! self.release-task (new Task 'udp-release (lambda (task)
