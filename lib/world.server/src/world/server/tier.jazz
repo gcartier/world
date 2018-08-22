@@ -24,10 +24,13 @@
         (jazz.network)
         (jazz.process)
         (jazz.presence)
+        (jazz.presence.transmission)
+        (jazz.syntax (phase syntax))
         (jazz.zlib)
         (world)
         (world.assets)
         (world.autoload)
+        (world.configure)
         (world.context)
         (world.geometry)
         (world.history)
@@ -43,19 +46,22 @@
         (world.server.serving)
         (world.server.udp)
         (world.settings)
-        (world.support))
+        (world.support)
+        (world.task))
 
 
 (class Server-Tier extends Serving-Tier implements Server-Interface
   
   
-  (slot configuration                                      getter generate)
-  (slot delegates     initialize '()                       getter generate)
-  (slot instances     initialize (make-table test: equal?) getter generate)
-  (slot zones         initialize '()                       getter generate)
-  (slot groups        initialize '()                       getter generate)
-  (slot hits          initialize 0                         getter generate)
-  (slot udp-server    initialize #f                        getter generate)
+  (slot configuration                                       getter generate)
+  (slot delegates      initialize '()                       getter generate)
+  (slot disconnected   initialize '()                       getter generate)
+  (slot instances      initialize (make-table test: equal?) getter generate)
+  (slot zones          initialize '()                       getter generate)
+  (slot groups         initialize '()                       getter generate)
+  (slot hits           initialize 0                         getter generate)
+  (slot aliveness-task initialize #f                        getter generate)
+  (slot udp-server     initialize #f                        getter generate)
   
   
   (method override (initialize self dir)
@@ -71,6 +77,7 @@
   
   (method override (startup self)
     (nextmethod self)
+    (start-aliveness-task self)
     (start-udp-server self))
   
   
@@ -83,6 +90,7 @@
   
   (method override (shutdown self)
     (stop-udp-server self)
+    (stop-aliveness-task self)
     (detach-clients self))
   
   
@@ -162,15 +170,15 @@
   
   
   (method (count-alive self)
-    (count-if still-alive? delegates))
+    (length delegates))
   
   
   (method package (collect-alive self)
-    (sort > (collect-if still-alive? delegates) key: get-alive))
+    (sort ci<? delegates key: get-name))
   
   
   (method package (collect-disconnected self)
-    (collect-if (lambda (delegate) (not (still-alive? delegate))) delegates))
+    disconnected)
   
   
   ;;;
@@ -312,7 +320,6 @@
           (let ((reconnected-delegate
                   (and existing-delegate
                        (or (get-exception existing-delegate)
-                           (not (still-alive? existing-delegate))
                            (not (alive? (get-client existing-delegate))))
                        existing-delegate)))
             (if (and existing-delegate
@@ -384,7 +391,7 @@
       (set-state delegate 'stopped)
       (broadcast-peers self)
       (broadcast-hierarchy self)
-      (broadcast-exited self delegate)))
+      (broadcast-exited self delegate #f)))
   
   
   (method package (client-disconnect self client character-name)
@@ -446,14 +453,14 @@
                 delegates)))
   
   
-  (method (broadcast-exited self client-delegate)
+  (method (broadcast-exited self client-delegate disconnected?)
     (let ((client-name (get-name client-delegate)))
       (for-each (lambda (delegate)
                   (unless (eq? delegate client-delegate)
                     (let ((client (get-client delegate)))
                       (calling-client self delegate
                         (lambda ()
-                          (server-exited client client-name))))))
+                          (server-exited client client-name disconnected?))))))
                 delegates)))
   
   
@@ -787,11 +794,6 @@
              delegates))
   
   
-  ;; todo
-  (method (check-clients-liveliness self)
-    )
-  
-  
   (method package (tile-server self)
     (tile self))
   
@@ -896,6 +898,69 @@
          (delay-event
            (lambda ()
              (quit-process process)))))))
+  
+  
+  ;;;
+  ;;;; Aliveness
+  ;;;
+  
+  
+  (method (start-aliveness-task self)
+    (set! aliveness-task (new Task 'aliveness (lambda (task)
+                                                (aliveness-loop self task))
+                              priority: aliveness-priority))
+    (start-task aliveness-task))
+  
+  
+  (method (stop-aliveness-task self)
+    (exit-thread (get-thread aliveness-task))
+    (thread-join! (get-thread aliveness-task))
+    (set! aliveness-task #f))
+  
+  
+  (method (aliveness-loop self task)
+    (declare (proper-tail-calls))
+    (with-task task
+      (lambda (exit)
+        (let (iter (previous (current-seconds)))
+          (let ((time (current-seconds)))
+            (let ((elapse (- time previous)))
+              (with-task-mutex
+                (lambda ()
+                  (when (running? task)
+                    (site (aliveness on?: #t)
+                      (check-aliveness self)))))
+              (let ((duration (- (current-seconds) time)))
+                (task-sleep task aliveness-period duration exit))
+              (iter time)))))))
+  
+  
+  (method (check-aliveness self)
+    (let ((newly-disconnected '()))
+      (for-each (lambda (delegate)
+                  (when (not (still-alive? delegate))
+                    (disconnected-client self delegate)
+                    (set! newly-disconnected (cons delegate newly-disconnected))))
+                delegates)
+      (set! disconnected (collect-if keep-disconnected? disconnected))
+      (when (not-null? newly-disconnected)
+        (broadcast-hierarchy self)
+        (for-each (lambda (delegate)
+                    (broadcast-exited self delegate #t))
+                  newly-disconnected))))
+  
+  
+  (method (disconnected-client self delegate)
+    (logger "Disconnected {a}" (get-name delegate))
+    (set! delegates (remove! delegate delegates))
+    (set! disconnected (cons delegate disconnected))
+    (let ((group (get-group delegate)))
+      (when group
+        (leave-group self group delegate)))
+    (calling-client self delegate
+      (lambda ()
+        (catch (Connection-Broke exc)
+          (detach-client (get-client delegate))))))
   
   
   ;;;
