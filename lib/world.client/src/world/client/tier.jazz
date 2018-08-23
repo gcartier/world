@@ -98,8 +98,14 @@
     (set! mutex (make-mutex 'client))
     (set! assets (make-assets self directory))
     (set! players-cache (make-table test: eqv?))
-    ;; aec quicky
-    (set-remote-problem-handler #f)
+    (set-connection-problem-handler
+      (lambda (process connection remote-uuid)
+        (continuation-capture
+          (lambda (exit)
+            (catch (connection-exception? exc
+                     (delay-bailout-client self exc)
+                     (continuation-return exit #f))
+              (process connection remote-uuid))))))
     (start-remote-switchboard)
     (connect-to-server self)
     (connect-to-udp-server self)
@@ -334,6 +340,14 @@
       (quit)))
   
   
+  (method (delay-bailout-client self exc)
+    (delay-event
+      (lambda ()
+        (with-maybe-task-mutex
+          (lambda ()
+            (bailout-client self exc))))))
+  
+  
   (method package (send-client-alive self)
     (with-mutex self
       (lambda ()
@@ -565,16 +579,9 @@
   
   
   (method (calling-processing self thunk)
-    (define (delay-bailout exc)
-      (delay-event
-        (lambda ()
-          (with-maybe-task-mutex
-            (lambda ()
-              (bailout-client self exc))))))
-    
     (parameterize ((post-problem-handler
                      (lambda (exc)
-                       (delay-bailout exc))))
+                       (delay-bailout-client self exc))))
       (let ((exit (current-exit)))
         (define (bailout exc)
           ;; else if the current thread is the mutex owner
@@ -592,10 +599,10 @@
                   (quit)))
             (continuation-graft exit
               (lambda ()
-                (delay-bailout exc)))))
+                (delay-bailout-client self exc)))))
         
         (catch (connection-exception? exc
-                                      (bailout exc))
+                 (bailout exc))
           (let ((result (thunk)))
             (if (eq? result disconnect-marker)
                 (bailout (new Error message: "Received disconnect marker"))
