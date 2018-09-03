@@ -315,6 +315,7 @@
             ;; quick hack to give media off a timestamp
             (let ((last-timestamp (or (get-last-timestamp channel) 0)))
               (let ((off? (not buffer))
+                    (client-no (get-client-no (current-client)))
                     (frame (next-frame-sequence! channel))
                     (timestamp (or timestamp (+ last-timestamp 1)))
                     (duration (or duration 1))
@@ -335,7 +336,7 @@
                                 (let ((data (make-u8vector size)))
                                   (write-udp-sent data (current-seconds))
                                   (write-udp-kind data kind)
-                                  (write-udp-origin data (get-client-no (current-client)))
+                                  (write-udp-origin data client-no)
                                   (write-udp-sequence data sequence)
                                   (write-udp-frame data frame)
                                   (write-udp-part data part)
@@ -367,6 +368,12 @@
                                                 (fixnum->flonum sequence)
                                                 (if off? 0. 1.)
                                                 0.)
+                                  (when (= kind udp-video)
+                                    (record-event udp-id-create-packet
+                                                  (fixnum->flonum sequence)
+                                                  (fixnum->flonum client-no)
+                                                  (fixnum->flonum frame)
+                                                  (timestamp->flonum timestamp)))
                                   (loop-part (+ part 1) (+ pos content-size))))))))))))))
           
           (when last-received-ack
@@ -678,7 +685,18 @@
   
   
   (method protected (retain self data)
-    (insert retain-ring (read-udp-media-seconds data) data))
+    (insert retain-ring (read-udp-media-seconds data) data)
+    (let ((kind (read-udp-kind data)))
+      (when (= kind udp-video)
+        (let ((origin (read-udp-origin data))
+              (sequence (read-udp-sequence data))
+              (ring-size (get-count retain-ring))
+              (timestamp (read-udp-media-timestamp data)))
+          (record-event udp-id-add-retain
+                        (fixnum->flonum sequence)
+                        (fixnum->flonum origin)
+                        (fixnum->flonum ring-size)
+                        (timestamp->flonum timestamp))))))
   
   
   (method protected (release-loop self task)
@@ -690,8 +708,17 @@
             (if (not data)
                 (continuation-return exit #f)
               (site (udp-release on?: #t)
-                ;; nothing to do
-                #f)
+                (let ((kind (read-udp-kind data)))
+                  (when (= kind udp-video)
+                    (let ((origin (read-udp-origin data))
+                          (sequence (read-udp-sequence data))
+                          (ring-size (get-count retain-ring))
+                          (timestamp (read-udp-media-timestamp data)))
+                      (record-event udp-id-remove-retain
+                                    (fixnum->flonum sequence)
+                                    (fixnum->flonum origin)
+                                    (fixnum->flonum ring-size)
+                                    (timestamp->flonum timestamp))))))
               (loop))))))))
 
 
@@ -739,9 +766,22 @@
   
   (method protected (add-nack self seconds sequence)
     (set! latest-nacks (cons (cons seconds sequence) latest-nacks))
+    (let ((ring-size (length latest-nacks)))
+      (record-event udp-id-add-nack
+                    (fixnum->flonum sequence)
+                    (fixnum->flonum origin)
+                    (fixnum->flonum ring-size)
+                    0.))
     ;; trim when more than udp-latest-nacks
     (when (> (length latest-nacks) udp-latest-nacks)
-      (set-cdr! (tail latest-nacks (- udp-latest-nacks 1)) '()))
+      (let ((removed-sequence (cdr (last latest-nacks))))
+        (set-cdr! (tail latest-nacks (- udp-latest-nacks 1)) '())
+        (let ((ring-size (length latest-nacks)))
+          (record-event udp-id-remove-nack
+                        (fixnum->flonum removed-sequence)
+                        (fixnum->flonum origin)
+                        (fixnum->flonum ring-size)
+                        0.))))
     latest-nacks)
   
   
@@ -793,12 +833,20 @@
       (let ((inserted? (insert process-ring (read-udp-media-seconds data) data)))
         (when (and udp-show-discard? (not inserted?))
           (let ((kind (read-udp-kind data))
-                (sequence (read-udp-sequence data)))
+                (sequence (read-udp-sequence data))
+                (timestamp (read-udp-media-timestamp data)))
             (record-event udp-id-discard
                           (fixnum->flonum media-kind)
                           (fixnum->flonum sequence)
                           0.
                           0.)
+            (when (= media-kind udp-video)
+              (let ((origin (read-udp-origin data)))
+                (record-event udp-id-discard-packet
+                              (fixnum->flonum sequence)
+                              (fixnum->flonum origin)
+                              0.
+                              (timestamp->flonum timestamp))))
             (format :terminal "{s} {s} {s} {s}{%}" remote-name (present-media-kind kind) '***discard*** sequence))))))
   
   
