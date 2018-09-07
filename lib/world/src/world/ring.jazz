@@ -57,26 +57,26 @@
   
   (method public (give self obj)
     (mutex-lock! mutex)
+    ;; grow
+    (when (and (= count size)
+               (< size max-size))
+      (let ((new-size (min max-size (fxround (* size GOLDEN_GROWTH)))))
+        (let ((new-content (make-vector new-size))
+              (growth (- new-size size)))
+          (subvector-move! content 0 tail new-content 0)
+          (subvector-move! content tail size new-content (+ tail growth))
+          (set! size new-size)
+          (set! content new-content)
+          (set! head (modulo (+ head growth) size)))))
+    ;; insert
     (cond ((< count size)
            (vector-set! content tail obj)
            (set! tail (modulo (+ tail 1) size))
            (increase! count))
-          ((= size max-size)
+          (else
            (vector-set! content tail obj)
            (set! tail (modulo (+ tail 1) size))
-           (set! head tail))
-          (else
-           (let ((new-size (min max-size (fxround (* size GOLDEN_GROWTH)))))
-             (let ((new-content (make-vector new-size))
-                   (growth (- new-size size)))
-               (subvector-move! content 0 tail new-content 0)
-               (subvector-move! content tail size new-content (+ tail growth))
-               (set! size new-size)
-               (set! content new-content)
-               (vector-set! content tail obj)
-               (set! tail (modulo (+ tail 1) size))
-               (set! head (modulo (+ head growth) size))
-               (increase! count)))))
+           (set! head tail)))
     (condition-variable-signal! take-condvar)
     (mutex-unlock! mutex))
   
@@ -92,8 +92,7 @@
                (get)
              (mutex-unlock! mutex take-condvar)
              (mutex-lock! mutex)
-             (assert (> count 0)
-               (get)))
+             (get))
       (mutex-unlock! mutex))))
 
 
@@ -111,13 +110,11 @@
 ;;   (earliest)                (latest)
 
 
-;; to convert to a full ring at a later stage
-
-
 (class Time-Ring extends Object
   
   
   (slot size         <fx>        getter generate)
+  (slot max-size     <fx>        getter generate)
   (slot times        <f64vector> getter generate)
   (slot content      <vector>    getter generate)
   (slot mutex        <object>    getter generate)
@@ -126,117 +123,111 @@
   (slot tail         <fx>        getter generate)
   (slot count        <fx>        getter generate)
   (slot now-proc                 getter generate)
+  (slot overflow-proc            getter generate)
   
   
-  (method override (initialize self size <fx> (now-proc: now-proc current-seconds))
+  (method override (initialize self size <fx> (max-size: max-size #f) (now-proc: now-proc current-seconds) (overflow-proc: overflow-proc #f))
     (nextmethod self)
     (assert (> size 0))
     (set! self.size size)
-    (set! self.times (make-f64vector size))
-    (set! self.content (make-vector size))
+    (set! self.max-size (or max-size size))
+    (set! self.times (make-f64vector size +nan.0))
+    (set! self.content (make-vector size #f))
     (set! self.mutex (make-mutex 'ring))
     (set! self.wait-condvar (make-condition-variable 'wait))
     (set! self.head 0)
     (set! self.tail 0)
     (set! self.count 0)
-    (set! self.now-proc now-proc))
+    (set! self.now-proc now-proc)
+    (set! self.overflow-proc overflow-proc))
   
   
   (method public (empty self)
-    (f64vector-fill! self.times 0.)
+    (f64vector-fill! self.times +nan.0)
     (vector-fill! self.content #f)
     (set! self.head 0)
     (set! self.tail 0)
     (set! self.count 0))
-  
-  
+
+
   (method public (insert self time obj)
     (mutex-lock! mutex)
     (prog1 (let ((now (now-proc)))
-             (if (>= time now)
-                 (let (loop (scan count))
-                   (if (= scan 0)
-                       (begin
-                         (insert-at self scan time obj)
-                         (condition-variable-signal! wait-condvar))
-                     (let ((candidate (f64vector-ref times (- scan 1))))
-                       (if (<= candidate time)
-                           (insert-at self scan time obj)
-                         (loop (- scan 1))))))
-               #f))
+             (if (< time now)
+                 #f
+               (let (loop (pos tail))
+                 (if (= pos head)
+                     (begin
+                       (insert-at self head time obj)
+                       (condition-variable-signal! wait-condvar))
+                   (let ((before (modulo (- pos 1) size)))
+                     (let ((candidate (f64vector-ref times before)))
+                       (if (> time candidate)
+                           (insert-at self pos time obj)
+                         (loop before))))))
+               #t))
       (mutex-unlock! mutex)))
   
   
   (method public (insert-earliest self obj)
     (mutex-lock! mutex)
-    (insert-at self count (now-proc) obj)
+    (insert-at self head (now-proc) obj)
     (condition-variable-signal! wait-condvar)
     (mutex-unlock! mutex))
   
   
-  (method private (insert-at self n time obj)
+  (method public (insert-at self pos time obj)
+    ;; grow
+    (when (and (= count size)
+               (< size max-size))
+      (let ((new-size (min max-size (fxround (* size GOLDEN_GROWTH)))))
+        (let ((new-times (make-f64vector new-size +nan.0))
+              (new-content (make-vector new-size #f))
+              (growth (- new-size size)))
+          (set! head (+ head growth))
+          (subf64vector-move! times 0 tail new-times 0)
+          (subf64vector-move! times tail size new-times head)
+          (subvector-move! content 0 tail new-content 0)
+          (subvector-move! content tail size new-content head)
+          (set! size new-size)
+          (set! times new-times)
+          (set! content new-content))))
+    ;; insert
     (cond ((< count size)
-           (if (= n count)
-               (begin
-                 (f64vector-set! times n time)
-                 (vector-set! content n obj))
-             (subf64vector-shift! times n count 1)
-             (f64vector-set! times n time)
-             (subvector-shift! content n count 1)
-             (vector-set! content n obj)))
+           (cond ((= pos head)
+                  (set! head (modulo (- head 1) size))
+                  (f64vector-set! times head time)
+                  (vector-set! content head obj)
+                  (increase! count))
+                 ((= pos tail)
+                  (f64vector-set! times tail time)
+                  (vector-set! content tail obj)
+                  (set! tail (modulo (+ tail 1) size))
+                  (increase! count))
+                 (else
+                  (if (and (> head tail)
+                           (>= pos head))
+                      (begin
+                        (subf64vector-shift! times head (+ pos 1) -1)
+                        (subvector-shift! content head (+ pos 1) -1)
+                        (f64vector-set! times pos time)
+                        (vector-set! content pos obj)
+                        (set! head (modulo (- head 1) size))
+                        (increase! count))
+                    (subf64vector-shift! times pos tail 1)
+                    (subvector-shift! content pos tail 1)
+                    (f64vector-set! times pos time)
+                    (vector-set! content pos obj)
+                    (set! tail (modulo (+ tail 1) size))
+                    (increase! count)))))
           (else
-           (let ((new-size (fxround (* size GOLDEN_GROWTH))))
-             (let ((new-times (make-f64vector new-size))
-                   (new-content (make-vector new-size))
-                   (growth (- new-size size)))
-               (subvector-move! times 0 tail new-times 0)
-               (subvector-move! times tail size new-times (+ tail growth))
-               (subvector-move! content 0 tail new-content 0)
-               (subvector-move! content tail size new-content (+ tail growth))
-               (set! size new-size)
-               (set! times new-times)
-               (set! content new-content)
-               (vector-set! times tail time)
-               (vector-set! content tail obj)
-               (set! tail (modulo (+ tail 1) size))
-               (set! head (modulo (+ head growth) size))
-               (increase! count)))))
-    (increase! count)
-    #t)
-  
-  
-  (method public (locate self predicate)
-    (mutex-lock! mutex)
-    (prog1 (let (loop (pos 0))
-             (if (>= pos count)
-                 #f
-               (let ((obj (vector-ref content pos)))
-                 (if (predicate obj)
-                     obj
-                   (loop (+ pos 1))))))
-      (mutex-unlock! mutex)))
-  
-  
-  (method public (updating self thunk)
-    (mutex-lock! mutex)
-    (prog1 (thunk)
-      (condition-variable-signal! wait-condvar)
-      (mutex-unlock! mutex)))
-  
-  
-  (method public (update self proc)
-    (let (loop (pos 0))
-      (if (>= pos count)
-          #f
-        (let ((time (f64vector-ref times pos))
-              (obj (vector-ref content pos)))
-          (proc
-            time
-            obj
-            (lambda (new-time new-obj)
-              (f64vector-set! times pos new-time)
-              (vector-set! content pos new-obj)))
-          (loop (+ pos 1))))))
+           (let ((obj (vector-ref content tail)))
+             (f64vector-set! times tail time)
+             (vector-set! content tail obj)
+             (set! tail (modulo (+ tail 1) size))
+             (set! head tail)
+             (when overflow-proc
+               (overflow-proc self obj))))))
   
   
   (method public (wait self)
@@ -248,15 +239,14 @@
             (mutex-unlock! mutex wait-condvar)
             (loop))
         (let ((now (now-proc))
-              (earliest-time (f64vector-ref times 0))
-              (earliest (vector-ref content 0)))
+              (earliest-time (f64vector-ref times head))
+              (earliest (vector-ref content head)))
           (let ((wait-duration (- earliest-time now)))
             (if (<= wait-duration 0.)
                 (prog1 earliest
-                  (subf64vector-shift! times 1 count -1)
-                  (subf64vector-fill! times (- count 1) count 0.)
-                  (subvector-shift! content 1 count -1)
-                  (subvector-fill! content (- count 1) count #f)
+                  (f64vector-set! times head +nan.0)
+                  (vector-set! content head #f)
+                  (set! head (modulo (+ head 1) size))
                   (decrease! count)
                   (mutex-unlock! mutex))
               (mutex-unlock! mutex wait-condvar wait-duration)
@@ -272,25 +262,65 @@
             (mutex-unlock! mutex wait-condvar)
             (loop))
         (let ((now (now-proc))
-              (earliest-time (f64vector-ref times 0))
-              (earliest (vector-ref content 0)))
+              (earliest-time (f64vector-ref times head))
+              (earliest (vector-ref content head)))
           (let ((wait-duration (- earliest-time now)))
             (if (<= wait-duration 0)
-                (let (collect (pos 1) (card 1) (result (list earliest)))
-                  (let ((next (and (< pos count)
-                                   (let ((next-time (f64vector-ref times pos))
-                                         (next (vector-ref content pos)))
-                                     (let ((wait-duration (- next-time now)))
-                                       (and (<= wait-duration 0)
-                                            next))))))
-                    (if next
-                        (collect (+ pos 1) (+ card 1) (cons next result))
-                      (prog1 result
-                        (subf64vector-shift! times card count (- card))
-                        (subf64vector-fill! times (- count card) count 0.)
-                        (subvector-shift! content card count (- card))
-                        (subvector-fill! content (- count card) count #f)
-                        (decrease! count card)
-                        (mutex-unlock! mutex)))))
+                (begin
+                  (f64vector-set! times head +nan.0)
+                  (vector-set! content head #f)
+                  (let (collect (n 1) (card 1) (result (list earliest)))
+                    (let ((pos (modulo (+ head n) size)))
+                      (let ((next (and (< n count)
+                                       (let ((next-time (f64vector-ref times pos))
+                                             (next (vector-ref content pos)))
+                                         (let ((wait-duration (- next-time now)))
+                                           (and (<= wait-duration 0)
+                                                next))))))
+                        (if next
+                            (begin
+                              (f64vector-set! times pos +nan.0)
+                              (vector-set! content pos #f)
+                              (collect (+ n 1) (+ card 1) (cons next result)))
+                          (prog1 result
+                            (set! head (modulo (+ head n) size))
+                            (decrease! count card)
+                            (mutex-unlock! mutex)))))))
               (mutex-unlock! mutex wait-condvar wait-duration)
-              (loop)))))))))
+              (loop)))))))
+  
+  
+  (method public (locate self predicate)
+    (mutex-lock! mutex)
+    (prog1 (let (loop (n 0))
+             (if (>= n count)
+                 #f
+               (let ((pos (modulo (+ head n) size)))
+                 (let ((obj (vector-ref content pos)))
+                   (if (predicate obj)
+                       obj
+                     (loop (+ n 1)))))))
+      (mutex-unlock! mutex)))
+  
+  
+  (method public (updating self thunk)
+    (mutex-lock! mutex)
+    (prog1 (thunk)
+      (condition-variable-signal! wait-condvar)
+      (mutex-unlock! mutex)))
+  
+  
+  (method public (update self proc)
+    (let (loop (n 0))
+      (if (>= n count)
+          #f
+        (let ((pos (modulo (+ head n) size)))
+          (let ((time (f64vector-ref times pos))
+                (obj (vector-ref content pos)))
+            (proc
+              time
+              obj
+              (lambda (new-time new-obj)
+                (f64vector-set! times pos new-time)
+                (vector-set! content pos new-obj)))
+            (loop (+ n 1)))))))))
