@@ -36,21 +36,24 @@
 (definition protected udp-connected
   1)
 
-(definition protected udp-ack
+(definition protected udp-state
   2)
 
-(definition protected udp-nack
+(definition protected udp-ack
   3)
 
-(definition protected udp-audio
+(definition protected udp-nack
   4)
 
-(definition protected udp-video
+(definition protected udp-audio
   5)
+
+(definition protected udp-video
+  6)
 
 
 (definition udp-names
-  #(connect connected ack nack audio video))
+  #(connect connected state ack nack audio video))
 
 (definition protected (udp-name kind)
   (vector-ref udp-names kind))
@@ -64,10 +67,10 @@
   (world-setting 'world.udp-retain-size 256))
 
 (definition protected udp-retain-max-size
-  (world-setting 'world.udp-retain-max-size 4096))
+  (world-setting 'world.udp-retain-max-size 8192))
 
 (definition protected udp-retain-window
-  (world-setting 'world.udp-retain-window .2))
+  (world-setting 'world.udp-retain-window 1.))
 
 (definition protected udp-process-size
   (world-setting 'world.udp-process-size 256))
@@ -87,11 +90,11 @@
 (definition protected udp-simulator-max-size
   (world-setting 'world.udp-simulator-max-size 4096))
 
-(definition protected udp-ack-frequency
-  (world-setting 'world.udp-ack-frequency 10.))
+(definition protected udp-state-frequency
+  (world-setting 'world.udp-state-frequency 10.))
 
-(definition protected udp-ack-period
-  (/ 1. udp-ack-frequency))
+(definition protected udp-state-period
+  (/ 1. udp-state-frequency))
 
 (definition protected udp-audio-throttle
   (world-setting 'world.udp-audio-throttle 2.))
@@ -105,6 +108,9 @@
 
 (definition protected udp-experimental-filter-nacks?
   (world-setting 'world.udp-experimental-filter-nacks? #t))
+
+(definition protected udp-experimental-timeless?
+  (world-setting 'world.udp-experimental-timeless? #t))
 
 
 (definition protected udp-show-roundtrip?
@@ -167,7 +173,7 @@
 (definition protected udp-id-connected
   1.)
 
-(definition protected udp-id-send-media
+(definition protected udp-id-create-packet
   2.)
 
 (definition protected udp-id-receive-ack
@@ -263,12 +269,29 @@
 ;;;
 
 
+(definition protected udp-ring-kind-retain
+  0.)
+
+(definition protected udp-ring-kind-process
+  1.)
+
+(definition protected udp-ring-kind-simulator
+  2.)
+
+
 (definition protected (udp-ring-key data)
   (read-udp-sequence data))
 
 
-(definition protected (udp-ring-overflow name)
+(definition protected (udp-ring-overflow name kind)
   (lambda (ring data)
+    (record-event udp-id-ring-overflow
+                  (if (= kind udp-ring-kind-simulator)
+                      -1.
+                    (fixnum->flonum (read-udp-sequence data)))
+                  kind
+                  (fixnum->flonum (get-count ring))
+                  -1.)
     (when udp-show-overflows?
       (format :terminal "{s} {s} {s}{%}" remote-name '***overflow*** name))))
 
@@ -312,18 +335,15 @@
   
   
   (slot media-kind    getter generate)
-  (slot last-sequence getter generate)
-  ;; time difference between local time and remote time
-  ;; noting that this includes lag that may vary over time
-  ;; at the moment we always update this upon receiving data
-  (slot time-delta    getter generate)
+  (slot last-sequence accessors generate)
+  (slot time-base     getter generate)
   
   
   (method override (initialize self media-kind)
     (nextmethod self)
     (set! self.media-kind media-kind)
     (set! self.last-sequence #f)
-    (set! self.time-delta 0.))
+    (set! self.time-base #f))
   
   
   (method override (print self output readably)
@@ -333,15 +353,53 @@
   
   
   (method protected (update-time self seq data ring)
-    (let ((remote-new (/ (read-udp-media-timestamp data) nanosecond))
-          (local-new (current-seconds)))
-      (set! last-sequence seq)
-      (set! time-delta (- local-new remote-new))))
+    (let ((new-time (current-seconds))
+          (new-timestamp (read-udp-media-seconds data)))
+      (define (update-time-base new-base)
+        (set! time-base new-base)
+        (let ((origin (read-udp-origin data)))
+          (record-event udp-id-update-time
+                        (fixnum->flonum seq)
+                        (fixnum->flonum origin)
+                        new-time
+                        new-timestamp)))
+      
+      (let ((new-base (- new-time new-timestamp)))
+        (if (not time-base)
+            (update-time-base new-base)
+          (let ((change (- new-base time-base)))
+            (when (< change -0.01)
+              (update-time-base new-base)
+              (updating ring
+                (lambda ()
+                  (update ring
+                    (lambda (time data updater)
+                      (let ((process-time (+ (read-udp-media-seconds data) new-base udp-process-window)))
+                        (updater process-time data)))))))))))))
+
+
+;;;
+;;;; Time
+;;;
+
+
+(class Time-Base extends Object
   
   
-  (method protected (now-timestamp self window)
-    (let ((now (current-seconds)))
-      (- now time-delta window))))
+  (slot timestamp getter generate)
+  (slot time      getter generate)
+  
+  
+  (method override (initialize self timestamp time)
+    (nextmethod self)
+    (set! self.timestamp timestamp)
+    (set! self.time time))
+  
+  
+  (method override (print self output readably)
+    (print-unreadable self output
+      (lambda (output)
+        (format output "{a} {a}" timestamp time)))))
 
 
 ;;;
@@ -375,7 +433,7 @@
     (set! self.congestion-occuring? #f)
     (set! self.congestion-ends #f)
     (set! self.writer writer)
-    (set! self.ring (new Time-Ring udp-simulator-size max-size: udp-simulator-max-size overflow-proc: (udp-ring-overflow 'simulator)))
+    (set! self.ring (new Time-Ring udp-simulator-size max-size: udp-simulator-max-size overflow-proc: (udp-ring-overflow 'simulator udp-ring-kind-simulator)))
     (set! self.thread (new-thread
                         (lambda ()
                           (send-loop self))
@@ -512,8 +570,12 @@
 (definition public (read-udp-connect-lag        data) (scan-float data 28)) (definition public (write-udp-connect-lag        data value) (put-float data 28 value))
 (definition public (read-udp-connect-drop       data) (scan-float data 32)) (definition public (write-udp-connect-drop       data value) (put-float data 32 value))
 
+;; state
+(definition public (read-udp-state-channels data) (scan-u8vector data 16)) (definition public (write-udp-state-channels data value) (put-u8vector data 16 value))
+
 ;; ack
-(definition public (read-udp-ack-channel-states data) (scan-u8vector data 16)) (definition public (write-udp-ack-channel-states data value) (put-u8vector data 16 value))
+(definition public (read-udp-ack-packets-sent     data) (scan-s32 data 16)) (definition public (write-udp-ack-packets-sent     data value) (put-s32 data 16 value))
+(definition public (read-udp-ack-packets-received data) (scan-s32 data 20)) (definition public (write-udp-ack-packets-received data value) (put-s32 data 20 value))
 
 ;; nack
 (definition public (read-udp-nack-media-kind     data) (scan-s32      data 16)) (definition public (write-udp-nack-media-kind     data value) (put-s32      data 16 value))

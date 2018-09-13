@@ -122,12 +122,16 @@
   
   
   (method (receive-data self data)
+    (let ((origin (read-udp-origin data)))
+      (let ((connection (origin->connection self origin)))
+        (when connection
+          (increase-packets-received connection))))
     (let ((kind (read-udp-kind data)))
       (ecase kind
         ((udp-connect)
          (connect-source self data))
-        ((udp-ack)
-         (receive-ack self data))
+        ((udp-state)
+         (receive-state self data))
         ((udp-nack)
          (receive-nack self data))
         ((udp-audio udp-video)
@@ -153,8 +157,7 @@
               (new UDP-Simulator latency lag drop
                    (lambda (info)
                      (bind (connection . data) info
-                       (udp-destination-set! (get-host connection) (get-port connection) udp-port)
-                       (retrying-write data udp-port))))
+                       (send-connection self connection data))))
             #f)))
       
         (let ((source-host (socket-info-address source-info))
@@ -174,19 +177,20 @@
             (send-connected)))))
   
   
-  (method (receive-ack self data)
+  (method (receive-state self data)
     (let ((origin (read-udp-origin data)))
+      ;; ack origin
+      (send-ack self origin data)
       ;; throttling
       (let ((connection (origin->connection self origin)))
         (when connection
-          (set-last-received-ack connection (current-seconds))
+          (set-last-received-state connection (current-seconds))
           (when (get-throttle-media? connection)
             (set-throttle-media? connection #f)
             (when udp-show-throttle?
               (let ((delegate (find-delegate-by-no (current-server) origin)))
                 (format :terminal "{s} {s} {a} {s}{%}" remote-name 'THROTTLE (if delegate (get-name delegate) origin) 'OFF))))))
-      ;; kind #f is a hack for audio/video-self?
-      (broadcast-ack self #f origin data)))
+      (broadcast-state self origin data)))
   
   
   (method (receive-nack self data)
@@ -213,18 +217,18 @@
                     (let ((seconds (current-seconds)))
                       (loop (for seq from expected below sequence)
                             (add-nack channel seconds seq))))))
-              ;; remember time information
-              (update-time channel sequence data (get-retain-ring channel)))))
-        ;; always send the lastest nacks
-        (let ((latest-missing (filter-latest-missing channel)))
-          (unless (null? latest-missing)
-            (let ((source-info (udp-source-socket-info udp-port)))
-              (let ((source-host (socket-info-address source-info))
-                    (source-port (socket-info-port-number source-info)))
-                (let ((connection (host/port->connection self source-host source-port)))
-                  (send-nack self connection origin kind latest-missing))))))
-        (retain channel data)
-        (broadcast-media self kind origin data))))
+              ;; remember last sequence
+              (set-last-sequence channel sequence)
+              ;; send the lastest nacks
+              (let ((latest-missing (filter-latest-missing channel)))
+                (unless (null? latest-missing)
+                  (let ((source-info (udp-source-socket-info udp-port)))
+                    (let ((source-host (socket-info-address source-info))
+                          (source-port (socket-info-port-number source-info)))
+                      (let ((connection (host/port->connection self source-host source-port)))
+                        (send-nack self connection origin kind latest-missing)))))))
+            (retain channel data)
+            (broadcast-media self kind origin data))))))
   
   
   (method (send-missing self origin media-kind missing)
@@ -262,15 +266,30 @@
           (send-data self connection data)))))
   
   
-  (method (broadcast-ack self kind origin data)
+  (method (send-ack self origin data)
+    (let ((connection (origin->connection self origin)))
+      (when connection
+        (let ((packets-sent (get-packets-sent connection))
+              (packets-received (get-packets-received connection)))
+          (let ((size (+ 8 4 4 4 4)))
+            (let ((data (make-u8vector size)))
+              (write-udp-sent data (current-seconds))
+              (write-udp-kind data udp-ack)
+              (write-udp-origin data origin)
+              (write-udp-ack-packets-sent data packets-sent)
+              (write-udp-ack-packets-received data packets-received)
+              (send-data self connection data)))))))
+  
+  
+  (method (broadcast-state self origin data)
     (let ((delegate (find-delegate-by-no (current-server) origin)))
       (when delegate
         (let ((group (get-group delegate)))
           (when group
             (for-each (lambda (member)
                         (when (or (neq? member delegate)
-                                  (and audio-self? (or (not kind) (= kind udp-audio)))
-                                  (and video-self? (or (not kind) (= kind udp-video))))
+                                  audio-self?
+                                  video-self?)
                           (let ((no (get-no member)))
                             (let ((connection (table-ref origin-connections no #f)))
                               (when connection
@@ -290,12 +309,12 @@
                           (let ((no (get-no member)))
                             (let ((connection (table-ref origin-connections no #f)))
                               (when connection
-                                (let ((last-received-ack (get-last-received-ack connection)))
-                                  (when last-received-ack
+                                (let ((last-received-state (get-last-received-state connection)))
+                                  (when last-received-state
                                     (unless (get-throttle-media? connection)
                                       (let ((now (current-seconds))
                                             (throttle (if (= kind udp-audio) udp-audio-throttle udp-video-throttle)))
-                                        (if (> (- now last-received-ack) throttle)
+                                        (if (> (- now last-received-state) throttle)
                                             (begin
                                               (set-throttle-media? connection #t)
                                               (when udp-show-throttle?
@@ -308,8 +327,13 @@
     (let ((simulator (get-simulator connection)))
       (if simulator
           (send simulator (cons connection data))
-        (udp-destination-set! (get-host connection) (get-port connection) udp-port)
-        (retrying-write data udp-port)))))
+        (send-connection self connection data))))
+  
+  
+  (method (send-connection self connection data)
+    (udp-destination-set! (get-host connection) (get-port connection) udp-port)
+    (retrying-write data udp-port)
+    (increase-packets-sent connection)))
 
 
 ;;;
@@ -320,13 +344,15 @@
 (class UDP-Connection extends Object
   
   
-  (slot host                            getter generate)
-  (slot port                            getter generate)
-  (slot local-host                      getter generate)
-  (slot local-port                      getter generate)
-  (slot simulator                       getter generate)
-  (slot last-received-ack initialize #f accessors generate)
-  (slot throttle-media?   initialize #f accessors generate)
+  (slot host                              getter generate)
+  (slot port                              getter generate)
+  (slot local-host                        getter generate)
+  (slot local-port                        getter generate)
+  (slot simulator                         getter generate)
+  (slot packets-sent        initialize 0  getter generate)
+  (slot packets-received    initialize 0  getter generate)
+  (slot last-received-state initialize #f accessors generate)
+  (slot throttle-media?     initialize #f accessors generate)
   
   
   (method override (initialize self host port local-host local-port simulator)
@@ -341,7 +367,15 @@
   (method override (print self output readably)
     (print-unreadable self output
       (lambda (output)
-        (format output "{a} {a}" host port)))))
+        (format output "{a} {a}" host port))))
+  
+  
+  (method protected (increase-packets-sent self)
+    (increase! packets-sent))
+  
+  
+  (method protected (increase-packets-received self)
+    (increase! packets-received)))
 
 
 ;;;
@@ -363,7 +397,7 @@
     (nextmethod self media-kind)
     (set! self.origin origin)
     (set! self.latest-nacks '())
-    (set! self.retain-ring (new Time-Ring udp-retain-size max-size: udp-retain-max-size now-proc: (lambda () (now-timestamp self udp-retain-window)) key-proc: udp-ring-key overflow-proc: (udp-ring-overflow 'server-retain)))
+    (set! self.retain-ring (new Time-Ring udp-retain-size max-size: udp-retain-max-size overflow-proc: (udp-ring-overflow 'retain udp-ring-kind-retain)))
     (set! self.retain-entries (make-table test: eqv?))
     (set! self.release-task (new Task 'udp-release (lambda (task)
                                                      (release-loop self task))
@@ -408,7 +442,7 @@
   
   
   (method protected (retain self data)
-    (insert retain-ring (read-udp-media-seconds data) data)
+    (insert retain-ring (+ (current-seconds) udp-retain-window) data)
     (table-set! retain-entries (read-udp-sequence data) data)
     (let ((kind (read-udp-kind data)))
       (when (= kind udp-video)
