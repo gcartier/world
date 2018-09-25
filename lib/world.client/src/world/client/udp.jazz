@@ -340,7 +340,9 @@
                   ;; udp-media-off is not really used for its content anymore
                   ;; but it is still useful as an empty buffer ends the logic
                   (buffer (or buffer udp-media-off)))
-              (set-last-timestamp channel timestamp)
+              ;; -1 means no timestamp used by vorbis header
+              (unless (= timestamp -1)
+                (set-last-timestamp channel timestamp))
               (let ((header-size (+ 8 4 4 4 4 4 4 8 8 4))
                     (payload-size (u8vector-length buffer)))
                 (let ((max-content-size (- udp-datagram-max header-size)))
@@ -384,9 +386,11 @@
                                               (fixnum->flonum client-no)
                                               (fixnum->flonum kind)
                                               (fixnum->flonum sequence)
-                                              (fixnum->flonum client-no)
+                                              -1.
                                               (fixnum->flonum frame)
-                                              (timestamp->flonum timestamp))
+                                              (if (= timestamp -1)
+                                                  -1.
+                                                (timestamp->flonum timestamp)))
                                 (loop-part (+ part 1) (+ pos content-size)))))))))))))
           
           (when last-received-state
@@ -922,58 +926,56 @@
   
   
   (method protected (insert-media self data)
-    (let ((sequence (read-udp-sequence data))
-          (timestamp (read-udp-media-seconds data)))
-      (if (not time-base)
-          (begin
-            (record-event udp-id-timeless-packet
-                          (fixnum->flonum origin)
-                          (fixnum->flonum media-kind)
-                          (fixnum->flonum sequence)
-                          -1.
-                          -1.
-                          timestamp)
-            #f)
-        (let ((process-time (+ timestamp time-base udp-process-window)))
-          (let ((problem (insert process-ring process-time data)))
-            (if (not problem)
-                (let ((ring-size (get-count process-ring))
-                      (origin (read-udp-origin data))
-                      (timestamp (read-udp-media-timestamp data)))
-                  (record-event udp-id-add-process
-                                (fixnum->flonum origin)
-                                (fixnum->flonum media-kind)
-                                (fixnum->flonum sequence)
-                                time-base
-                                process-time
-                                (timestamp->flonum timestamp))
-                  #t)
-              (case problem
-                ((discard)
-                 (let ((origin (read-udp-origin data))
-                       (timestamp (read-udp-media-timestamp data)))
-                   (record-event udp-id-discard-packet
-                                 (fixnum->flonum origin)
-                                 (fixnum->flonum media-kind)
-                                 (fixnum->flonum sequence)
-                                 time-base
-                                 process-time
-                                 (timestamp->flonum timestamp)))
-                 (when udp-show-discard?
-                   (format :terminal "{s} {s} {s} {s}{%}" remote-name (present-media-kind media-kind) '***discard*** sequence)))
-                ((duplicate)
-                 (let ((origin (read-udp-origin data))
-                       (timestamp (read-udp-media-timestamp data)))
-                   (record-event udp-id-duplicate-packet
-                                 (fixnum->flonum origin)
-                                 (fixnum->flonum media-kind)
-                                 (fixnum->flonum sequence)
-                                 time-base
-                                 process-time
-                                 (timestamp->flonum timestamp)))
-                 (when udp-show-duplicates?
-                   (format :terminal "{s} {s} {s} {s}{%}" remote-name (present-media-kind media-kind) '***duplicate*** sequence))))
-              #f))))))
+    (let ((sequence (read-udp-sequence data)))
+      (let ((timestamp? (/= (read-udp-media-timestamp data) -1)))
+        (let ((timestamp (read-udp-media-seconds data)))
+          (if (and timestamp? (not time-base))
+              (begin
+                (record-event udp-id-baseless-packet
+                              (fixnum->flonum origin)
+                              (fixnum->flonum media-kind)
+                              (fixnum->flonum sequence)
+                              -1.
+                              -1.
+                              timestamp)
+                #f)
+            (let ((process-time (and timestamp? (+ timestamp time-base udp-process-window))))
+              (let ((problem (insert process-ring process-time data)))
+                (if (not problem)
+                    (let ((ring-size (get-count process-ring))
+                          (origin (read-udp-origin data)))
+                      (record-event udp-id-add-process
+                                    (fixnum->flonum origin)
+                                    (fixnum->flonum media-kind)
+                                    (fixnum->flonum sequence)
+                                    -1.
+                                    (if (not timestamp?) -1. process-time)
+                                    (if (not timestamp?) -1. timestamp))
+                      #t)
+                  (case problem
+                    ((discard)
+                     (let ((origin (read-udp-origin data)))
+                       (record-event udp-id-discard-packet
+                                     (fixnum->flonum origin)
+                                     (fixnum->flonum media-kind)
+                                     (fixnum->flonum sequence)
+                                     -1.
+                                     (if (not timestamp?) -1. process-time)
+                                     (if (not timestamp?) -1. timestamp)))
+                     (when udp-show-discard?
+                       (format :terminal "{s} {s} {s} {s} {s}{%}" remote-name (present-media-kind media-kind) '***discard*** sequence (- (current-seconds) process-time))))
+                    ((duplicate)
+                     (let ((origin (read-udp-origin data)))
+                       (record-event udp-id-duplicate-packet
+                                     (fixnum->flonum origin)
+                                     (fixnum->flonum media-kind)
+                                     (fixnum->flonum sequence)
+                                     -1.
+                                     (if (not timestamp?) -1. process-time)
+                                     (if (not timestamp?) -1. timestamp)))
+                     (when udp-show-duplicates?
+                       (format :terminal "{s} {s} {s} {s}{%}" remote-name (present-media-kind media-kind) '***duplicate*** sequence))))
+                  #f))))))))
   
   
   ;;;
@@ -1015,7 +1017,9 @@
                                         (fixnum->flonum sequence)
                                         -1.
                                         (fixnum->flonum ring-size)
-                                        (timestamp->flonum timestamp)))
+                                        (if (= timestamp -1)
+                                            -1.
+                                          (timestamp->flonum timestamp))))
                         (let ((gap (if (not last-sequence) 0 (- sequence (+ last-sequence 1)))))
                           (when (> gap 0)
                             (let ((origin (read-udp-origin data)))
@@ -1082,9 +1086,10 @@
                             (let ((headers (u8vector->object complete-buffer)))
                               (for-each (lambda (header)
                                           (bind (buffer timestamp duration) header
-                                            ;; be very careful as timestamp is incorrect
-                                            ;; this works because gst_app_src_write3 doesnt
-                                            ;; actually use the timestamp at the moment
+                                            ;; be very careful as timestamp is incorrect as it
+                                            ;; is the timestamp at time the header was captured
+                                            ;; this only works because gst_app_src_write3
+                                            ;; doesn't actually use the timestamp
                                             (receive-server-audio (current-audio) id buffer timestamp duration)))
                                         headers))
                           (receive-server-audio (current-audio) id complete-buffer timestamp duration)))))))
