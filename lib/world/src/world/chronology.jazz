@@ -1,0 +1,213 @@
+;;;===============
+;;;  WorldScheme
+;;;===============
+;;;
+;;;; World Chronology
+;;;
+;;;  The Initial Developer of the Original Code is Guillaume Cartier.
+;;;  Portions created by the Initial Developer are Copyright (C) 2012-2018
+;;;  the Initial Developer. All Rights Reserved.
+;;;
+;;;  Contributor(s):
+
+
+(module world.chronology jazz
+
+
+(proclaim (not check bounds zero)
+          (warn optimizations))
+
+(declare (optimize-dead-local-variables))
+
+
+;;;
+;;;; Chronology
+;;;
+
+
+(definition sample-size <fx>
+  4)
+
+
+(class Chronology-Class extends Class
+  
+  
+  (method override (marshall-object self object)
+    (serialize-object (class-of object)
+                      (vector (serialize (get-size object))
+                              (serialize (get-content-size object))
+                              (serialize (get-content object))
+                              (serialize (get-next-marker object))
+                              (serialize (get-now object))
+                              (serialize (get-head object))
+                              (serialize (get-count object)))))
+  
+  
+  (method override (unmarshall-object self content)
+    (bind-vector (size content-size content next-marker now head count) content
+      (allocate self
+                (deserialize size)
+                (deserialize content-size)
+                (deserialize content)
+                (make-mutex 'chronology)
+                (deserialize next-marker)
+                (deserialize now)
+                (deserialize head)
+                (deserialize count)))))
+
+
+(class Chronology metaclass Chronology-Class extends Object
+  
+  
+  (slot size         <fx>        getter generate)
+  (slot content-size <fx>        getter generate)
+  (slot content      <f64vector> getter generate)
+  (slot mutex        <object>    getter generate)
+  (slot next-marker  <fx>        getter generate)
+  (slot now          <fx>        accessors generate)
+  (slot head         <fx>        accessors generate)
+  (slot count        <fx>        accessors generate)
+  
+  
+  (method override (initialize self size <fx>)
+    (nextmethod self)
+    (set! self.size size)
+    (set! content-size (* size sample-size))
+    (set! content (make-f64vector content-size))
+    (set! mutex (make-mutex 'chronology))
+    (set! next-marker 0)
+    (set! now 0)
+    (set! head 0)
+    (set! count 0))
+  
+  
+  (method package (reset self)
+    (mutex-lock! mutex)
+    (f64vector-fill! content 0.)
+    (set! next-marker 0)
+    (set! now 0)
+    (set! head 0)
+    (set! count 0)
+    (mutex-unlock! mutex))
+  
+  
+  (method package (with-mutex self thunk)
+    (mutex-lock! mutex)
+    (prog1 (thunk)
+      (mutex-unlock! mutex)))
+  
+  
+  (method package (next-marker! self) <fx>
+    (prog1 next-marker
+      (increase! next-marker 2)))
+
+  
+  (method package inline (start-position self) <fx>
+    0)
+  
+  
+  (method package inline (end-position self) <fx>
+    count)
+  
+  
+  (method package inline (first-position self) <fx>
+    0)
+  
+  
+  (method package inline (last-position self) <fx>
+    (- (end-position self) 1))
+  
+  
+  (method package inline (index self n <fx>) <fx>
+    (modulo (+ head (* n sample-size)) content-size))
+  
+  
+  (method package inline (index-now self) <fx>
+    (index self now))
+  
+  
+  (method package (chronological-id self n <fx>) <fl>
+    (f64vector-ref content (index self n)))
+  
+  (method package (chronological-marker self n <fx>) <fl>
+    (f64vector-ref content (+ (index self n) 1)))
+  
+  (method package (chronological-time self n <fx>) <fl>
+    (f64vector-ref content (+ (index self n) 2)))
+  
+  (method package (chronological-memory self n <fx>) <fl>
+    (f64vector-ref content (+ (index self n) 3)))
+  
+  
+  (method package inline (advance! self)
+    (if (< count size)
+        (begin
+          (increase! count)
+          (increase! now))
+      (set! head (modulo (+ head sample-size) content-size)))))
+
+
+;; about one minute of recorded chronology
+(definition chronology <Chronology>
+  (new Chronology 90000))
+
+
+(definition public inline (current-chronology) <Chronology>
+  chronology)
+
+
+(definition protected (copy-chronology chronology <Chronology>) <Chronology>
+  (let ((copy (new Chronology (get-size chronology))))
+    (mutex-lock! (get-mutex copy))
+    (mutex-lock! (get-mutex chronology))
+    (subf64vector-move! (get-content chronology) 0 (get-content-size chronology) (get-content copy) 0)
+    (set-now copy (get-now chronology))
+    (set-head copy (get-head chronology))
+    (set-count copy (get-count chronology))
+    (mutex-unlock! (get-mutex copy))
+    (mutex-unlock! (get-mutex chronology))
+    copy))
+
+
+(definition protected (reset-chronology)
+  (reset (current-chronology)))
+
+
+(definition protected (chronology-cpu% chronology)
+  (with-mutex chronology
+    (lambda ()
+      (let ((first (first-position chronology))
+            (last (last-position chronology)))
+        (let ((first-time (chronological-time chronology first))
+              (last-time (chronological-time chronology last)))
+          (let ((last-end first-time))
+            (define (count-already-in)
+              (let ((count 0)
+                    (starts (make-vector (site-id-count) #f)))
+                (loop (for n from first to last)
+                      (let ((id (flonum->fixnum (chronological-id chronology n))))
+                        (when (not (vector-ref starts id))
+                          (vector-set! starts id #t)
+                          (let ((end? (odd? (flonum->fixnum (chronological-marker chronology n)))))
+                            (when end?
+                              (set! last-end (chronological-time chronology n))
+                              (increase! count))))))
+                count))
+            
+            (let ((in (count-already-in))
+                  (idle 0.))
+              (loop (for n from first to last)
+                    (let ((marker (chronological-marker chronology n))
+                          (time (chronological-time chronology n)))
+                      (let ((start? (even? (flonum->fixnum marker))))
+                        (cond (start?
+                               (when (= in 0)
+                                 (increase! idle (- time last-end)))
+                               (increase! in))
+                              (else
+                               (decrease! in)
+                               (when (= in 0)
+                                 (set! last-end time)))))))
+              (let ((elapsed (- last-time first-time)))
+                (let ((cpu (- elapsed idle)))
+                  (percentage cpu elapsed)))))))))))
