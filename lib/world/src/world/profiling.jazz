@@ -210,87 +210,110 @@
   (reset (current-chronology)))
 
 
+(definition protected (determine-cpu% chronology)
+  (with-mutex chronology
+    (lambda ()
+      (let ((first (first-position chronology))
+            (last (last-position chronology)))
+        (let ((first-time (chronological-time chronology first))
+              (last-time (chronological-time chronology last)))
+          (let ((last-end first-time))
+            (define (count-already-in)
+              (let ((count 0)
+                    (starts (make-vector (site-id-count) #f)))
+                (loop (for n from first to last)
+                      (let ((id (flonum->fixnum (chronological-id chronology n))))
+                        (when (not (vector-ref starts id))
+                          (vector-set! starts id #t)
+                          (let ((end? (odd? (flonum->fixnum (chronological-marker chronology n)))))
+                            (when end?
+                              (set! last-end (chronological-time chronology n))
+                              (increase! count))))))
+                count))
+            
+            (let ((in (count-already-in))
+                  (idle 0.))
+              (loop (for n from first to last)
+                    (let ((marker (chronological-marker chronology n))
+                          (time (chronological-time chronology n)))
+                      (let ((start? (even? (flonum->fixnum marker))))
+                        (cond (start?
+                               (when (= in 0)
+                                 (increase! idle (- time last-end)))
+                               (increase! in))
+                              (else
+                               (decrease! in)
+                               (when (= in 0)
+                                 (set! last-end time)))))))
+              (let ((elapsed (- last-time first-time)))
+                (let ((cpu (- elapsed idle)))
+                  (percentage cpu elapsed))))))))))
+
+
+(definition protected (update-sites! chronology)
+  (with-mutex chronology
+    (lambda ()
+      (let ((first (first-position chronology))
+            (last (last-position chronology)))
+        (iterate-table (registered-sites)
+          (lambda (identifier site)
+            (site-profile-reset (get-profile site))))
+        (let ((starts (make-vector (site-id-count) #f)))
+          (loop (for n from first to last)
+                (let ((id (flonum->fixnum (chronological-id chronology n)))
+                      (marker (chronological-marker chronology n)))
+                  (let ((start? (even? (flonum->fixnum marker))))
+                    (cond (start?
+                           (vector-set! starts id n))
+                          (else
+                           (let ((start (vector-ref starts id)))
+                             (when start
+                               (let ((start-time (chronological-time chronology start))
+                                     (start-memory (chronological-memory chronology start)))
+                                 (let ((running (- (chronological-time chronology n) start-time))
+                                       (allocated (- (chronological-memory chronology n) start-memory))
+                                       (profile (get-profile (id->site id))))
+                                   (site-profile-running-set! profile (+ (site-profile-running profile) running))
+                                   (site-profile-allocated-set! profile (+ (site-profile-allocated profile) allocated))
+                                   (site-profile-called-set! profile (+ (site-profile-called profile) 1.))
+                                   (vector-set! starts id #f)))))))))))
+        (- (chronological-time chronology last)
+           (chronological-time chronology first))))))
+
+
 ;;;
 ;;;; Site
 ;;;
 
 
 (definition inline (make-site-profile) <f64vector>
-  (f64vector (current-seconds) -1. 0. 0. 0.))
+  (f64vector 0. 0. 0.))
 
-
-(definition protected inline (site-profile-started profile <f64vector>) <fl>
-  (f64vector-ref profile 0))
-
-(definition protected inline (site-profile-elapsed profile <f64vector>) <fl>
-  (f64vector-ref profile 1))
 
 (definition protected inline (site-profile-running profile <f64vector>) <fl>
-  (f64vector-ref profile 2))
+  (f64vector-ref profile 0))
 
 (definition protected inline (site-profile-allocated profile <f64vector>) <fl>
-  (f64vector-ref profile 3))
+  (f64vector-ref profile 1))
 
 (definition protected inline (site-profile-called profile <f64vector>) <fl>
-  (f64vector-ref profile 4))
+  (f64vector-ref profile 2))
 
-
-(definition protected inline (site-profile-started-set! profile <f64vector> started <fl>) <void>
-  (f64vector-set! profile 0 started))
-
-(definition protected inline (site-profile-elapsed-set! profile <f64vector> elapsed <fl>) <void>
-  (f64vector-set! profile 1 elapsed))
 
 (definition protected inline (site-profile-running-set! profile <f64vector> running <fl>) <void>
-  (f64vector-set! profile 2 running))
+  (f64vector-set! profile 0 running))
 
 (definition protected inline (site-profile-allocated-set! profile <f64vector> allocated <fl>) <void>
-  (f64vector-set! profile 3 allocated))
+  (f64vector-set! profile 1 allocated))
 
 (definition protected inline (site-profile-called-set! profile <f64vector> called <fl>) <void>
-  (f64vector-set! profile 4 called))
+  (f64vector-set! profile 2 called))
 
 
 (definition protected (site-profile-reset profile <f64vector>) <void>
-  (site-profile-started-set! profile (current-seconds))
-  (site-profile-elapsed-set! profile -1.)
   (site-profile-running-set! profile 0.)
   (site-profile-allocated-set! profile 0.)
   (site-profile-called-set! profile 0.))
-
-
-(definition protected (active-site identifier)
-  (when current-advise
-    (let ((profile (get-profile (registered-site identifier))))
-      (site-profile-started-set! profile (current-seconds)))))
-
-
-(definition protected (inactive-site identifier)
-  (when current-advise
-    (let ((profile (get-profile (registered-site identifier))))
-      (let ((end (current-seconds)))
-        (let ((duration (- end (site-profile-started profile)))
-              (actual (site-profile-elapsed profile)))
-          (site-profile-elapsed-set! profile (if (= actual -1.) duration (+ actual duration))))))))
-
-
-(definition protected (active-sites)
-  (iterate-table (registered-sites)
-    (lambda (identifier site)
-      (active-site identifier))))
-
-
-(definition protected (inactive-sites)
-  (iterate-table (registered-sites)
-    (lambda (identifier site)
-      (inactive-site identifier))))
-
-
-(definition protected (site-profile-effective-elapsed profile <f64vector>) <fl>
-  (let ((elapsed (site-profile-elapsed profile)))
-    (if (/= elapsed -1.)
-        elapsed
-      (- (current-seconds) (site-profile-started profile)))))
 
 
 (definition public (iterate-sites proc)
@@ -461,31 +484,4 @@
                     (describe children (+ level 1))))
                 nodes))
     
-    (describe (cdr root) 0)))
-
-
-(definition public (report-sites)
-  (define (present-memory elapsed allocated called)
-    (let ((average (fxround (/ allocated called 1024.)))
-          (rate (fxround (/ allocated elapsed 1024. 1024.))))
-      (format " {a}, {a}k, {a}m"
-              (fxround called)
-              average
-              rate)))
-  
-  (let ((root (sites-tree)))
-    (define (report nodes level)
-      (for-each (lambda (node)
-                  (let ((site (car node))
-                        (children (cdr node)))
-                    (let ((name (get-name site))
-                          (profile (get-profile site)))
-                      (let ((elapsed (site-profile-effective-elapsed profile))
-                            (allocated (site-profile-allocated profile))
-                            (called (site-profile-called profile)))
-                        (when (> called 0.)
-                          (format :console "{_ :v}{a}{a}{%}" (* level 2) name (present-memory elapsed allocated called)))))
-                    (report children (+ level 1))))
-                nodes))
-    
-    (report (cdr root) 0))))
+    (describe (cdr root) 0))))
