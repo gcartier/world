@@ -112,17 +112,30 @@
         (console-evaluate self))))
 
   
-  (method (console-evaluate self)
+  (method (console-evaluate self (range #f))
     (let ((client (current-client)))
-      (let ((range (current-command self)))
-        (let ((all (read-string-content (get-string self range))))
+      (let ((range (or range (current-command self))))
+        (define (process-aliases all)
+          (let ((aliases (world-setting 'world.console-aliases #f)))
+            (if (not aliases)
+                all
+              (or (getf aliases all test: equal?)
+                  all))))
+        
+        (define (process-command/arguments all)
+          (bind (command . arguments) all
+            (case command
+              ((shared)
+               (bind (who) arguments
+                 (values 'request (list who 'shared))))
+              ((transfer)
+               (values 'request arguments))
+              (else
+               (values command arguments)))))
+        
+        (let ((all (process-aliases (read-string-content (get-string self range)))))
           (unless (null? all)
-            (let ((aliases (world-setting 'world.console-aliases #f)))
-              (when aliases
-                (let ((alias (getf aliases all test: equal?)))
-                  (when alias
-                    (set! all alias)))))
-            (bind (command . arguments) all
+            (receive (command arguments) (process-command/arguments all)
               (define (insert-line line style)
                 (insert-styled self line style)
                 (insert-newline self))
@@ -290,20 +303,29 @@
                              (insert-line err 'Error)
                              (insert-newline self)
                              (display-prompt self))
-                         (let ((infos (make-table test: equal?))
-                               (directory (timestamped-directory {Directory Settings "work" "requests"} (->string what))))
-                           (create-directories directory)
-                           (insert-styled self (get-name directory)
-                             (new Link-Style
-                               base: 'Link
-                               action: (lambda (text pos style)
-                                         (case what
-                                           ((caps)
-                                            (caps-action directory))
-                                           ((replay)
-                                            (replay-action directory))))))
-                           (insert-newline self)
-                           (let ((insertion-line (get-line (get-end self))))
+                         (let ((infos (make-table test: equal?)))
+                           (define (receive-directory)
+                             (cond ((eq? what 'shared)
+                                    #f)
+                                   ((string? what)
+                                    {Directory Settings "work" "requests"})
+                                   (else
+                                    (let ((directory (timestamped-directory {Directory Settings "work" "requests"} (->string what))))
+                                      (create-directories directory)
+                                      (insert-styled self (get-name directory)
+                                        (new Link-Style
+                                          base: 'Link
+                                          action: (lambda (text pos style)
+                                                    (case what
+                                                      ((caps)
+                                                       (caps-action directory))
+                                                      ((replay)
+                                                       (replay-action directory))))))
+                                      (insert-newline self)
+                                      directory))))
+                           
+                           (let ((directory (receive-directory))
+                                 (insertion-line (get-line (get-end self))))
                              (insert-newline self)
                              (display-prompt self)
                              (register-request-procedure cookie
@@ -316,26 +338,47 @@
                                            info))))
                                  
                                  (define (determine-file)
-                                   (new-file directory (add-extension sender (->string what))))
+                                   (if (string? what)
+                                       (new-file directory what)
+                                     (new-file directory (add-extension sender (->string what)))))
                                  
-                                 (let ((info (determine-info)))
-                                   (bind (file name-end line-end) info
-                                     (when (not chunk)
-                                       (let ((insert-range (new Range$Cell$ (new Cell insertion-line 0) (new Cell insertion-line 0))))
-                                         (let ((end (get-end (replace-styled self insert-range (list (format "  {a}" (get-name file))) 'Output))))
-                                           (set-second! info end)
-                                           (replace-styled self (new Range$Cell$ end end) (list "" "") 'Output)
-                                           (ensure-displayed self)
-                                           (increase! insertion-line))))
-                                     (let ((thread
-                                             (new-thread
-                                               (lambda ()
-                                                 (when chunk
-                                                   (case what
-                                                     ((caps)
-                                                      (save-binary file (zlib-inflate chunk)))
-                                                     ((replay)
-                                                      (save-binary file chunk))))
+                                 (if (eq? what 'shared)
+                                     (when done?
+                                       (let ((filenames (u8vector->object (zlib-inflate chunk))))
+                                         (for-each (lambda (filename)
+                                                     (let ((insert-range (new Range$Cell$ (new Cell insertion-line 0) (new Cell insertion-line 0))))
+                                                       (replace-styled self insert-range (list filename "")
+                                                         (new Link-Style
+                                                           base: 'Link
+                                                           action: (lambda (text pos style)
+                                                                     (let ((start (get-start self)))
+                                                                       (insert-styled self (format "transfer {a} {s}" who filename) 'Entry)
+                                                                       (let ((end (get-end self)))
+                                                                         (let ((range (new Range$Cell$ start end)))
+                                                                           (console-evaluate self range)))))))
+                                                       (ensure-displayed self)
+                                                       (increase! insertion-line)))
+                                                   filenames)))
+                                   (let ((info (determine-info)))
+                                     (bind (file name-end line-end) info
+                                       (when (not chunk)
+                                         (let ((insert-range (new Range$Cell$ (new Cell insertion-line 0) (new Cell insertion-line 0))))
+                                           (let ((end (get-end (replace-styled self insert-range (list (format "  {a}" (get-name file))) 'Output))))
+                                             (set-second! info end)
+                                             (replace-styled self (new Range$Cell$ end end) (list "" "") 'Output)
+                                             (ensure-displayed self)
+                                             (increase! insertion-line))))
+                                       (let ((thread
+                                               (new-thread
+                                                 (lambda ()
+                                                   (when chunk
+                                                     (if (string? what)
+                                                         (save-binary file (zlib-inflate chunk))
+                                                       (case what
+                                                         ((caps)
+                                                          (save-binary file (zlib-inflate chunk)))
+                                                         ((replay)
+                                                          (save-binary file chunk)))))
                                                    (when done?
                                                      (stylize-range self (new Range$Cell$ (new Cell (get-line name-end) 0) name-end)
                                                        (new Link-Style
@@ -357,7 +400,7 @@
                                                          (set-third! info (new Range$Cell$ end end))))))
                                                  'save)))
                                          (thread-base-priority-set! thread background-priority)
-                                         (thread-start! thread)))))))))))))
+                                         (thread-start! thread))))))))))))))
                 ((list)
                  (stylize-range model range (locate-style self 'Input))
                  (insert-newline self)
@@ -400,8 +443,10 @@
                  (insert-line "request <what> <who>" 'Output)
                  (insert-line "reset <what>" 'Output)
                  (insert-line "restart" 'Output)
+                 (insert-line "shared <who>" 'Output)
                  (insert-line "test <no>" 'Output)
                  (insert-line "threads" 'Output)
+                 (insert-line "transfer <who> <filename>" 'Output)
                  (insert-line "who" 'Output)
                  (insert-line "clear" 'Output)
                  (insert-line "help / ?" 'Output)
