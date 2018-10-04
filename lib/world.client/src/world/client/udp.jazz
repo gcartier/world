@@ -53,6 +53,7 @@
 (class UDP-Client extends Object
   
   
+  (slot client-no           initialize #f getter generate)
   (slot udp-port            initialize #f getter generate)
   (slot udp-stopping?       initialize #f getter generate)
   (slot local-host          initialize #f getter generate)
@@ -79,7 +80,12 @@
   (slot simulator           initialize #f getter generate)
   
   
-  (method (connect self client-no local-host host service)
+  (method override (initialize self client-no)
+    (nextmethod self)
+    (set! self.client-no client-no))
+  
+  
+  (method (connect self local-host host service)
     ;; quick heuristic
     (define (determine-local-address)
       (if local?
@@ -213,8 +219,7 @@
   
   (method protected (peers-update self peers-info)
     (mutex-lock! peers-mutex)
-    (let ((client-no (get-client-no (current-tier)))
-          (p (make-table)))
+    (let ((p (make-table)))
       (let ((my-info (cdr (assv client-no peers-info))))
         (bind (my-host my-port my-local) my-info
           (for-each (lambda (info)
@@ -333,7 +338,6 @@
                          (close-port udp-video-port)
                          (set! udp-video-port #f))))))
             (let ((off? (not buffer))
-                  (client-no (get-client-no (current-client)))
                   (frame (next-frame-sequence! channel))
                   ;; give media off and resent header a sequential timestamp so it gets inserted correctly
                   (timestamp (or timestamp (+ (or (get-last-timestamp channel) 0) 1)))
@@ -495,41 +499,64 @@
   
   
   (method (receive-state self data)
-    (let ((client-no (get-client-no (current-client))))
-      (let ((states (u8vector->object (read-udp-state-channels data))))
-        (for-each (lambda (info)
-                    (bind (channel-origin media-kind client-state) info
-                      (when (= channel-origin client-no)
-                        ;; throttling
-                        (set! last-received-state (current-seconds))
-                        (when throttle-media?
-                          (set! throttle-media? #f)
-                          ;; force camera reset in the code below
-                          (set! client-state 'waiting)
-                          (record-event udp-id-throttle-off
-                                        (fixnum->flonum channel-origin)
-                                        (fixnum->flonum media-kind)
-                                        -1.
-                                        -1.
-                                        -1.
-                                        -1.)
-                          (when udp-show-throttle?
-                            (format :terminal "{s} {s} {s} {s}{%}" remote-name (present-media-kind media-kind) 'THROTTLE 'OFF)))
-                        ;; waiting
-                        (when (eq? client-state 'waiting)
-                          (let ((channel (find-send-channel self media-kind)))
-                            (when channel
-                              (ecase media-kind
-                                ((udp-audio)
-                                 ;; resend headers
-                                 (let ((audio (current-audio)))
-                                   (when (audio-playing? audio)
-                                     (when (eq? audio-codec 'vorbis)
-                                       (let ((header (locate (get-retain-ring channel) media-packet-header?)))
-                                         (if header
-                                             (when udp-show-resetting?
-                                               (format :terminal "{s} {s} {s} {s} {s}{%}" remote-name (present-media-kind media-kind) 'RESEND 'AVOIDED (read-udp-sequence header)))
-                                           (resend-mic-header audio)
+    (let ((states (u8vector->object (read-udp-state-channels data))))
+      (for-each (lambda (info)
+                  (bind (channel-origin media-kind client-state) info
+                    (when (= channel-origin client-no)
+                      ;; throttling
+                      (set! last-received-state (current-seconds))
+                      (when throttle-media?
+                        (set! throttle-media? #f)
+                        ;; force camera reset in the code below
+                        (set! client-state 'waiting)
+                        (record-event udp-id-throttle-off
+                                      (fixnum->flonum channel-origin)
+                                      (fixnum->flonum media-kind)
+                                      -1.
+                                      -1.
+                                      -1.
+                                      -1.)
+                        (when udp-show-throttle?
+                          (format :terminal "{s} {s} {s} {s}{%}" remote-name (present-media-kind media-kind) 'THROTTLE 'OFF)))
+                      ;; waiting
+                      (when (eq? client-state 'waiting)
+                        (let ((channel (find-send-channel self media-kind)))
+                          (when channel
+                            (ecase media-kind
+                              ((udp-audio)
+                               ;; resend headers
+                               (let ((audio (current-audio)))
+                                 (when (audio-playing? audio)
+                                   (when (eq? audio-codec 'vorbis)
+                                     (let ((header (locate (get-retain-ring channel) media-packet-header?)))
+                                       (if header
+                                           (when udp-show-resetting?
+                                             (format :terminal "{s} {s} {s} {s} {s}{%}" remote-name (present-media-kind media-kind) 'RESEND 'AVOIDED (read-udp-sequence header)))
+                                         (resend-mic-header audio)
+                                         (record-event udp-id-reset-media
+                                                       (fixnum->flonum channel-origin)
+                                                       (fixnum->flonum media-kind)
+                                                       -1.
+                                                       -1.
+                                                       -1.
+                                                       -1.)
+                                         (when udp-show-resets?
+                                           (format :terminal "{s} {s} {s} {s}{%}" remote-name (present-media-kind media-kind) 'RESEND 'HEADERS))))))))
+                              ((udp-video)
+                               ;; camera reset
+                               (let ((video (current-video)))
+                                 (when (video-playing? video)
+                                   (if (and camera-resetting
+                                            (= camera-resetting (get-data-sequence channel)))
+                                       (when udp-show-resetting?
+                                         (format :terminal "{s} {s} {s} {s}{%}" remote-name (present-media-kind media-kind) 'RESET 'IN-PROGRESS))
+                                     (let ((header (locate (get-retain-ring channel) media-packet-header?)))
+                                       (if header
+                                           (when udp-show-resetting?
+                                             (format :terminal "{s} {s} {s} {s} {s}{%}" remote-name (present-media-kind media-kind) 'RESET 'AVOIDED (read-udp-sequence header)))
+                                         (reset-camera video)
+                                         (let ((sequence (get-data-sequence channel)))
+                                           (set! camera-resetting sequence)
                                            (record-event udp-id-reset-media
                                                          (fixnum->flonum channel-origin)
                                                          (fixnum->flonum media-kind)
@@ -538,32 +565,8 @@
                                                          -1.
                                                          -1.)
                                            (when udp-show-resets?
-                                             (format :terminal "{s} {s} {s} {s}{%}" remote-name (present-media-kind media-kind) 'RESEND 'HEADERS))))))))
-                                ((udp-video)
-                                 ;; camera reset
-                                 (let ((video (current-video)))
-                                   (when (video-playing? video)
-                                     (if (and camera-resetting
-                                              (= camera-resetting (get-data-sequence channel)))
-                                         (when udp-show-resetting?
-                                           (format :terminal "{s} {s} {s} {s}{%}" remote-name (present-media-kind media-kind) 'RESET 'IN-PROGRESS))
-                                       (let ((header (locate (get-retain-ring channel) media-packet-header?)))
-                                         (if header
-                                             (when udp-show-resetting?
-                                               (format :terminal "{s} {s} {s} {s} {s}{%}" remote-name (present-media-kind media-kind) 'RESET 'AVOIDED (read-udp-sequence header)))
-                                           (reset-camera video)
-                                           (let ((sequence (get-data-sequence channel)))
-                                             (set! camera-resetting sequence)
-                                             (record-event udp-id-reset-media
-                                                           (fixnum->flonum channel-origin)
-                                                           (fixnum->flonum media-kind)
-                                                           -1.
-                                                           -1.
-                                                           -1.
-                                                           -1.)
-                                             (when udp-show-resets?
-                                               (format :terminal "{s} {s} {s} {s}{%}" remote-name (present-media-kind media-kind) 'RESET sequence))))))))))))))))
-                  states))))
+                                             (format :terminal "{s} {s} {s} {s}{%}" remote-name (present-media-kind media-kind) 'RESET sequence))))))))))))))))
+                states)))
   
   
   (method (receive-ack self data)
@@ -678,7 +681,7 @@
           (let ((data (make-u8vector size)))
             (write-udp-sent data (current-seconds))
             (write-udp-kind data udp-state)
-            (write-udp-origin data (get-client-no (current-client)))
+            (write-udp-origin data client-no)
             (write-udp-state-channels data states)
             (send-data self data))))
       (mutex-unlock! write-mutex)))
