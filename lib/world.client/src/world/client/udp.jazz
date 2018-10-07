@@ -1041,6 +1041,32 @@
                           -1.
                         (timestamp->flonum timestamp)))))
     
+    (define (record-discard-packet data)
+      (let ((sequence (read-udp-sequence data))
+            (frame (read-udp-frame data))
+            (origin (read-udp-origin data))
+            (timestamp (read-udp-media-timestamp data)))
+        (record-event udp-id-discard-packet
+                      (fixnum->flonum origin)
+                      (fixnum->flonum media-kind)
+                      (fixnum->flonum sequence)
+                      (fixnum->flonum frame)
+                      -1.
+                      (if (= timestamp -1)
+                          -1.
+                        (timestamp->flonum timestamp)))))
+    
+    (define (record-missing-packet origin sequence frame timestamp)
+      (record-event udp-id-missing-packet
+                    (fixnum->flonum origin)
+                    (fixnum->flonum media-kind)
+                    (fixnum->flonum sequence)
+                    (fixnum->flonum frame)
+                    -1.
+                    (if (= timestamp -1)
+                        -1.
+                      (timestamp->flonum timestamp))))
+    
     (declare (proper-tail-calls))
     (with-task task
       (lambda (exit)
@@ -1065,7 +1091,7 @@
                             (table-set! process-frames frame vec)
                             (set! chunks vec))))
                       (vector-set! chunks part data))
-                    ;; process
+                    ;; scan
                     (let ((keys (table-keys process-frames)))
                       ;; quicky for tests to find bounds
                       (let ((lowest (minimum keys))
@@ -1088,16 +1114,41 @@
                           (when (<= frame highest)
                             (let ((chunks (table-ref process-frames frame #f)))
                               (if (complete? chunks)
+                                  ;; complete
                                   (begin
                                     (table-clear process-frames frame)
                                     (process-frame self chunks)
                                     (loop-frame (+ frame 1)))
+                                ;; incomplete
                                 (let ((header (loop (for f from (+ frame 1) to highest)
                                                     (when (complete-header? (table-ref process-frames f #f))
                                                       (return f))
                                                     (finally #f))))
                                   (when header
-                                    (loop (for f from lowest below header)
+                                    (loop (for f from frame below header)
+                                          (let ((chunks (table-ref process-frames f #f))
+                                                ;; super quicky
+                                                (missing-origin #f)
+                                                (missing-base-sequence #f)
+                                                (missing-base-rank #f)
+                                                (missing-frame #f)
+                                                (missing-timestamp #f))
+                                            (let ((len (vector-length chunks)))
+                                              (loop (for n from 0 below len)
+                                                    (let ((data (vector-ref chunks n)))
+                                                      (when data
+                                                        (record-discard-packet data)
+                                                        (when (not missing-origin)
+                                                          (set! missing-origin (read-udp-origin data))
+                                                          (set! missing-base-sequence (read-udp-sequence data))
+                                                          (set! missing-base-rank n)
+                                                          (set! missing-frame (read-udp-frame data))
+                                                          (set! missing-timestamp (read-udp-media-timestamp data))))))
+                                              (loop (for n from 0 below len)
+                                                    (let ((data (vector-ref chunks n)))
+                                                      (when (not data)
+                                                        (let ((missing-sequence (+ missing-base-sequence (- n missing-base-rank))))
+                                                          (record-missing-packet missing-origin missing-sequence missing-frame missing-timestamp)))))))
                                           (table-clear process-frames f))
                                     (loop-frame header)))))))))
                     @redo!?
