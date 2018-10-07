@@ -831,16 +831,17 @@
 (class UDP-Receive-Channel extends UDP-Channel
   
   
-  (slot origin                getter generate)
-  (slot latest-nacks          accessors generate)
-  (slot process-state         getter generate)
-  (slot process-last-sequence getter generate)
-  (slot process-last-frame    getter generate)
-  (slot process-ring          getter generate)
-  (slot process-task          getter generate)
-  (slot process-average       getter generate)
-  (slot processed             getter generate)
-  (slot missing               getter generate)
+  (slot origin             getter generate)
+  (slot latest-nacks       accessors generate)
+  (slot process-state      getter generate)
+  (slot process-times      getter generate)
+  (slot process-frames     getter generate)
+  (slot process-last-frame getter generate)
+  (slot process-ring       getter generate)
+  (slot process-task       getter generate)
+  (slot process-average    getter generate)
+  (slot processed          getter generate)
+  (slot missing            getter generate)
   
   
   (method override (initialize self origin media-kind)
@@ -848,8 +849,9 @@
     (set! self.origin origin)
     (set! self.latest-nacks '())
     (set! self.process-state 'waiting)
+    (set! self.process-times (make-table test: eqv?))
+    (set! self.process-frames (make-table test: eqv?))
     (set! self.process-last-frame #f)
-    (set! self.process-last-sequence #f)
     (set! self.process-ring (new Time-Ring udp-process-size max-size: udp-process-max-size key-proc: udp-ring-key invalid-proc: (udp-ring-invalid origin media-kind) overflow-proc: (udp-ring-overflow 'process udp-ring-kind-process)))
     (set! self.process-task (new Task 'udp-process (lambda (task)
                                                      (process-loop self task))
@@ -976,7 +978,7 @@
               (if (not problem)
                   (let ((origin (read-udp-origin data))
                         (ring-size (get-count process-ring)))
-                    (record-event udp-id-add-process
+                    (record-event udp-id-insert-packet
                                   (fixnum->flonum origin)
                                   (fixnum->flonum media-kind)
                                   (fixnum->flonum sequence)
@@ -985,18 +987,6 @@
                                   (if timeless? -1. timestamp))
                     #t)
                 (case problem
-                  ((late)
-                   (let ((origin (read-udp-origin data))
-                         (ring-size (get-count process-ring)))
-                     (record-event udp-id-late-packet
-                                   (fixnum->flonum origin)
-                                   (fixnum->flonum media-kind)
-                                   (fixnum->flonum sequence)
-                                   (fixnum->flonum ring-size)
-                                   (if timeless? -1. process-time)
-                                   (if timeless? -1. timestamp)))
-                   (when udp-show-late?
-                     (format :terminal "{s} {s} {s} {s} {s}{%}" remote-name (present-media-kind media-kind) '***late*** sequence (and process-time (- now process-time)))))
                   ((duplicate)
                    (let ((origin (read-udp-origin data))
                          (ring-size (get-count process-ring)))
@@ -1018,70 +1008,122 @@
   
   
   (method (process-loop self task)
+    (define (record-reject-packet data)
+      (let ((sequence (read-udp-sequence data))
+            (frame (read-udp-frame data))
+            (origin (read-udp-origin data))
+            (timestamp (read-udp-media-timestamp data)))
+        (record-event udp-id-process-packet
+                      (fixnum->flonum origin)
+                      (fixnum->flonum media-kind)
+                      (fixnum->flonum sequence)
+                      (fixnum->flonum frame)
+                      -1.
+                      (if (= timestamp -1)
+                          -1.
+                        (timestamp->flonum timestamp)))))
+    
+    (define (record-process-packet data)
+      (let ((sequence (read-udp-sequence data))
+            (frame (read-udp-frame data))
+            (origin (read-udp-origin data))
+            (timestamp (read-udp-media-timestamp data)))
+        (record-event udp-id-process-packet
+                      (fixnum->flonum origin)
+                      (fixnum->flonum media-kind)
+                      (fixnum->flonum sequence)
+                      (fixnum->flonum frame)
+                      -1.
+                      (if (= timestamp -1)
+                          -1.
+                        (timestamp->flonum timestamp)))))
+    
     (declare (proper-tail-calls))
     (with-task task
       (lambda (exit)
         (let (looping)
-          (let ((all (wait-all process-ring)))
-            ;; quick solution until we have a clean way to
-            ;; unblock a time ring and make it return false
-            (if (memq? #f all)
+          (let ((data (wait process-ring)))
+            (if (not data)
                 (continuation-return exit #f)
-              @sanity-check
-              (let ((unique (remove-duplicates all key: read-udp-sequence)))
-                (let ((sorted (sort < unique key: read-udp-sequence)))
-                  (let ((all (map read-udp-sequence all))
-                        (sorted (map read-udp-sequence sorted)))
-                    (unless (equal? all sorted)
-                      (terminal 'all all)
-                      (terminal 'sorted sorted)
-                      (error "assertion failed")))))
               (site (udp-process on?: #t)
-                (let (loop-data (scan all) (last-sequence process-last-sequence))
-                  (if (null? scan)
-                      (set! process-last-sequence last-sequence)
-                    (let ((data (car scan)))
-                      (let ((sequence (read-udp-sequence data)))
-                        (let ((ring-size (get-count process-ring))
-                              (origin (read-udp-origin data))
-                              (timestamp (read-udp-media-timestamp data)))
-                          (record-event udp-id-remove-process
-                                        (fixnum->flonum origin)
-                                        (fixnum->flonum media-kind)
-                                        (fixnum->flonum sequence)
-                                        (fixnum->flonum ring-size)
-                                        -1.
-                                        (if (= timestamp -1)
-                                            -1.
-                                          (timestamp->flonum timestamp))))
-                        (let ((gap (if (not last-sequence) 0 (- sequence (+ last-sequence 1)))))
-                          (when (> gap 0)
-                            (let ((origin (read-udp-origin data)))
-                              (loop (for seq from (+ last-sequence 1) below sequence)
-                                    (record-event udp-id-missing-packet
-                                                  (fixnum->flonum origin)
-                                                  (fixnum->flonum media-kind)
-                                                  (fixnum->flonum seq)
-                                                  (fixnum->flonum sequence)
-                                                  -1.
-                                                  -1.)
-                                    (when udp-show-missing?
-                                      (format :terminal "{s} {s} {s} {s}{%}" remote-name (present-media-kind media-kind) '***missing*** seq)))))
-                          (loop-data (cdr scan) sequence))))))
-                (for-each (lambda (partition)
-                            (bind (frame . datas) partition
-                              (process-frame self datas)))
-                          (sort < (partition all key: read-udp-frame) key: car))
-                (when (eq? process-state 'waiting)
-                  (let ((udp-client (get-udp-client (current-client))))
-                    ;; should not be necessary but lets
-                    ;; do the necessary changes later...
-                    (when udp-client
-                      (send-state udp-client)))))))
+                (let ((sequence (read-udp-sequence data))
+                      (frame (read-udp-frame data))
+                      (part (read-udp-part data)))
+                  (if (and process-last-frame (<= frame process-last-frame))
+                      ;; reject
+                      (record-reject-packet data)
+                    ;; process
+                    (record-process-packet data)
+                    ;; fill
+                    (let ((chunks (table-ref process-frames frame #f)))
+                      (when (not chunks)
+                        (let ((total (read-udp-total data)))
+                          (let ((vec (make-vector total #f)))
+                            (table-set! process-frames frame vec)
+                            (set! chunks vec))))
+                      (vector-set! chunks part data))
+                    ;; process
+                    (let ((keys (table-keys process-frames)))
+                      ;; quicky for tests to find bounds
+                      (let ((lowest (minimum keys))
+                            (highest (maximum keys)))
+                        ;; quicky
+                        (define (complete? chunks)
+                          (and chunks
+                               (= (loop (for data in-vector chunks)
+                                        (when data
+                                          (sum 1)))
+                                  (vector-length chunks))))
+                        
+                        ;; quicky
+                        (define (complete-header? chunks)
+                          (and (complete? chunks)
+                               (read-udp-media-header? (vector-ref chunks 0))))
+                        
+                        ;; quicky
+                        (let (loop-frame (frame lowest))
+                          (when (<= frame highest)
+                            (let ((chunks (table-ref process-frames frame #f)))
+                              (if (complete? chunks)
+                                  (begin
+                                    (table-clear process-frames frame)
+                                    (process-frame self chunks)
+                                    (loop-frame (+ frame 1)))
+                                (let ((header (loop (for f from (+ frame 1) to highest)
+                                                    (when (complete-header? (table-ref process-frames f #f))
+                                                      (return f))
+                                                    (finally #f))))
+                                  (when header
+                                    (loop (for f from lowest below header)
+                                          (table-clear process-frames f))
+                                    (loop-frame header)))))))))
+                    @redo!?
+                    (when (eq? process-state 'waiting)
+                      (let ((udp-client (get-udp-client (current-client))))
+                        ;; should not be necessary but lets
+                        ;; do the necessary changes later...
+                        (when udp-client
+                          (send-state udp-client)))))))))
           (looping)))))
   
   
   (method (process-frame self datas)
+    (define (record-present-frame data)
+      (let ((frame (read-udp-frame data))
+            (origin (read-udp-origin data))
+            (timestamp (read-udp-media-timestamp data)))
+        (record-event udp-id-present-frame
+                      (fixnum->flonum origin)
+                      (fixnum->flonum media-kind)
+                      -1.
+                      (fixnum->flonum frame)
+                      -1.
+                      (if (= timestamp -1)
+                          -1.
+                        (timestamp->flonum timestamp)))))
+    
+    ;; what a quicky!!!
+    (set! datas (vector->list datas))
     (let ((member (find-group-member-by-no (current-client) origin)))
       ;; quick solution for when logging in and starting receiving
       ;; someone's media before the client is actually registered
@@ -1126,7 +1168,8 @@
                                             ;; doesn't actually use the timestamp
                                             (receive-server-audio (current-audio) id buffer timestamp duration)))
                                         headers))
-                          (receive-server-audio (current-audio) id complete-buffer timestamp duration)))))))
+                          (receive-server-audio (current-audio) id complete-buffer timestamp duration))
+                        (record-present-frame first))))))
               
               (define (process-video)
                 (let ((complete-buffer (assemble-chunks)))
@@ -1145,7 +1188,8 @@
                                 (add process-average 1.)
                                 (process-state-ok self kind)
                                 (set! process-last-frame frame)
-                                (receive-server-video (current-video) id complete-buffer timestamp duration))
+                                (receive-server-video (current-video) id complete-buffer timestamp duration)
+                                (record-present-frame first))
                             ;; gap
                             (process-state-waiting self kind))))
                     ;; incomplete
