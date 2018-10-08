@@ -849,7 +849,6 @@
   (slot origin             getter generate)
   (slot latest-nacks       accessors generate)
   (slot process-state      getter generate)
-  (slot process-times      getter generate)
   (slot process-frames     getter generate)
   (slot process-frame-last getter generate)
   (slot process-last-frame getter generate)
@@ -865,7 +864,6 @@
     (set! self.origin origin)
     (set! self.latest-nacks '())
     (set! self.process-state 'waiting)
-    (set! self.process-times (make-table test: eqv?))
     (set! self.process-frames (make-table test: eqv?))
     (set! self.process-frame-last #f)
     (set! self.process-last-frame #f)
@@ -1193,22 +1191,18 @@
                           -1.
                         (timestamp->flonum timestamp)))))
     
-    ;; what a quicky!!!
-    (set! datas (vector->list datas))
     (let ((member (find-group-member-by-no (current-client) origin)))
       ;; quick solution for when logging in and starting receiving
       ;; someone's media before the client is actually registered
       ;; need to revisit this code for a cleaner solution
       (when member
         (let ((id (second member)))
-          (let ((count (length datas))
-                (first (car datas)))
+          (let ((count (vector-length datas))
+                (first (vector-ref datas 0)))
             (increase! processed count)
             (let ((kind (read-udp-kind first))
                   (origin (read-udp-origin first))
-                  (sequence (read-udp-sequence first))
                   (frame (read-udp-frame first))
-                  (part (read-udp-part first))
                   (total (read-udp-total first))
                   (timestamp (read-udp-media-timestamp first))
                   (duration (read-udp-media-duration first))
@@ -1216,62 +1210,58 @@
                   (off? (read-udp-media-off? first)))
               (define (process-audio)
                 (let ((complete-buffer (assemble-chunks)))
-                  (when complete-buffer
-                    (if off?
-                        (receive-server-audio (current-audio) id #f #f #f)
-                      ;; audio has no problem with gaps
-                      (when (or (eq? audio-codec 'opus) ;; opus has no headers
-                                (eq? process-state 'ok)
-                                header?)
-                        (let ((gap (if (not process-last-frame) 0 (- frame (+ process-last-frame 1)))))
-                          (loop (repeat gap)
-                                (add process-average 0.))
-                          (add process-average 1.))
-                        (process-state-ok self kind)
-                        (set! process-last-frame frame)
-                        (if (and header? (eq? audio-codec 'vorbis))
-                            (let ((headers (u8vector->object complete-buffer)))
-                              (for-each (lambda (header)
-                                          (bind (buffer timestamp duration) header
-                                            ;; be very careful as timestamp is incorrect as it
-                                            ;; is the timestamp at time the header was captured
-                                            ;; this only works because gst_app_src_write3
-                                            ;; doesn't actually use the timestamp
-                                            (receive-server-audio (current-audio) id buffer timestamp duration)))
-                                        headers))
-                          (receive-server-audio (current-audio) id complete-buffer timestamp duration))
-                        (record-present-frame first))))))
+                  (if off?
+                      (receive-server-audio (current-audio) id #f #f #f)
+                    ;; audio has no problem with gaps
+                    (when (or (eq? audio-codec 'opus) ;; opus has no headers
+                              (eq? process-state 'ok)
+                              header?)
+                      (let ((gap (if (not process-last-frame) 0 (- frame (+ process-last-frame 1)))))
+                        (loop (repeat gap)
+                              (add process-average 0.))
+                        (add process-average 1.))
+                      (process-state-ok self kind)
+                      (set! process-last-frame frame)
+                      (if (and header? (eq? audio-codec 'vorbis))
+                          (let ((headers (u8vector->object complete-buffer)))
+                            (for-each (lambda (header)
+                                        (bind (buffer timestamp duration) header
+                                          ;; be very careful as timestamp is incorrect as it
+                                          ;; is the timestamp at time the header was captured
+                                          ;; this only works because gst_app_src_write3
+                                          ;; doesn't actually use the timestamp
+                                          (receive-server-audio (current-audio) id buffer timestamp duration)))
+                                      headers))
+                        (receive-server-audio (current-audio) id complete-buffer timestamp duration))
+                      (record-present-frame first)))))
               
               (define (process-video)
                 (let ((complete-buffer (assemble-chunks)))
-                  (if complete-buffer
-                      (if off?
-                          ;; off
-                          (receive-server-video (current-video) id #f #f #f)
-                        ;; complete
-                        (let ((gap (if (not process-last-frame) 0 (- frame (+ process-last-frame 1)))))
-                          (if (or (and (= gap 0) (eq? process-state 'ok))
-                                  header?)
-                              ;; no gap or header
-                              (begin
-                                (loop (repeat gap)
-                                      (add process-average 0.))
-                                (add process-average 1.)
-                                (process-state-ok self kind)
-                                (set! process-last-frame frame)
-                                (receive-server-video (current-video) id complete-buffer timestamp duration)
-                                (record-present-frame first))
-                            ;; gap
-                            (process-state-waiting self kind))))
-                    ;; incomplete
-                    (process-state-waiting self kind))))
+                  (if off?
+                      ;; off
+                      (receive-server-video (current-video) id #f #f #f)
+                    ;; complete
+                    (let ((gap (if (not process-last-frame) 0 (- frame (+ process-last-frame 1)))))
+                      (if (or (and (= gap 0) (eq? process-state 'ok))
+                              header?)
+                          ;; no gap or header
+                          (begin
+                            (loop (repeat gap)
+                                  (add process-average 0.))
+                            (add process-average 1.)
+                            (process-state-ok self kind)
+                            (set! process-last-frame frame)
+                            (receive-server-video (current-video) id complete-buffer timestamp duration)
+                            (record-present-frame first))
+                        ;; gap
+                        (process-state-waiting self kind))))))
               
               (define (assemble-chunks)
-                (and (= total count)
-                     (if (= total 1)
-                         (read-udp-media-payload first)
-                       (let ((chunks (map read-udp-media-payload datas)))
-                         (apply u8vector-append chunks)))))
+                (if (= total 1)
+                    (read-udp-media-payload first)
+                  (let ((chunks (loop (for data in-vector datas)
+                                      (collect (read-udp-media-payload data)))))
+                    (apply u8vector-append chunks))))
               
               (ecase kind
                 ((udp-audio)
