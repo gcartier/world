@@ -846,16 +846,17 @@
 (class UDP-Receive-Channel extends UDP-Channel
   
   
-  (slot origin             getter generate)
-  (slot latest-nacks       accessors generate)
-  (slot process-state      getter generate)
-  (slot process-frames     getter generate)
-  (slot process-last-frame getter generate)
-  (slot process-ring       getter generate)
-  (slot process-task       getter generate)
-  (slot process-average    getter generate)
-  (slot processed          getter generate)
-  (slot missing            getter generate)
+  (slot origin          getter generate)
+  (slot latest-nacks    accessors generate)
+  (slot process-state   getter generate)
+  (slot process-ring    getter generate)
+  (slot process-task    getter generate)
+  (slot process-average getter generate)
+  (slot ready-frames    getter generate)
+  (slot ready-count     getter generate)
+  (slot last-processed  getter generate)
+  (slot processed       getter generate)
+  (slot missing         getter generate)
   
   
   (method override (initialize self origin media-kind)
@@ -863,8 +864,9 @@
     (set! self.origin origin)
     (set! self.latest-nacks '())
     (set! self.process-state 'waiting)
-    (set! self.process-frames (make-table test: eqv?))
-    (set! self.process-last-frame #f)
+    (set! self.ready-frames (make-table test: eqv?))
+    (set! self.ready-count 0)
+    (set! self.last-processed #f)
     (set! self.process-ring (new Time-Ring udp-process-size max-size: udp-process-max-size key-proc: udp-ring-key invalid-proc: (udp-ring-invalid origin media-kind) overflow-proc: (udp-ring-overflow 'process udp-ring-kind-process)))
     (set! self.process-task (new Task 'udp-process (lambda (task)
                                                      (process-loop self task))
@@ -1087,21 +1089,22 @@
                       (frame (read-udp-frame data))
                       (part (read-udp-part data))
                       (timestamp (read-udp-media-timestamp data)))
-                  (if (and process-last-frame (<= frame process-last-frame))
+                  (if (and last-processed (<= frame last-processed))
                       ;; reject
                       (record-reject-packet origin sequence frame timestamp)
                     ;; process
                     (record-process-packet origin sequence frame timestamp)
-                    ;; fill
-                    (let ((chunks (table-ref process-frames frame #f)))
+                    ;; add
+                    (let ((chunks (table-ref ready-frames frame #f)))
                       (when (not chunks)
                         (let ((total (read-udp-total data)))
                           (let ((vec (make-vector total #f)))
-                            (table-set! process-frames frame vec)
+                            (table-set! ready-frames frame vec)
                             (set! chunks vec))))
-                      (vector-set! chunks part data))
+                      (vector-set! chunks part data)
+                      (increase! ready-count))
                     ;; scan
-                    (let ((keys (table-keys process-frames)))
+                    (let ((keys (table-keys ready-frames)))
                       (let ((lowest (minimum keys))
                             (highest (maximum keys)))
                         (define (complete? chunks)
@@ -1117,26 +1120,27 @@
                         
                         (let (loop-frame (frame lowest))
                           (when (<= frame highest)
-                            (let ((chunks (table-ref process-frames frame #f)))
+                            (let ((chunks (table-ref ready-frames frame #f)))
                               (if (and (complete? chunks)
                                        (or (read-udp-media-header? (vector-ref chunks 0))
-                                           (not process-last-frame)
-                                           (= frame (+ process-last-frame 1))))
+                                           (not last-processed)
+                                           (= frame (+ last-processed 1))))
                                   ;; complete
                                   (begin
-                                    (table-clear process-frames frame)
-                                    (set! process-last-frame frame)
+                                    (table-clear ready-frames frame)
+                                    (decrease! ready-count (vector-length chunks))
+                                    (set! last-processed frame)
                                     (process-frame self chunks)
                                     (loop-frame (+ frame 1)))
                                 ;; incomplete
                                 (let ((header (loop (for f from (+ frame 1) to highest)
-                                                    (when (complete-header? (table-ref process-frames f #f))
+                                                    (when (complete-header? (table-ref ready-frames f #f))
                                                       (return f))
                                                     (finally #f))))
                                   (when header
-                                    ;; flush old frames
+                                    ;; flush frames before header
                                     (loop (for f from frame below header)
-                                          (let ((chunks (table-ref process-frames f #f))
+                                          (let ((chunks (table-ref ready-frames f #f))
                                                 (chunks-origin #f)
                                                 (chunks-base #f)
                                                 (chunks-frame #f)
@@ -1161,12 +1165,13 @@
                                                       (let ((data (vector-ref chunks n)))
                                                         (when (not data)
                                                           (let ((missing-sequence (+ chunks-base n)))
-                                                            (record-missing-packet chunks-origin missing-sequence chunks-frame chunks-timestamp))))))))
-                                          (table-clear process-frames f))
+                                                            (record-missing-packet chunks-origin missing-sequence chunks-frame chunks-timestamp)))))
+                                                (decrease! ready-count len))))
+                                          (table-clear ready-frames f))
                                     ;; continue with header
                                     (loop-frame header)))))))))
                     @redo
-                    (let ((gap (if (not process-last-frame) 0 (- frame (+ process-last-frame 1)))))
+                    (let ((gap (if (not last-processed) 0 (- frame (+ last-processed 1)))))
                       (loop (repeat gap)
                             (add process-average 0.))
                       (add process-average 1.)))))))
