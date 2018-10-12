@@ -62,8 +62,6 @@
   (slot names      initialize #f accessors generate)
   (slot evolutions initialize #f accessors generate)
   (slot base-time  initialize 0. accessors generate)
-  (slot from       initialize #f accessors generate)
-  (slot to         initialize #f accessors generate)
   (slot now        initialize #f accessors generate)
   
   
@@ -97,15 +95,13 @@
             (warn optimizations))
 
   
-  (method package (view-evolutions-at self (from #f) (to #f) (now #f))
-    (set! self.from from)
-    (set! self.to to)
+  (method package (view-evolutions-at self (now #f))
     (set! self.now now)
     (let ((world (current-world))
           (tree (locate self 'entries))
           (color {Color World-Red})
           (data-color {Color White})
-          (highlight-row #f)
+          (now-row #f)
           (numerical-test
             (lambda (value value/range)
               (if (pair? value/range)
@@ -115,6 +111,7 @@
       (let ((filtered (get-filtered-columns tree))
             (entries (new-queue))
             (total 0))
+        ;; scan
         (iterate-table evolutions
           (lambda (id <fx> evolution <Evolution>)
             (define filters
@@ -136,39 +133,45 @@
                   (last (last-position evolution)))
               (define (find-now)
                 (if (not now)
-                    first
+                    (values first (+ first 1))
                   (loop (for n from first to last)
                         (for time = (evolutionary-udp-time evolution n))
                         (when (> time now)
-                          (return n))
-                        (finally last))))
+                          (return (values (- n 1) n)))
+                        (finally (values (- last 1) last)))))
               
-              (let ((now-index (find-now)))
-                ;; gather entries
-                (loop (for n from (max first (- now-index evolutions-max)) to (min last (+ now-index evolutions-max)))
-                      (let ((time (evolutionary-udp-time evolution n)))
-                        (when (and (or (not from) (>= time from))
-                                   (or (not to) (<= time to))
-                                   (loop (for filter in filters)
-                                         (every (filter n))))
-                          (let ((user-data (vector time
-                                                   id
-                                                   (evolutionary-udp-id evolution n)
-                                                   (evolutionary-udp-origin evolution n)
-                                                   (evolutionary-udp-kind evolution n)
-                                                   (evolutionary-udp-data1 evolution n)
-                                                   (evolutionary-udp-data2 evolution n)
-                                                   (evolutionary-udp-data3 evolution n)
-                                                   (evolutionary-udp-data4 evolution n))))
-                            (enqueue entries user-data)))))
-                ;; calculate total
-                (loop (for n from first to last)
-                      (let ((time (evolutionary-udp-time evolution n)))
-                        (when (and (or (not from) (>= time from))
-                                   (or (not to) (<= time to))
-                                   (loop (for filter in filters)
-                                         (every (filter n))))
-                          (increase! total))))))))
+              (receive (l r) (find-now)
+                (define (scan n found)
+                  (let ((time (evolutionary-udp-time evolution n)))
+                    (if (loop (for filter in filters)
+                              (every (filter n)))
+                        (begin
+                          (when (< found evolutions-max)
+                            (let ((user-data (vector time
+                                                     id
+                                                     (evolutionary-udp-id evolution n)
+                                                     (evolutionary-udp-origin evolution n)
+                                                     (evolutionary-udp-kind evolution n)
+                                                     (evolutionary-udp-data1 evolution n)
+                                                     (evolutionary-udp-data2 evolution n)
+                                                     (evolutionary-udp-data3 evolution n)
+                                                     (evolutionary-udp-data4 evolution n))))
+                              (enqueue entries user-data)))
+                          (increase! total)
+                          #t)
+                      #f)))
+                
+                ;; scan left
+                (let ((found 0))
+                  (loop (for n from l downto first)
+                        (when (scan n found)
+                          (increase! found))))
+                ;; scan right
+                (let ((found 0))
+                  (loop (for n from r to last)
+                        (when (scan n found)
+                          (increase! found))))))))
+        ;; gather neighborhood
         (let ((entries (queue-list entries)))
           (define (now-neighborhood)
             (let ((closest (sort < entries key: (lambda (entry)
@@ -180,8 +183,10 @@
                                               (subseq closest 0 evolutions-max))
                                       key: (lambda (entry)
                                              (vector-ref entry 0))))
-                      (highlight (and (not-null? closest) (car closest))))
-                  (values neighborhood highlight)))))
+                      (closest-now (and (not-null? closest) (car closest))))
+                  (let ((left (and (not-null? neighborhood) (vector-ref (first neighborhood) 0)))
+                        (right (and (not-null? neighborhood) (vector-ref (last neighborhood) 0))))
+                    (values neighborhood closest-now left right))))))
           
           (define (present-data data)
             (if (= data -1.)
@@ -227,7 +232,8 @@
                   (else
                    (format "{r precision: 3}" data))))
           
-          (receive (neighborhood highlight) (now-neighborhood)
+          ;; populate
+          (receive (neighborhood closest-now left right) (now-neighborhood)
             (parameterize ((inhibit-updates? #t)
                            (inhibit-scrollee-layouts? #t))
               (remove-every-row tree)
@@ -256,26 +262,21 @@
                                                                       (new Tree-Label title: data3 font: {Font Label-User} color: data-color)
                                                                       (new Tree-Label title: data4 font: {Font Label-User} color: data-color))
                                                       user-data: user-data)))
-                                    (when (eq? user-data highlight)
-                                      (set! highlight-row row))
+                                    (when (eq? user-data closest-now)
+                                      (set! now-row row))
                                     row))))
                             neighborhood)
-                  (when highlight-row
-                    (let ((line (row->line tree highlight-row)))
-                      (let ((line (if (> line 0) (- line 1) line)))
-                        (ensure-row-displayed tree line center?: #t)
-                        (let ((data (get-cell-data tree (new Cell line 0))))
-                          (set-color data {Color Light-Gray}))))))))
+                  (when now-row
+                    (let ((line (row->line tree now-row)))
+                      (ensure-row-displayed tree line center?: #t)
+                      (let ((data (get-cell-data tree (new Cell line 0))))
+                        (set-color data {Color Light-Gray})))))))
             (layout-scrollee tree)
-            (values (length neighborhood) total))))))
+            (values (length neighborhood) total left right))))))
   
   
   (proclaim (default check bounds zero)
             (default warn optimizations))
-  
-  
-  (method package (redisplay-evolutions self)
-    (view-evolutions-at self from to now))
   
   
   (method package (clear-evolutions self)
