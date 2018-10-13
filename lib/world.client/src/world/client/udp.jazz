@@ -1032,6 +1032,19 @@
   
   
   (method (process-loop self task)
+    (declare (proper-tail-calls))
+    (with-task task
+      (lambda (exit)
+        (let (looping)
+          (let ((data (wait process-ring)))
+            (if (not data)
+                (continuation-return exit #f)
+              (site (udp-process on?: #t)
+                (process-data self data))
+              (looping)))))))
+  
+  
+  (method (process-data self data)
     (define (record-reject-packet origin sequence frame timestamp)
       (record-event udp-id-process-packet
                     (fixnum->flonum origin)
@@ -1076,111 +1089,102 @@
                         -1.
                       (timestamp->flonum timestamp))))
     
-    (declare (proper-tail-calls))
-    (with-task task
-      (lambda (exit)
-        (let (looping)
-          (let ((data (wait process-ring)))
-            (if (not data)
-                (continuation-return exit #f)
-              (site (udp-process on?: #t)
-                (let ((origin (read-udp-origin data))
-                      (sequence (read-udp-sequence data))
-                      (frame (read-udp-frame data))
-                      (part (read-udp-part data))
-                      (timestamp (read-udp-media-timestamp data)))
-                  (if (and last-processed (<= frame last-processed))
-                      ;; reject
-                      (record-reject-packet origin sequence frame timestamp)
-                    ;; process
-                    (record-process-packet origin sequence frame timestamp)
-                    ;; add
-                    (let ((buffer (table-ref ready-buffers frame #f)))
+    (let ((origin (read-udp-origin data))
+          (sequence (read-udp-sequence data))
+          (frame (read-udp-frame data))
+          (part (read-udp-part data))
+          (total (read-udp-total data))
+          (timestamp (read-udp-media-timestamp data)))
+      (if (and last-processed (<= frame last-processed))
+          ;; reject
+          (record-reject-packet origin sequence frame timestamp)
+        ;; process
+        (record-process-packet origin sequence frame timestamp)
+        ;; add
+        (let ((buffer (table-ref ready-buffers frame #f)))
+          (if (not buffer)
+              (let ((chunks (make-vector total #f))
+                    (base (- sequence part))
+                    (count 1))
+                (vector-set! chunks part data)
+                (table-set! ready-buffers frame (new UDP-Ready-Buffer origin base frame count total timestamp chunks))
+                (increase! ready-count))
+            (let ((chunks (get-chunks buffer)))
+              (if (vector-ref chunks part)
+                  #f @w (terminal (present-media-kind media-kind) '***DUPLICATE***)
+                (add-count! buffer 1)
+                (vector-set! chunks part data)
+                (increase! ready-count)))))
+        ;; scan
+        (let ((keys (table-keys ready-buffers)))
+          (let ((lowest (minimum keys))
+                (highest (maximum keys)))
+            (define (complete? buffer)
+              (and buffer
+                   (= (get-count buffer)
+                      (get-total buffer))))
+            
+            (define (complete-header? buffer)
+              (and (complete? buffer)
+                   (read-udp-media-header? (vector-ref (get-chunks buffer) 0))))
+            
+            (define (flush-frames lower upper)
+              (loop (for f from lower to upper)
+                    (let ((buffer (table-ref ready-buffers f #f)))
+                      ;; TODO deduce sequences in the missing buffers
                       (if (not buffer)
-                          (let ((total (read-udp-total data)))
-                            (let ((chunks (make-vector total #f)))
-                              (vector-set! chunks part data)
-                              (table-set! ready-buffers frame (new UDP-Ready-Buffer 1 total chunks))))
-                        (let ((chunks (get-chunks buffer)))
-                          (if (vector-ref chunks part)
-                              #f ;; (terminal '***DUPLICATE***)
-                            (add-count! buffer 1)
-                            (vector-set! chunks part data))))
-                      (increase! ready-count))
-                    ;; scan
-                    (let ((keys (table-keys ready-buffers)))
-                      (let ((lowest (minimum keys))
-                            (highest (maximum keys)))
-                        (define (complete? buffer)
-                          (and buffer
-                               (= (get-count buffer)
-                                  (get-total buffer))))
-                        
-                        (define (complete-header? buffer)
-                          (and (complete? buffer)
-                               (read-udp-media-header? (vector-ref (get-chunks buffer) 0))))
-                        
-                        (let (loop-frame (frame lowest))
-                          (when (<= frame highest)
-                            (let ((buffer (table-ref ready-buffers frame #f)))
-                              (if (and (complete? buffer)
-                                       (or (read-udp-media-header? (vector-ref (get-chunks buffer) 0))
-                                           (not last-processed)
-                                           (= frame (+ last-processed 1))))
-                                  ;; complete
-                                  (begin
-                                    (table-clear ready-buffers frame)
-                                    (decrease! ready-count (get-count buffer))
-                                    (set! last-processed frame)
-                                    (process-frame self (get-chunks buffer))
-                                    (loop-frame (+ frame 1)))
-                                ;; incomplete
-                                (let ((header (loop (for f from (+ frame 1) to highest)
-                                                    (when (complete-header? (table-ref ready-buffers f #f))
-                                                      (return f))
-                                                    (finally #f))))
-                                  (when header
-                                    ;; flush frames before header
-                                    (loop (for f from frame below header)
-                                          (let ((buffer (table-ref ready-buffers f #f))
-                                                (buffer-origin #f)
-                                                (buffer-base #f)
-                                                (buffer-frame #f)
-                                                (buffer-timestamp #f))
-                                            ;; TODO deduce sequences in the missing buffers
-                                            (if (not buffer)
-                                                (terminal '***NO-BUFFER***)
-                                              (let ((count (get-count buffer))
-                                                    (total (get-total buffer))
-                                                    (chunks (get-chunks buffer)))
-                                                (loop (for n from 0 below total)
-                                                      (let ((data (vector-ref chunks n)))
-                                                        (when data
-                                                          (let ((origin (read-udp-origin data))
-                                                                (sequence (read-udp-sequence data))
-                                                                (frame (read-udp-frame data))
-                                                                (timestamp (read-udp-media-timestamp data)))
-                                                            (record-discard-packet origin sequence frame timestamp)
-                                                            (when (not buffer-origin)
-                                                              (set! buffer-origin origin)
-                                                              (set! buffer-base (- sequence n))
-                                                              (set! buffer-frame frame)
-                                                              (set! buffer-timestamp timestamp))))))
-                                                (loop (for n from 0 below total)
-                                                      (let ((data (vector-ref chunks n)))
-                                                        (when (not data)
-                                                          (let ((missing-sequence (+ buffer-base n)))
-                                                            (record-missing-packet buffer-origin missing-sequence buffer-frame buffer-timestamp)))))
-                                                (decrease! ready-count count))))
-                                          (table-clear ready-buffers f))
-                                    ;; continue with header
-                                    (loop-frame header)))))))))
-                    @redo
-                    (let ((gap (if (not last-processed) 0 (- frame (+ last-processed 1)))))
-                      (loop (repeat gap)
-                            (add process-average 0.))
-                      (add process-average 1.)))))))
-          (looping)))))
+                          #f @w (terminal (present-media-kind media-kind) '***NO-BUFFER***)
+                        (let ((count (get-count buffer))
+                              (total (get-total buffer))
+                              (chunks (get-chunks buffer)))
+                          (loop (for part from 0 below total)
+                                (let ((data (vector-ref chunks part)))
+                                  (if data
+                                      (record-discard-packet origin sequence frame timestamp)
+                                    (let ((origin (get-origin buffer))
+                                          (base (get-base buffer))
+                                          (frame (get-frame buffer))
+                                          (timestamp (get-timestamp buffer)))
+                                      (let ((missing-sequence (+ base part)))
+                                        (record-missing-packet origin missing-sequence frame timestamp))))))
+                          (decrease! ready-count count))))
+                    (table-clear ready-buffers f)))
+            
+            (let (loop-frame (frame lowest))
+              (when (<= frame highest)
+                (let ((buffer (table-ref ready-buffers frame #f)))
+                  (if (and (complete? buffer)
+                           (or (read-udp-media-header? (vector-ref (get-chunks buffer) 0))
+                               (not last-processed)
+                               (= frame (+ last-processed 1))))
+                      ;; complete
+                      (begin
+                        (table-clear ready-buffers frame)
+                        (decrease! ready-count (get-count buffer))
+                        (set! last-processed frame)
+                        (process-frame self (get-chunks buffer))
+                        (loop-frame (+ frame 1)))
+                    ;; incomplete
+                    (ecase media-kind
+                      ((udp-audio)
+                       ;; quick code until a full audio revamp
+                       (when (> (table-length ready-buffers) 1)
+                         (flush-frames frame frame)
+                         (set! last-processed frame)
+                         (loop-frame (+ frame 1))))
+                      ((udp-video)
+                       (let ((header (loop (for f from (+ frame 1) to highest)
+                                           (when (complete-header? (table-ref ready-buffers f #f))
+                                             (return f))
+                                           (finally #f))))
+                         (when header
+                           (flush-frames frame (- header 1))
+                           (loop-frame header)))))))))))
+        @redo
+        (let ((gap (if (not last-processed) 0 (- frame (+ last-processed 1)))))
+          (loop (repeat gap)
+                (add process-average 0.))
+          (add process-average 1.)))))
   
   
   (method (process-frame self datas)
@@ -1262,15 +1266,23 @@
 (class UDP-Ready-Buffer extends Object
   
   
-  (slot count  getter generate)
-  (slot total  getter generate)
-  (slot chunks getter generate)
+  (slot origin    getter generate)
+  (slot base      getter generate)
+  (slot frame     getter generate)
+  (slot count     getter generate)
+  (slot total     getter generate)
+  (slot timestamp getter generate)
+  (slot chunks    getter generate)
   
   
-  (method override (initialize self count total chunks)
+  (method override (initialize self origin base frame count total timestamp chunks)
     (nextmethod self)
+    (set! self.origin origin)
+    (set! self.base base)
+    (set! self.frame frame)
     (set! self.count count)
     (set! self.total total)
+    (set! self.timestamp timestamp)
     (set! self.chunks chunks))
   
   
