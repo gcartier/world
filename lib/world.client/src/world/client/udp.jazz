@@ -527,7 +527,7 @@
   (method (receive-state self data)
     (let ((states (u8vector->object (read-udp-state-channels data))))
       (for-each (lambda (info)
-                  (bind (channel-origin media-kind client-state) info
+                  (bind (channel-origin media-kind client-state client-last-header) info
                     (when (= channel-origin client-no)
                       ;; throttling
                       (set! last-received-state (current-seconds))
@@ -547,6 +547,13 @@
                       ;; waiting
                       (when (eq? client-state 'waiting)
                         (let ((channel (find-send-channel self media-kind)))
+                          (define (locate-later-header header)
+                            (locate-latest (get-retain-ring channel)
+                              (lambda (data)
+                                (and (media-packet-header? data)
+                                     (or (not header)
+                                         (> (read-udp-frame data) header))))))
+                          
                           (when channel
                             (ecase media-kind
                               ((udp-audio)
@@ -554,10 +561,10 @@
                                (let ((audio (current-audio)))
                                  (when (audio-playing? audio)
                                    (when (eq? audio-codec 'vorbis)
-                                     (let ((header (locate (get-retain-ring channel) media-packet-header?)))
+                                     (let ((header (locate-later-header client-last-header)))
                                        (if header
                                            (when udp-show-resetting?
-                                             (format :terminal "{s} {s} {s} {s} {s}{%}" remote-name (present-media-kind media-kind) 'RESEND 'AVOIDED (read-udp-sequence header)))
+                                             (format :terminal "{s} {s} {s} {s} {s} {s}{%}" remote-name (present-media-kind media-kind) 'RESEND 'AVOIDED client-last-header (read-udp-sequence header)))
                                          (resend-mic-header audio)
                                          (record-event udp-id-reset-media
                                                        (fixnum->flonum channel-origin)
@@ -575,11 +582,11 @@
                                    (if (and camera-resetting
                                             (= camera-resetting (get-data-sequence channel)))
                                        (when udp-show-resetting?
-                                         (format :terminal "{s} {s} {s} {s}{%}" remote-name (present-media-kind media-kind) 'RESET 'IN-PROGRESS))
-                                     (let ((header (locate (get-retain-ring channel) media-packet-header?)))
+                                         (format :terminal "{s} {s} {s} {s} {s}{%}" remote-name (present-media-kind media-kind) 'RESET 'IN-PROGRESS client-last-header))
+                                     (let ((header (locate-later-header client-last-header)))
                                        (if header
                                            (when udp-show-resetting?
-                                             (format :terminal "{s} {s} {s} {s} {s}{%}" remote-name (present-media-kind media-kind) 'RESET 'AVOIDED (read-udp-sequence header)))
+                                             (format :terminal "{s} {s} {s} {s} {s} {s}{%}" remote-name (present-media-kind media-kind) 'RESET 'AVOIDED client-last-header (read-udp-sequence header)))
                                          (reset-camera video)
                                          (let ((sequence (get-data-sequence channel)))
                                            (set! camera-resetting sequence)
@@ -591,7 +598,7 @@
                                                          -1.
                                                          -1.)
                                            (when udp-show-resets?
-                                             (format :terminal "{s} {s} {s} {s}{%}" remote-name (present-media-kind media-kind) 'RESET sequence))))))))))))))))
+                                             (format :terminal "{s} {s} {s} {s} {s}{%}" remote-name (present-media-kind media-kind) 'RESET client-last-header sequence))))))))))))))))
                 states)))
   
   
@@ -707,11 +714,13 @@
       (let ((queue (new-queue)))
         (iterate-table receive-channels
           (lambda (key channel)
-            (let ((state (get-process-state channel)))
+            (let ((state (get-process-state channel))
+                  (header (get-last-processed-header channel)))
               (enqueue queue
                        (list (get-origin channel)
                              (get-media-kind channel)
-                             state)))))
+                             state
+                             header)))))
         (queue-list queue)))
     
     (let ((states (collect-states)))
@@ -872,6 +881,7 @@
   (slot process-average         getter generate)
   (slot ready-buffers           getter generate)
   (slot ready-count             getter generate)
+  (slot last-processed-header   getter generate)
   (slot last-processed-frame    getter generate)
   (slot last-processed-sequence getter generate)
   (slot last-processed-seconds  getter generate)
@@ -886,6 +896,7 @@
     (set! self.process-state 'waiting)
     (set! self.ready-buffers (make-table test: eqv?))
     (set! self.ready-count 0)
+    (set! self.last-processed-header #f)
     (set! self.last-processed-frame #f)
     (set! self.last-processed-sequence #f)
     (set! self.last-processed-seconds #f)
@@ -985,18 +996,23 @@
         (format :terminal "{s} {s} {s} {s}{%}" remote-name (present-media-kind media-kind) 'STATE 'OK))))
   
   
-  (method private (process-state-waiting self (gaveup-on #f))
+  (method private (process-state-waiting self)
     (unless (eq? process-state 'waiting)
       (set! process-state 'waiting)
+      (let ((udp-client (get-udp-client (current-client))))
+        ;; should not be necessary but lets
+        ;; do the necessary changes later...
+        (when udp-client
+          (send-state udp-client)))
       (record-event udp-id-state-waiting
                     (fixnum->flonum origin)
                     (fixnum->flonum media-kind)
                     -1.
                     -1.
-                    (if gaveup-on (fixnum->flonum gaveup-on) -1.)
+                    (if last-processed-header (fixnum->flonum last-processed-header) -1.)
                     -1.)
       (when udp-show-states?
-        (format :terminal "{s} {s} {s} {s}{%}" remote-name (present-media-kind media-kind) 'STATE 'WAITING))))
+        (format :terminal "{s} {s} {s} {s} {s}{%}" remote-name (present-media-kind media-kind) 'STATE 'WAITING last-processed-header))))
   
   
   ;;;
@@ -1204,6 +1220,8 @@
                           (table-clear ready-buffers frame)
                           (decrease! ready-count (get-count buffer))
                           (present-frame self (get-chunks buffer))
+                          (when (complete-header? buffer)
+                            (set! last-processed-header frame))
                           (set! last-processed-frame frame)
                           (set! last-processed-sequence (rebase-last buffer))
                           (set! last-processed-seconds now)
@@ -1228,6 +1246,8 @@
                           (table-clear ready-buffers frame)
                           (decrease! ready-count (get-count buffer))
                           (present-frame self (get-chunks buffer))
+                          (when (complete-header? buffer)
+                            (set! last-processed-header frame))
                           (set! last-processed-frame frame)
                           (set! last-processed-sequence (rebase-last buffer))
                           (set! last-processed-seconds now)
