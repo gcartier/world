@@ -636,7 +636,8 @@
   
   (method (receive-media self kind data)
     (let ((origin (read-udp-origin data))
-          (sequence (read-udp-sequence data)))
+          (sequence (read-udp-sequence data))
+          (frame (read-udp-frame data)))
       (let ((channel (find-receive-channel self origin kind)))
         (when channel
           (let ((last-sequence (get-last-sequence channel)))
@@ -645,7 +646,7 @@
                   (now (current-seconds)))
               (if (not in-order?)
                   (begin
-                    (remove-nack channel sequence)
+                    (remove-nack channel sequence frame)
                     (insert-media channel data now))
                 ;; remember last sequence
                 (set-last-sequence channel sequence)
@@ -662,14 +663,13 @@
                                 (add-nack channel now seq sequence)))
                         (let ((gap (- sequence expected)))
                           (when (> gap 0)
-                            (let ((frame (read-udp-frame data)))
-                              (record-event udp-id-packet-gap
-                                            (fixnum->flonum origin)
-                                            (fixnum->flonum kind)
-                                            (fixnum->flonum sequence)
-                                            (fixnum->flonum frame)
-                                            (fixnum->flonum gap)
-                                            -1.))
+                            (record-event udp-id-packet-gap
+                                          (fixnum->flonum origin)
+                                          (fixnum->flonum kind)
+                                          (fixnum->flonum sequence)
+                                          (fixnum->flonum frame)
+                                          (fixnum->flonum gap)
+                                          -1.)
                             (when udp-show-gaps?
                               (terminal remote-name (present-media-kind kind) '***packet-gap*** now gap sequence)))))))
                   ;; send the lastest nacks
@@ -941,21 +941,29 @@
     latest-nacks)
   
   
-  (method protected (remove-nack self sequence)
-    (set! latest-nacks (remove! sequence latest-nacks key: cdr)))
+  (method protected (remove-nack self sequence frame)
+    (set! latest-nacks (remove! sequence latest-nacks key: cdr))
+    (let ((ring-size (length latest-nacks)))
+      (record-event udp-id-got-packet
+                    (fixnum->flonum origin)
+                    (fixnum->flonum media-kind)
+                    (fixnum->flonum sequence)
+                    (fixnum->flonum frame)
+                    (fixnum->flonum ring-size)
+                    -1.)))
   
   
   (method protected (filter-latest-missing self)
     ;; discard any nack older than udp-process-window
     (let ((now (current-seconds))
           (ring-size (length latest-nacks))
-          (gaveup-on #f))
+          @not-sure (gaveup? #f))
       (set! latest-nacks (collect-if (lambda (nack)
                                        (let ((seconds (car nack)))
                                          (let ((keep? (< (- now seconds) udp-nack-window)))
                                            (when (not keep?)
                                              (let ((removed-sequence (cdr nack)))
-                                               (set! gaveup-on removed-sequence)
+                                               @not-sure (set! gaveup? #t)
                                                (decrease! ring-size)
                                                (record-event udp-id-giveup-packet
                                                              (fixnum->flonum origin)
@@ -966,14 +974,9 @@
                                                              -1.)))
                                            keep?)))
                                      latest-nacks))
-      (when (and gaveup-on (= media-kind udp-video))
-        (unless (eq? process-state 'waiting)
-          (process-state-waiting self gaveup-on)
-          (let ((udp-client (get-udp-client (current-client))))
-            ;; should not be necessary but lets
-            ;; do the necessary changes later...
-            (when udp-client
-              (send-state udp-client))))))
+      @not-sure
+      (when (and gaveup? (= media-kind udp-video))
+        (process-state-waiting self)))
     (map cdr latest-nacks))
   
   
