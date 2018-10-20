@@ -1129,62 +1129,109 @@
                    (looping))))))))
   
   
+  (method (flush-frames self now lowest to)
+    (let ((from (if (not last-processed-frame)
+                    lowest
+                  (+ last-processed-frame 1))))
+      (loop (for f from from below to)
+            (flush-frame self now f))
+      (let ((buffer (table-ref ready-buffers to #f)))
+        (when buffer
+          (missing-buffers self buffer)))))
+  
+  
+  (method (flush-frame self now f)
+    (let ((buffer (table-ref ready-buffers f #f)))
+      (when buffer
+        (missing-buffers self buffer)
+        (let ((origin (get-origin buffer))
+              (frame (get-frame buffer))
+              (count (get-count buffer))
+              (total (get-total buffer))
+              (timestamp (get-timestamp buffer))
+              (chunks (get-chunks buffer)))
+          (loop (for part from 0 below total)
+                (let ((data (vector-ref chunks part)))
+                  (if data
+                      (let ((discard-sequence (read-udp-sequence data)))
+                        (record-discard-packet self origin discard-sequence frame timestamp))
+                    (let ((missing-sequence (rebase-sequence buffer part)))
+                      (record-missing-packet self origin missing-sequence frame timestamp)))))
+          (decrease! ready-count count))
+        (set! last-processed-frame f)
+        (set! last-processed-sequence (rebase-last buffer))
+        (set! last-processed-seconds now)))
+    (table-clear ready-buffers f))
+  
+  
+  (method (missing-buffers self buffer)
+    (when last-processed-sequence
+      (let ((expected-sequence (+ last-processed-sequence 1)))
+        (loop (for seq from expected-sequence below (rebase-first buffer))
+              (record-missing-packet self origin seq -1 -1)))))
+  
+  
+  (method (record-reject-packet self origin sequence frame timestamp)
+    (record-event udp-id-process-packet
+                  (fixnum->flonum origin)
+                  (fixnum->flonum media-kind)
+                  (fixnum->flonum sequence)
+                  (fixnum->flonum frame)
+                  -1.
+                  (if (= timestamp -1)
+                      -1.
+                    (timestamp->flonum timestamp))))
+  
+  
+  (method (record-process-packet self origin sequence frame timestamp)
+    (record-event udp-id-process-packet
+                  (fixnum->flonum origin)
+                  (fixnum->flonum media-kind)
+                  (fixnum->flonum sequence)
+                  (fixnum->flonum frame)
+                  -1.
+                  (if (= timestamp -1)
+                      -1.
+                    (timestamp->flonum timestamp))))
+  
+  
+  (method (record-repeat-packet self origin sequence frame timestamp)
+    (record-event udp-id-repeat-packet
+                  (fixnum->flonum origin)
+                  (fixnum->flonum media-kind)
+                  (fixnum->flonum sequence)
+                  (fixnum->flonum frame)
+                  -1.
+                  (if (= timestamp -1)
+                      -1.
+                    (timestamp->flonum timestamp))))
+  
+  
+  (method (record-discard-packet self origin sequence frame timestamp)
+    (record-event udp-id-discard-packet
+                  (fixnum->flonum origin)
+                  (fixnum->flonum media-kind)
+                  (fixnum->flonum sequence)
+                  (fixnum->flonum frame)
+                  -1.
+                  (if (= timestamp -1)
+                      -1.
+                    (timestamp->flonum timestamp))))
+  
+  
+  (method (record-missing-packet self origin sequence frame timestamp)
+    (record-event udp-id-missing-packet
+                  (fixnum->flonum origin)
+                  (fixnum->flonum media-kind)
+                  (fixnum->flonum sequence)
+                  (fixnum->flonum frame)
+                  -1.
+                  (if (= timestamp -1)
+                      -1.
+                    (timestamp->flonum timestamp))))
+  
+  
   (method (process-data self time data)
-    (define (record-reject-packet origin sequence frame timestamp)
-      (record-event udp-id-process-packet
-                    (fixnum->flonum origin)
-                    (fixnum->flonum media-kind)
-                    (fixnum->flonum sequence)
-                    (fixnum->flonum frame)
-                    -1.
-                    (if (= timestamp -1)
-                        -1.
-                      (timestamp->flonum timestamp))))
-    
-    (define (record-process-packet origin sequence frame timestamp)
-      (record-event udp-id-process-packet
-                    (fixnum->flonum origin)
-                    (fixnum->flonum media-kind)
-                    (fixnum->flonum sequence)
-                    (fixnum->flonum frame)
-                    -1.
-                    (if (= timestamp -1)
-                        -1.
-                      (timestamp->flonum timestamp))))
-    
-    (define (record-repeat-packet origin sequence frame timestamp)
-      (record-event udp-id-repeat-packet
-                    (fixnum->flonum origin)
-                    (fixnum->flonum media-kind)
-                    (fixnum->flonum sequence)
-                    (fixnum->flonum frame)
-                    -1.
-                    (if (= timestamp -1)
-                        -1.
-                      (timestamp->flonum timestamp))))
-    
-    (define (record-discard-packet origin sequence frame timestamp)
-      (record-event udp-id-discard-packet
-                    (fixnum->flonum origin)
-                    (fixnum->flonum media-kind)
-                    (fixnum->flonum sequence)
-                    (fixnum->flonum frame)
-                    -1.
-                    (if (= timestamp -1)
-                        -1.
-                      (timestamp->flonum timestamp))))
-    
-    (define (record-missing-packet origin sequence frame timestamp)
-      (record-event udp-id-missing-packet
-                    (fixnum->flonum origin)
-                    (fixnum->flonum media-kind)
-                    (fixnum->flonum sequence)
-                    (fixnum->flonum frame)
-                    -1.
-                    (if (= timestamp -1)
-                        -1.
-                      (timestamp->flonum timestamp))))
-    
     (let ((origin (read-udp-origin data))
           (sequence (read-udp-sequence data))
           (frame (read-udp-frame data))
@@ -1193,9 +1240,9 @@
           (timestamp (read-udp-media-timestamp data)))
       (if (and last-processed-frame (<= frame last-processed-frame))
           ;; reject
-          (record-reject-packet origin sequence frame timestamp)
+          (record-reject-packet self origin sequence frame timestamp)
         ;; process
-        (record-process-packet origin sequence frame timestamp)
+        (record-process-packet self origin sequence frame timestamp)
         ;; add
         (let ((buffer (table-ref ready-buffers frame #f)))
           (if (not buffer)
@@ -1207,7 +1254,7 @@
                 (increase! ready-count))
             (let ((chunks (get-chunks buffer)))
               (if (vector-ref chunks part)
-                  (record-repeat-packet origin sequence frame timestamp)
+                  (record-repeat-packet self origin sequence frame timestamp)
                 (add-count! buffer 1)
                 (vector-set! chunks part data)
                 (increase! ready-count)))))
@@ -1216,45 +1263,6 @@
               (keys (table-keys ready-buffers)))
           (let ((lowest (minimum keys))
                 (highest (maximum keys)))
-            (define (flush-frames to)
-              (let ((from (if (not last-processed-frame)
-                              lowest
-                            (+ last-processed-frame 1))))
-                (loop (for f from from below to)
-                      (flush-frame f))
-                (let ((buffer (table-ref ready-buffers to #f)))
-                  (when buffer
-                    (missing-buffers buffer)))))
-            
-            (define (flush-frame f)
-              (let ((buffer (table-ref ready-buffers f #f)))
-                (when buffer
-                  (missing-buffers buffer)
-                  (let ((origin (get-origin buffer))
-                        (frame (get-frame buffer))
-                        (count (get-count buffer))
-                        (total (get-total buffer))
-                        (timestamp (get-timestamp buffer))
-                        (chunks (get-chunks buffer)))
-                    (loop (for part from 0 below total)
-                          (let ((data (vector-ref chunks part)))
-                            (if data
-                                (let ((discard-sequence (read-udp-sequence data)))
-                                  (record-discard-packet origin discard-sequence frame timestamp))
-                              (let ((missing-sequence (rebase-sequence buffer part)))
-                                  (record-missing-packet origin missing-sequence frame timestamp)))))
-                    (decrease! ready-count count))
-                  (set! last-processed-frame f)
-                  (set! last-processed-sequence (rebase-last buffer))
-                  (set! last-processed-seconds now)))
-              (table-clear ready-buffers f))
-            
-            (define (missing-buffers buffer)
-              (when last-processed-sequence
-                (let ((expected-sequence (+ last-processed-sequence 1)))
-                  (loop (for seq from expected-sequence below (rebase-first buffer))
-                        (record-missing-packet origin seq -1 -1)))))
-            
             (define (scan-audio)
               (let (loop-frame (frame lowest))
                 (when (<= frame highest)
@@ -1262,7 +1270,7 @@
                     (if (and buffer
                              (complete? buffer))
                         (begin
-                          (missing-buffers buffer)
+                          (missing-buffers self buffer)
                           (table-clear ready-buffers frame)
                           (decrease! ready-count (get-count buffer))
                           (present-frame self now (get-time buffer) (get-chunks buffer))
@@ -1274,7 +1282,7 @@
                           (loop-frame (+ frame 1)))
                       (when (> (table-length ready-buffers) 1)
                         (let ((next-frame (max (+ frame 1) highest)))
-                          (flush-frames next-frame)
+                          (flush-frames self now lowest next-frame)
                           (loop-frame next-frame))))))))
             
             (define (scan-video)
@@ -1287,7 +1295,7 @@
                                  (not last-processed-frame)
                                  (= frame (+ last-processed-frame 1))))
                         (begin
-                          (missing-buffers buffer)
+                          (missing-buffers self buffer)
                           (table-clear ready-buffers frame)
                           (decrease! ready-count (get-count buffer))
                           (present-frame self now (get-time buffer) (get-chunks buffer))
@@ -1305,12 +1313,13 @@
                         (if header
                             ;; found header
                             (begin
-                              (flush-frames header)
+                              (flush-frames self now lowest header)
                               (loop-frame header))
                           ;; go to waiting
                           (unless (read-udp-media-header? data)
                             (when (and last-processed-seconds (> (- now last-processed-seconds) udp-ready-window))
-                              (process-state-waiting self))))))))))
+                              (process-state-waiting self)
+                              (flush-frames self now lowest (+ highest 1)))))))))))
             
             ;; scan
             (ecase media-kind
