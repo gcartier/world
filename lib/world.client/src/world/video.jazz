@@ -1214,8 +1214,8 @@
     )
   
   
-  (method package (update self color alpha texture (background: background #f))
-    (define (add-overlay)
+  (method package virtual (add-overlay self color alpha texture)
+    (when overlay?
       (if (not frame-count)
           (begin
             (set! frame-count 1)
@@ -1225,10 +1225,13 @@
         (increase! total-size (u8vector-length color))
         (let ((elapse (- (current-seconds) frame-start)))
           (let ((rate (/ (cast <fl> frame-count) elapse))
-                (size (/ (cast <fl> total-size) frame-count)))
-            (set-font (get-surface texture) {Font font-name: tahoma point-size: 24 hint-style: slight hint-metrics: on})
-            (draw-text (get-surface texture) 5 (- (get-height resolution) 30) (format "Rate: {r precision: 3}, Size: {a}" rate size) {Color World-Red})))))
-    
+                (size (/ (cast <fl> total-size) frame-count))
+                (surface (get-surface texture)))
+            (set-font surface {Font font-name: tahoma point-size: 24 hint-style: slight hint-metrics: on})
+            (draw-text surface 5 (- (get-height resolution) 30) (format "Rate: {r precision: 3}, Size: {a}" rate size) {Color World-Red}))))))
+  
+  
+  (method package (update self color alpha texture (background: background #f))
     (if (not alpha?)
         (move-u8vector->pointer! color (get-data texture))
       (let ((width (get-width resolution))
@@ -1241,8 +1244,7 @@
           (let ((surface (get-surface texture)))
             (clear-glass surface resolution background: background)
             (draw-surface surface image-surface 0 0)))))
-    (when overlay?
-      (add-overlay))
+    (add-overlay self color alpha texture)
     (unless image-inhibit?
       (map-texture texture)))
   
@@ -1519,10 +1521,13 @@
 (class Sheet-Video-Sink extends Video-Sink
   
   
-  (slot id     initialize #f accessors generate)
-  (slot player initialize #f accessors generate)
-  (slot size   initialize #f accessors generate)
-  (slot sheet  initialize #f accessors generate)
+  (slot id         initialize #f accessors generate)
+  (slot player     initialize #f accessors generate)
+  (slot size       initialize #f accessors generate)
+  (slot sheet      initialize #f accessors generate)
+  (slot draw-mode  initialize #f accessors generate)
+  (slot draw-mutex initialize #f accessors generate)
+  (slot last-color initialize #f accessors generate)
   
   
   (method override (initialize self id entity . rest)
@@ -1537,7 +1542,10 @@
             (set-size s size)
             (set! self.id id)
             (set! self.player entity)
-            (set! self.sheet s))))))
+            (set! self.sheet s)
+            (set! self.draw-mode 'draw)
+            (set! self.draw-mutex (make-mutex 'draw))
+            (set! self.last-color #f))))))
   
   
   (method override (sheet? self)
@@ -1562,8 +1570,45 @@
       (set! sheet #f)))
   
   
+  ;; probably have a subclass in together that understand
+  ;; about the various process-states
+  (method package (change-draw-mode self mode)
+    (unless (eq? mode draw-mode)
+      (set! draw-mode mode)
+      ;; super quick try
+      (when last-color
+        (parameterize ((testing? #t)) ;; oh boy fix me!
+        (draw self last-color #f #f #f)))))
+  
+  
   (method override (draw self color alpha timestamp duration)
-    (update self color alpha (get-texture sheet)))
+    (mutex-lock! draw-mutex)
+    (when (or (eq? draw-mode 'draw) (testing?))
+      (let ((texture (get-texture sheet)))
+        (update self color alpha texture))
+      (set! last-color color))
+    (when id
+      (record-event udp-id-draw-video
+                    (fixnum->flonum client-no)
+                    (fixnum->flonum world.udp:udp-video)
+                    -1.
+                    -1.
+                    -1.
+                    (if (not timestamp)
+                        -1.
+                      (timestamp->flonum timestamp))))
+    (mutex-unlock! draw-mutex))
+  
+  
+  (method override (add-overlay self color alpha texture)
+    (when (and id (neq? draw-mode 'draw))
+      (case draw-mode
+        ((freeze)
+         (when world.udp:udp-freeze-overlay
+           (fill-rect (get-surface texture) (size-rect resolution) world.udp:udp-freeze-overlay)))
+        ((wait)
+         (when world.udp:udp-wait-overlay
+           (fill-rect (get-surface texture) (size-rect resolution) world.udp:udp-wait-overlay))))))
   
   
   (method override (render self)

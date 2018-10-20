@@ -916,6 +916,20 @@
     (nextmethod self))
   
   
+  (method (find-id-quick-hack self)
+    (let ((member (find-group-member-by-no (current-client) origin)))
+      ;; quick solution for when logging in and starting receiving
+      ;; someone's media before the client is actually registered
+      ;; need to revisit this code for a cleaner solution
+      (when member
+        (second member))))
+  
+  
+  ;;;
+  ;;;; Nack
+  ;;;
+  
+  
   (method protected (add-nack self seconds seq sequence)
     (set! latest-nacks (cons (cons seconds seq) latest-nacks))
     (let ((ring-size (length latest-nacks)))
@@ -956,14 +970,12 @@
   (method protected (filter-latest-missing self)
     ;; discard any nack older than udp-process-window
     (let ((now (current-seconds))
-          (ring-size (length latest-nacks))
-          @not-sure (gaveup? #f))
+          (ring-size (length latest-nacks)))
       (set! latest-nacks (collect-if (lambda (nack)
                                        (let ((seconds (car nack)))
                                          (let ((keep? (< (- now seconds) udp-nack-window)))
                                            (when (not keep?)
                                              (let ((removed-sequence (cdr nack)))
-                                               @not-sure (set! gaveup? #t)
                                                (decrease! ring-size)
                                                (record-event udp-id-giveup-packet
                                                              (fixnum->flonum origin)
@@ -973,10 +985,7 @@
                                                              (fixnum->flonum ring-size)
                                                              -1.)))
                                            keep?)))
-                                     latest-nacks))
-      @not-sure
-      (when (and gaveup? (= media-kind udp-video))
-        (process-state-waiting self)))
+                                     latest-nacks)))
     (map cdr latest-nacks))
   
   
@@ -988,6 +997,11 @@
   (method private (process-state-ok self)
     (unless (eq? process-state 'ok)
       (set! process-state 'ok)
+      (let ((id (find-id-quick-hack self)))
+        (when id
+          (let ((output (find-output (current-video) id)))
+            (when output
+              (change-draw-mode output 'draw)))))
       (record-event udp-id-state-ok
                     (fixnum->flonum origin)
                     (fixnum->flonum media-kind)
@@ -999,9 +1013,33 @@
         (format :terminal "{s} {s} {s} {s}{%}" remote-name (present-media-kind media-kind) 'STATE 'OK))))
   
   
+  (method private (process-state-late self)
+    (unless (eq? process-state 'late)
+      (set! process-state 'late)
+      (let ((id (find-id-quick-hack self)))
+        (when id
+          (let ((output (find-output (current-video) id)))
+            (when output
+              (change-draw-mode output 'freeze)))))
+      (record-event udp-id-state-late
+                    (fixnum->flonum origin)
+                    (fixnum->flonum media-kind)
+                    -1.
+                    -1.
+                    -1.
+                    -1.)
+      (when udp-show-states?
+        (format :terminal "{s} {s} {s} {s}{%}" remote-name (present-media-kind media-kind) 'STATE 'LATE))))
+  
+  
   (method private (process-state-waiting self)
     (unless (eq? process-state 'waiting)
       (set! process-state 'waiting)
+      (let ((id (find-id-quick-hack self)))
+        (when id
+          (let ((output (find-output (current-video) id)))
+            (when output
+              (change-draw-mode output 'wait)))))
       (let ((udp-client (get-udp-client (current-client))))
         ;; should not be necessary but lets
         ;; do the necessary changes later...
@@ -1078,15 +1116,20 @@
     (with-task task
       (lambda (exit)
         (let (looping)
-          (let ((data (wait process-ring)))
-            (if (not data)
-                (continuation-return exit #f)
-              (site (udp-process on?: #t)
-                (process-data self data))
-              (looping)))))))
+          (receive (time data) (wait2 process-ring udp-ready-window)
+            (cond ((and time (not data))
+                   (continuation-return exit #f))
+                  ((and (not time) (not data))
+                   (when (= media-kind udp-video)
+                     (process-state-waiting self))
+                   (looping))
+                  (else
+                   (site (udp-process on?: #t)
+                     (process-data self time data))
+                   (looping))))))))
   
   
-  (method (process-data self data)
+  (method (process-data self time data)
     (define (record-reject-packet origin sequence frame timestamp)
       (record-event udp-id-process-packet
                     (fixnum->flonum origin)
@@ -1160,7 +1203,7 @@
                     (base (- sequence part))
                     (count 1))
                 (vector-set! chunks part data)
-                (table-set! ready-buffers frame (new UDP-Ready-Buffer origin base frame count total timestamp chunks))
+                (table-set! ready-buffers frame (new UDP-Ready-Buffer time origin base frame count total timestamp chunks))
                 (increase! ready-count))
             (let ((chunks (get-chunks buffer)))
               (if (vector-ref chunks part)
@@ -1222,7 +1265,7 @@
                           (missing-buffers buffer)
                           (table-clear ready-buffers frame)
                           (decrease! ready-count (get-count buffer))
-                          (present-frame self (get-chunks buffer))
+                          (present-frame self now (get-time buffer) (get-chunks buffer))
                           (when (complete-header? buffer)
                             (set! last-processed-header frame))
                           (set! last-processed-frame frame)
@@ -1243,19 +1286,17 @@
                              (or (complete-header? buffer)
                                  (not last-processed-frame)
                                  (= frame (+ last-processed-frame 1))))
-                        ;; complete
                         (begin
                           (missing-buffers buffer)
                           (table-clear ready-buffers frame)
                           (decrease! ready-count (get-count buffer))
-                          (present-frame self (get-chunks buffer))
+                          (present-frame self now (get-time buffer) (get-chunks buffer))
                           (when (complete-header? buffer)
                             (set! last-processed-header frame))
                           (set! last-processed-frame frame)
                           (set! last-processed-sequence (rebase-last buffer))
                           (set! last-processed-seconds now)
                           (loop-frame (+ frame 1)))
-                      ;; incomplete
                       (let ((header (loop (for f from (+ frame 1) to highest)
                                           (when (let ((buffer (table-ref ready-buffers f #f)))
                                                   (and buffer (complete-header? buffer)))
@@ -1269,13 +1310,7 @@
                           ;; go to waiting
                           (unless (read-udp-media-header? data)
                             (when (and last-processed-seconds (> (- now last-processed-seconds) udp-ready-window))
-                              (unless (eq? process-state 'waiting)
-                                (process-state-waiting self)
-                                (let ((udp-client (get-udp-client (current-client))))
-                                  ;; should not be necessary but lets
-                                  ;; do the necessary changes later...
-                                  (when udp-client
-                                    (send-state udp-client)))))))))))))
+                              (process-state-waiting self))))))))))
             
             ;; scan
             (ecase media-kind
@@ -1290,7 +1325,7 @@
           (add process-average 1.)))))
   
   
-  (method (present-frame self datas)
+  (method (present-frame self now time datas)
     (define (record-present-frame origin frame timestamp header?)
       (record-event udp-id-present-frame
                     (fixnum->flonum origin)
@@ -1302,63 +1337,61 @@
                         -1.
                       (timestamp->flonum timestamp))))
     
-    (let ((member (find-group-member-by-no (current-client) origin)))
-      ;; quick solution for when logging in and starting receiving
-      ;; someone's media before the client is actually registered
-      ;; need to revisit this code for a cleaner solution
-      (when member
-        (let ((id (second member)))
-          (let ((count (vector-length datas))
-                (first (vector-ref datas 0)))
-            (increase! processed count)
-            (let ((kind (read-udp-kind first))
-                  (origin (read-udp-origin first))
-                  (frame (read-udp-frame first))
-                  (total (read-udp-total first))
-                  (timestamp (read-udp-media-timestamp first))
-                  (duration (read-udp-media-duration first))
-                  (header? (read-udp-media-header? first))
-                  (off? (read-udp-media-off? first)))
-              (define (process-audio)
-                (let ((buffer (assemble-chunks)))
-                  (if off?
-                      (receive-server-audio (current-audio) id #f #f #f)
-                    (when header?
-                      (process-state-ok self))
-                    (if (and header? (eq? audio-codec 'vorbis))
-                        (let ((headers (u8vector->object buffer)))
-                          (for-each (lambda (header)
-                                      (bind (buffer timestamp duration) header
-                                        ;; be very careful as timestamp is incorrect as it
-                                        ;; is the timestamp at time the header was captured
-                                        ;; this only works because gst_app_src_write3
-                                        ;; doesn't actually use the timestamp
-                                        (receive-server-audio (current-audio) id buffer timestamp duration)))
-                                    headers))
-                      (receive-server-audio (current-audio) id buffer timestamp duration))
-                    (record-present-frame origin frame timestamp header?))))
-              
-              (define (process-video)
-                (let ((buffer (assemble-chunks)))
-                  (if off?
-                      (receive-server-video (current-video) id #f #f #f)
-                    (when header?
-                      (process-state-ok self))
-                    (receive-server-video (current-video) id buffer timestamp duration)
-                    (record-present-frame origin frame timestamp header?))))
-              
-              (define (assemble-chunks)
-                (if (= total 1)
-                    (read-udp-media-payload first)
-                  (let ((chunks (loop (for data in-vector datas)
-                                      (collect (read-udp-media-payload data)))))
-                    (apply u8vector-append chunks))))
-              
-              (ecase kind
-                ((udp-audio)
-                 (process-audio))
-                ((udp-video)
-                 (process-video))))))))))
+    (let ((id (find-id-quick-hack self)))
+      (when id
+        (let ((count (vector-length datas))
+              (first (vector-ref datas 0)))
+          (increase! processed count)
+          (let ((kind (read-udp-kind first))
+                (origin (read-udp-origin first))
+                (frame (read-udp-frame first))
+                (total (read-udp-total first))
+                (timestamp (read-udp-media-timestamp first))
+                (duration (read-udp-media-duration first))
+                (header? (read-udp-media-header? first))
+                (off? (read-udp-media-off? first)))
+            (define (process-audio)
+              (let ((buffer (assemble-chunks)))
+                (if off?
+                    (receive-server-audio (current-audio) id #f #f #f)
+                  (when header?
+                    (process-state-ok self))
+                  (if (and header? (eq? audio-codec 'vorbis))
+                      (let ((headers (u8vector->object buffer)))
+                        (for-each (lambda (header)
+                                    (bind (buffer timestamp duration) header
+                                      ;; be very careful as timestamp is incorrect as it
+                                      ;; is the timestamp at time the header was captured
+                                      ;; this only works because gst_app_src_write3
+                                      ;; doesn't actually use the timestamp
+                                      (receive-server-audio (current-audio) id buffer timestamp duration)))
+                                  headers))
+                    (receive-server-audio (current-audio) id buffer timestamp duration))
+                  (record-present-frame origin frame timestamp header?))))
+            
+            (define (process-video)
+              (let ((buffer (assemble-chunks)))
+                (if off?
+                    (receive-server-video (current-video) id #f #f #f)
+                  (let ((lateness (- now time)))
+                    (if (< lateness .05)
+                        (process-state-ok self)
+                      (process-state-late self)))
+                  (receive-server-video (current-video) id buffer timestamp duration)
+                  (record-present-frame origin frame timestamp header?))))
+            
+            (define (assemble-chunks)
+              (if (= total 1)
+                  (read-udp-media-payload first)
+                (let ((chunks (loop (for data in-vector datas)
+                                    (collect (read-udp-media-payload data)))))
+                  (apply u8vector-append chunks))))
+            
+            (ecase kind
+              ((udp-audio)
+               (process-audio))
+              ((udp-video)
+               (process-video)))))))))
 
 
 ;;;
@@ -1369,6 +1402,7 @@
 (class UDP-Ready-Buffer extends Object
   
   
+  (slot time      getter generate)
   (slot origin    getter generate)
   (slot base      getter generate)
   (slot frame     getter generate)
@@ -1378,8 +1412,9 @@
   (slot chunks    getter generate)
   
   
-  (method override (initialize self origin base frame count total timestamp chunks)
+  (method override (initialize self time origin base frame count total timestamp chunks)
     (nextmethod self)
+    (set! self.time time)
     (set! self.origin origin)
     (set! self.base base)
     (set! self.frame frame)
