@@ -123,12 +123,12 @@
   (slot head         <fx>        getter generate)
   (slot tail         <fx>        getter generate)
   (slot count        <fx>        getter generate)
-  (slot key-proc                 getter generate)
+  (slot terminate?               getter generate)
   (slot invalid-proc             getter generate)
   (slot overflow-proc            getter generate)
   
   
-  (method override (initialize self size <fx> (max-size: max-size #f) (key-proc: key-proc #f) (invalid-proc: invalid-proc #f) (overflow-proc: overflow-proc #f))
+  (method override (initialize self size <fx> (max-size: max-size #f) (invalid-proc: invalid-proc #f) (overflow-proc: overflow-proc #f))
     (nextmethod self)
     (assert (> size 0))
     (set! self.size size)
@@ -140,9 +140,16 @@
     (set! self.head 0)
     (set! self.tail 0)
     (set! self.count 0)
-    (set! self.key-proc key-proc)
+    (set! self.terminate? #f)
     (set! self.invalid-proc invalid-proc)
     (set! self.overflow-proc overflow-proc))
+  
+  
+  (method public (terminate self)
+    (mutex-lock! mutex)
+    (set! terminate? #t)
+    (condition-variable-signal! wait-condvar)
+    (mutex-unlock! mutex))
   
   
   (method public (empty self)
@@ -154,92 +161,22 @@
   
   
   (method public (insert self time obj)
+    (declare (proper-tail-calls))
     (mutex-lock! mutex)
-    (prog1 (if (not key-proc)
-               (insert-time self time obj)
-             (insert-key self time obj key-proc))
+    (prog1 (let (loop (n count))
+             (if (= n 0)
+                 (begin
+                   (insert-before self head time obj)
+                   (condition-variable-signal! wait-condvar)
+                   #f)
+               (let ((before (modulo (- (+ head n) 1) size)))
+                 (let ((before-time (f64vector-ref times before)))
+                   (if (> time before-time)
+                       (let ((pos (modulo (+ head n) size)))
+                         (insert-before self pos time obj)
+                         #f)
+                     (loop (- n 1)))))))
       (mutex-unlock! mutex)))
-  
-  
-  (method public (insert-time self time obj)
-    (declare (proper-tail-calls))
-    (let (loop (n count))
-      (if (= n 0)
-          (begin
-            (insert-before self head time obj)
-            (condition-variable-signal! wait-condvar)
-            #f)
-        (let ((before (modulo (- (+ head n) 1) size)))
-          (let ((before-time (f64vector-ref times before)))
-            (if (> time before-time)
-                (let ((pos (modulo (+ head n) size)))
-                  (insert-before self pos time obj)
-                  #f)
-              (loop (- n 1))))))))
-  
-  
-  (method public (insert-key self time obj key-proc)
-    (declare (proper-tail-calls))
-    (let ((key (key-proc obj)))
-      ;; validate that key preserves time
-      (define (invalid-time n)
-        (if (= count 0)
-            #f
-          (or ;; before
-            (and (> n 0)
-                 (let ((before (modulo (- (+ head n) 1) size)))
-                   (let ((before-time (f64vector-ref times before)))
-                     (and (< time before-time)
-                          (let ((before-key (key-proc (vector-ref content before))))
-                            (invalid-proc self 'smaller key before-key time before-time)
-                            'invalid)))))
-            ;; after
-            (and (< n count)
-                 (let ((after (modulo (+ head n) size)))
-                   (let ((after-time (f64vector-ref times after)))
-                     (and (> time after-time)
-                          (let ((after-key (key-proc (vector-ref content after))))
-                            (invalid-proc self 'greater key after-key time after-time)
-                            'invalid))))))))
-      
-      (let (loop (n count))
-        (if (= n 0)
-            (if (not time)
-                (begin
-                  (insert-before self head 0. obj)
-                  (condition-variable-signal! wait-condvar)
-                  #f)
-              (or (invalid-time n)
-                  (begin
-                    (insert-before self head time obj)
-                    (condition-variable-signal! wait-condvar)
-                    #f)))
-          (let ((before (modulo (- (+ head n) 1) size)))
-            (let ((before-obj (vector-ref content before)))
-              ;; quick hack to our stopping the process task by inserting a false
-              (if (not before-obj)
-                  #f
-                (let ((before-key (key-proc before-obj)))
-                  (if (> key before-key)
-                      (if (not time)
-                          (let ((pos (modulo (+ head n) size)))
-                            (let ((before-time (f64vector-ref times before)))
-                              (insert-before self pos before-time obj)
-                              #f))
-                        (or (invalid-time n)
-                            (let ((pos (modulo (+ head n) size)))
-                              (insert-before self pos time obj)
-                              #f)))
-                    (if (= key before-key)
-                        'duplicate
-                      (loop (- n 1))))))))))))
-  
-  
-  (method public (insert-earliest self obj)
-    (mutex-lock! mutex)
-    (insert-before self head (current-seconds) obj)
-    (condition-variable-signal! wait-condvar)
-    (mutex-unlock! mutex))
   
   
   (method public (insert-before self pos time obj)
@@ -300,42 +237,19 @@
     (declare (proper-tail-calls))
     (let (loop-wait)
       (mutex-lock! mutex)
-      (if (= count 0)
-          (begin
-            (mutex-unlock! mutex wait-condvar)
-            (loop-wait))
-        (let ((now (current-seconds))
-              (earliest-time (f64vector-ref times head))
-              (earliest (vector-ref content head)))
-          (let ((earliest-duration (- earliest-time now)))
-            (if (<= earliest-duration 0.)
-                (prog1 earliest
-                  (f64vector-set! times head +nan.0)
-                  (vector-set! content head #f)
-                  (set! head (modulo (+ head 1) size))
-                  (decrease! count)
-                  (mutex-unlock! mutex))
-              (mutex-unlock! mutex wait-condvar earliest-duration)
-              (loop-wait)))))))
-  
-  
-  ;; move code to together!?
-  (method public (wait2 self timeout)
-    (declare (proper-tail-calls))
-    (let (loop-wait)
-      (mutex-lock! mutex)
-      (let ((now (current-seconds)))
+      (if terminate?
+          (prog1 #f
+            (mutex-unlock! mutex))
         (if (= count 0)
             (begin
-              (mutex-unlock! mutex wait-condvar timeout)
-              (if (= count 0)
-                  (values #f #f)
-                (loop-wait)))
-          (let ((earliest-time (f64vector-ref times head))
+              (mutex-unlock! mutex wait-condvar)
+              (loop-wait))
+          (let ((now (current-seconds))
+                (earliest-time (f64vector-ref times head))
                 (earliest (vector-ref content head)))
             (let ((earliest-duration (- earliest-time now)))
               (if (<= earliest-duration 0.)
-                  (prog1 (values earliest-time earliest)
+                  (prog1 earliest
                     (f64vector-set! times head +nan.0)
                     (vector-set! content head #f)
                     (set! head (modulo (+ head 1) size))
@@ -349,34 +263,37 @@
     (declare (proper-tail-calls))
     (let (loop-wait)
       (mutex-lock! mutex)
-      (if (= count 0)
-          (begin
-            (mutex-unlock! mutex wait-condvar)
-            (loop-wait))
-        (let ((now (current-seconds)))
-          (let ((earliest-time (f64vector-ref times head)))
-            (let ((earliest-duration (- earliest-time now)))
-              (if (<= earliest-duration 0.)
-                  (let ((avail (let (scan (n 1))
-                                 (if (>= n count)
-                                     n
-                                   (let ((time (f64vector-ref times (modulo (+ head n) size))))
-                                     (let ((duration (- time now)))
-                                       (if (<= duration 0.)
-                                           (scan (+ n 1))
-                                         n)))))))
-                    (prog1 (loop (for n from 0 below avail)
-                                 (collect
-                                   (let ((pos (modulo (+ head n) size)))
-                                     (let ((obj (vector-ref content pos)))
-                                       (f64vector-set! times pos +nan.0)
-                                       (vector-set! content pos #f)
-                                       obj))))
-                      (set! head (modulo (+ head avail) size))
-                      (decrease! count avail)
-                      (mutex-unlock! mutex)))
-                (mutex-unlock! mutex wait-condvar earliest-duration)
-                (loop-wait))))))))
+      (if terminate?
+          (prog1 (values 'terminate #f)
+            (mutex-unlock! mutex))
+        (if (= count 0)
+            (begin
+              (mutex-unlock! mutex wait-condvar)
+              (loop-wait))
+          (let ((now (current-seconds)))
+            (let ((earliest-time (f64vector-ref times head)))
+              (let ((earliest-duration (- earliest-time now)))
+                (if (<= earliest-duration 0.)
+                    (let ((avail (let (scan (n 1))
+                                   (if (>= n count)
+                                       n
+                                     (let ((time (f64vector-ref times (modulo (+ head n) size))))
+                                       (let ((duration (- time now)))
+                                         (if (<= duration 0.)
+                                             (scan (+ n 1))
+                                           n)))))))
+                      (prog1 (loop (for n from 0 below avail)
+                                   (collect
+                                     (let ((pos (modulo (+ head n) size)))
+                                       (let ((obj (vector-ref content pos)))
+                                         (f64vector-set! times pos +nan.0)
+                                         (vector-set! content pos #f)
+                                         obj))))
+                        (set! head (modulo (+ head avail) size))
+                        (decrease! count avail)
+                        (mutex-unlock! mutex)))
+                  (mutex-unlock! mutex wait-condvar earliest-duration)
+                  (loop-wait)))))))))
   
   
   (method public (locate-earliest self predicate)
@@ -405,7 +322,7 @@
       (mutex-unlock! mutex)))
   
   
-  (method public (iterate-content self proc)
+  (method public (iterate-earliest self proc)
     (mutex-lock! mutex)
     (prog1 (let (loop (n 0))
              (when (< n count)
@@ -414,6 +331,18 @@
                        (obj (vector-ref content pos)))
                    (proc time obj)
                    (loop (+ n 1))))))
+      (mutex-unlock! mutex)))
+  
+  
+  (method public (iterate-latest self proc)
+    (mutex-lock! mutex)
+    (prog1 (let (loop (n (- count 1)))
+             (when (>= n 0)
+               (let ((pos (modulo (+ head n) size)))
+                 (let ((time (f64vector-ref times pos))
+                       (packet (vector-ref packets pos)))
+                   (proc time packet)
+                   (loop (- n 1))))))
       (mutex-unlock! mutex)))
   
   
