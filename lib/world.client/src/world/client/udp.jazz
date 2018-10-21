@@ -549,10 +549,12 @@
                         (let ((channel (find-send-channel self media-kind)))
                           (define (locate-later-header header)
                             (locate-latest (get-retain-ring channel)
-                              (lambda (data)
-                                (and (media-packet-header? data)
-                                     (or (not header)
-                                         (> (read-udp-frame data) header))))))
+                              (lambda (packet)
+                                (let ((data (get-data packet)))
+                                  (and data
+                                       (media-packet-header? data)
+                                       (or (not header)
+                                           (> (read-udp-frame data) header)))))))
                           
                           (when channel
                             (ecase media-kind
@@ -677,11 +679,11 @@
       (when channel
         (let ((ring (get-retain-ring channel)))
           (for-each (lambda (sequence)
-                      (let ((found (locate-sequence ring sequence)))
-                        (if found
+                      (let ((data (locate-data ring sequence)))
+                        (if data
                             (begin
-                              (send-data self found)
-                              (let ((frame (read-udp-frame found)))
+                              (send-data self data)
+                              (let ((frame (read-udp-frame data)))
                                 (record-event udp-id-resend-packet
                                               (fixnum->flonum origin)
                                               (fixnum->flonum media-kind)
@@ -833,36 +835,37 @@
     (with-task task
       (lambda (exit)
         (let (loop)
-          (let ((data (wait retain-ring)))
-            (if (eq? data 'terminate)
+          (let ((packet (wait retain-ring)))
+            (if (eq? packet 'terminate)
                 (continuation-return exit #f)
               (site (udp-release on?: #t)
-                (release-media self data))
+                (release-media self packet))
               (loop)))))))
   
   
-  (method protected (release-media self data)
-    (if (integer? data)
-        (let ((removed-sequence data))
-          (record-event udp-id-giveup-packet
+  (method protected (release-media self packet)
+    (let ((data (get-data packet)))
+      (if (not data)
+          (let ((removed-sequence data))
+            (record-event udp-id-giveup-packet
+                          (fixnum->flonum origin)
+                          (fixnum->flonum media-kind)
+                          (fixnum->flonum removed-sequence)
+                          -1.
+                          -1.
+                          -1.))
+        (let ((origin (read-udp-origin data))
+              (sequence (read-udp-sequence data))
+              (frame (read-udp-frame data))
+              (ring-size (get-count retain-ring))
+              (timestamp (read-udp-media-timestamp data)))
+          (record-event udp-id-release-packet
                         (fixnum->flonum origin)
                         (fixnum->flonum media-kind)
-                        (fixnum->flonum removed-sequence)
-                        -1.
-                        -1.
-                        -1.))
-      (let ((origin (read-udp-origin data))
-            (sequence (read-udp-sequence data))
-            (frame (read-udp-frame data))
-            (ring-size (get-count retain-ring))
-            (timestamp (read-udp-media-timestamp data)))
-        (record-event udp-id-release-packet
-                      (fixnum->flonum origin)
-                      (fixnum->flonum media-kind)
-                      (fixnum->flonum sequence)
-                      (fixnum->flonum frame)
-                      (fixnum->flonum ring-size)
-                      (timestamp->flonum timestamp))))))
+                        (fixnum->flonum sequence)
+                        (fixnum->flonum frame)
+                        (fixnum->flonum ring-size)
+                        (timestamp->flonum timestamp)))))))
 
 
 ;;;
@@ -918,9 +921,9 @@
       (continuation-capture
         (lambda (done)
           (iterate-latest process-ring
-            (lambda (time data)
-              (when (integer? data)
-                (enqueue missing data)
+            (lambda (packet)
+              (when (not (get-data packet))
+                (enqueue missing (get-sequence packet))
                 (increase! count)
                 (when (>= count udp-latest-nacks)
                   (continuation-return done #f)))))))
@@ -930,8 +933,8 @@
   (method protected (count-missing self)
     (let ((count 0))
       (iterate-latest process-ring
-        (lambda (time data)
-          (when (integer? data)
+        (lambda (packet)
+          (when (not (get-data packet))
             (increase! count))))
       count))
   
@@ -1058,23 +1061,24 @@
     (with-task task
       (lambda (exit)
         (let (looping)
-          (receive (time data) (wait-for process-ring udp-ready-window)
-            (if (eq? time 'terminate)
+          (let ((packet (wait-for process-ring udp-ready-window)))
+            (if (eq? packet 'terminate)
                 (continuation-return exit #f)
               (site (udp-process on?: #t)
-                (if (not time)
+                (if (not packet)
                     (when (= media-kind udp-video)
                       (process-state-waiting self))
-                  (if (integer? data)
-                      (let ((removed-sequence data))
-                        (record-event udp-id-giveup-packet
-                                      (fixnum->flonum origin)
-                                      (fixnum->flonum media-kind)
-                                      (fixnum->flonum removed-sequence)
-                                      -1.
-                                      -1.
-                                      -1.))
-                    (process-data self time data)))
+                  (let ((data (get-data packet)))
+                    (if (not data)
+                        (let ((removed-sequence (get-sequence packet)))
+                          (record-event udp-id-giveup-packet
+                                        (fixnum->flonum origin)
+                                        (fixnum->flonum media-kind)
+                                        (fixnum->flonum removed-sequence)
+                                        -1.
+                                        -1.
+                                        -1.))
+                      (process-data self (get-time packet) data))))
                 (looping))))))))
   
   
