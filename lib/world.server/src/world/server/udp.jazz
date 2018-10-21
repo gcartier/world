@@ -229,47 +229,40 @@
           (let ((in-order? (or (not last-sequence)
                                (> sequence last-sequence)))
                 (now (current-seconds)))
-            (if (not in-order?)
-                (remove-nack channel sequence frame)
-              ;; remember last sequence
+            (when in-order?
+              ;; remember sequence
               (set-last-sequence channel sequence)
-              ;; add nacks to list
+              ;; record gap event
               (when last-sequence
                 (let ((expected (+ last-sequence 1)))
-                  (when (> sequence expected)
-                    (let ((from-sequence (max expected (- sequence udp-max-nacks))))
-                      (loop (for seq from from-sequence below sequence)
-                            (add-nack channel now seq sequence)))
-                    (let ((gap (- sequence expected)))
-                      (when (> gap 0)
-                        (record-event udp-id-packet-gap
-                                      (fixnum->flonum origin)
-                                      (fixnum->flonum kind)
-                                      (fixnum->flonum sequence)
-                                      (fixnum->flonum frame)
-                                      (fixnum->flonum gap)
-                                      -1.)
-                        (when udp-show-gaps?
-                          (terminal remote-name (present-media-kind kind) '***packet-gap*** now gap sequence)))))))
+                  (let ((gap (- sequence expected)))
+                    (when (> gap 0)
+                      (record-event udp-id-packet-gap
+                                    (fixnum->flonum origin)
+                                    (fixnum->flonum kind)
+                                    (fixnum->flonum sequence)
+                                    (fixnum->flonum frame)
+                                    (fixnum->flonum gap)
+                                    -1.)
+                      (when udp-show-gaps?
+                        (terminal remote-name (present-media-kind kind) '***packet-gap*** now gap sequence))))))
               ;; send the lastest nacks
-              (let ((latest-missing (filter-latest-missing channel)))
+              (let ((latest-missing (collect-latest-missing channel)))
                 (unless (null? latest-missing)
                   (let ((source-info (udp-source-socket-info udp-port)))
                     (let ((source-host (socket-info-address source-info))
                           (source-port (socket-info-port-number source-info)))
                       (let ((connection (host/port->connection self source-host source-port)))
                         (send-nack self connection origin kind latest-missing)))))))
-            (retain channel data)
+            (retain-media channel data)
             (broadcast-media self kind origin data))))))
   
   
   (method (send-missing self origin media-kind missing)
     (let ((channel (require-server-channel self origin media-kind)))
-      (let ((ring (get-retain-ring channel))
-            (entries (get-retain-entries channel)))
+      (let ((ring (get-retain-ring channel)))
         (for-each (lambda (sequence)
-                    (let ((found (table-ref entries sequence #f) @old (locate ring (lambda (data)
-                                                (= (read-udp-sequence data) sequence)))))
+                    (let ((found (locate-sequence ring sequence)))
                       (if found
                           (let ((source-info (udp-source-socket-info udp-port)))
                             (let ((source-host (socket-info-address source-info))
@@ -448,100 +441,56 @@
 (class UDP-Server-Channel extends UDP-Channel
   
   
-  (slot origin         getter generate)
-  (slot latest-nacks   accessors generate)
-  (slot retain-ring    getter generate)
-  (slot retain-entries getter generate)
-  (slot release-task   getter generate)
+  (slot origin       getter generate)
+  (slot retain-ring  getter generate)
+  (slot release-task getter generate)
   
   
   (method override (initialize self origin media-kind)
     (nextmethod self media-kind)
     (set! self.origin origin)
-    (set! self.latest-nacks '())
-    (set! self.retain-ring (new Time-Ring udp-retain-size max-size: udp-retain-max-size overflow-proc: (udp-ring-overflow 'retain udp-ring-kind-retain)))
-    (set! self.retain-entries (make-table test: eqv?))
+    (set! self.retain-ring (new UDP-Ring origin media-kind udp-retain-size max-size: udp-retain-max-size overflow-proc: (udp-ring-overflow 'retain udp-ring-kind-retain)))
     (set! self.release-task (new Task 'udp-release (lambda (task)
                                                      (release-loop self task))
                                  priority: udp-priority))
     (start-task release-task))
   
   
-  (method protected (add-nack self seconds seq sequence)
-    (set! latest-nacks (cons (cons seconds seq) latest-nacks))
-    (let ((ring-size (length latest-nacks)))
-      (record-event udp-id-nack-packet
-                    (fixnum->flonum origin)
-                    (fixnum->flonum media-kind)
-                    (fixnum->flonum seq)
-                    (fixnum->flonum sequence)
-                    (fixnum->flonum ring-size)
-                    -1.))
-    ;; trim when more than udp-latest-nacks
-    (when (> (length latest-nacks) udp-latest-nacks)
-      (let ((removed-sequence (cdr (last latest-nacks))))
-        (set-cdr! (tail latest-nacks (- udp-latest-nacks 1)) '())
-        (let ((ring-size (length latest-nacks)))
-          (record-event udp-id-giveup-packet
-                        (fixnum->flonum origin)
-                        (fixnum->flonum media-kind)
-                        (fixnum->flonum removed-sequence)
-                        -1.
-                        (fixnum->flonum ring-size)
-                        -1.))))
-    latest-nacks)
+  (method override (destroy self)
+    (terminate retain-ring)
+    (thread-join! (get-thread release-task))
+    (nextmethod self))
   
   
-  (method protected (remove-nack self sequence frame)
-    (set! latest-nacks (remove! sequence latest-nacks key: cdr))
-    (let ((ring-size (length latest-nacks)))
-      (record-event udp-id-got-packet
+  (method protected (collect-latest-missing self)
+    (let ((missing (new-queue))
+          (count 0))
+      (continuation-capture
+        (lambda (done)
+          (iterate-latest retain-ring
+            (lambda (time data)
+              (when (integer? data)
+                (enqueue missing data)
+                (increase! count)
+                (when (>= count udp-latest-nacks)
+                  (continuation-return done #f)))))))
+      (queue-list missing)))
+  
+  
+  (method protected (retain-media self data)
+    (add retain-ring (+ (current-seconds) udp-retain-window) data)
+    (let ((origin (read-udp-origin data))
+          (sequence (read-udp-sequence data))
+          (frame (read-udp-frame data))
+          (ring-size (get-count retain-ring))
+          (timestamp (read-udp-media-timestamp data)))
+      (record-event udp-id-retain-packet
                     (fixnum->flonum origin)
                     (fixnum->flonum media-kind)
                     (fixnum->flonum sequence)
                     (fixnum->flonum frame)
                     (fixnum->flonum ring-size)
-                    -1.)))
-  
-  
-  (method protected (filter-latest-missing self)
-    ;; discard any nack older than udp-process-window
-    (let ((now (current-seconds))
-          (ring-size (length latest-nacks)))
-      (set! latest-nacks (collect-if (lambda (nack)
-                                       (let ((seconds (car nack)))
-                                         (let ((keep? (< (- now seconds) udp-nack-window)))
-                                           (when (not keep?)
-                                             (decrease! ring-size)
-                                             (let ((removed-sequence (cdr nack)))
-                                               (record-event udp-id-giveup-packet
-                                                             (fixnum->flonum origin)
-                                                             (fixnum->flonum media-kind)
-                                                             (fixnum->flonum removed-sequence)
-                                                             -1.
-                                                             (fixnum->flonum ring-size)
-                                                             -1.)))
-                                           keep?)))
-                                     latest-nacks)))
-    (map cdr latest-nacks))
-  
-  
-  (method protected (retain self data)
-    (insert retain-ring (+ (current-seconds) udp-retain-window) data)
-    (table-set! retain-entries (read-udp-sequence data) data)
-    (let ((kind (read-udp-kind data)))
-      (let ((origin (read-udp-origin data))
-            (sequence (read-udp-sequence data))
-            (frame (read-udp-frame data))
-            (ring-size (get-count retain-ring))
-            (timestamp (read-udp-media-timestamp data)))
-        (record-event udp-id-retain-packet
-                      (fixnum->flonum origin)
-                      (fixnum->flonum media-kind)
-                      (fixnum->flonum sequence)
-                      (fixnum->flonum frame)
-                      (fixnum->flonum ring-size)
-                      (timestamp->flonum timestamp)))))
+                    (timestamp->flonum timestamp))))
   
   
   (method protected (release-loop self task)
@@ -550,21 +499,32 @@
       (lambda (exit)
         (let (loop)
           (let ((data (wait retain-ring)))
-            (if (not data)
+            (if (eq? data 'terminate)
                 (continuation-return exit #f)
               (site (udp-release on?: #t)
-                (table-clear retain-entries (read-udp-sequence data))
-                (let ((kind (read-udp-kind data)))
-                  (let ((origin (read-udp-origin data))
-                        (sequence (read-udp-sequence data))
-                        (frame (read-udp-frame data))
-                        (ring-size (get-count retain-ring))
-                        (timestamp (read-udp-media-timestamp data)))
-                    (record-event udp-id-release-packet
-                                  (fixnum->flonum origin)
-                                  (fixnum->flonum media-kind)
-                                  (fixnum->flonum sequence)
-                                  (fixnum->flonum frame)
-                                  (fixnum->flonum ring-size)
-                                  (timestamp->flonum timestamp)))))
-              (loop)))))))))
+                )
+              (loop)))))))
+  
+  
+  (method protected (release-media self data)
+    (if (integer? data)
+        (let ((removed-sequence data))
+          (record-event udp-id-giveup-packet
+                        (fixnum->flonum origin)
+                        (fixnum->flonum media-kind)
+                        (fixnum->flonum removed-sequence)
+                        -1.
+                        -1.
+                        -1.))
+      (let ((origin (read-udp-origin data))
+            (sequence (read-udp-sequence data))
+            (frame (read-udp-frame data))
+            (ring-size (get-count retain-ring))
+            (timestamp (read-udp-media-timestamp data)))
+        (record-event udp-id-release-packet
+                      (fixnum->flonum origin)
+                      (fixnum->flonum media-kind)
+                      (fixnum->flonum sequence)
+                      (fixnum->flonum frame)
+                      (fixnum->flonum ring-size)
+                      (timestamp->flonum timestamp)))))))

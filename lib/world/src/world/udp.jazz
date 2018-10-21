@@ -15,7 +15,8 @@
 (module world.udp jazz
 
 
-(import (jazz.presence)
+(import (jazz.geometry)
+        (jazz.presence)
         (jazz.stream)
         (jazz.syntax (phase syntax))
         (world)
@@ -219,7 +220,7 @@
 
 
 ;;;
-;;;; Ring
+;;;; Ring (old)
 ;;;
 
 
@@ -394,6 +395,371 @@
     (print-unreadable self output
       (lambda (output)
         (format output "{a} {a}" timestamp time)))))
+
+
+;;;
+;;;; Ring
+;;;
+
+
+;;               ---> time
+;;  wait +----+----+----+----+----+ insert
+;;  <--- | T0 | T1 | T2 | T3 | T4 | <---
+;;       +----+----+----+----+----+
+;;       ^                        ^
+;;      HEAD                     TAIL
+;;   (earliest)                (latest)
+;;    (lowest)                 (highest)
+
+
+(class UDP-Ring extends Object
+  
+  
+  (slot origin                   getter generate)
+  (slot media-kind               getter generate)
+  (slot size         <fx>        getter generate)
+  (slot max-size     <fx>        getter generate)
+  (slot times        <f64vector> getter generate)
+  (slot packets      <vector>    getter generate)
+  (slot mutex        <object>    getter generate)
+  (slot wait-condvar <object>    getter generate)
+  (slot head         <fx>        getter generate)
+  (slot tail         <fx>        getter generate)
+  (slot count        <fx>        getter generate)
+  (slot lowest       <fx>        getter generate)
+  (slot highest      <fx>        getter generate)
+  (slot terminate?               getter generate)
+  (slot invalid-proc             getter generate)
+  (slot overflow-proc            getter generate)
+  
+  
+  (method override (initialize self origin media-kind size <fx> (max-size: max-size #f) (invalid-proc: invalid-proc #f) (overflow-proc: overflow-proc #f))
+    (nextmethod self)
+    (set! self.origin origin)
+    (set! self.media-kind media-kind)
+    (assert (> size 0))
+    (set! self.size size)
+    (set! self.max-size (or max-size size))
+    (set! self.times (make-f64vector size +nan.0))
+    (set! self.packets (make-vector size #f))
+    (set! self.mutex (make-mutex 'ring))
+    (set! self.wait-condvar (make-condition-variable 'wait))
+    (set! self.head 0)
+    (set! self.tail 0)
+    (set! self.count 0)
+    (set! self.lowest 0)
+    (set! self.highest 0)
+    (set! self.terminate? #f)
+    (set! self.invalid-proc invalid-proc)
+    (set! self.overflow-proc overflow-proc))
+  
+  
+  (method public (terminate self)
+    (mutex-lock! mutex)
+    (set! terminate? #t)
+    (condition-variable-signal! wait-condvar)
+    (mutex-unlock! mutex))
+  
+  
+  (method public (empty self)
+    (f64vector-fill! self.times +nan.0)
+    (vector-fill! self.packets #f)
+    (set! self.head 0)
+    (set! self.tail 0)
+    (set! self.count 0)
+    (set! self.lowest 0)
+    (set! self.highest 0))
+  
+  
+  (method protected (check self)
+    (define (get pos)
+      (let ((data (vector-ref packets pos)))
+        (if (integer? data)
+            data
+          (read-udp-sequence data))))
+    
+    (when (> count 0)
+      (let ((low (get head))
+            (high (get (modulo (- tail 1) size))))
+        (assert (= lowest low))
+        (assert (= highest high)))))
+  
+  
+  (method protected (index self seq)
+    (modulo (+ head (- seq lowest)) size))
+  
+  
+  (method public (add self time packet)
+    (mutex-lock! mutex)
+    (prog1 (let ((sequence (read-udp-sequence packet)))
+             (define (record-nack seq)
+               (record-event udp-id-nack-packet
+                             (fixnum->flonum origin)
+                             (fixnum->flonum media-kind)
+                             (fixnum->flonum seq)
+                             (fixnum->flonum sequence)
+                             (fixnum->flonum count)
+                             -1.))
+             
+             (cond ;; empty
+                   ((= count 0)
+                    (insert-before self head time packet)
+                    (set! lowest sequence)
+                    (set! highest sequence)
+                    (check self)
+                    (condition-variable-signal! wait-condvar))
+                   ;; head
+                   ((< sequence lowest)
+                    (loop (for seq from (- lowest 1) above sequence)
+                          (insert-before self head time seq)
+                          (record-nack seq))
+                    (insert-before self head time packet)
+                    (set! lowest sequence)
+                    (check self)
+                    (condition-variable-signal! wait-condvar))
+                   ;; tail
+                   ((> sequence highest)
+                    (loop (for seq from (+ highest 1) below sequence)
+                          (insert-before self tail time seq)
+                          (record-nack seq))
+                    (insert-before self tail time packet)
+                    (set! highest sequence)
+                    (check self)
+                    (condition-variable-signal! wait-condvar))
+                   ;; replace
+                   (else
+                    (let ((pos (index self sequence)))
+                      (let ((actual-packet (vector-ref packets pos)))
+                        (if (u8vector? actual-packet)
+                            (let ((actual-time (f64vector-ref times pos))
+                                  (frame (read-udp-frame packet)))
+                              (if (= time actual-time)
+                                  (record-event udp-id-duplicate-packet
+                                                (fixnum->flonum origin)
+                                                (fixnum->flonum media-kind)
+                                                (fixnum->flonum sequence)
+                                                (fixnum->flonum frame)
+                                                (fixnum->flonum count)
+                                                -1.)
+                                (record-event udp-id-invalid-time
+                                              (fixnum->flonum origin)
+                                              (fixnum->flonum media-kind)
+                                              (fixnum->flonum sequence)
+                                              (fixnum->flonum frame)
+                                              time
+                                              actual-time)))
+                          (f64vector-set! times pos time)
+                          (vector-set! packets pos packet)
+                          (let ((frame (read-udp-frame packet)))
+                            (record-event udp-id-got-packet
+                                          (fixnum->flonum origin)
+                                          (fixnum->flonum media-kind)
+                                          (fixnum->flonum sequence)
+                                          (fixnum->flonum frame)
+                                          (fixnum->flonum count)
+                                          -1.))
+                          (condition-variable-signal! wait-condvar)))))))
+      (mutex-unlock! mutex)))
+  
+  
+  (method public (insert-earliest self packet)
+    (mutex-lock! mutex)
+    (insert-before self head (current-seconds) packet)
+    (condition-variable-signal! wait-condvar)
+    (mutex-unlock! mutex))
+  
+  
+  (method public (insert-before self pos time packet)
+    ;; grow
+    (when (and (= count size)
+               (< size max-size))
+      (let ((new-size (min max-size (fxround (* size GOLDEN_GROWTH)))))
+        (let ((new-times (make-f64vector new-size +nan.0))
+              (new-packets (make-vector new-size #f))
+              (growth (- new-size size)))
+          (set! head (+ head growth))
+          (subf64vector-move! times 0 tail new-times 0)
+          (subf64vector-move! times tail size new-times head)
+          (subvector-move! packets 0 tail new-packets 0)
+          (subvector-move! packets tail size new-packets head)
+          (set! size new-size)
+          (set! times new-times)
+          (set! packets new-packets))))
+    ;; insert
+    (cond ((< count size)
+           (cond ((= pos head)
+                  (set! head (modulo (- head 1) size))
+                  (f64vector-set! times head time)
+                  (vector-set! packets head packet)
+                  (increase! count))
+                 ((= pos tail)
+                  (f64vector-set! times tail time)
+                  (vector-set! packets tail packet)
+                  (set! tail (modulo (+ tail 1) size))
+                  (increase! count))
+                 (else
+                  (if (and (> head tail)
+                           (>= pos head))
+                      (begin
+                        (subf64vector-shift! times head pos -1)
+                        (subvector-shift! packets head pos -1)
+                        (f64vector-set! times (- pos 1) time)
+                        (vector-set! packets (- pos 1) packet)
+                        (set! head (modulo (- head 1) size))
+                        (increase! count))
+                    (subf64vector-shift! times pos tail 1)
+                    (subvector-shift! packets pos tail 1)
+                    (f64vector-set! times pos time)
+                    (vector-set! packets pos packet)
+                    (set! tail (modulo (+ tail 1) size))
+                    (increase! count)))))
+          (else
+           (if overflow-proc
+               (overflow-proc self packet)
+             (let ((packet (vector-ref packets tail)))
+               (f64vector-set! times tail time)
+               (vector-set! packets tail packet)
+               (set! tail (modulo (+ tail 1) size))
+               (set! head tail))))))
+  
+  
+  (method public (wait self)
+    (declare (proper-tail-calls))
+    (let (loop-wait)
+      (mutex-lock! mutex)
+      (if terminate?
+          (prog1 'terminate
+            (mutex-unlock! mutex))
+        (if (= count 0)
+            (begin
+              (mutex-unlock! mutex wait-condvar)
+              (loop-wait))
+          (let ((now (current-seconds))
+                (earliest-time (f64vector-ref times head))
+                (earliest (vector-ref packets head)))
+            (let ((earliest-duration (- earliest-time now)))
+              (if (<= earliest-duration 0.)
+                  (prog1 earliest
+                    (f64vector-set! times head +nan.0)
+                    (vector-set! packets head #f)
+                    (set! head (modulo (+ head 1) size))
+                    (decrease! count)
+                    (increase! lowest)
+                    (check self)
+                    (mutex-unlock! mutex))
+                (mutex-unlock! mutex wait-condvar earliest-duration)
+                (loop-wait))))))))
+  
+  
+  ;; move code to together!?
+  (method public (wait2 self timeout)
+    (declare (proper-tail-calls))
+    (let (loop-wait)
+      (mutex-lock! mutex)
+      (let ((now (current-seconds)))
+        (if (= count 0)
+            (begin
+              (mutex-unlock! mutex wait-condvar timeout)
+              (if (= count 0)
+                  (values #f #f)
+                (loop-wait)))
+          (let ((earliest-time (f64vector-ref times head))
+                (earliest (vector-ref packets head)))
+            (let ((earliest-duration (- earliest-time now)))
+              (if (<= earliest-duration 0.)
+                  (prog1 (values earliest-time earliest)
+                    (f64vector-set! times head +nan.0)
+                    (vector-set! packets head #f)
+                    (set! head (modulo (+ head 1) size))
+                    (decrease! count)
+                    (mutex-unlock! mutex))
+                (mutex-unlock! mutex wait-condvar earliest-duration)
+                (loop-wait))))))))
+  
+  
+  (method public (locate-sequence self sequence)
+    (mutex-lock! mutex)
+    (prog1 (and (>= sequence lowest)
+                (<= sequence highest)
+                (let ((pos (index self sequence)))
+                  (let ((packet (vector-ref packets pos)))
+                    (if (integer? packet)
+                        #f
+                      packet))))
+      (mutex-unlock! mutex)))
+  
+  
+  (method public (locate-earliest self predicate)
+    (mutex-lock! mutex)
+    (prog1 (let (loop (n 0))
+             (if (>= n count)
+                 #f
+               (let ((pos (modulo (+ head n) size)))
+                 (let ((packet (vector-ref packets pos)))
+                   (if (predicate packet)
+                       packet
+                     (loop (+ n 1)))))))
+      (mutex-unlock! mutex)))
+  
+  
+  (method public (locate-latest self predicate)
+    (mutex-lock! mutex)
+    (prog1 (let (loop (n (- count 1)))
+             (if (< n 0)
+                 #f
+               (let ((pos (modulo (+ head n) size)))
+                 (let ((packet (vector-ref packets pos)))
+                   (if (predicate packet)
+                       packet
+                     (loop (- n 1)))))))
+      (mutex-unlock! mutex)))
+  
+  
+  (method public (iterate-earliest self proc)
+    (mutex-lock! mutex)
+    (prog1 (let (loop (n 0))
+             (when (< n count)
+               (let ((pos (modulo (+ head n) size)))
+                 (let ((time (f64vector-ref times pos))
+                       (packet (vector-ref packets pos)))
+                   (proc time packet)
+                   (loop (+ n 1))))))
+      (mutex-unlock! mutex)))
+  
+  
+  (method public (iterate-latest self proc)
+    (mutex-lock! mutex)
+    (prog1 (let (loop (n (- count 1)))
+             (when (>= n 0)
+               (let ((pos (modulo (+ head n) size)))
+                 (let ((time (f64vector-ref times pos))
+                       (packet (vector-ref packets pos)))
+                   (proc time packet)
+                   (loop (- n 1))))))
+      (mutex-unlock! mutex)))
+  
+  
+  (method public (updating self thunk)
+    (mutex-lock! mutex)
+    (prog1 (thunk)
+      (condition-variable-signal! wait-condvar)
+      (mutex-unlock! mutex)))
+  
+  
+  (method public (update self proc)
+    (let (loop (n 0))
+      (if (>= n count)
+          #f
+        (let ((pos (modulo (+ head n) size)))
+          (let ((time (f64vector-ref times pos))
+                (packet (vector-ref packets pos)))
+            (proc
+              time
+              packet
+              (lambda (new-time new-packet)
+                (f64vector-set! times pos new-time)
+                (vector-set! packets pos new-packet)))
+            (loop (+ n 1))))))))
 
 
 ;;;
