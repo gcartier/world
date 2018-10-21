@@ -266,7 +266,7 @@
   (method package (require-send-channel self media-kind)
     (let ((key media-kind))
       (or (table-ref send-channels key #f)
-          (let ((channel (new UDP-Send-Channel media-kind)))
+          (let ((channel (new UDP-Send-Channel client-no media-kind)))
             (table-set! send-channels key channel)
             channel))))
   
@@ -681,11 +681,9 @@
   (method (send-missing self origin media-kind missing)
     (let ((channel (find-send-channel self media-kind)))
       (when channel
-        (let ((ring (get-retain-ring channel))
-              (entries (get-retain-entries channel)))
+        (let ((ring (get-retain-ring channel)))
           (for-each (lambda (sequence)
-                      (let ((found (table-ref entries sequence #f) @old (locate ring (lambda (data)
-                                                  (= (read-udp-sequence data) sequence)))))
+                      (let ((found (locate-sequence ring sequence)))
                         (if found
                             (begin
                               (send-data self found)
@@ -788,17 +786,15 @@
   (slot frame-sequence accessors generate)
   (slot last-timestamp accessors generate)
   (slot retain-ring    getter generate)
-  (slot retain-entries getter generate)
   (slot release-task   getter generate)
   
   
-  (method override (initialize self media-kind)
-    (nextmethod self media-kind)
+  (method override (initialize self origin media-kind)
+    (nextmethod self origin media-kind)
     (set! self.data-sequence 0)
     (set! self.frame-sequence 0)
     (set! self.last-timestamp #f)
-    (set! self.retain-ring (new Time-Ring udp-retain-size max-size: udp-retain-max-size overflow-proc: (udp-ring-overflow 'retain udp-ring-kind-retain)))
-    (set! self.retain-entries (make-table test: eqv?))
+    (set! self.retain-ring (new UDP-Ring origin media-kind udp-retain-size max-size: udp-retain-max-size overflow-proc: (udp-ring-overflow 'retain udp-ring-kind-retain)))
     (set! self.release-task (new Task 'udp-release (lambda (task)
                                                      (release-loop self task))
                                  priority: udp-priority))
@@ -806,7 +802,7 @@
   
   
   (method override (destroy self)
-    (insert-earliest retain-ring #f)
+    (terminate retain-ring)
     (thread-join! (get-thread release-task))
     (nextmethod self))
   
@@ -822,8 +818,7 @@
   
   
   (method protected (retain-media self data)
-    (insert retain-ring (+ (current-seconds) udp-retain-window) data)
-    (table-set! retain-entries (read-udp-sequence data) data)
+    (add retain-ring (+ (current-seconds) udp-retain-window) data)
     (let ((kind (read-udp-kind data)))
       (let ((origin (read-udp-origin data))
             (sequence (read-udp-sequence data))
@@ -845,7 +840,7 @@
       (lambda (exit)
         (let (loop)
           (let ((data (wait retain-ring)))
-            (if (not data)
+            (if (eq? data 'terminate)
                 (continuation-return exit #f)
               (site (udp-release on?: #t)
                 (release-media self data))
@@ -853,8 +848,15 @@
   
   
   (method protected (release-media self data)
-    (table-clear retain-entries (read-udp-sequence data))
-    (let ((kind (read-udp-kind data)))
+    (if (integer? data)
+        (let ((removed-sequence data))
+          (record-event udp-id-giveup-packet
+                        (fixnum->flonum origin)
+                        (fixnum->flonum media-kind)
+                        (fixnum->flonum removed-sequence)
+                        -1.
+                        -1.
+                        -1.))
       (let ((origin (read-udp-origin data))
             (sequence (read-udp-sequence data))
             (frame (read-udp-frame data))
@@ -877,7 +879,6 @@
 (class UDP-Receive-Channel extends UDP-Channel
   
   
-  (slot origin                  getter generate)
   (slot latest-nacks            accessors generate)
   (slot process-state           getter generate)
   (slot process-ring            getter generate)
@@ -894,8 +895,7 @@
   
   
   (method override (initialize self origin media-kind)
-    (nextmethod self media-kind)
-    (set! self.origin origin)
+    (nextmethod self origin media-kind)
     (set! self.latest-nacks '())
     (set! self.process-state 'waiting)
     (set! self.ready-buffers (make-table test: eqv?))
