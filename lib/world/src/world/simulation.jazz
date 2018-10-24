@@ -1,0 +1,130 @@
+;;;===============
+;;;  WorldScheme
+;;;===============
+;;;
+;;;; UDP Simulation
+;;;
+;;;  The Initial Developer of the Original Code is Guillaume Cartier.
+;;;  Portions created by the Initial Developer are Copyright (C) 2012-2018
+;;;  the Initial Developer. All Rights Reserved.
+;;;
+;;;  Contributor(s):
+;;;    Barbara Samson
+
+
+(module world.simulation jazz
+
+
+(import (jazz.stream)
+        (world)
+        (world.context)
+        (world.event)
+        (world.evolution)
+        (world.client.udp)
+        (world.server.udp)
+        (world.udp))
+
+
+(definition ignored
+  #f)
+
+
+(definition public (simulate-udp names)
+  (let ((simulation (new UDP-Simulation)))
+    (let ((server (simulate-udp-server)))
+      (add-tier simulation #f server)
+      (iterate-table names
+        (lambda (no name)
+          (when no
+            (let ((tier (simulate-udp-client server no)))
+              (add-tier simulation no tier)))))
+      (add-channels simulation)
+      simulation)))
+
+
+(definition (simulate-udp-server)
+  (parameterize ((simulation? #t))
+    (let ((server (new UDP-Server)))
+      (start server ignored ignored)
+      server)))
+
+
+(definition (simulate-udp-client server no)
+  (parameterize ((simulation? #t))
+    (let ((client (new UDP-Client no)))
+      (connect client ignored ignored ignored)
+      client)))
+
+
+(definition public (replay-client simulation no evolution)
+  (let ((client (require-tier simulation no))
+        (count 0)
+        (packets (make-table test: equal?)))
+    ;; quick test
+    (set-slot-value client 'last-received-state (current-seconds))
+    (loop (for n from (first-position evolution) to (last-position evolution))
+          (when (< count 100)
+            (let ((id (evolutionary-udp-id evolution n)))
+              (ecase id
+                ((udp-id-create-packet)
+                 (let ((kind (flonum->fixnum (evolutionary-udp-kind evolution n)))
+                       (buffer (u8vector 2 3 5))
+                       (header? #f)
+                       (timestamp (let ((data (evolutionary-udp-data4 evolution n)))
+                                    (if (= data -1.)
+                                        -1
+                                      (flonum->timestamp data))))
+                       (duration 1000))
+                   (parameterize ((simulation? #t))
+                     (let ((packet (send-media client kind buffer header? timestamp duration)))
+                       (when packet
+                         (table-set! packets (list no kind (read-udp-sequence packet)) packet)))))
+                 (increase! count))
+                @w
+                ((udp-id-add-process)
+                 (let ((origin (flonum->fixnum (evolutionary-udp-origin evolution n)))
+                       (kind (flonum->fixnum (evolutionary-udp-kind evolution n)))
+                       (sequence (flonum->fixnum (evolutionary-udp-data1 evolution n))))
+                   (let ((packet (table-ref packets (list origin kind sequence) #f)))
+                     (if (not packet)
+                         (terminal 'cannot 'find origin kind sequence)
+                       (terminal 'FOUND origin kind sequence))))
+                 (increase! count))))))))
+
+
+(class UDP-Simulation extends Object
+  
+  
+  (slot tiers initialize (make-table test: equal?) getter generate)
+  
+  
+  (method public (add-tier self no tier)
+    (table-set! tiers no tier))
+  
+  
+  (method public (require-tier self no)
+    (table-ref tiers no))
+  
+  
+  (method package (add-channels self)
+    ;; from hierarchy-update
+    (iterate-table tiers
+      (lambda (no tier)
+        (typecase tier
+          ((UDP-Server)
+           (iterate-table tiers
+             (lambda (other-no other-tier)
+               (unless (eq? other-tier tier)
+                 (require-server-channel tier other-no udp-audio)
+                 (require-server-channel tier other-no udp-video)))))
+          ((UDP-Client)
+           (iterate-table tiers
+             (lambda (other-no other-tier)
+               (unless (eq? other-tier tier)
+                 (typecase other-tier
+                   ((UDP-Server)
+                    (require-send-channel tier udp-audio)
+                    (require-send-channel tier udp-video))
+                   ((UDP-Client)
+                    (require-receive-channel tier other-no udp-audio)
+                    (require-receive-channel tier other-no udp-video)))))))))))))
