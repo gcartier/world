@@ -29,17 +29,17 @@
   #f)
 
 
-(definition public (simulate-udp names)
-  (let ((simulation (new UDP-Simulation)))
+(definition public (simulate-udp-call names)
+  (let ((call (new UDP-Call)))
     (let ((server (simulate-udp-server)))
-      (add-tier simulation #f server)
+      (add-tier call server-no server)
       (iterate-table names
         (lambda (no name)
-          (when no
+          (when (/= no server-no)
             (let ((tier (simulate-udp-client server no)))
-              (add-tier simulation no tier)))))
-      (add-channels simulation)
-      simulation)))
+              (add-tier call no tier)))))
+      (add-channels call)
+      call)))
 
 
 (definition (simulate-udp-server)
@@ -56,46 +56,11 @@
       client)))
 
 
-(definition public (replay-client simulation no evolution)
-  (let ((client (require-tier simulation no))
-        (count 0)
-        (packets (make-table test: equal?)))
-    ;; quick test
-    (set-slot-value client 'last-received-state (current-seconds))
-    (loop (for n from (first-position evolution) to (last-position evolution))
-          (when (< count 100)
-            (let ((id (evolutionary-udp-id evolution n)))
-              (ecase id
-                ((udp-id-create-packet)
-                 (let ((kind (flonum->fixnum (evolutionary-udp-kind evolution n)))
-                       (buffer (u8vector 2 3 5))
-                       (header? #f)
-                       (timestamp (let ((data (evolutionary-udp-data4 evolution n)))
-                                    (if (= data -1.)
-                                        -1
-                                      (flonum->timestamp data))))
-                       (duration 1000))
-                   (parameterize ((simulation? #t))
-                     (let ((packet (send-media client kind buffer header? timestamp duration)))
-                       (when packet
-                         (table-set! packets (list no kind (read-udp-sequence packet)) packet)))))
-                 (increase! count))
-                @w
-                ((udp-id-add-process)
-                 (let ((origin (flonum->fixnum (evolutionary-udp-origin evolution n)))
-                       (kind (flonum->fixnum (evolutionary-udp-kind evolution n)))
-                       (sequence (flonum->fixnum (evolutionary-udp-data1 evolution n))))
-                   (let ((packet (table-ref packets (list origin kind sequence) #f)))
-                     (if (not packet)
-                         (terminal 'cannot 'find origin kind sequence)
-                       (terminal 'FOUND origin kind sequence))))
-                 (increase! count))))))))
-
-
-(class UDP-Simulation extends Object
+(class UDP-Call extends Object
   
   
   (slot tiers initialize (make-table test: equal?) getter generate)
+  (slot datas initialize (make-table test: eqv?) getter generate)
   
   
   (method public (add-tier self no tier)
@@ -127,4 +92,124 @@
                     (require-send-channel tier udp-video))
                    ((UDP-Client)
                     (require-receive-channel tier other-no udp-audio)
-                    (require-receive-channel tier other-no udp-video)))))))))))))
+                    (require-receive-channel tier other-no udp-video)))))))))))
+  
+  
+  ;; is this the right place
+  (method protected (need-data self sequence frame part total timestamp header?)
+    (or (table-ref datas sequence #f)
+        (let ((header-size (+ 8 4 4 4 4 4 4 8 8 4)))
+          (let ((data (make-u8vector header-size)))
+            (write-udp-sequence data sequence)
+            (write-udp-frame data frame)
+            (write-udp-part data part)
+            (write-udp-total data total)
+            (write-udp-media-timestamp data timestamp)
+            (write-udp-media-header? data header?)
+            (table-set! datas sequence data)
+            data)))))
+
+
+;;;
+;;;; Visualize
+;;;
+
+
+(class UDP-Visualizer extends Object
+  
+  
+  (slot call                     getter generate)
+  (slot ring                     getter generate)
+  (slot evolution                getter generate)
+  (slot last-time  initialize #f accessors generate)
+  (slot last-event initialize #f accessors generate)
+  
+  
+  (method override (initialize self call ring evolution)
+    (nextmethod self)
+    (set! self.call call)
+    (set! self.ring ring)
+    (set! self.evolution evolution))
+  
+  
+  (method protected (visualize-from self from target)
+    (declare (proper-tail-calls))
+    (let ((first (first-position evolution))
+          (last (last-position evolution)))
+      (let (loop (n (or from first)))
+        (when (<= n last)
+          (let ((time (evolutionary-udp-time evolution n)))
+            (when (<= time target)
+              (visualize-event self n)
+              (set! last-time time)
+              (set! last-event n)
+              (loop (+ n 1))))))))
+  
+  
+  (method protected (visualize-event self n)
+    (let ((id (evolutionary-udp-id evolution n)))
+      (ecase id
+        ((udp-id-insert-packet)
+         (let ((sequence (flonum->fixnum (evolutionary-udp-data1 evolution n)))
+               (frame 0)
+               (part 0)
+               (total 1)
+               (process-time (evolutionary-udp-data3 evolution n))
+               (timestamp (let ((x (evolutionary-udp-data4 evolution n)))
+                            (if (= x -1.)
+                                #f
+                              (flonum->timestamp x))))
+               (header? #f))
+           (let ((data (need-data call sequence frame part total timestamp header?)))
+             (let ((inserted? (insert ring process-time data)))
+               @w
+               (terminal 'insert process-time sequence inserted?)))))
+        ((udp-id-play-frame)
+         (let ((frame (flonum->fixnum (evolutionary-udp-data2 evolution n))))
+           @w
+           (terminal 'play frame)))))))
+
+
+(definition public (visualize-call call ring evolution)
+  (new UDP-Visualizer call ring evolution))
+
+
+;;;
+;;;; Simulate
+;;;
+
+
+(definition public (simulate-call call no evolution)
+  (let ((client (require-tier call no))
+        (count 0)
+        (packets (make-table test: equal?)))
+    ;; quick test
+    (set-slot-value client 'last-received-state (current-seconds))
+    (loop (for n from (first-position evolution) to (last-position evolution))
+          (when (< count 100)
+            (let ((id (evolutionary-udp-id evolution n)))
+              (ecase id
+                ((udp-id-create-packet)
+                 (let ((kind (flonum->fixnum (evolutionary-udp-kind evolution n)))
+                       (buffer (u8vector 2 3 5))
+                       (header? #f)
+                       (timestamp (let ((data (evolutionary-udp-data4 evolution n)))
+                                    (if (= data -1.)
+                                        -1
+                                      (flonum->timestamp data))))
+                       (duration 1000))
+                   (parameterize ((simulation? #t))
+                     (let ((packet (send-media client kind buffer header? timestamp duration)))
+                       (when packet
+                         (table-set! packets (list no kind (read-udp-sequence packet)) packet)))))
+                 (increase! count))
+                @w
+                ((udp-id-add-process)
+                 (let ((origin (flonum->fixnum (evolutionary-udp-origin evolution n)))
+                       (kind (flonum->fixnum (evolutionary-udp-kind evolution n)))
+                       (sequence (flonum->fixnum (evolutionary-udp-data1 evolution n))))
+                   (let ((packet (table-ref packets (list origin kind sequence) #f)))
+                     (if (not packet)
+                         (terminal 'cannot 'find origin kind sequence)
+                       (terminal 'FOUND origin kind sequence))))
+                 (increase! count)))))))))

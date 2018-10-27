@@ -172,6 +172,7 @@
   (slot live?                        initialize #t  accessors generate)
   (slot replay?                      initialize #f  accessors generate)
   (slot uptodate?                    initialize #f  accessors generate)
+  (slot visualize?                   initialize #f  getter generate)
   ;; scroll code is a copy/paste from showcase
   (slot point                        initialize #f  getter generate)
   (slot moved?                       initialize #f  getter generate)
@@ -181,6 +182,9 @@
   (slot last-speed                   initialize #f  getter generate)
   (slot pulse                        initialize #f  getter generate)
   (slot labels                       initialize #f  getter generate)
+  ;; experimental play
+  (slot playing?                     initialize #f  getter generate)
+  (slot play-thread                  initialize #f  getter generate)
   ;; experimental quicky
   (slot missings                     initialize #f  getter generate)
   ;; experimental quicky
@@ -291,63 +295,81 @@
     (copy-information self)
     (with-bounds self
       (lambda (from~ to~)
-        (set! point (get-h evt))
-        (set! moved? #f)
-        (set! last-to to~)
-        (set! last-seconds (current-seconds))
-        (set! last-speed #f)
-        (kill-autoscroll self))))
+        (if (between? (get-v evt) 85 115)
+            (begin
+              (set! visualize? #t)
+              (set! now (h->when self from to (get-h evt)))
+              (redraw self)
+              (now-update self))
+          (set! visualize? #f)
+          (set! point (get-h evt))
+          (set! moved? #f)
+          (set! last-to to~)
+          (set! last-seconds (current-seconds))
+          (set! last-speed #f)
+          (kill-autoscroll self)))))
   
   
   (method override (drag-move self evt)
     (let ((h (get-h evt)))
-      (when (and point (not (near? h point 2)))
-        (with-bounds self
-          (lambda (from~ to~)
-            (let ((delta (* (/ (cast <fl> (- h point)) (cast <fl> (get-width self))) (- span)))
-                  (head (timeline-head self))
-                  (tail (timeline-tail self)))
-              (let ((new-from (+ from~ delta))
-                    (new-to (+ to~ delta)))
-                (cond ((> new-to tail)
-                       (set-bounds self (- tail span) tail))
-                      ((< new-from head)
-                       (set-bounds self head (+ head span)))
-                      (else
-                       (set-bounds self new-from new-to))))
-              (update-span self)
-              (redraw self))
-            (set! point h)
-            (set! moved? #t)
-            (let ((new-to to)
-                  (new-seconds (current-seconds))
-                  (old-to last-to)
-                  (old-seconds last-seconds))
-              (set! last-to new-to)
-              (set! last-seconds new-seconds)
-              (unless (= new-seconds old-seconds)
-                (let ((new-speed (/ (- new-to old-to) (- new-seconds old-seconds)))
-                      (p .9))
-                  (set! last-speed (+ (* new-speed (- 1. p)) (* (or last-speed 0.) p)))))))))))
+      (if visualize?
+          (begin
+            (set! now (h->when self from to (get-h evt)))
+            (redraw self)
+            (now-update self))
+        (when (and point (not (near? h point 2)))
+          (with-bounds self
+            (lambda (from~ to~)
+              (let ((delta (* (/ (cast <fl> (- h point)) (cast <fl> (get-width self))) (- span)))
+                    (head (timeline-head self))
+                    (tail (timeline-tail self)))
+                (let ((new-from (+ from~ delta))
+                      (new-to (+ to~ delta)))
+                  (cond ((> new-to tail)
+                         (set-bounds self (- tail span) tail))
+                        ((< new-from head)
+                         (set-bounds self head (+ head span)))
+                        (else
+                         (set-bounds self new-from new-to))))
+                (update-span self)
+                (redraw self))
+              (set! point h)
+              (set! moved? #t)
+              (let ((new-to to)
+                    (new-seconds (current-seconds))
+                    (old-to last-to)
+                    (old-seconds last-seconds))
+                (set! last-to new-to)
+                (set! last-seconds new-seconds)
+                (unless (= new-seconds old-seconds)
+                  (let ((new-speed (/ (- new-to old-to) (- new-seconds old-seconds)))
+                        (p .9))
+                    (set! last-speed (+ (* new-speed (- 1. p)) (* (or last-speed 0.) p))))))))))))
 
   
   (method override (mouse-up self evt)
-    (if (or (not moved?) (< (- (current-seconds) last-seconds) .1))
-        (if moved?
-            (begin
-              (set! scrolled? #f)
-              (start-autoscroll self))
-          (with-bounds self
-            (lambda (from to)
-              (set! point (get-h evt))
-              (set! moved? #f)
-              (set! scrolled? #f)
-              (set! last-speed #f)
-              (set! now (h->when self from to point))
-              (redraw self)
-              (now-update self)
-              (kill-autoscroll self))))
-      (view-update self)))
+    (if visualize?
+        (begin
+          (set! visualize? #f)
+          (set! now (h->when self from to (get-h evt)))
+          (redraw self)
+          (now-update self))
+      (if (or (not moved?) (< (- (current-seconds) last-seconds) .1))
+          (if moved?
+              (begin
+                (set! scrolled? #f)
+                (start-autoscroll self))
+            (with-bounds self
+              (lambda (from to)
+                (set! point (get-h evt))
+                (set! moved? #f)
+                (set! scrolled? #f)
+                (set! last-speed #f)
+                (set! now (h->when self from to point))
+                (redraw self)
+                (now-update self)
+                (kill-autoscroll self))))
+        (view-update self))))
   
   
   (method override (right-mouse-up self evt)
@@ -1114,7 +1136,44 @@
                               (let ((h (+ (fxround h) 4))
                                     (v (max (min (fxround (- vert (/ height 2.))) 86) 0)))
                                 (fill-rect surface (h/v/width/height->rect h v width height) {Color Black})
-                                (draw-text surface h v s text-color)))))))))))))))))
+                                (draw-text surface h v s text-color))))))))))))))))
+  
+  
+  ;;;
+  ;;;; Play
+  ;;;
+  
+  
+  (method protected (set-playing? self flag)
+    (unless (eq? flag playing?)
+      (if flag
+          (let ((thread
+                  (new-thread
+                    (lambda ()
+                      (play-loop self))
+                    'play)))
+            (thread-start! thread)
+            (set! visualize? #t)
+            (set! play-thread thread)
+            (set! playing? #t))
+        ;; quicky to test
+        (thread-terminate! play-thread)
+        (set! visualize? #f)
+        (set! play-thread #f)
+        (set! playing? #f))))
+  
+  
+  (method (play-loop self)
+    (declare (proper-tail-calls))
+    (let (loop)
+      (increase! now .004)
+      (let ((over (- now to)))
+        (when (> over 0.)
+          (set! now (+ from over))))
+      (redraw self)
+      (now-update self)
+      (sleep .01)
+      (loop))))
 
 
 ;;;
