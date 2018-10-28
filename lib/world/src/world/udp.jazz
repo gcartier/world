@@ -720,13 +720,64 @@
                 (earliest (vector-ref packets head)))
             (let ((earliest-time (get-time earliest)))
               (let ((earliest-giveup (+ earliest-time giveup-window)))
+                (define (ready? time)
+                  (>= now time))
+                
+                (define (packet-ref n)
+                  (vector-ref packets (modulo (+ head n) size)))
+                
                 (define (complete?)
                   (let ((part (get-part earliest))
                         (total (get-total earliest)))
                     (and (= part 0)
                          (<= total count)
                          (loop (for n from 0 below total)
-                               (every (get-data (vector-ref packets (modulo (+ head n) size))))))))
+                               (every (get-data (packet-ref n)))))))
+                
+                (define (ready-header)
+                  (continuation-capture
+                    (lambda (found)
+                      (loop (for n from 1 below count)
+                            (let ((packet (packet-ref n)))
+                              (when (and (get-data packet)
+                                         (get-header? packet)
+                                         (= (get-part packet) 0)
+                                         (ready? (get-time packet)))
+                                (let ((frame (get-frame packet))
+                                      (total (get-total packet)))
+                                  (let ((last (+ n total -1)))
+                                    (when (and (< last count)
+                                               (loop (for i from (+ n 1) to last)
+                                                     (every (let ((packet (packet-ref i)))
+                                                              (and (get-data packet)
+                                                                   (= (get-frame packet) frame))))))
+                                      (continuation-return found n)))))))
+                      #f)))
+                
+                (define (flush pos)
+                  (loop (for n from 0 below pos)
+                        (let ((packet (packet-ref n)))
+                          ;; write flush code
+                          ))
+                  (remove pos))
+                
+                (define (remove cnt)
+                  (loop (repeat cnt)
+                        (vector-set! packets head #f)
+                        (set! head (modulo (+ head 1) size))
+                        (decrease! count)
+                        (increase! lowest))
+                  (check self))
+                
+                (define (present)
+                  (let ((frame (get-frame earliest))
+                        (total (get-total earliest)))
+                    (prog1 (values now
+                                   earliest-time
+                                   (loop (for n from 0 below total)
+                                         (collect (get-data (packet-ref n)))))
+                      (remove total)
+                      (add-average frame 1.))))
                 
                 (define (add-average frame x)
                   (when (and last-frame
@@ -740,25 +791,22 @@
                     (set! last-frame frame)))
                 
                 (cond ;; sleep
-                      ((< now earliest-time)
+                      ((not (ready? earliest-time))
                        (mutex-unlock! mutex wait-condvar (- earliest-time now))
                        (loop-wait))
                       ;; packet
                       ((get-data earliest)
                        (cond ;; complete
                              ((complete?)
-                              (let ((frame (get-frame earliest)))
-                                (prog1 (values now
-                                               earliest-time
-                                               (loop (for n from 0 below (get-total earliest))
-                                                     (collect (get-data (vector-ref packets head)))
-                                                     (vector-set! packets head #f)
-                                                     (set! head (modulo (+ head 1) size))
-                                                     (decrease! count)
-                                                     (increase! lowest)))
-                                  (check self)
-                                  (add-average frame 1.)
-                                  (mutex-unlock! mutex))))
+                              (prog1 (present)
+                                (mutex-unlock! mutex)))
+                             ;; incomplete
+                             ((ready-header)
+                              => (lambda (n)
+                                   (terminal 'HEADER n)
+                                   (flush n)
+                                   (prog1 (present)
+                                     (mutex-unlock! mutex))))
                              ;; loop
                              ((< now earliest-giveup)
                               (mutex-unlock! mutex wait-condvar (- earliest-giveup now))
@@ -767,11 +815,7 @@
                              (else
                               (let ((frame (get-frame earliest)))
                                 (prog1 'waiting
-                                  (vector-set! packets head #f)
-                                  (set! head (modulo (+ head 1) size))
-                                  (decrease! count)
-                                  (increase! lowest)
-                                  (check self)
+                                  (remove 1)
                                   (add-average frame 0.)
                                   (record-discard-packet (get-sequence earliest) frame (get-header? earliest) (get-timestamp earliest))
                                   (mutex-unlock! mutex))))))
@@ -783,11 +827,7 @@
                               (loop-wait))
                              ;; missing
                              (else
-                              (vector-set! packets head #f)
-                              (set! head (modulo (+ head 1) size))
-                              (decrease! count)
-                              (increase! lowest)
-                              (check self)
+                              (remove 1)
                               (record-missing-packet (get-sequence earliest) (get-frame earliest) (get-header? earliest) (get-timestamp earliest))
                               (mutex-unlock! mutex)
                               (loop-wait))))))))))))
