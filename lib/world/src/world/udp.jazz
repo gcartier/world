@@ -393,15 +393,13 @@
   (slot highest      <fx>        getter generate)
   ;; quicky for test
   (slot last-frame               getter generate)
-  ;; quick hack
   (slot time-base                getter generate)
-  (slot time-base?               getter generate)
   (slot terminate?               getter generate)
   (slot invalid-proc             getter generate)
   (slot overflow-proc            getter generate)
   
   
-  (method override (initialize self origin media-kind size <fx> (max-size: max-size #f) (time-base?: time-base? #f) (invalid-proc: invalid-proc #f) (overflow-proc: overflow-proc #f))
+  (method override (initialize self origin media-kind size <fx> (max-size: max-size #f) (invalid-proc: invalid-proc #f) (overflow-proc: overflow-proc #f))
     (nextmethod self)
     (set! self.origin origin)
     (set! self.media-kind media-kind)
@@ -418,7 +416,6 @@
     (set! self.highest 0)
     (set! self.last-frame #f)
     (set! self.time-base #f)
-    (set! self.time-base? time-base?)
     (set! self.terminate? #f)
     (set! self.invalid-proc invalid-proc)
     (set! self.overflow-proc overflow-proc))
@@ -460,10 +457,10 @@
     (modulo (+ head (- seq lowest)) size))
   
   
-  (method protected (update-time self seq data now)
+  (method protected (update-time self seq data)
     (let ((new-timestamp (read-udp-media-seconds data)))
       (when new-timestamp
-        (let ((new-time now))
+        (let ((new-time (current-seconds)))
           (define (update-time-base new-base change)
             (set! time-base new-base)
             (let ((origin (read-udp-origin data)))
@@ -482,45 +479,10 @@
                     (effective-change -.01))
                 (when (< change effective-change)
                   (let ((new-base (+ time-base effective-change)))
-                    (updating self
-                      (lambda ()
-                        (update-time-base new-base change)
-                        (update self
-                          (lambda (packet updater)
-                            (let ((timestamp (get-timestamp packet)))
-                              (when timestamp
-                                (let ((process-time (+ timestamp new-base udp-process-window)))
-                                  (set-time packet process-time)))))))))))))))))
+                    (update-time-base new-base change))))))))))
   
   
-  (method protected (insert-data self data now)
-    (let ((sequence (read-udp-sequence data)))
-      (let ((timestamp (read-udp-media-seconds data)))
-        (let ((process-time (cond ((not timestamp)
-                                   0.)
-                                  ((not time-base)
-                                   (+ now udp-process-window))
-                                  (else
-                                   (+ timestamp time-base udp-process-window)
-                                   ;; (+ timestamp (- base-time base-timestamp) udp-process-window)
-                                   ;; (+ base-time (- timestamp base-timestamp) udp-process-window)
-                                   ))))
-          (let ((inserted? (insert self process-time data)))
-            (when inserted?
-              (let ((origin (read-udp-origin data))
-                    (frame (read-udp-frame data))
-                    (ring-size count))
-                (record-event udp-id-insert-packet
-                              (fixnum->flonum origin)
-                              (fixnum->flonum media-kind)
-                              (fixnum->flonum sequence)
-                              (fixnum->flonum frame)
-                              (if (not timestamp) -1. process-time)
-                              (if (not timestamp) -1. timestamp))))
-            inserted?)))))
-  
-  
-  (method public (insert self time data)
+  (method public (insert self data)
     (mutex-lock! mutex)
     (prog1 (let ((timestamp (read-udp-media-seconds data))
                  (sequence (read-udp-sequence data))
@@ -537,7 +499,7 @@
                              -1.
                              -1.))
              
-             (let ((packet (new UDP-Packet time timestamp sequence frame part total header? data)))
+             (let ((packet (new UDP-Packet timestamp sequence frame part total header? data)))
                (cond ;; empty
                      ((= count 0)
                       (insert-before self head packet)
@@ -549,12 +511,10 @@
                      ;; head
                      ((< sequence lowest)
                       (let ((lowest-packet (lowest-packet self)))
-                        (let ((lowest-time (get-time lowest-packet))
-                              (lowest-timestamp (get-timestamp lowest-packet)))
+                        (let ((lowest-timestamp (get-timestamp lowest-packet)))
                           (loop (for seq from (- lowest 1) above sequence)
-                                (let ((time (interpolate seq sequence lowest time lowest-time))
-                                      (timestamp (and timestamp lowest-timestamp (interpolate seq sequence lowest timestamp lowest-timestamp))))
-                                  (insert-before self head (new UDP-Packet time timestamp seq #f #f #f #f #f))
+                                (let ((timestamp (and timestamp lowest-timestamp (interpolate seq sequence lowest timestamp lowest-timestamp))))
+                                  (insert-before self head (new UDP-Packet timestamp seq #f #f #f #f #f))
                                   (record-nack seq)))))
                       (insert-before self head packet)
                       (set! lowest sequence)
@@ -564,12 +524,10 @@
                      ;; tail
                      ((> sequence highest)
                       (let ((highest-packet (highest-packet self)))
-                        (let ((highest-time (get-time highest-packet))
-                              (highest-timestamp (get-timestamp highest-packet)))
+                        (let ((highest-timestamp (get-timestamp highest-packet)))
                           (loop (for seq from (+ highest 1) below sequence)
-                                (let ((time (interpolate seq highest sequence highest-time time))
-                                      (timestamp (and timestamp highest-timestamp (interpolate seq highest sequence highest-timestamp timestamp))))
-                                  (insert-before self tail (new UDP-Packet time timestamp seq #f #f #f #f #f))
+                                (let ((timestamp (and timestamp highest-timestamp (interpolate seq highest sequence highest-timestamp timestamp))))
+                                  (insert-before self tail (new UDP-Packet timestamp seq #f #f #f #f #f))
                                   (record-nack seq)))))
                       (insert-before self tail packet)
                       (set! highest sequence)
@@ -581,23 +539,14 @@
                       (let ((pos (index self sequence)))
                         (let ((actual-packet (vector-ref packets pos)))
                           (if (get-data actual-packet)
-                              (let ((actual-time (get-time actual-packet))
-                                    (frame (read-udp-frame data)))
-                                (if (and time-base? (/= time actual-time))
-                                    (record-event udp-id-invalid-time
-                                                  (fixnum->flonum origin)
-                                                  (fixnum->flonum media-kind)
-                                                  (fixnum->flonum sequence)
-                                                  (fixnum->flonum frame)
-                                                  time
-                                                  actual-time)
-                                  (record-event udp-id-duplicate-packet
+                              (let ((frame (read-udp-frame data)))
+                                (record-event udp-id-duplicate-packet
                                                 (fixnum->flonum origin)
                                                 (fixnum->flonum media-kind)
                                                 (fixnum->flonum sequence)
                                                 (fixnum->flonum frame)
-                                                time
-                                                -1.))
+                                                -1.
+                                                -1.)
                                 #f)
                             (vector-set! packets pos packet)
                             (let ((frame (read-udp-frame data)))
@@ -657,6 +606,12 @@
   
   
   (method public (retain-wait self)
+    (define (release-time packet)
+      (let ((timestamp (get-timestamp packet)))
+        (if (not timestamp)
+            0.
+          (+ time-base timestamp udp-retain-window))))
+    
     (declare (proper-tail-calls))
     (let (loop-wait)
       (if terminate?
@@ -668,7 +623,7 @@
               (loop-wait))
           (let ((now (current-seconds))
                 (earliest (vector-ref packets head)))
-            (let ((earliest-time (get-time earliest)))
+            (let ((earliest-time (release-time earliest)))
               (if (>= now earliest-time)
                   (prog1 earliest
                     (vector-set! packets head #f)
@@ -687,7 +642,9 @@
                     (fixnum->flonum origin)
                     (fixnum->flonum media-kind)
                     (fixnum->flonum sequence)
-                    (fixnum->flonum frame)
+                    (if (not frame)
+                        -1.
+                      (fixnum->flonum frame))
                     (barbara-header-hack header?)
                     (if (not timestamp)
                         -1.
@@ -704,6 +661,12 @@
                         -1.
                       (timestamp->flonum timestamp))))
     
+    (define (present-time packet)
+      (let ((timestamp (get-timestamp packet)))
+        (if (not timestamp)
+            0.
+          (+ time-base timestamp udp-process-window))))
+    
     (declare (proper-tail-calls))
     (let (loop-wait)
       (if terminate?
@@ -718,10 +681,10 @@
           (let ((now (current-seconds))
                 (giveup-window (if (= media-kind udp-audio) udp-audio-window udp-video-window))
                 (earliest (vector-ref packets head)))
-            (let ((earliest-time (get-time earliest)))
+            (let ((earliest-time (present-time earliest)))
               (let ((earliest-giveup (+ earliest-time giveup-window)))
-                (define (ready? time)
-                  (>= now time))
+                (define (ready? packet)
+                  (>= now (present-time packet)))
                 
                 (define (packet-ref n)
                   (vector-ref packets (modulo (+ head n) size)))
@@ -742,7 +705,7 @@
                               (when (and (get-data packet)
                                          (get-header? packet)
                                          (= (get-part packet) 0)
-                                         (ready? (get-time packet)))
+                                         (ready? packet))
                                 (let ((frame (get-frame packet))
                                       (total (get-total packet)))
                                   (let ((last (+ n total -1)))
@@ -791,7 +754,7 @@
                     (set! last-frame frame)))
                 
                 (cond ;; sleep
-                      ((not (ready? earliest-time))
+                      ((not (ready? earliest))
                        (mutex-unlock! mutex wait-condvar (- earliest-time now))
                        (loop-wait))
                       ;; packet
@@ -888,27 +851,7 @@
                  (let ((packet (vector-ref packets pos)))
                    (proc packet)
                    (loop (- n 1))))))
-      (mutex-unlock! mutex)))
-  
-  
-  (method public (updating self thunk)
-    (mutex-lock! mutex)
-    (prog1 (thunk)
-      (condition-variable-signal! wait-condvar)
-      (mutex-unlock! mutex)))
-  
-  
-  (method public (update self proc)
-    (let (loop (n 0))
-      (if (>= n count)
-          #f
-        (let ((pos (modulo (+ head n) size)))
-          (let ((packet (vector-ref packets pos)))
-            (proc
-              packet
-              (lambda (new-packet)
-                (vector-set! packets pos new-packet)))
-            (loop (+ n 1))))))))
+      (mutex-unlock! mutex))))
 
 
 ;;;
@@ -919,7 +862,6 @@
 (class UDP-Packet extends Object
   
   
-  (slot time      getter generate)
   (slot timestamp getter generate)
   (slot sequence  getter generate)
   (slot frame     getter generate)
@@ -929,9 +871,8 @@
   (slot data      getter generate)
   
   
-  (method override (initialize self time timestamp sequence frame part total header? data)
+  (method override (initialize self timestamp sequence frame part total header? data)
     (nextmethod self)
-    (set! self.time time)
     (set! self.timestamp timestamp)
     (set! self.sequence sequence)
     (set! self.frame frame)
@@ -944,12 +885,7 @@
   (method override (print self output readably)
     (print-unreadable self output
       (lambda (output)
-        (format output "{a}" sequence))))
-  
-  
-  ;; TEMP
-  (method protected (set-time self t)
-    (set! time t)))
+        (format output "{a}" sequence)))))
 
 
 ;;;
