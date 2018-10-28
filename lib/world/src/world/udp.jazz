@@ -321,55 +321,20 @@
 (class UDP-Channel extends Object
   
   
-  (slot origin        getter generate)
-  (slot media-kind    getter generate)
-  (slot time-base     getter generate)
+  (slot origin     getter generate)
+  (slot media-kind getter generate)
   
   
   (method override (initialize self origin media-kind)
     (nextmethod self)
     (set! self.origin origin)
-    (set! self.media-kind media-kind)
-    (set! self.time-base #f))
+    (set! self.media-kind media-kind))
   
   
   (method override (print self output readably)
     (print-unreadable self output
       (lambda (output)
-        (format output "{a} {a}" origin media-kind))))
-  
-  
-  (method protected (update-time self seq data now ring)
-    (let ((new-timestamp (read-udp-media-seconds data)))
-      (when new-timestamp
-        (let ((new-time now))
-          (define (update-time-base new-base change)
-            (set! time-base new-base)
-            (let ((origin (read-udp-origin data)))
-              (record-event udp-id-update-time
-                            (fixnum->flonum origin)
-                            (fixnum->flonum media-kind)
-                            (fixnum->flonum seq)
-                            change
-                            new-time
-                            new-timestamp)))
-          
-          (let ((new-base (- new-time new-timestamp)))
-            (if (not time-base)
-                (update-time-base new-base -1.)
-              (let ((change (- new-base time-base))
-                    (effective-change -.01))
-                (when (< change effective-change)
-                  (let ((new-base (+ time-base effective-change)))
-                    (updating ring
-                      (lambda ()
-                        (update-time-base new-base change)
-                        (update ring
-                          (lambda (packet updater)
-                            (let ((timestamp (get-timestamp packet)))
-                              (when timestamp
-                                (let ((process-time (+ timestamp new-base udp-process-window)))
-                                  (set-time packet process-time))))))))))))))))))
+        (format output "{a} {a}" origin media-kind)))))
 
 
 ;;;
@@ -429,6 +394,7 @@
   ;; quicky for test
   (slot last-frame               getter generate)
   ;; quick hack
+  (slot time-base                getter generate)
   (slot time-base?               getter generate)
   (slot terminate?               getter generate)
   (slot invalid-proc             getter generate)
@@ -451,6 +417,7 @@
     (set! self.lowest 0)
     (set! self.highest 0)
     (set! self.last-frame #f)
+    (set! self.time-base #f)
     (set! self.time-base? time-base?)
     (set! self.terminate? #f)
     (set! self.invalid-proc invalid-proc)
@@ -491,6 +458,65 @@
   
   (method protected (index self seq)
     (modulo (+ head (- seq lowest)) size))
+  
+  
+  (method protected (update-time self seq data now)
+    (let ((new-timestamp (read-udp-media-seconds data)))
+      (when new-timestamp
+        (let ((new-time now))
+          (define (update-time-base new-base change)
+            (set! time-base new-base)
+            (let ((origin (read-udp-origin data)))
+              (record-event udp-id-update-time
+                            (fixnum->flonum origin)
+                            (fixnum->flonum media-kind)
+                            (fixnum->flonum seq)
+                            change
+                            new-time
+                            new-timestamp)))
+          
+          (let ((new-base (- new-time new-timestamp)))
+            (if (not time-base)
+                (update-time-base new-base -1.)
+              (let ((change (- new-base time-base))
+                    (effective-change -.01))
+                (when (< change effective-change)
+                  (let ((new-base (+ time-base effective-change)))
+                    (updating self
+                      (lambda ()
+                        (update-time-base new-base change)
+                        (update self
+                          (lambda (packet updater)
+                            (let ((timestamp (get-timestamp packet)))
+                              (when timestamp
+                                (let ((process-time (+ timestamp new-base udp-process-window)))
+                                  (set-time packet process-time)))))))))))))))))
+  
+  
+  (method protected (insert-data self data now)
+    (let ((sequence (read-udp-sequence data)))
+      (let ((timestamp (read-udp-media-seconds data)))
+        (let ((process-time (cond ((not timestamp)
+                                   0.)
+                                  ((not time-base)
+                                   (+ now udp-process-window))
+                                  (else
+                                   (+ timestamp time-base udp-process-window)
+                                   ;; (+ timestamp (- base-time base-timestamp) udp-process-window)
+                                   ;; (+ base-time (- timestamp base-timestamp) udp-process-window)
+                                   ))))
+          (let ((inserted? (insert self process-time data)))
+            (when inserted?
+              (let ((origin (read-udp-origin data))
+                    (ring-size count))
+                (record-event udp-id-insert-packet
+                              (fixnum->flonum origin)
+                              (fixnum->flonum media-kind)
+                              (fixnum->flonum sequence)
+                              (fixnum->flonum ring-size)
+                              (if (not timestamp) -1. process-time)
+                              (if (not timestamp) -1. timestamp))))
+            inserted?)))))
   
   
   (method public (insert self time data)
