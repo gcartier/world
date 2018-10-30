@@ -393,15 +393,16 @@
   (slot count        <fx>        getter generate)
   (slot lowest       <fx>        getter generate)
   (slot highest      <fx>        getter generate)
-  ;; quicky for test
+  (slot state                    getter generate)
   (slot last-frame               getter generate)
   (slot time-base                getter generate)
   (slot terminate?               getter generate)
+  (slot state-proc               getter generate)
   (slot invalid-proc             getter generate)
   (slot overflow-proc            getter generate)
   
   
-  (method override (initialize self origin media-kind size <fx> (max-size: max-size #f) (invalid-proc: invalid-proc #f) (overflow-proc: overflow-proc #f))
+  (method override (initialize self origin media-kind size <fx> (max-size: max-size #f) (state-proc: state-proc #f) (invalid-proc: invalid-proc #f) (overflow-proc: overflow-proc #f))
     (nextmethod self)
     (set! self.origin origin)
     (set! self.media-kind media-kind)
@@ -416,9 +417,11 @@
     (set! self.count 0)
     (set! self.lowest 0)
     (set! self.highest 0)
+    (set! self.state 'waiting)
     (set! self.last-frame #f)
     (set! self.time-base #f)
     (set! self.terminate? #f)
+    (set! self.state-proc state-proc)
     (set! self.invalid-proc invalid-proc)
     (set! self.overflow-proc overflow-proc))
   
@@ -679,7 +682,10 @@
             (begin
               (mutex-unlock! mutex wait-condvar timeout)
               (if (= count 0)
-                  #f
+                  (begin
+                    (when (= media-kind udp-video)
+                      (state-waiting self))
+                    (loop-wait))
                 (loop-wait)))
           (let ((now (current-seconds))
                 (giveup-window (if (= media-kind udp-audio) udp-audio-window udp-video-window))
@@ -742,12 +748,20 @@
                     (set! last-frame frame)))
                 
                 (define (present)
-                  (let ((frame (get-frame earliest))
+                  (let ((header? (get-header? earliest))
+                        (frame (get-frame earliest))
                         (total (get-total earliest)))
-                    (prog1 (values now
-                                   earliest-time
-                                   (loop (for n from 0 below total)
-                                         (collect (get-data (packet-ref self n)))))
+                    (let ((late? (> (- now earliest-time) .05)))
+                      (ecase media-kind
+                        ((udp-audio)
+                         (when header?
+                           (state-ok self)))
+                        ((udp-video)
+                         (if late?
+                             (state-late self)
+                           (state-ok self)))))
+                    (prog1 (loop (for n from 0 below total)
+                                 (collect (get-data (packet-ref self n))))
                       (remove-complete-frame self)
                       (add-average frame 1.))))
                 
@@ -775,9 +789,10 @@
                               (loop-wait))
                              ;; discard
                              (else
-                              (prog1 'waiting
-                                (flush-discard)
-                                (mutex-unlock! mutex)))))
+                              (flush-discard)
+                              (state-waiting self)
+                              (mutex-unlock! mutex)
+                              (loop-wait))))
                       ;; nack
                       (else
                        (cond ;; loop
@@ -787,6 +802,7 @@
                              ;; missing
                              (else
                               (flush-missing)
+                              (state-waiting self)
                               (mutex-unlock! mutex)
                               (loop-wait))))))))))))
   
@@ -830,6 +846,54 @@
           (decrease! count)
           (increase! lowest))
     (check self))
+  
+  
+  (method protected (state-ok self)
+    (unless (eq? state 'ok)
+      (set! state 'ok)
+      (when state-proc
+        (state-proc state))
+      (record-event udp-id-state-ok
+                    (fixnum->flonum origin)
+                    (fixnum->flonum media-kind)
+                    -1.
+                    -1.
+                    -1.
+                    -1.)
+      (when udp-show-states?
+        (format :terminal "{s} {s} {s} {s}{%}" remote-name (present-media-kind media-kind) 'STATE 'OK))))
+  
+  
+  (method protected (state-late self)
+    (unless (eq? state 'late)
+      (set! state 'late)
+      (when state-proc
+        (state-proc state))
+      (record-event udp-id-state-late
+                    (fixnum->flonum origin)
+                    (fixnum->flonum media-kind)
+                    -1.
+                    -1.
+                    -1.
+                    -1.)
+      (when udp-show-states?
+        (format :terminal "{s} {s} {s} {s}{%}" remote-name (present-media-kind media-kind) 'STATE 'LATE))))
+  
+  
+  (method protected (state-waiting self)
+    (unless (eq? state 'waiting)
+      (set! state 'waiting)
+      (when state-proc
+        (state-proc state))
+      (record-event udp-id-state-waiting
+                    (fixnum->flonum origin)
+                    (fixnum->flonum media-kind)
+                    -1.
+                    -1.
+                    -1.
+                    -1.)
+      (when udp-show-states?
+        (format :terminal "{s} {s} {s} {s}{%}" remote-name (present-media-kind media-kind) 'STATE 'WAITING))))
   
   
   (method public (locate-data self sequence)

@@ -51,6 +51,29 @@
   #f)
 
 
+(definition (find-id-quick-hack no)
+  (let ((member (find-group-member-by-no (current-client) no)))
+    ;; quick solution for when logging in and starting receiving
+    ;; someone's media before the client is actually registered
+    ;; need to revisit this code for a cleaner solution
+    (and member
+         (second member))))
+
+
+(definition (state-callback origin)
+  (lambda (state)
+    (unless (or (simulation?) (visualization?))
+      (let ((id (find-id-quick-hack origin)))
+        (when id
+          (let ((output (find-output (current-video) id)))
+            (when output
+              (let ((mode (case state
+                            ((ok) 'draw)
+                            ((late) 'freeze)
+                            ((waiting) 'wait))))
+                (change-draw-mode output mode)))))))))
+
+
 (class UDP-Client extends Object
   
   
@@ -719,7 +742,7 @@
       (let ((queue (new-queue)))
         (iterate-table receive-channels
           (lambda (key channel)
-            (let ((state (get-process-state channel))
+            (let ((state (get-state (get-process-ring channel)))
                   (header (get-last-processed-header channel)))
               (enqueue queue
                        (list (get-origin channel)
@@ -891,7 +914,6 @@
   
   
   (slot last-sequence         accessors generate)
-  (slot process-state         getter generate)
   (slot process-ring          getter generate)
   (slot process-task          getter generate)
   (slot process-average       getter generate)
@@ -904,10 +926,9 @@
   (method override (initialize self origin media-kind)
     (nextmethod self origin media-kind)
     (set! self.last-sequence #f)
-    (set! self.process-state 'waiting)
     (set! self.last-processed-header #f)
     (set! self.last-processed-frame #f)
-    (set! self.process-ring (new UDP-Ring origin media-kind udp-process-size max-size: udp-process-max-size invalid-proc: (udp-ring-invalid origin media-kind) overflow-proc: (udp-ring-overflow 'process udp-ring-kind-process)))
+    (set! self.process-ring (new UDP-Ring origin media-kind udp-process-size max-size: udp-process-max-size state-proc: (state-callback origin) invalid-proc: (udp-ring-invalid origin media-kind) overflow-proc: (udp-ring-overflow 'process udp-ring-kind-process)))
     (unless (visualization?)
       (set! self.process-task (new Task 'udp-process (lambda (task)
                                                        (process-loop self task))
@@ -947,85 +968,6 @@
           (when (not (get-data packet))
             (increase! count))))
       count))
-  
-  
-  (method (find-id-quick-hack self)
-    (let ((member (find-group-member-by-no (current-client) origin)))
-      ;; quick solution for when logging in and starting receiving
-      ;; someone's media before the client is actually registered
-      ;; need to revisit this code for a cleaner solution
-      (and member
-           (second member))))
-  
-  
-  ;;;
-  ;;;; State
-  ;;;
-  
-  
-  (method protected (process-state-ok self)
-    (unless (eq? process-state 'ok)
-      (set! process-state 'ok)
-      (unless (or (simulation?) (visualization?))
-        (let ((id (find-id-quick-hack self)))
-          (when id
-            (let ((output (find-output (current-video) id)))
-              (when output
-                (change-draw-mode output 'draw))))))
-      (record-event udp-id-state-ok
-                    (fixnum->flonum origin)
-                    (fixnum->flonum media-kind)
-                    -1.
-                    -1.
-                    -1.
-                    -1.)
-      (when udp-show-states?
-        (format :terminal "{s} {s} {s} {s}{%}" remote-name (present-media-kind media-kind) 'STATE 'OK))))
-  
-  
-  (method protected (process-state-late self)
-    (unless (eq? process-state 'late)
-      (set! process-state 'late)
-      (unless (or (simulation?) (visualization?))
-        (let ((id (find-id-quick-hack self)))
-          (when id
-            (let ((output (find-output (current-video) id)))
-              (when output
-                (change-draw-mode output 'freeze))))))
-      (record-event udp-id-state-late
-                    (fixnum->flonum origin)
-                    (fixnum->flonum media-kind)
-                    -1.
-                    -1.
-                    -1.
-                    -1.)
-      (when udp-show-states?
-        (format :terminal "{s} {s} {s} {s}{%}" remote-name (present-media-kind media-kind) 'STATE 'LATE))))
-  
-  
-  (method protected (process-state-waiting self)
-    (unless (eq? process-state 'waiting)
-      (set! process-state 'waiting)
-      (unless (or (simulation?) (visualization?))
-        (let ((id (find-id-quick-hack self)))
-          (when id
-            (let ((output (find-output (current-video) id)))
-              (when output
-                (change-draw-mode output 'wait))))))
-      (let ((udp-client (get-udp-client (current-client))))
-        ;; should not be necessary but lets
-        ;; do the necessary changes later...
-        (when udp-client
-          (send-state udp-client)))
-      (record-event udp-id-state-waiting
-                    (fixnum->flonum origin)
-                    (fixnum->flonum media-kind)
-                    -1.
-                    -1.
-                    (if last-processed-header (fixnum->flonum last-processed-header) -1.)
-                    -1.)
-      (when udp-show-states?
-        (format :terminal "{s} {s} {s} {s} {s}{%}" remote-name (present-media-kind media-kind) 'STATE 'WAITING last-processed-header))))
   
   
   ;;;
@@ -1070,23 +1012,11 @@
             (if (eq? info 'terminate)
                 (continuation-return exit #f)
               (site (udp-process on?: #t)
-                (process-info self info))
+                (present-frame self info))
               (looping)))))))
   
   
-  (method protected (process-info self info)
-    (cond ((not info)
-           (when (= media-kind udp-video)
-             (process-state-waiting self)))
-          ((eq? info 'waiting)
-           (when (= media-kind udp-video)
-             (process-state-waiting self)))
-          (else
-           (receive (now time datas) info
-             (present-frame self now time datas)))))
-  
-  
-  (method protected (present-frame self now time datas)
+  (method protected (present-frame self datas)
     (define (record-play-frame origin frame header? timestamp)
       (record-event udp-id-play-frame
                     (fixnum->flonum origin)
@@ -1109,7 +1039,7 @@
                         -1.
                       (timestamp->flonum timestamp))))
     
-    (let ((id (find-id-quick-hack self)))
+    (let ((id (find-id-quick-hack origin)))
       (when (or id (simulation?))
         (let ((count (length datas))
               (first (car datas)))
@@ -1126,8 +1056,6 @@
               (let ((buffer (assemble-chunks)))
                 (if off?
                     (receive-server-audio (current-audio) id #f #f #f)
-                  (when header?
-                    (process-state-ok self))
                   (if (and header? (eq? audio-codec 'vorbis))
                       (let ((headers (u8vector->object buffer)))
                         (for-each (lambda (header)
@@ -1145,15 +1073,11 @@
               (let ((buffer (assemble-chunks)))
                 (if off?
                     (receive-server-video (current-video) id #f #f #f)
-                  (let ((late? (> (- now time) .05)))
-                    (if late?
-                        (process-state-late self)
-                      (process-state-ok self))
-                    (unless (simulation?)
-                      (receive-server-video (current-video) id buffer timestamp duration))
-                    (if late?
-                        (record-freeze-frame origin frame header? timestamp)
-                      (record-play-frame origin frame header? timestamp))))))
+                  (unless (simulation?)
+                    (receive-server-video (current-video) id buffer timestamp duration))
+                  (if (eq? (get-state process-ring) 'late)
+                      (record-freeze-frame origin frame header? timestamp)
+                    (record-play-frame origin frame header? timestamp)))))
             
             (define (assemble-chunks)
               (if (= total 1)
