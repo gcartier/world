@@ -462,6 +462,11 @@
     (modulo (+ head (- seq lowest)) size))
   
   
+  ;;;
+  ;;;; Time
+  ;;;
+  
+  
   (method protected (update-time self data (now #f)) ; for simulation
     (let ((new-timestamp (read-udp-media-seconds data)))
       (when new-timestamp
@@ -486,6 +491,11 @@
                 (when (< change effective-change)
                   (let ((new-base (+ time-base effective-change)))
                     (update-time-base new-base change))))))))))
+  
+  
+  ;;;
+  ;;;; Insert
+  ;;;
   
   
   (method public (insert self data (record record-event))
@@ -611,13 +621,12 @@
                (set! head tail))))))
   
   
+  ;;;
+  ;;;; Retain
+  ;;;
+  
+  
   (method public (retain-wait self)
-    (define (release-time packet)
-      (let ((timestamp (get-timestamp packet)))
-        (if (not timestamp)
-            0.
-          (+ time-base timestamp udp-retain-window))))
-    
     (declare (proper-tail-calls))
     (let (loop-wait)
       (if terminate?
@@ -629,7 +638,7 @@
               (loop-wait))
           (let ((now (current-seconds))
                 (earliest (vector-ref packets head)))
-            (let ((earliest-time (release-time earliest)))
+            (let ((earliest-time (release-time self earliest)))
               (if (>= now earliest-time)
                   (prog1 earliest
                     (vector-set! packets head #f)
@@ -642,37 +651,19 @@
                 (loop-wait))))))))
   
   
+  (method (release-time self packet)
+    (let ((timestamp (get-timestamp packet)))
+      (if (not timestamp)
+          0.
+        (+ time-base timestamp udp-retain-window))))
+  
+  
+  ;;;
+  ;;;; Process
+  ;;;
+  
+  
   (method public (process-wait self timeout average)
-    (define (record-missing-packet sequence frame header? timestamp)
-      (record-event udp-id-missing-packet
-                    (fixnum->flonum origin)
-                    (fixnum->flonum media-kind)
-                    (fixnum->flonum sequence)
-                    (if (not frame)
-                        -1.
-                      (fixnum->flonum frame))
-                    (barbara-header-hack header?)
-                    (if (not timestamp)
-                        -1.
-                      (timestamp->flonum timestamp))))
-    
-    (define (record-discard-packet sequence frame header? timestamp)
-      (record-event udp-id-discard-packet
-                    (fixnum->flonum origin)
-                    (fixnum->flonum media-kind)
-                    (fixnum->flonum sequence)
-                    (fixnum->flonum frame)
-                    (barbara-header-hack header?)
-                    (if (not timestamp)
-                        -1.
-                      (timestamp->flonum timestamp))))
-    
-    (define (present-time packet)
-      (let ((timestamp (get-timestamp packet)))
-        (if (not timestamp)
-            0.
-          (+ time-base timestamp udp-process-window))))
-    
     (declare (proper-tail-calls))
     (let (loop-wait)
       (if terminate?
@@ -690,83 +681,10 @@
           (let ((now (current-seconds))
                 (giveup-window (if (= media-kind udp-audio) udp-audio-window udp-video-window))
                 (earliest (vector-ref packets head)))
-            (let ((earliest-time (present-time earliest)))
+            (let ((earliest-time (present-time self earliest)))
               (let ((earliest-giveup (+ earliest-time giveup-window)))
-                (define (ready? packet)
-                  (>= now (present-time packet)))
-                
-                (define (ready-header)
-                  (continuation-capture
-                    (lambda (found)
-                      (loop (for n from 1 below count)
-                            (let ((packet (packet-ref self n)))
-                              (when (and (get-data packet)
-                                         (get-header? packet)
-                                         (= (get-part packet) 0)
-                                         (ready? packet))
-                                (let ((frame (get-frame packet))
-                                      (total (get-total packet)))
-                                  (let ((last (+ n total -1)))
-                                    (when (and (< last count)
-                                               (loop (for i from (+ n 1) to last)
-                                                     (every (let ((packet (packet-ref self i)))
-                                                              (and (get-data packet)
-                                                                   (= (get-frame packet) frame))))))
-                                      (continuation-return found n)))))))
-                      #f)))
-                
-                (define (flush cnt)
-                  (loop (repeat cnt)
-                        (let ((packet (packet-ref self 0)))
-                          (if (get-data packet)
-                              (flush-discard)
-                            (flush-missing)))))
-                
-                (define (flush-missing)
-                  (let ((earliest (packet-ref self 0)))
-                    (record-missing-packet (get-sequence earliest) (get-frame earliest) (get-header? earliest) (get-timestamp earliest))
-                    (remove-missing self)
-                    (when (get-frame earliest)
-                      (add-average (get-frame earliest) 0.))))
-                
-                (define (flush-discard)
-                  (let ((earliest (packet-ref self 0)))
-                    (record-discard-packet (get-sequence earliest) (get-frame earliest) (get-header? earliest) (get-timestamp earliest))
-                    (remove-discard self)
-                    (when (get-frame earliest)
-                      (add-average (get-frame earliest) 0.))))
-                
-                (define (add-average frame x)
-                  (when (and last-frame
-                             (/= frame last-frame))
-                    (let ((gap (- frame (+ last-frame 1))))
-                      (loop (repeat gap)
-                            (add average 0.))))
-                  (when (or (not last-frame)
-                            (/= frame last-frame))
-                    (add average x)
-                    (set! last-frame frame)))
-                
-                (define (present)
-                  (let ((header? (get-header? earliest))
-                        (frame (get-frame earliest))
-                        (total (get-total earliest)))
-                    (let ((late? (> (- now earliest-time) .05)))
-                      (ecase media-kind
-                        ((udp-audio)
-                         (when header?
-                           (state-ok self)))
-                        ((udp-video)
-                         (if late?
-                             (state-late self)
-                           (state-ok self)))))
-                    (prog1 (loop (for n from 0 below total)
-                                 (collect (get-data (packet-ref self n))))
-                      (remove-complete-frame self)
-                      (add-average frame 1.))))
-                
                 (cond ;; sleep
-                      ((not (ready? earliest))
+                      ((not (ready? self now earliest))
                        (mutex-unlock! mutex wait-condvar (- earliest-time now))
                        (loop-wait))
                       ;; packet
@@ -775,15 +693,15 @@
                              ((and (or (get-header? earliest)
                                        (neq? state 'waiting))
                                    (complete-frame? self))
-                              (prog1 (present)
+                              (prog1 (present self now average)
                                 (mutex-unlock! mutex)))
                              ;; incomplete
-                             ((ready-header)
+                             ((ready-header self now)
                               => (lambda (n)
-                                   (flush n)
+                                   (flush self n)
                                    (set! earliest (vector-ref packets head))
-                                   (set! earliest-time (present-time earliest))
-                                   (prog1 (present)
+                                   (set! earliest-time (present-time self earliest))
+                                   (prog1 (present self now average)
                                      (mutex-unlock! mutex))))
                              ;; loop
                              ((< now earliest-giveup)
@@ -791,7 +709,7 @@
                               (loop-wait))
                              ;; discard
                              (else
-                              (flush-discard)
+                              (flush-discard self)
                               (state-waiting self)
                               (mutex-unlock! mutex)
                               (loop-wait))))
@@ -803,10 +721,15 @@
                               (loop-wait))
                              ;; missing
                              (else
-                              (flush-missing)
+                              (flush-missing self)
                               (state-waiting self)
                               (mutex-unlock! mutex)
                               (loop-wait))))))))))))
+  
+  
+  ;;;
+  ;;;; Interface
+  ;;;
   
   
   (method protected (earliest-packet self)
@@ -818,6 +741,17 @@
     (vector-ref packets (modulo (+ head n) size)))
   
   
+  (method (present-time self packet)
+    (let ((timestamp (get-timestamp packet)))
+      (if (not timestamp)
+          0.
+        (+ time-base timestamp udp-process-window))))
+  
+  
+  (method (ready? self now packet)
+    (>= now (present-time self packet)))
+  
+  
   (method protected (complete-frame? self)
     (let ((earliest (vector-ref packets head)))
       (let ((part (get-part earliest))
@@ -826,6 +760,84 @@
              (<= total count)
              (loop (for n from 0 below total)
                    (every (get-data (packet-ref self n))))))))
+  
+  
+  (method (ready-header self now)
+    (continuation-capture
+      (lambda (found)
+        (loop (for n from 1 below count)
+              (let ((packet (packet-ref self n)))
+                (when (and (get-data packet)
+                           (get-header? packet)
+                           (= (get-part packet) 0)
+                           (ready? self now packet))
+                  (let ((frame (get-frame packet))
+                        (total (get-total packet)))
+                    (let ((last (+ n total -1)))
+                      (when (and (< last count)
+                                 (loop (for i from (+ n 1) to last)
+                                       (every (let ((packet (packet-ref self i)))
+                                                (and (get-data packet)
+                                                     (= (get-frame packet) frame))))))
+                        (continuation-return found n)))))))
+        #f)))
+  
+  
+  (method (present self now average)
+    (let ((earliest (vector-ref packets head)))
+      (let ((header? (get-header? earliest))
+            (frame (get-frame earliest))
+            (total (get-total earliest))
+            (present (present-time self earliest)))
+        (let ((late? (> (- now present) .05)))
+          (ecase media-kind
+            ((udp-audio)
+             (when header?
+               (state-ok self)))
+            ((udp-video)
+             (if late?
+                 (state-late self)
+               (state-ok self)))))
+        (prog1 (loop (for n from 0 below total)
+                     (collect (get-data (packet-ref self n))))
+          (remove-complete-frame self)
+          (add-average self average frame 1.)))))
+  
+  
+  (method (add-average self average frame x)
+    (when (and last-frame
+               (/= frame last-frame))
+      (let ((gap (- frame (+ last-frame 1))))
+        (loop (repeat gap)
+              (add average 0.))))
+    (when (or (not last-frame)
+              (/= frame last-frame))
+      (add average x)
+      (set! last-frame frame)))
+  
+  
+  (method (flush self cnt)
+    (loop (repeat cnt)
+          (let ((packet (packet-ref self 0)))
+            (if (get-data packet)
+                (flush-discard self)
+              (flush-missing self)))))
+  
+  
+  (method (flush-missing self)
+    (let ((earliest (packet-ref self 0)))
+      (record-missing-packet self (get-sequence earliest) (get-frame earliest) (get-header? earliest) (get-timestamp earliest))
+      (remove-missing self)
+      (when (get-frame earliest)
+        (add-average self average (get-frame earliest) 0.))))
+  
+  
+  (method (flush-discard self)
+    (let ((earliest (packet-ref self 0)))
+      (record-discard-packet self (get-sequence earliest) (get-frame earliest) (get-header? earliest) (get-timestamp earliest))
+      (remove-discard self)
+      (when (get-frame earliest)
+        (add-average self average (get-frame earliest) 0.))))
   
   
   (method protected (remove-complete-frame self)
@@ -896,6 +908,32 @@
                     -1.)
       (when udp-show-states?
         (format :terminal "{s} {s} {s} {s}{%}" remote-name (present-media-kind media-kind) 'STATE 'WAITING))))
+  
+  
+  (method (record-missing-packet self sequence frame header? timestamp)
+    (record-event udp-id-missing-packet
+                  (fixnum->flonum origin)
+                  (fixnum->flonum media-kind)
+                  (fixnum->flonum sequence)
+                  (if (not frame)
+                      -1.
+                    (fixnum->flonum frame))
+                  (barbara-header-hack header?)
+                  (if (not timestamp)
+                      -1.
+                    (timestamp->flonum timestamp))))
+  
+  
+  (method (record-discard-packet self sequence frame header? timestamp)
+    (record-event udp-id-discard-packet
+                  (fixnum->flonum origin)
+                  (fixnum->flonum media-kind)
+                  (fixnum->flonum sequence)
+                  (fixnum->flonum frame)
+                  (barbara-header-hack header?)
+                  (if (not timestamp)
+                      -1.
+                    (timestamp->flonum timestamp))))
   
   
   (method public (locate-data self sequence)
