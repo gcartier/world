@@ -35,18 +35,20 @@
 (class UDP-Visualizer extends Object
   
   
-  (slot call                     getter generate)
-  (slot client                   getter generate)
-  (slot origin                   getter generate)
-  (slot media-kind               getter generate)
-  (slot channel                  getter generate)
-  (slot ring                     getter generate)
-  (slot evolution                getter generate)
-  (slot last-time  initialize #f accessors generate)
-  (slot last-event initialize #f accessors generate)
+  (slot call                             getter generate)
+  (slot client                           getter generate)
+  (slot origin                           getter generate)
+  (slot media-kind                       getter generate)
+  (slot channel                          getter generate)
+  (slot ring                             getter generate)
+  (slot origin-evolution                 getter generate)
+  (slot receiver-evolution               getter generate)
+  (slot datas                            getter generate)
+  (slot last-time          initialize #f accessors generate)
+  (slot last-event         initialize #f accessors generate)
   
   
-  (method override (initialize self call client origin media-kind channel ring evolution)
+  (method override (initialize self call client origin media-kind channel ring origin-evolution receiver-evolution)
     (nextmethod self)
     (set! self.call call)
     (set! self.client client)
@@ -54,16 +56,61 @@
     (set! self.media-kind media-kind)
     (set! self.channel channel)
     (set! self.ring ring)
-    (set! self.evolution evolution))
+    (set! self.origin-evolution origin-evolution)
+    (set! self.receiver-evolution receiver-evolution)
+    (set! self.datas (make-table test: eqv?)))
+  
+  
+  (method (find-data self sequence)
+    (define (locate-create)
+      (loop (for n from (first-position origin-evolution) to (last-position origin-evolution))
+            (when (and (= (evolutionary-udp-id origin-evolution n) udp-id-create-packet)
+                       (= (evolutionary-udp-sequence origin-evolution n) sequence))
+              (return n))
+            (finally #f)))
+    
+    (define (locate-info)
+      (loop (for n from (first-position origin-evolution) to (last-position origin-evolution))
+            (when (and (= (evolutionary-udp-id origin-evolution n) udp-id-create-info)
+                       (= (evolutionary-udp-sequence origin-evolution n) sequence))
+              (return n))
+            (finally #f)))
+    
+    (or (table-ref datas sequence #f)
+        (let ((create (locate-create))
+              (info (locate-info)))
+          (assert (and create info)
+            (let ((header-size (+ 8 4 4 4 4 4 4 8 8 4)))
+              (let ((origin (flonum->fixnum (evolutionary-udp-origin origin-evolution create)))
+                    (kind (flonum->fixnum (evolutionary-udp-kind origin-evolution create)))
+                    (frame (evolutionary-udp-frame origin-evolution create))
+                    (part (flonum->fixnum (evolutionary-udp-data3 origin-evolution info)))
+                    (total (flonum->fixnum (evolutionary-udp-data4 origin-evolution info)))
+                    (header? (= (evolutionary-udp-data3 origin-evolution create) 123456.))
+                    (timestamp (evolutionary-udp-data4 origin-evolution create)))
+                (let ((data (make-u8vector header-size))
+                      (nanostamp (if (not timestamp)
+                                     -1.
+                                   (flonum->timestamp timestamp))))
+                  (write-udp-kind data kind)
+                  (write-udp-origin data origin)
+                  (write-udp-sequence data sequence)
+                  (write-udp-frame data frame)
+                  (write-udp-part data part)
+                  (write-udp-total data total)
+                  (write-udp-media-timestamp data nanostamp)
+                  (write-udp-media-header? data header?)
+                  (table-set! datas sequence data)
+                  data)))))))
   
   
   (method protected (visualize-from self from target)
     (declare (proper-tail-calls))
-    (let ((first (first-position evolution))
-          (last (last-position evolution)))
+    (let ((first (first-position receiver-evolution))
+          (last (last-position receiver-evolution)))
       (let (loop (n (or from first)))
         (when (<= n last)
-          (let ((time (evolutionary-udp-time evolution n)))
+          (let ((time (evolutionary-udp-time receiver-evolution n)))
             (when (<= time target)
               (visualize-event self n)
               (set! last-time time)
@@ -73,42 +120,34 @@
   
   (method protected (visualize-event self n)
     (define (visualized-channel?)
-      (and (= (evolutionary-udp-origin evolution n) origin)
-           (= (evolutionary-udp-kind evolution n) media-kind)))
+      (and (= (evolutionary-udp-origin receiver-evolution n) origin)
+           (= (evolutionary-udp-kind receiver-evolution n) media-kind)))
     
-    (let ((debug? #f)
-          (id (evolutionary-udp-id evolution n)))
+    (let ((debug? #t)
+          (id (evolutionary-udp-id receiver-evolution n)))
       (ecase id
-        ;; self / src / sink
-        ((udp-id-src-self udp-id-src-media udp-id-sink-media))
-        ;; create
-        ((udp-id-create-packet))
+        ;; self / src / sink / draw
+        ((udp-id-src-self udp-id-src-media udp-id-sink-media udp-id-draw-video))
+        ;; create / info
+        ((udp-id-create-packet udp-id-create-info))
         ;; retain / release
         ((udp-id-retain-packet udp-id-release-packet))
         ;; insert
         ((udp-id-insert-packet)
          (when (visualized-channel?)
-           (let ((sequence (evolutionary-udp-sequence evolution n))
-                 (frame (evolutionary-udp-frame evolution n))
-                 (part 0)
-                 (total 1)
-                 (timestamp (let ((x (evolutionary-udp-data4 evolution n)))
-                              (if (= x -1.)
-                                  #f
-                                (flonum->timestamp x))))
-                 (header? #f))
-             (let ((data (need-data call sequence frame part total timestamp header?)))
+           (let ((sequence (evolutionary-udp-sequence receiver-evolution n)))
+             (let ((data (find-data self sequence)))
                (when debug?
-                 (terminal 'insert header? sequence frame part total))
+                 (terminal 'insert sequence (evolutionary-udp-data4 receiver-evolution n)))
                (insert ring data)))))
         ;; time
         ((udp-id-update-time)
          (when (visualized-channel?)
-           (let ((sequence (evolutionary-udp-sequence evolution n))
-                 (now (evolutionary-udp-data3 evolution n)))
-             (let ((data (find-data call sequence)))
+           (let ((sequence (evolutionary-udp-sequence receiver-evolution n))
+                 (now (evolutionary-udp-data3 receiver-evolution n)))
+             (let ((data (find-data self sequence)))
                (when debug?
-                 (terminal 'time sequence))
+                 (terminal 'time sequence (evolutionary-udp-data4 receiver-evolution n)))
                (update-time ring data now)))))
         ;; gap
         ((udp-id-packet-gap))
@@ -117,7 +156,7 @@
         ;; play / freeze
         ((udp-id-play-frame udp-id-freeze-frame)
          (when (visualized-channel?)
-           (let ((frame (evolutionary-udp-frame evolution n)))
+           (let ((frame (evolutionary-udp-frame receiver-evolution n)))
              (let ((packet (earliest-packet ring)))
                (assert (eqv? (get-frame packet) frame)
                  (assert (complete-frame? ring)
@@ -127,7 +166,7 @@
         ;; missing
         ((udp-id-missing-packet)
          (when (visualized-channel?)
-           (let ((sequence (evolutionary-udp-sequence evolution n)))
+           (let ((sequence (evolutionary-udp-sequence receiver-evolution n)))
              (let ((packet (earliest-packet ring)))
                (assert (eqv? (get-sequence packet) sequence)
                  (assert (not (get-data packet))
@@ -137,7 +176,7 @@
         ;; discard
         ((udp-id-discard-packet)
          (when (visualized-channel?)
-           (let ((sequence (evolutionary-udp-sequence evolution n)))
+           (let ((sequence (evolutionary-udp-sequence receiver-evolution n)))
              (let ((packet (earliest-packet ring)))
                (assert (eqv? (get-sequence packet) sequence)
                  (assert (get-data packet)
@@ -173,5 +212,5 @@
          (terminal 'unvisualized (evolution-id->abbrev id)))))))
 
 
-(definition public (visualize-call call client origin media-kind channel ring evolution)
-  (new UDP-Visualizer call client origin media-kind channel ring evolution)))
+(definition public (visualize-call call client origin media-kind channel ring origin-evolution receiver-evolution)
+  (new UDP-Visualizer call client origin media-kind channel ring origin-evolution receiver-evolution)))
