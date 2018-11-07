@@ -750,37 +750,42 @@
               (let ((earliest-giveup (+ earliest-present giveup-window)))
                 (cond ;; waiting
                       ((eq? state 'waiting)
-                       (let ((n (ready-header self now)))
-                         (if n
+                       (let ((header (complete-header self now)))
+                         (if header
                              ;; header
-                             (begin
-                               (flush self n average)
-                               (state-ok self)
-                               (mutex-unlock! mutex)
-                               (loop-wait))
+                             (let ((packet (packet-ref self header)))
+                               (let ((packet-present (present-time self packet)))
+                                 (if (< now packet-present)
+                                     ;; not ready
+                                     (begin
+                                       (mutex-unlock! mutex wait-condvar (- packet-present now))
+                                       (loop-wait))
+                                   ;; ready
+                                   (begin
+                                     (flush self header average)
+                                     (state-ok self)
+                                     (mutex-unlock! mutex)
+                                     (loop-wait)))))
                            ;; no header
                            (mutex-unlock! mutex wait-condvar)
                            (loop-wait))))
-                      ;; not ready to present
+                      ;; not ready
                       ((< now earliest-present)
                        (mutex-unlock! mutex wait-condvar (- earliest-present now))
                        (loop-wait))
                       ;; frame
-                      ((ready-frame? self)
+                      ((complete-frame? self)
                        (prog1 (present self now average)
                          (mutex-unlock! mutex)))
                       ;; not ready to giveup
                       ((< now earliest-giveup)
                        (mutex-unlock! mutex wait-condvar (- earliest-giveup now))
                        (loop-wait))
-                      ;; discard
-                      ((get-data earliest)
-                       (flush-discard self average)
-                       (mutex-unlock! mutex)
-                       (loop-wait))
-                      ;; missing
+                      ;; giveup
                       (else
-                       (flush-missing self average)
+                       (if (get-data earliest)
+                           (flush-discard self average)
+                         (flush-missing self average))
                        (mutex-unlock! mutex)
                        (loop-wait))))))))))
   
@@ -821,13 +826,34 @@
                               sleep
                               content))))
                 
-                (cond ;; sleep
+                (cond ;; waiting
+                      ((eq? state 'waiting)
+                       (let ((header (complete-header self now)))
+                         (if header
+                             ;; header
+                             (let ((packet (packet-ref self header)))
+                               (let ((packet-present (present-time self packet)))
+                                 (if (< now packet-present)
+                                     ;; not ready
+                                     (begin
+                                       (mutex-unlock! mutex wait-condvar (- packet-present now))
+                                       (loop-wait))
+                                   ;; ready
+                                   (begin
+                                     (flush self header average)
+                                     (state-ok self)
+                                     (mutex-unlock! mutex)
+                                     (loop-wait)))))
+                           ;; no header
+                           (mutex-unlock! mutex wait-condvar)
+                           (loop-wait))))
+                      ;; not ready
                       ((< now earliest-present)
                        (debugging 'sleep (- earliest-present now))
                        (mutex-unlock! mutex wait-condvar (- earliest-present now))
                        (loop-wait))
                       ;; frame
-                      ((ready-frame? self)
+                      ((complete-frame? self)
                        (prog1 (begin
                                 (if (< now earliest-late)
                                     (state-ok self)
@@ -835,17 +861,9 @@
                                 (present self now average))
                          (debugging (if (eq? state 'ok) "play  " "freeze") 'return)
                          (mutex-unlock! mutex)))
-                      ;; header
-                      ((ready-header self now)
-                       => (lambda (n)
-                            (debugging 'header 'loop)
-                            (flush self n average)
-                            (mutex-unlock! mutex)
-                            (loop-wait)))
                       ;; ok
                       ((< now earliest-late)
                        (debugging 'ok (- earliest-late now))
-                       (state-ok self)
                        (mutex-unlock! mutex wait-condvar (- earliest-late now))
                        (loop-wait))
                       ;; late
@@ -915,25 +933,16 @@
              (<= (+ pos total) count)
              (loop (for n from 0 below total)
                    (every (get-data (packet-ref self (+ pos n)))))))))
-  
-  
-  (method (ready-frame? self)
-    (let ((earliest (vector-ref packets head)))
-      (and (get-data earliest)
-           (and (complete-frame? self)
-                (or (get-header? earliest)
-                    (neq? state 'waiting))))))
     
   
-  (method (ready-header self now)
+  (method (complete-header self now)
     (continuation-capture
       (lambda (found)
         (loop (for n from 1 below count)
               (let ((packet (packet-ref self n)))
                 (when (and (get-data packet)
                            (get-header? packet)
-                           (= (get-part packet) 0)
-                           (ready? self now packet))
+                           (= (get-part packet) 0))
                   (let ((frame (get-frame packet))
                         (total (get-total packet)))
                     (let ((last (+ n total -1)))
