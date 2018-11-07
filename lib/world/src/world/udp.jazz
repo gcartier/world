@@ -724,13 +724,13 @@
   ;;;
   
   
-  (method public (process-wait self timeout average)
+  (method public (process-wait self timeout average (debug? #f))
     (ecase media-kind
-      ((udp-audio) (process-audio self timeout average))
-      ((udp-video) (process-video self timeout average))))
+      ((udp-audio) (process-audio self timeout average debug?))
+      ((udp-video) (process-video self timeout average debug?))))
   
   
-  (method (process-audio self timeout average)
+  (method (process-audio self timeout average debug?)
     (declare (proper-tail-calls))
     (let (loop-wait)
       (if terminate?
@@ -788,7 +788,7 @@
                        (loop-wait))))))))))
   
   
-  (method (process-video self timeout average)
+  (method (process-video self timeout average debug?)
     (declare (proper-tail-calls))
     (let (loop-wait)
       (if terminate?
@@ -805,42 +805,58 @@
           (let ((now (current-seconds))
                 (giveup-window udp-video-window)
                 (earliest (vector-ref packets head)))
-            (let ((earliest-present (present-time self earliest)))
+            (let ((earliest-time (earliest-time self earliest))
+                  (earliest-present (present-time self earliest)))
               (let ((earliest-late (+ earliest-present .05))
                     (earliest-giveup (+ earliest-present giveup-window)))
                 (cond ;; sleep
                       ((< now earliest-present)
+                       (when debug?
+                         (process-debug self 'sleep (get-sequence earliest) (- now earliest-time) (- earliest-present now)))
                        (mutex-unlock! mutex wait-condvar (- earliest-present now))
                        (loop-wait))
                       ;; frame
                       ((ready-frame? self)
                        (prog1 (begin
-                                (if (> now earliest-late)
-                                    (state-late self)
-                                  (state-ok self))
+                                (if (< now earliest-late)
+                                    (state-ok self)
+                                  (state-late self))
                                 (present self now average))
+                         (when debug?
+                           (let ((action (if (eq? state 'ok) "play  " "freeze")))
+                             (process-debug self action (get-sequence earliest) (- now earliest-time) 'return)))
                          (mutex-unlock! mutex)))
                       ;; header
                       ((ready-header self now)
                        => (lambda (n)
+                            (when debug?
+                              (process-debug self 'header (get-sequence earliest) (- now earliest-time) 'loop))
                             (flush self n average)
                             (set! earliest (vector-ref packets head))
                             (set! earliest-present (present-time self earliest))
                             (mutex-unlock! mutex)
                             (loop-wait)))
-                      ;; sleep
-                      ((< now earliest-giveup)
+                      ;; ok
+                      ((< now earliest-late)
+                       (when debug?
+                         (process-debug self 'ok (get-sequence earliest) (- now earliest-time) (- earliest-giveup now)))
+                       (state-ok self)
                        (mutex-unlock! mutex wait-condvar (- earliest-giveup now))
                        (loop-wait))
-                      ;; discard
-                      ((get-data earliest)
-                       (flush-discard self average)
-                       (state-waiting self)
-                       (mutex-unlock! mutex)
+                      ;; late
+                      ((< now earliest-giveup)
+                       (when debug?
+                         (process-debug self 'late (get-sequence earliest) (- now earliest-time) (- earliest-giveup now)))
+                       (state-late self)
+                       (mutex-unlock! mutex wait-condvar (- earliest-giveup now))
                        (loop-wait))
-                      ;; missing
+                      ;; giveup
                       (else
-                       (flush-missing self average)
+                       (when debug?
+                         (process-debug self 'giveup (get-sequence earliest) (- now earliest-time) 'loop))
+                       (if (get-data earliest)
+                           (flush-discard self average)
+                         (flush-missing self average))
                        (state-waiting self)
                        (mutex-unlock! mutex)
                        (loop-wait))))))))))
@@ -858,6 +874,13 @@
   
   (method protected (packet-ref self n)
     (vector-ref packets (modulo (+ head n) size)))
+  
+  
+  (method (earliest-time self packet)
+    (let ((timestamp (get-timestamp packet)))
+      (if (not timestamp)
+          0.
+        (+ time-base timestamp))))
   
   
   (method (present-time self packet)
@@ -1060,6 +1083,21 @@
                   (if (not timestamp)
                       -1.
                     (timestamp->flonum timestamp))))
+  
+  
+  (method (process-debug self what sequence time sleep)
+    (let ((content (loop (for n from 0 below count)
+                         (collect (get-sequence (packet-ref self n))))))
+      (format :terminal
+              "{a width: 6} {a width: 3} {a width: 3} {a width: 3} {a} {r precision: 3} {a width: 6} ({l}){%}"
+              what
+              head
+              tail
+              count
+              sequence
+              time
+              (if (symbol? sleep) sleep (format "{r precision: 3}" sleep))
+              content)))
   
   
   (method public (locate-data self sequence)
