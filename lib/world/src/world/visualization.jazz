@@ -52,6 +52,8 @@
   (slot origin-evolution                 getter generate)
   (slot receiver-evolution               getter generate)
   (slot datas                            getter generate)
+  (slot adds                             getter generate)
+  (slot removes                          getter generate)
   (slot last-time          initialize #f accessors generate)
   (slot last-event         initialize #f accessors generate)
   
@@ -66,7 +68,9 @@
     (set! self.ring ring)
     (set! self.origin-evolution origin-evolution)
     (set! self.receiver-evolution receiver-evolution)
-    (set! self.datas (make-table test: eqv?)))
+    (set! self.datas (make-table test: eqv?))
+    (set! self.adds (make-table test: eqv? weak-keys: #t))
+    (set! self.removes (make-table test: eqv?)))
   
   
   (method (find-data self sequence)
@@ -116,14 +120,14 @@
             data)))))
   
   
-  (method protected (visualize-from self from target)
+  (method protected (visualize-from self from-event to-time)
     (declare (proper-tail-calls))
     (let ((first (first-position receiver-evolution))
           (last (last-position receiver-evolution)))
-      (let (loop (n (or from first)))
+      (let (loop (n (or from-event first)))
         (when (<= n last)
           (let ((time (evolutionary-udp-time receiver-evolution n)))
-            (when (<= time target)
+            (when (<= time to-time)
               (visualize-event self n)
               (set! last-time time)
               (set! last-event n)
@@ -150,22 +154,29 @@
         ;; insert
         ((udp-id-insert-packet)
          (when (visualized-channel?)
-           (let ((sequence (evolutionary-udp-sequence receiver-evolution n))
-                 (time-base (let ((time-base (evolutionary-udp-data3 receiver-evolution n)))
-                              ;; quick hack for timeless
-                              (if (= time-base -1.)
-                                  (- (evolutionary-udp-time receiver-evolution n) (evolutionary-udp-data4 receiver-evolution n))
-                                time-base))))
-             (let ((data (find-data self sequence)))
-               (when data
-                 (when show-visualize?
-                   (terminal 'insert sequence))
-                 (visualizer-update-time ring time-base)
-                 (insert ring data))))))
-        ;; gap
-        ((udp-id-packet-gap))
+           (let ((time (evolutionary-udp-time receiver-evolution n))
+                 (sequence (evolutionary-udp-sequence receiver-evolution n)))
+             (let ((time-base (let ((time-base (evolutionary-udp-data3 receiver-evolution n)))
+                                ;; quick hack for timeless
+                                (if (= time-base -1.)
+                                    (- time (evolutionary-udp-data4 receiver-evolution n))
+                                  time-base))))
+               (let ((data (find-data self sequence)))
+                 (when data
+                   (when show-visualize?
+                     (terminal 'insert sequence))
+                   (visualizer-update-time ring time-base)
+                   (let ((from (get-highest ring)))
+                     (insert ring data)
+                     (table-set! adds (locate-packet ring sequence) time)
+                     (let ((to (get-highest ring)))
+                       ;; nacks
+                       (loop (for seq from (+ from 1) below to)
+                             (table-set! adds (locate-packet ring seq) time))))))))))
         ;; nack
         ((udp-id-nack-packet))
+        ;; gap
+        ((udp-id-packet-gap))
         ;; got
         ((udp-id-got-packet)
          (when (visualized-channel?)
@@ -193,6 +204,10 @@
                    (if (= id udp-id-play-frame)
                        (state-ok ring)
                      (state-late ring))
+                   (let ((complete? (frame-complete? ring 0)))
+                     (visualizer-iterate-frame ring
+                       (lambda (packet)
+                         (table-set! removes packet (cons (evolutionary-udp-time receiver-evolution n) complete?)))))
                    (visualizer-remove-frame ring)))))))
         ;; missing
         ((udp-id-missing-packet)
@@ -204,6 +219,7 @@
                (let ((consistent? (and packet (eqv? (get-sequence packet) sequence))))
                  (when (if debug-visualize? (assert consistent? #t) consistent?)
                    (assert (not (get-data packet))
+                     (table-set! removes packet (cons (evolutionary-udp-time receiver-evolution n) #f))
                      (remove-packet ring))))))))
         ;; discard
         ((udp-id-discard-packet)
@@ -215,6 +231,7 @@
                (let ((consistent? (and packet (eqv? (get-sequence packet) sequence))))
                  (when (if debug-visualize? (assert consistent? #t) consistent?)
                    (assert (get-data packet)
+                     (table-set! removes packet (cons (evolutionary-udp-time receiver-evolution n) (frame-complete? ring 0)))
                      (remove-packet ring))))))))
         ;; ok
         ((udp-id-state-ok)
