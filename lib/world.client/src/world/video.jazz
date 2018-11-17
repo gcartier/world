@@ -134,24 +134,37 @@
 
 
 (definition protected (new-world-video)
-  (let ((camera-src (new Camera-Video-Src
-                      resolution: video-resolution
-                      framerate: video-framerate
-                      bitrate: video-bitrate
-                      codec: video-codec))
-        (server-sink (new Stream-Sink
+  (let ((video-stream (world-setting 'together.video-stream #f)))
+    (let ((camera-src (and (not video-stream)
+                           (new Camera-Video-Src
+                             resolution: video-resolution
+                             framerate: video-framerate
+                             bitrate: video-bitrate
+                             codec: video-codec)))
+          (file-src (and video-stream
+                         (new File-Stream-Video-Src
+                           video-stream
+                           resolution: video-resolution
+                           framerate: video-framerate
+                           bitrate: video-bitrate
+                           codec: video-codec
+                           audio?: #f)))
+          (server-sink (new Stream-Sink
+                         consumer: (lambda (buffer timestamp duration)
+                                     (let ((video (current-video)))
+                                       (send-camera-video video buffer timestamp duration)))))
+          (self-sink (new Stream-Sink
                        consumer: (lambda (buffer timestamp duration)
                                    (let ((video (current-video)))
-                                     (send-camera-video video buffer timestamp duration)))))
-        (self-sink (new Stream-Sink
-                     consumer: (lambda (buffer timestamp duration)
-                                 (let ((video (current-video)))
-                                   (let ((sink (find-output video #f)))
-                                     (set-stream-state sink 'drawn)
-                                     (draw sink buffer #f timestamp duration)))))))
-    (new World-Video input: (pipeline camera-src (if self-sink
-                                                     (list server-sink self-sink)
-                                                   server-sink)))))
+                                     (let ((sink (find-output video #f)))
+                                       (set-stream-state sink 'drawn)
+                                       (draw sink buffer #f timestamp duration)))))))
+      (new World-Video input: (pipeline (if video-stream
+                                            file-src
+                                          camera-src)
+                                        (if self-sink
+                                            (list server-sink self-sink)
+                                          server-sink))))))
 
 
 ;; first four bytes are always 00 00 00 01
@@ -217,7 +230,9 @@
     (with-camera-mutex self
       (lambda ()
         (let ((camera (car (get-elements input))))
-          (reset camera)))))
+          ;; quicky for tests
+          (when (is? camera Camera-Video-Src)
+            (reset camera))))))
   
   
   (method package (resize self)
@@ -669,19 +684,20 @@
                         (if (video-buffer-header? buffer) 1. -1.)
                         (fixnum->flonum size)
                         (timestamp->flonum timestamp)))))
-    (let ((size (gst_app_sink_read appsinkself data info)))
-      (when (/= size -1)
-        (let ((buffer (subu8vector data 0 size))
-              (timestamp (u64vector-ref info 0))
-              (duration (u64vector-ref info 1)))
-          (consume sinkself buffer timestamp duration)
-          (record-event udp-id-src-self
-                        (fixnum->flonum client-no)
-                        (fixnum->flonum world.udp:udp-video)
-                        -1.
-                        -1.
-                        (fixnum->flonum size)
-                        (timestamp->flonum timestamp)))))))
+    (when appsinkself
+      (let ((size (gst_app_sink_read appsinkself data info)))
+        (when (/= size -1)
+          (let ((buffer (subu8vector data 0 size))
+                (timestamp (u64vector-ref info 0))
+                (duration (u64vector-ref info 1)))
+            (consume sinkself buffer timestamp duration)
+            (record-event udp-id-src-self
+                          (fixnum->flonum client-no)
+                          (fixnum->flonum world.udp:udp-video)
+                          -1.
+                          -1.
+                          (fixnum->flonum size)
+                          (timestamp->flonum timestamp))))))))
 
 
 ;;;
@@ -990,6 +1006,92 @@
                 (timestamp (u64vector-ref audio-info 0))
                 (duration (u64vector-ref audio-info 1)))
             (consume audio-sink buffer timestamp duration)))))))
+
+
+;;;
+;;;; File-Stream-Video-Src
+;;;
+
+
+;; quicky for tests
+(class File-Stream-Video-Src extends File-Video-Src
+  
+  
+  (method override (setup-element self)
+    (nextmethod self)
+    (let ((width (get-width resolution))
+          (height (get-height resolution))
+          (self-width (get-width self-resolution))
+          (self-height (get-height self-resolution)))
+      (let ((pipeline (gst-launch (tie "filesrc name=filesrc")
+                                  "decodebin name=decoder"
+                                  (and audio?
+                                       (list "decoder."
+                                             "queue"
+                                             "audioconvert"
+                                             "audioresample"
+                                             (cond-expand
+                                               (windows "audio/x-raw, format=S16LE, layout=interleaved, rate=80000, channels=2")
+                                               (else "audio/x-raw, format=F32LE, layout=interleaved, rate=80000, channels=2"))
+                                             "appsink name=audioappsink"))
+                                  (list "decoder."
+                                        "tee name=tee"
+                                        (list
+                                          "tee."
+                                          "queue"
+                                          "videoscale"
+                                          "videoconvert"
+                                          (tie "video/x-raw, format=I420, width={width}, height={height}, pixel-aspect-ratio=(fraction)1/1")
+                                          "valve name=valve"
+                                          (and (eq? codec 'h264)
+                                               (let ((key-int-max (and video-key-period (fxround (* (cast <fl> framerate) video-key-period))))
+                                                     (pass video-pass)
+                                                     (psy-tune #f)
+                                                     (quantizer #f)
+                                                     (bitrate bitrate)
+                                                     (tune "zerolatency")
+                                                     (speed-preset "superfast"))
+                                                 (let ((elem
+                                                         (gst-element "x264enc"
+                                                                      key-int-max: key-int-max
+                                                                      pass: pass
+                                                                      psy-tune: psy-tune
+                                                                      quantizer: quantizer
+                                                                      bitrate: bitrate
+                                                                      tune: tune
+                                                                      speed-preset: speed-preset
+                                                                      name: "enc")))
+                                                   @w (format :terminal "size={a}x{a} framerate={a}{%}" width height framerate)
+                                                   @w (format :terminal "{a}{%}" elem)
+                                                   elem)))
+                                          "appsink name=appsink")
+                                        (list
+                                          "tee."
+                                          "queue"
+                                          "videoscale"
+                                          "videoconvert"
+                                          (tie "video/x-raw, format=BGRA, width={self-width}, height={self-height}, pixel-aspect-ratio=(fraction)1/1")
+                                          "appsink name=sinkself")))))
+        (gst_object_set_name pipeline "file")
+        (let ((filesrc (gst_bin_get_by_name pipeline "filesrc"))
+              (appsink (gst_bin_get_by_name pipeline "appsink"))
+              (appsinkself (gst_bin_get_by_name pipeline "sinkself"))
+              (data (make-u8vector (* (max width self-width) (max height self-height) 4)))
+              (info (make-u64vector 2))
+              (audio-appsink (and audio? (gst_bin_get_by_name pipeline "audioappsink")))
+              (audio-data (and audio? (make-u8vector (* width height 4))))
+              (audio-info (and audio? (make-u64vector 2))))
+          (g_object_set_string filesrc "location" (path-normalize location))
+          (gst_element_set_state pipeline GST_STATE_READY)
+          (set! self.data data)
+          (set! self.info info)
+          (set! self.pipeline pipeline)
+          (set! self.appsink appsink)
+          (set! self.appsinkself appsinkself)
+          (when audio?
+            (set! self.audio-appsink audio-appsink)
+            (set! self.audio-data audio-data)
+            (set! self.audio-info audio-info)))))))
 
 
 ;;;

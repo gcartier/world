@@ -60,18 +60,26 @@
 
 
 (definition protected (new-world-audio)
-  (let ((mic-src (new Mic-Audio-Src))
-        (server-sink (new Stream-Sink
-                       consumer: (lambda (buffer timestamp duration)
-                                   (case audio-codec
-                                     ((opus)
-                                      (let ((header? (and buffer (audio-buffer-header? buffer))))
-                                        (send-client-audio (current-client) buffer header? timestamp duration)))
-                                     ((vorbis)
-                                      (if (pair? buffer)
-                                          (send-client-audio (current-client) (car buffer) #t -1 -1)
-                                        (send-client-audio (current-client) buffer #f timestamp duration))))))))
-    (new World-Audio input: (pipeline mic-src server-sink))))
+  (let ((audio-stream (world-setting 'together.audio-stream #f)))
+    (let ((mic-src (and (not audio-stream)
+                        (new Mic-Audio-Src)))
+          (file-src (and audio-stream
+                         (new File-Stream-Audio-Src
+                           audio-stream)))
+          (server-sink (new Stream-Sink
+                         consumer: (lambda (buffer timestamp duration)
+                                     (case audio-codec
+                                       ((opus)
+                                        (let ((header? (and buffer (audio-buffer-header? buffer))))
+                                          (send-client-audio (current-client) buffer header? timestamp duration)))
+                                       ((vorbis)
+                                        (if (pair? buffer)
+                                            (send-client-audio (current-client) (car buffer) #t -1 GST_CLOCK_TIME_NONE)
+                                          (send-client-audio (current-client) buffer #f timestamp duration))))))))
+      (new World-Audio input: (pipeline (if audio-stream
+                                            file-src
+                                          mic-src)
+                                        server-sink)))))
 
 
 (definition protected (audio-buffer-header? buffer)
@@ -114,7 +122,7 @@
       (let ((mic (car (get-elements input))))
         (let ((header (get-mic-header mic)))
           (when header
-            (send-client-audio tier (car header) #t -1 -1))))))
+            (send-client-audio tier (car header) #t -1 GST_CLOCK_TIME_NONE))))))
   
   
   (method package (microphone-header self)
@@ -402,6 +410,50 @@
                           (if header? 1. -1.)
                           (fixnum->flonum size)
                           (timestamp->flonum timestamp))))))))
+
+
+;;;
+;;;; File-Stream-Audio-Src
+;;;
+
+
+;; quicky for tests
+(class File-Stream-Audio-Src extends Mic-Audio-Src
+  
+  
+  (slot location initialize #f accessors generate)
+  
+  
+  (method override (initialize self location . rest)
+    (apply nextmethod self rest)
+    (set! self.location location))
+  
+  
+  (method override (setup-element self)
+    (nextmethod self)
+    (let ((properties (or audio-properties "")))
+      (let ((pipeline (gst-launch (tie "filesrc name=filesrc")
+                                  "decodebin name=decoder"
+                                  (list "decoder."
+                                        "queue"
+                                        "audioconvert"
+                                        "audioresample"
+                                        (and (eq? audio-codec 'opus) (tie "opusenc {properties} name=enc"))
+                                        (and (eq? audio-codec 'vorbis) "audioconvert")
+                                        (and (eq? audio-codec 'vorbis) "audio/x-raw, format=F32LE, layout=interleaved, rate=48000, channels=1")
+                                        (and (eq? audio-codec 'vorbis) (tie "vorbisenc {properties} name=enc"))
+                                        "appsink name=sink"))))
+        (gst_object_set_name pipeline "codec")
+        (let ((filesrc (gst_bin_get_by_name pipeline "filesrc"))
+              (appsink (gst_bin_get_by_name pipeline "sink"))
+              (data (make-u8vector 4096))
+              (info (make-u64vector 2)))
+          (g_object_set_string filesrc "location" (path-normalize location))
+          (gst_element_set_state pipeline GST_STATE_READY)
+          (set! self.codec-data data)
+          (set! self.codec-info info)
+          (set! self.codec-pipeline pipeline)
+          (set! self.codec-sink appsink))))))
 
 
 ;;;
