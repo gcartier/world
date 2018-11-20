@@ -935,8 +935,8 @@
                                              "audioconvert"
                                              "audioresample"
                                              (cond-expand
-                                               (windows "audio/x-raw, format=S16LE, layout=interleaved, rate=80000, channels=2")
-                                               (else "audio/x-raw, format=F32LE, layout=interleaved, rate=80000, channels=2"))
+                                               (windows "audio/x-raw, format=S16LE, layout=interleaved, rate=48000, channels=1")
+                                               (else "audio/x-raw, format=F32LE, layout=interleaved, rate=48000, channels=1"))
                                              "appsink name=audioappsink"))
                                   (list "decoder."
                                         "videoscale"
@@ -1006,64 +1006,39 @@
 ;;;
 
 
-;; quicky for tests
 (class File-Preprocess-Video-Src extends File-Video-Src
   
   
   (method override (setup-element self)
     (nextmethod self)
     (let ((width (get-width resolution))
-          (height (get-height resolution))
-          (self-width (get-width self-resolution))
-          (self-height (get-height self-resolution)))
+          (height (get-height resolution)))
       (let ((pipeline (gst-launch (tie "filesrc name=filesrc")
-                                  "decodebin name=decoder"
-                                  (and audio?
-                                       (list "decoder."
-                                             "queue"
-                                             "audioconvert"
-                                             "audioresample"
-                                             (cond-expand
-                                               (windows "audio/x-raw, format=S16LE, layout=interleaved, rate=80000, channels=2")
-                                               (else "audio/x-raw, format=F32LE, layout=interleaved, rate=80000, channels=2"))
-                                             "appsink name=audioappsink sync=false"))
-                                  (list "decoder."
-                                        "tee name=tee"
-                                        (list
-                                          "tee."
-                                          "queue"
-                                          "videoscale"
-                                          "videoconvert"
-                                          (tie "video/x-raw, format=I420, width={width}, height={height}, pixel-aspect-ratio=(fraction)1/1")
-                                          (let ((bitrate bitrate)
-                                                (tune "zerolatency")
-                                                (speed-preset "superfast"))
-                                            (gst-element "x264enc"
-                                                         bitrate: bitrate
-                                                         tune: tune
-                                                         speed-preset: speed-preset
-                                                         name: "enc"))
-                                          "appsink name=appsink sync=false")))))
+                                  "decodebin"
+                                  (and framerate (tie "videorate max-rate={framerate}"))
+                                  "videoscale"
+                                  "videoconvert"
+                                  (tie "video/x-raw, format=I420, width={width}, height={height}, pixel-aspect-ratio=(fraction)1/1")
+                                  (let ((bitrate bitrate)
+                                        (tune "zerolatency")
+                                        (speed-preset "superfast"))
+                                    (gst-element "x264enc"
+                                                 bitrate: bitrate
+                                                 tune: tune
+                                                 speed-preset: speed-preset
+                                                 name: "enc"))
+                                  "appsink name=appsink sync=false")))
         (gst_object_set_name pipeline "file")
         (let ((filesrc (gst_bin_get_by_name pipeline "filesrc"))
               (appsink (gst_bin_get_by_name pipeline "appsink"))
-              (appsinkself (and (not streaming?) (gst_bin_get_by_name pipeline "sinkself")))
-              (data (make-u8vector (* (max width self-width) (max height self-height) 4)))
-              (info (make-u64vector 2))
-              (audio-appsink (and audio? (gst_bin_get_by_name pipeline "audioappsink")))
-              (audio-data (and audio? (make-u8vector (* width height 4))))
-              (audio-info (and audio? (make-u64vector 2))))
+              (data (make-u8vector (* width height 4)))
+              (info (make-u64vector 2)))
           (g_object_set_string filesrc "location" (path-normalize location))
           (gst_element_set_state pipeline GST_STATE_READY)
           (set! self.data data)
           (set! self.info info)
           (set! self.pipeline pipeline)
-          (set! self.appsink appsink)
-          (set! self.appsinkself appsinkself)
-          (when audio?
-            (set! self.audio-appsink audio-appsink)
-            (set! self.audio-data audio-data)
-            (set! self.audio-info audio-info))))))
+          (set! self.appsink appsink)))))
   
   
   (method override (video-task self task)
@@ -1073,7 +1048,9 @@
         (let (iter)
           (when (running? task)
             (site (preprocess on?: #t)
-              (process self)))
+              (if (gst_app_sink_is_eos appsink)
+                  (consume sink #f #f #f)
+                (process self))))
           (sleep .001)
           (iter))))))
 
@@ -1083,7 +1060,6 @@
 ;;;
 
 
-;; quicky for tests
 (class File-Stream-Video-Src extends Video-Src
   
   
@@ -1091,7 +1067,8 @@
   (slot file          getter generate)
   (slot port          getter generate)
   (slot temporary     getter generate)
-  (slot last-playtime getter generate)
+  (slot time-base     getter generate)
+  (slot last-sendtime getter generate)
   
   
   (method override (initialize self location)
@@ -1100,12 +1077,13 @@
     (set! self.file #f)
     (set! self.port #f)
     (set! self.temporary (make-u8vector 8))
-    (set! self.last-playtime #f))
+    (set! self.time-base #f)
+    (set! self.last-sendtime #f))
   
   
   (method override (start-element self)
     (nextmethod self)
-    (set! file (new-file {Directory Settings} (list "stream" (add-extension location "stream"))))
+    (set! file (new-file {Directory Settings} (list "stream" (add-extension location "streamvideo"))))
     (set! port (open-input-file (path-settings file)))
     (task-start self 'stream))
   
@@ -1124,12 +1102,8 @@
       (lambda (exit)
         (let (iter)
           (when (running? task)
-            (let ((wait (site (stream on?: #t)
-                          (process self))))
-              (when wait
-                (sleep wait)
-                @w
-                (task-sleep task 0. wait exit))))
+            (site (stream on?: #t)
+              (process self)))
           (iter)))))
   
   
@@ -1147,20 +1121,26 @@
                 (read-subu8vector buffer 0 size port)
                 (proc buffer timestamp duration)))))))
     
+    (define (update-time new-time new-nanostamp)
+      (let ((new-base (- new-time new-nanostamp)))
+        (if (not time-base)
+            (set! time-base new-base)
+          (let ((change (- new-base time-base))
+                (effective-change -.01))
+            (when (< change effective-change)
+              (let ((effective-base (+ time-base effective-change)))
+                (set! time-base effective-base)))))))
+    
     (read-frame
       (lambda (buffer timestamp duration)
         (let ((tier (current-client)))
           (let ((header? (video-buffer-header? buffer))
-                (time (timestamp->flonum timestamp)))
-            (cond ((not last-playtime)
-                   (send-client-video tier buffer header? timestamp duration)
-                   (set! last-playtime time)
-                   #f)
-                  (else
-                   (let ((wait (- time last-playtime)))
-                     (send-client-video tier buffer header? timestamp duration)
-                     (set! last-playtime time)
-                     wait)))))))))
+                (time (current-seconds))
+                (nanostamp (timestamp->flonum timestamp)))
+            (update-time time nanostamp)
+            (let ((sendtime (+ time-base nanostamp)))
+              (sleep (- sendtime time))
+              (send-client-video tier buffer header? timestamp duration))))))))
 
 
 ;;;
