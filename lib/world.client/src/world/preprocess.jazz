@@ -1,0 +1,115 @@
+;;;===============
+;;;  WorldScheme
+;;;===============
+;;;
+;;;; Stream Preprocess
+;;;
+;;;  The Initial Developer of the Original Code is Guillaume Cartier.
+;;;  Portions created by the Initial Developer are Copyright (C) 2012-2018
+;;;  the Initial Developer. All Rights Reserved.
+;;;
+;;;  Contributor(s):
+
+
+(module world.preprocess jazz
+
+
+(import (jazz.io)
+        (jazz.stream)
+        (world)
+        (world.audio)
+        (world.context)
+        (world.settings)
+        (world.video))
+
+
+(definition public (preprocess-directory dir (what #f))
+  (define (maybe-audio file)
+    (let ((media-file (media-brother file 'audio)))
+      (unless (exists? media-file)
+        (preprocess-audio file))))
+  
+  (define (maybe-video file)
+    (let ((media-file (media-brother file 'video)))
+      (unless (exists? media-file)
+        (preprocess-video file))))
+  
+  (iterate-directory dir
+    (lambda (file)
+      (when (member? (get-extension file) '("mp4" "webm") test: extension=?)
+        (case what
+          ((audio)
+           (maybe-audio file))
+          ((video)
+           (maybe-video file))
+          (else
+           (maybe-audio file)
+           (maybe-video file)))))
+    files?: #t;
+    directories?: #f
+    recursive?: #f))
+
+
+(definition public (preprocess-audio file)
+  (preprocess-media file (media-brother file 'audio)
+    (new File-Preprocess-Audio-Src
+      (parse file))))
+
+
+(definition public (preprocess-video file)
+  (preprocess-media file (media-brother file 'video)
+    (new File-Preprocess-Video-Src
+      (parse file)
+      resolution: (world-setting 'world.stream-resolution {Dimension 640 360})
+      framerate: (world-setting 'world.stream-framerate 20)
+      bitrate: (world-setting 'world.stream-bitrate 2048))))
+
+
+(definition (preprocess-media file media-file src)
+  (let ((preprocess-pipeline #f)
+        (preprocess-output #f)
+        (temporary (make-u8vector 8))
+        (start-time #f)
+        (count 0))
+    (define (start-pipeline)
+      (set! start-time (current-seconds))
+      (start preprocess-pipeline)
+      (terminal-string (get-name file)))
+    
+    (define (pipeline-output buffer timestamp duration)
+      (unless preprocess-output
+        (set! preprocess-output (open-output-file (path-settings media-file))))
+      (put-s64 temporary 0 timestamp)
+      (write-subu8vector temporary 0 8 preprocess-output)
+      (put-u64 temporary 0 duration)
+      (write-subu8vector temporary 0 8 preprocess-output)
+      (let ((size (u8vector-length buffer)))
+        (write-32-bit-integer size preprocess-output)
+        (write-subu8vector buffer 0 size preprocess-output))
+      (when (= (modulo count 100) 0)
+        (terminal-string "."))
+      (increase! count))
+    
+    (define (pipeline-eos)
+      (close preprocess-output)
+      (terminal-string (format "done({a})" (present-seconds (- (current-seconds) start-time))))
+      (terminal-newline))
+    
+    (define (stop-pipeline)
+      (stop preprocess-pipeline))
+    
+    (let ((sink (new Stream-Sink
+                  consumer: (lambda (buffer timestamp duration)
+                              (if buffer
+                                  (pipeline-output buffer timestamp duration)
+                                (pipeline-eos)
+                                (stop-pipeline))))))
+      (set! preprocess-pipeline (pipeline src sink))
+      (start-pipeline))))
+
+
+(definition (media-brother file kind)
+  (let ((extension (case kind
+                     ((audio) "streamaudio")
+                     ((video) "streamvideo"))))
+    (get-brother file (add-extension (get-base file) extension)))))
