@@ -29,6 +29,7 @@
         (world.ring)
         (world.settings)
         (world.task)
+        (world.time)
         (world.video))
 
 
@@ -592,7 +593,7 @@
     (set! self.state 'waiting)
     (set! self.last-sequence #f)
     (set! self.last-frame #f)
-    (set! self.time-base #f)
+    (set! self.time-base (new Time-Base))
     (set! self.terminate? #f)
     (set! self.state-proc state-proc)
     (set! self.overflow-proc overflow-proc))
@@ -640,57 +641,43 @@
   
   
   (method public (insert self data (insert-event #f))
-    (let ((new-time (current-seconds))
-          (new-timestamp (read-udp-media-seconds data)))
-      (define (update-time)
-        (define (update-time-base new-base change)
-          (set! time-base new-base)
-          (condition-variable-signal! wait-condvar)
-          (let ((origin (read-udp-origin data))
-                (sequence (read-udp-sequence data)))
-            (record-event udp-id-update-time
-                          (fixnum->flonum origin)
-                          (fixnum->flonum media-kind)
-                          (fixnum->flonum sequence)
-                          new-time
-                          change
-                          new-timestamp)))
-        
-        (when new-timestamp
-          (let ((new-base (- new-time new-timestamp)))
-            (if (not time-base)
-                (update-time-base new-base -1.)
-              (let ((change (- new-base time-base)))
-                (cond ((< change (- udp-latency-threshold))
-                       (let ((new-base (- time-base udp-latency-decrement)))
-                         (update-time-base new-base change)))
-                      ((> change udp-latency-threshold)
-                       (let ((new-base (+ time-base udp-latency-increment)))
-                         (update-time-base new-base change)))))))))
-      
+    (let ((now (current-seconds))
+          (timestamp (read-udp-media-seconds data)))
       (mutex-lock! mutex)
       (unless (emulation?)
-        (update-time))
-      (let ((timestamp (read-udp-media-seconds data))
-            (duration (read-udp-media-duration data))
+        (when timestamp
+          (update-time time-base now timestamp
+            (lambda (change)
+              (condition-variable-signal! wait-condvar)
+              (let ((origin (read-udp-origin data))
+                    (sequence (read-udp-sequence data)))
+                (record-event udp-id-update-time
+                              (fixnum->flonum origin)
+                              (fixnum->flonum media-kind)
+                              (fixnum->flonum sequence)
+                              now
+                              change
+                              timestamp))))))
+      (let ((duration (read-udp-media-duration data))
             (sequence (read-udp-sequence data))
             (frame (read-udp-frame data))
             (part (read-udp-part data))
             (total (read-udp-total data))
             (header? (read-udp-media-header? data)))
         (define (record-insert)
-          (record-event (or insert-event udp-id-insert-packet)
-                        (fixnum->flonum origin)
-                        (fixnum->flonum media-kind)
-                        (fixnum->flonum sequence)
-                        (fixnum->flonum frame)
-                        (if (not new-timestamp)
-                            -1.
-                          (- (- new-time new-timestamp) time-base))
-                        (if (not timestamp)
-                            -1.
-                          timestamp)
-                        (or time-base -1.)))
+          (let ((base (get-base time-base)))
+            (record-event (or insert-event udp-id-insert-packet)
+                          (fixnum->flonum origin)
+                          (fixnum->flonum media-kind)
+                          (fixnum->flonum sequence)
+                          (fixnum->flonum frame)
+                          (if (not timestamp)
+                              -1.
+                            (- (- now timestamp) base))
+                          (if (not timestamp)
+                              -1.
+                            timestamp)
+                          (or base -1.))))
         
         (define (record-nack seq)
           (record-event udp-id-nack-packet
@@ -829,8 +816,8 @@
              (increase! lowest)))))
   
   
-  (method protected (visualizer-update-time self time-base)
-    (set! self.time-base time-base))
+  (method protected (visualizer-update-time self base)
+    (update-base time-base base))
   
   
   (method protected (visualizer-replace-got self sequence data)
@@ -902,7 +889,7 @@
     (let ((timestamp (get-timestamp packet)))
       (if (not timestamp)
           0.
-        (+ time-base timestamp udp-retain-window))))
+        (+ (remote->local time-base timestamp) udp-retain-window))))
   
   
   ;;;
@@ -1122,14 +1109,14 @@
     (let ((timestamp (get-timestamp packet)))
       (if (not timestamp)
           0.
-        (+ time-base timestamp))))
+        (remote->local time-base timestamp))))
   
   
   (method (present-time self packet)
     (let ((timestamp (get-timestamp packet)))
       (if (not timestamp)
           0.
-        (+ time-base timestamp udp-process-window))))
+        (+ (remote->local time-base timestamp) udp-process-window))))
   
   
   (method (ready? self now packet)
