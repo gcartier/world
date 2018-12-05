@@ -14,10 +14,12 @@
 (module world.interface.timeline jazz
 
 
-(import (jazz.component)
+(import (jazz.cairo)
+        (jazz.component)
         (jazz.event)
         (jazz.geometry)
         (jazz.graphic)
+        (jazz.screen)
         (jazz.time)
         (world)
         (world.biome)
@@ -83,7 +85,7 @@
         (let ((texture (get-texture sheet)))
           (let ((surface (get-surface texture))
                 (data (get-data texture)))
-            (draw-view view surface data)
+            (draw-view-data view surface data)
             (map-texture texture)
             (set-uptodate? view #t))))
       (let ((x (cast <fl> (get-left view)))
@@ -197,6 +199,8 @@
   (slot live?                         initialize #t  accessors generate)
   (slot replay?                       initialize #f  accessors generate)
   (slot uptodate?                     initialize #f  accessors generate)
+  (slot image-surface                 initialize #f  accessors generate)
+  (slot image-valid?                  initialize #f  accessors generate)
   (slot visualizer-start <fl+>        initialize #f  accessors generate)
   (slot visualizer-end   <fl+>        initialize #f  accessors generate)
   (slot visualize?                    initialize #f  getter generate)
@@ -219,6 +223,39 @@
   (slot elapses                       initialize #f  getter generate)
   (slot graphs                        initialize '() getter generate)
   (slot graph-button                  initialize #f  getter generate)
+  
+  
+  ;;;
+  ;;;; Image
+  ;;;
+  
+  
+  (method override (size-change self size)
+    (nextmethod self size)
+    (when image-surface
+      (close image-surface)
+      (set! image-surface #f)))
+  
+  
+  (method (cache-image-surface self)
+    (or image-surface
+        (let ((scale-factor (main-screen-scale-factor)))
+          (define (new-image-surface width height)
+            (let ((surface (new Image-Surface (new Dimension width height)))
+                  (scale (cast <fl> scale-factor)))
+              (cairo_surface_set_device_scale (get-handle surface) scale scale)
+              surface))
+          
+          (let ((width (* scale-factor (get-width self)))
+                (height (* scale-factor (get-height self))))
+            (let ((surface (new-image-surface width height)))
+              (set! image-surface surface)
+              (set! image-valid? #f)
+              surface)))))
+  
+  
+  (method protected (invalidate-image self)
+    (set! image-valid? #f))
   
   
   ;;;
@@ -564,6 +601,8 @@
   
   
   (method package (redraw self)
+    (unless visualize?
+      (set! image-valid? #f))
     (if replay?
         (invalidate-view self)
       (set-uptodate? self #f)))
@@ -573,10 +612,24 @@
     ;; quick solution
     (let ((interface (current-interface)))
       (unless (eq? self (child interface 'timeline))
-        (draw-view self surface #f))))
+        (with-bounds self
+          (lambda (from to)
+            (let ((image-surface (cache-image-surface self)))
+              (when (not image-valid?)
+                (draw-view self image-surface from to #f)
+                (set! image-valid? #t))
+              (blit-surface surface image-surface)
+              (plot-now self surface from to)))))))
+  
+  
+  (method package (draw-view-data self surface <Surface> data)
+    (with-bounds self
+      (lambda (from to)
+        (draw-view self surface from to data)
+        (plot-now self surface from to))))
 
 
-  (method package (draw-view self surface <Surface> data)
+  (method package (draw-view self surface <Surface> from <fl> to <fl> data)
     (clear surface)
     (fill-rect surface (new Rect 0 0 (get-width self) (get-height self)) {Color red: .000 green: .000 blue: .000 alpha: .450})
     (draw-timeline self surface)
@@ -594,7 +647,7 @@
                 (chronology-duration #f)
                 (evolution-duration #f)
                 (highlight-duration #f)
-                (now-duration #f))
+                (nowinfo-duration #f))
             (set! labels '())
             (set! discards '())
             (set! missings '())
@@ -610,27 +663,26 @@
             ;; chronology
             (let ((timer (new Timer)))
               (when (or (not together?) (not live?))
-                (unless (or full-mode? visualize?)
+                (unless full-mode?
                   (plot-chronology self surface from to)))
               (set! chronology-duration (real-duration timer)))
             ;; evolution
             (let ((timer (new Timer)))
-              (unless (or full-mode? visualize?)
-                (plot-evolution self surface from to))
+              (plot-evolution self surface from to)
               (set! evolution-duration (real-duration timer)))
             ;; highlight
             (let ((timer (new Timer)))
               (plot-highlight self surface from to)
               (set! highlight-duration (real-duration timer)))
-            ;; now
+            ;; nowinfo
             (let ((timer (new Timer)))
-              (plot-now self surface from to)
-              (set! now-duration (real-duration timer)))
+              (plot-nowinfo self surface from to)
+              (set! nowinfo-duration (real-duration timer)))
             ;; info
-            (plot-info self surface history-duration chronology-duration evolution-duration highlight-duration now-duration (real-duration timer)))))))
+            (plot-info self surface history-duration chronology-duration evolution-duration highlight-duration nowinfo-duration (real-duration timer)))))))
   
   
-  (method (plot-info self surface <Surface> history-duration chronology-duration evolution-duration highlight-duration now-duration duration)
+  (method (plot-info self surface <Surface> history-duration chronology-duration evolution-duration highlight-duration nowinfo-duration duration)
     (set-font surface {Font Label})
     (when tier
       (let ((title tier))
@@ -659,7 +711,7 @@
                              (present-seconds chronology-duration)
                              (present-seconds evolution-duration)
                              (present-seconds highlight-duration)
-                             (present-seconds now-duration))))
+                             (present-seconds nowinfo-duration))))
           (let ((width (get-width self))
                 (extent (get-text-extent surface title)))
             (draw-text surface (- width (get-width extent) 5) 17 title timeline-text-color))))))
@@ -1151,8 +1203,24 @@
         ;; line
         (set-color surface {Color White})
         (set-line-width surface 1.5)
-        (move-to surface h 0)
-        (line-to surface h height)
+        (move-to surface h 1)
+        (line-to surface h (- height 1))
+        ;; text
+        (let ((height (cast <fl> (get-height self))))
+          (let ((s (format "{r precision: 3}" (if together? (- now base-time) (- now (floor kernel-boot)))))
+                (v (/ height 2.)))
+            (let ((width (get-text-width surface s)))
+              (let ((h (if (< h 60) (+ (fxround h) 4) (- (fxround h) width 4)))
+                    (v (- (+ (fxround v) 1) 9)))
+                (set-font surface {Font Label})
+                (draw-text surface h v s text-color))))))))
+  
+  
+  (method (plot-nowinfo self surface <Surface> from <fl> to <fl>)
+    (when (and now (not live?))
+      (let ((h (when->h self from to span now))
+            (height (cast <fl> (get-height self)))
+            (text-color {Color Light-Gray}))
         ;; evolution
         (unless (or full-mode? visualize?)
           (when evolution-left
@@ -1167,15 +1235,6 @@
               (set-line-width surface 1.)
               (move-to surface h 0)
               (line-to surface h height))))
-        ;; time
-        (let ((height (cast <fl> (get-height self))))
-          (let ((s (format "{r precision: 3}" (if together? (- now base-time) (- now (floor kernel-boot)))))
-                (v (/ height 2.)))
-            (let ((width (get-text-width surface s)))
-              (let ((h (if (< h 60) (+ (fxround h) 4) (- (fxround h) width 4)))
-                    (v (- (+ (fxround v) 1) 9)))
-                (set-font surface {Font Label})
-                (draw-text surface h v s text-color)))))
         ;; labels
         (for-each (lambda (label)
                     (bind (v . text) label
