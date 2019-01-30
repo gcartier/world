@@ -136,19 +136,23 @@
 
 
 (definition protected (new-world-video)
-  (let ((input-src (if (not video-stream)
-                       (new Camera-Video-Src
-                         resolution: video-resolution
-                         framerate: video-framerate
-                         bitrate: video-bitrate
-                         codec: video-codec)
-                     (new File-Stream-Video-Src
-                       video-stream)))
+  (let ((input-src (cond (video-stream
+                          (new File-Stream-Video-Src
+                            video-stream))
+                         (image-stream
+                          (new Image-Stream-Video-Src
+                            image-stream))
+                         (else
+                          (new Camera-Video-Src
+                            resolution: video-resolution
+                            framerate: video-framerate
+                            bitrate: video-bitrate
+                            codec: video-codec))))
         (server-sink (new Stream-Sink
                        consumer: (lambda (buffer timestamp duration)
                                    (let ((video (current-video)))
                                      (send-camera-video video buffer timestamp duration)))))
-        (self-sink (and (not video-stream)
+        (self-sink (and (not streaming?)
                         (new Stream-Sink
                           consumer: (lambda (buffer timestamp duration)
                                       (let ((video (current-video)))
@@ -175,6 +179,8 @@
   (slot inputs            getter generate)
   (slot outputs           getter generate)
   (slot ordered-outputs   getter generate)
+  ;; quicky to test
+  (slot extra-outputs     getter generate)
   (slot fullscreen-output accessors generate)
   (slot self-output       getter generate)
   (slot camera-mutex      getter generate)
@@ -187,6 +193,7 @@
     (set! self.inputs (make-table test: equal?))
     (set! self.outputs (make-table test: equal?))
     (set! ordered-outputs '())
+    (set! extra-outputs '())
     (set! fullscreen-output #f)
     (set! self-output #f)
     (set! camera-mutex (make-mutex 'camera))
@@ -201,14 +208,16 @@
   (method package (start self)
     (unless (and streaming?
                  audio-stream
-                 (not video-stream))
+                 (not video-stream)
+                 (not image-stream))
       (start input)))
   
   
   (method package (stop self)
     (unless (and streaming?
                  audio-stream
-                 (not video-stream))
+                 (not video-stream)
+                 (not image-stream))
       (release input)))
   
   
@@ -317,6 +326,14 @@
     (table-set! outputs id output))
   
   
+  ;; quicky for tests
+  (method package (register-extra-output self output)
+    (set! extra-outputs (cons output extra-outputs)))
+  ;; quicky for tests
+  (method package (unregister-extra-output self output)
+    (set! extra-outputs (remove output extra-outputs)))
+  
+  
   (method package (entity-output self id (position: position #f) (size: size #f) (resolution: resolution #f) (layout: layout #f) (codec: codec #f))
     (or (table-ref outputs id #f)
         (let ((entity (find-entity id)))
@@ -353,6 +370,17 @@
                              codec: (or codec video-codec)
                              alpha-overlay: video-alpha
                              overlay?: video-overlay?))
+                          ((circle)
+                           (new Circle-Video-Sink
+                             id
+                             player
+                             resolution: (if (not id) self-resolution (or resolution video-resolution))
+                             framerate: video-framerate
+                             bitrate: video-bitrate
+                             codec: (or codec video-codec)
+                             alpha-overlay: video-alpha
+                             overlay?: video-overlay?
+                             process?: id))
                           (else
                            (new Sheet-Video-Sink
                              id
@@ -397,6 +425,7 @@
   (method package (close-output self id output (layout?: layout? #t))
     (table-clear outputs id)
     (set! ordered-outputs (remove! output ordered-outputs))
+    (set! extra-outputs (remove! output extra-outputs))
     (when (eq? output self-output)
       (set! self-output #f))
     (when (eq? output fullscreen-output)
@@ -472,7 +501,8 @@
             (when fullscreen-output
               (render fullscreen-output)))
         ;; use ordered-outputs so order is stable
-        (for-each render ordered-outputs))))
+        (for-each render ordered-outputs)
+        (for-each render extra-outputs))))
   
   
   (method package (render-minis self)
@@ -1092,7 +1122,7 @@
   
   (method override (start-element self)
     (nextmethod self)
-    (set! file (new-file {Directory Settings} (list "stream" (add-extension location "streamvideo"))))
+    (set! file (new-file {Directory Settings} (list "streams" (add-extension location "streamvideo"))))
     (set! port (open-input-file (path-settings file)))
     (task-start self 'stream))
   
@@ -1124,6 +1154,124 @@
                       (site (stream on?: #t)
                         (consume sink buffer timestamp duration)))))))
             (iter)))))))
+
+
+;;;
+;;;; Draw-Video-Src
+;;;
+
+
+(class Draw-Video-Src extends Video-Src
+  
+  
+  (slot resolution initialize #f accessors generate)
+  (slot context    initialize #f accessors generate)
+  
+  
+  (method override (initialize self)
+    (nextmethod self)
+    (set! self.resolution video-resolution))
+  
+  
+  (method override (start-element self)
+    (nextmethod self)
+    (let ((width (get-width video-resolution))
+          (height (get-height video-resolution)))
+      (set! context (new Draw-Context width height video-framerate video-bitrate)))
+    (task-start self 'draw))
+  
+  
+  (method override (stop-element self)
+    (nextmethod self)
+    (task-stop self)
+    (close context)
+    (set! context #f))
+  
+  
+  (method override (video-loop self task)
+    (declare (proper-tail-calls))
+    (let ((tier (current-client)))
+      (with-task task
+        (lambda (exit)
+          (let (iter)
+            (when (running? task)
+              (let ((surface (get-surface context)))
+                (draw-stream self surface)
+                (receive (color alpha timestamp duration) (extract context)
+                  (site (stream on?: #t)
+                    (consume sink color timestamp duration)))))
+            (sleep 1.)
+            (iter))))))
+  
+  
+  (method protected virtual (draw-stream self surface)
+    (clear surface)))
+
+
+;;;
+;;;; Image-Stream-Video-Src
+;;;
+
+
+(class Image-Stream-Video-Src extends Draw-Video-Src
+  
+  
+  (slot location  getter generate)
+  (slot live?     getter generate)
+  (slot file      getter generate)
+  (slot color     getter generate)
+  (slot alpha     getter generate)
+  (slot timestamp getter generate)
+  (slot duration  getter generate)
+  
+  
+  (method override (initialize self location (live?: live? #t))
+    (nextmethod self)
+    (set! self.location location)
+    (set! self.live? live?)
+    (set! self.file (new-file {Directory Settings} (list "images" location)))
+    (set! self.color #f)
+    (set! self.alpha #f)
+    (set! self.timestamp #f)
+    (set! self.duration #f))
+  
+  
+  (method (extract/cache self)
+    (if color
+        (values color alpha timestamp duration)
+      (let ((surface (get-surface context)))
+        (draw-stream self surface)
+        (receive (color alpha timestamp duration) (extract context)
+          (set! self.color color)
+          (set! self.alpha alpha)
+          (set! self.timestamp timestamp)
+          (set! self.duration duration)
+          (values color alpha timestamp duration)))))
+  
+  
+  (method override (video-loop self task)
+    (declare (proper-tail-calls))
+    (let ((tier (current-client)))
+      (with-task task
+        (lambda (exit)
+          (let (iter)
+            (when (running? task)
+              (receive (color alpha timestamp duration) (extract/cache self)
+                (site (stream on?: #t)
+                  (consume sink color timestamp duration))))
+            (if (not live?)
+                (begin
+                  (consume sink #f #f #f)
+                  (continuation-return exit #f))
+              (sleep 1.)
+              (iter)))))))
+  
+  
+  (method override (draw-stream self surface)
+    (fill-image surface
+                (new Rect 0 0 (get-width resolution) (get-height resolution))
+                (new Image moniker: file)
+                mode: 'fill)))
 
 
 ;;;
@@ -1730,8 +1878,6 @@
       (set! sheet #f)))
   
   
-  ;; probably have a subclass in together that understand
-  ;; about the various process-states
   (method package (change-draw-mode self mode)
     (unless (eq? mode draw-mode)
       (set! draw-mode mode)
@@ -1784,6 +1930,117 @@
 
 
 ;;;
+;;;; Circle-Video-Sink
+;;;
+
+
+(definition protected circle-count
+  10)
+
+
+(definition protected (circle-distance)
+  (case circle-count
+    ((3)  1.)
+    ((4)  1.5)
+    ((5)  2.)
+    ((6)  1.5)
+    ((10) 1.6)
+    ((100) 7.)
+    (else 3.15)))
+
+
+(definition protected quicky-n
+  0)
+
+(definition protected (next-quicky-n!)
+  (prog1 quicky-n
+    (increase! quicky-n)))
+
+
+(class Circle-Video-Sink extends Video-Sink
+  
+  
+  (slot id         initialize #f accessors generate)
+  (slot player     initialize #f accessors generate)
+  (slot pane       initialize #f accessors generate)
+  (slot matrix     initialize #f accessors generate)
+  (slot draw-mode  initialize #f accessors generate)
+  (slot draw-mutex initialize #f accessors generate)
+  (slot last-color initialize #f accessors generate)
+  
+  
+  (method override (initialize self id entity . rest)
+    (apply nextmethod self rest)
+    (let ((world (current-world)))
+      (let ((p (new World-Pane
+                 title: "Player"
+                 size: (new Dimension$fl$ 1. .5625)
+                 resolution: resolution)))
+        (set! self.id id)
+        (set! self.player entity)
+        (set! self.pane p)
+        (set! self.matrix (copy-matrix (make-circle-matrix (next-quicky-n!))))
+        (set! self.draw-mode 'draw)
+        (set! self.draw-mutex (make-mutex 'draw))
+        (set! self.last-color #f))))
+  
+  
+  (method override (release-element self)
+    (nextmethod self)
+    (when pane
+      (glDeleteTextures* (get-id (get-texture (cache-quad-texture pane))))
+      (set! pane #f)))
+  
+  
+  (method package (change-draw-mode self mode)
+    (unless (eq? mode draw-mode)
+      (set! draw-mode mode)
+      ;; super quick try
+      (when last-color
+        (parameterize ((testing? #t)) ;; oh boy fix me!
+        (draw self last-color #f #f #f)))))
+  
+  
+  (method override (draw self color alpha timestamp duration)
+    (mutex-lock! draw-mutex)
+    (when (or (eq? draw-mode 'draw) (testing?))
+      (let ((texture (get-texture (cache-quad-texture pane))))
+        (update self color alpha texture))
+      (set! last-color color))
+    (when id
+      (record-event udp-id-draw-video
+                    (fixnum->flonum client-no)
+                    (fixnum->flonum world.udp:udp-video)
+                    -1.
+                    -1.
+                    -1.
+                    (if (not timestamp)
+                        -1.
+                      (timestamp->flonum timestamp))))
+    (mutex-unlock! draw-mutex))
+  
+  
+  (method override (add-overlay self color alpha texture)
+    (when (and id (neq? draw-mode 'draw))
+      (case draw-mode
+        ((freeze)
+         (when world.udp:udp-freeze-overlay
+           (fill-rect (get-surface texture) (size-rect resolution) world.udp:udp-freeze-overlay)))
+        ((wait)
+         (when world.udp:udp-wait-overlay
+           (fill-rect (get-surface texture) (size-rect resolution) world.udp:udp-wait-overlay))))))
+  
+  
+  (method override (render self)
+    (when (eq? stream-state 'drawn)
+    ;; QUICKY
+    (when pane
+      (render-texture (cache-quad-texture pane) matrix)
+      @not-needed-i-think
+      (render-pane pane matrix)))))
+
+
+;;;
 ;;;; Test
 ;;;
 
@@ -1818,6 +2075,8 @@
             (set-elements pipeline (append (get-elements pipeline) (list audio-sink))))
           (register-input video name video-src)
           (register-output video name video-sink)
+          (register-extra-output video video-sink)
+          (set-stream-state video-sink 'on)
           (start pipeline)
           pipeline)))))
 
@@ -1883,24 +2142,35 @@
 
 
 (definition protected (make-circle-videos)
-  (let ((count 15))
-    (loop (for n from 0 below count)
-          (collect (let ((name (string->symbol (format "circle{a}" n)))
-                         (size #f)
-                         (resolution {Dimension 300 200})
-                         (framerate (cond-expand (unix 25) (else 30)))
-                         (bitrate video-bitrate)
-                         (codec 'none))
-                     (make-texture-pipeline name size resolution framerate codec
-                       (new Test-Video-Src
-                         resolution: resolution
-                         framerate: framerate
-                         bitrate: bitrate
-                         codec: codec)
-                       (copy-matrix (matrix-multiply& (make-translation-matrix (vertex 0. 7. 0.))
-                                                      (make-scaling-matrix (vertex 6. 6. 6.))
-                                                      (make-rotation-matrix (vertex 0. 1. 0.) (* (/ PI*2 (cast <fl> count)) (cast <fl> n)))
-                                                      (make-translation-matrix (vertex 0. 0. 4.))))))))))
+  (let ((count circle-count))
+    (loop (for n from 4 below count)
+          (collect (make-circle-video #f n)))))
+
+
+(definition protected (make-circle-video location n)
+  (let ((name (string->symbol (format "circle{a}" n)))
+        (size @w #f (new Dimension$fl$ 1. .5625))
+        (resolution {Dimension 640 360})
+        (framerate (cond-expand (unix 25) (else 30)))
+        (bitrate video-bitrate)
+        (codec video-codec @w 'none))
+    (make-texture-pipeline name size resolution framerate codec
+      (if location
+          (new Image-Stream-Video-Src
+            location)
+        (new Test-Video-Src
+          resolution: resolution
+          framerate: framerate
+          bitrate: bitrate
+          codec: codec))
+      (copy-matrix (make-circle-matrix n)))))
+
+
+(definition (make-circle-matrix n)
+  (matrix-multiply&
+    (make-scaling-matrix (vertex 10. 10. 10.))
+    (make-rotation-matrix (vertex 0. 1. 0.) (* (/ PI*2 (cast <fl> circle-count)) (cast <fl> n)))
+    (make-translation-matrix (vertex 0. 0. (circle-distance)))))
 
 
 (definition (random-name!)
@@ -1983,15 +2253,17 @@
               (display-message world (format "{a} left" name)))))))))
 
 
-(definition (close-pipelines pipelines)
+(definition protected (close-pipeline pipeline)
   (let ((video (current-video)))
-    (for-each stop pipelines)
-    (for-each (lambda (pipeline)
-                (bind (input output) (get-elements pipeline)
-                  (let ((id (table-find (get-outputs video) output)))
-                    (close-input video id input)
-                    (close-output video id output))))
-              pipelines)))
+    (stop pipeline)
+    (bind (input output) (get-elements pipeline)
+      (let ((id (table-find (get-outputs video) output)))
+        (close-input video id input)
+        (close-output video id output)))))
+
+
+(definition protected (close-pipelines pipelines)
+  (for-each close-pipeline pipelines))
 
 
 (definition protected (video-test7)

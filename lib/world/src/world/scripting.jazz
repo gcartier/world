@@ -36,6 +36,7 @@
         (world.pane)
         (world.scriptum)
         (world.sound)
+        (world.stream)
         (world.task))
 
 
@@ -103,45 +104,6 @@
 ;;;
 
 
-;; quantization
-;; chroma subsampling
-
-;; input 3686400
-;; output first frame
-;; quantizer=10 131874
-;; quantizer=20 131865
-;; quantizer=21 131865 (default)
-;; quantizer=30 70973
-;; quantizer=40 24978
-;; quantizer=50 6898
-
-;; just tune=zerolatency results in a beautiful image
-;; with almost no latency but very high cpu usage but
-;; adding speed-preset=superfast reduces cpu usage a lot
-
-
-(class Draw-Context extends Object
-  
-  
-  (slot surface        getter generate)
-  (slot color-pipeline getter generate)
-  (slot alpha-pipeline getter generate)
-  
-  
-  (method override (initialize self width height framerate bitrate)
-    (nextmethod self)
-    (set! surface (new Image-Surface (new Dimension width height)))
-    (set! color-pipeline (make-color-pipeline width height framerate bitrate))
-    (set! alpha-pipeline (make-alpha-pipeline width height framerate bitrate)))
-  
-  
-  (method override (destroy self)
-    (close surface)
-    (gst_element_release color-pipeline)
-    (gst_element_release alpha-pipeline)
-    (nextmethod self)))
-
-
 (definition protected draw-contexts
   (make-table test: eq?))
 
@@ -158,30 +120,6 @@
     (when context
       (close context)
       (table-clear draw-contexts entity))))
-
-
-(definition (make-color-pipeline width height framerate bitrate)
-  (let ((pipeline (gst-launch "appsrc name=src"
-                              "videoconvert name=convert"
-                              (tie "video/x-raw, format=I420, width={width}, height={height}, framerate={framerate}/1")
-                              (tie "x264enc pass=qual quantizer=20 bitrate={bitrate} tune=zerolatency speed-preset=superfast name=enc")
-                              "appsink name=sink")))
-    (let ((src (gst_bin_get_by_name pipeline "src"))
-          (sink (gst_bin_get_by_name pipeline "sink")))
-      (gst-setup-source src "video/x-raw" "BGRA" width height framerate)
-      (gst_element_set_state pipeline GST_STATE_PLAYING))
-    pipeline))
-
-
-(definition (make-alpha-pipeline width height framerate bitrate)
-  (let ((pipeline (gst-launch "appsrc name=src"
-                              (tie "x264enc pass=qual quantizer=20 bitrate={bitrate} tune=zerolatency speed-preset=superfast name=enc")
-                              "appsink name=sink")))
-    (let ((src (gst_bin_get_by_name pipeline "src"))
-          (sink (gst_bin_get_by_name pipeline "sink")))
-      (gst-setup-source src "video/x-raw" "I420" width height framerate)
-      (gst_element_set_state pipeline GST_STATE_PLAYING))
-    pipeline))
 
 
 (definition public (%%draw proc background slide?)
@@ -218,64 +156,17 @@
 
 
 (definition (broadcast-draw entity context background slide?)
-  (let ((width 1280)
-        (height 720))
-    (let ((start (real-time))
-          (surface (get-surface context))
-          (color-pipeline (get-color-pipeline context))
-          (alpha-pipeline (get-alpha-pipeline context))
-          (pixels (* width height)))
-      (let ((color-src (gst_bin_get_by_name color-pipeline "src"))
-            (color-sink (gst_bin_get_by_name color-pipeline "sink"))
-            (alpha-src (gst_bin_get_by_name alpha-pipeline "src"))
-            (alpha-sink (gst_bin_get_by_name alpha-pipeline "sink")))
-        ;; feed drawing into src
-        (let ((data (cairo_image_surface_get_data (get-handle surface)))
-              (size (* pixels 4))
-              (alpha-size (/ (* pixels 12) 8))
-              (timestamp 0)
-              (duration 100))
-          (let ((color-buffer (make-u8vector size))
-                (color-info (make-u64vector 2))
-                (color-bytes #f)
-                (alpha-buffer (make-u8vector alpha-size))
-                (alpha-info (make-u64vector 2))
-                (alpha-bytes #f)
-                (alpha-data (heap-calloc alpha-size 1)))
-            (separate-alpha data alpha-data pixels)
-            (gst_app_src_write4 color-src data size timestamp duration)
-            (gst_app_src_write4 alpha-src alpha-data alpha-size timestamp duration)
-            ;; retrieve frames from sink
-            (let (loop)
-              (when (not color-bytes)
-                (let ((size (gst_app_sink_read color-sink color-buffer color-info)))
-                  (when (/= size -1)
-                    (set! color-bytes size))))
-              (when (not alpha-bytes)
-                (let ((size (gst_app_sink_read alpha-sink alpha-buffer alpha-info)))
-                  (when (/= size -1)
-                    (set! alpha-bytes size))))
-              (if (and color-bytes alpha-bytes)
-                  (let ((timestamp (u64vector-ref color-info 0))
-                        (duration (u64vector-ref color-info 1)))
-                    ;(debug (- (real-time) start) color-bytes alpha-bytes)
-                    (broadcast-processor-draw (current-tier) (get-id entity) (subu8vector color-buffer 0 color-bytes) (subu8vector alpha-buffer 0 alpha-bytes) timestamp duration background slide?))
-                (sleep .001)
-                (loop)))))))))
+  (receive (color alpha timestamp duration) (extract context)
+    (broadcast-processor-draw (current-tier) (get-id entity) color alpha timestamp duration background slide?)))
 
 
 (definition package (rebroadcast-draws)
   (iterate-table draw-contexts
     (lambda (entity context)
-      (let ((color-pipeline (get-color-pipeline context))
-            (alpha-pipeline (get-alpha-pipeline context)))
-        ;; reset pipelines
-        (gst_element_set_state color-pipeline GST_STATE_READY)
-        (gst_element_set_state color-pipeline GST_STATE_PLAYING)
-        (gst_element_set_state alpha-pipeline GST_STATE_READY)
-        (gst_element_set_state alpha-pipeline GST_STATE_PLAYING)
-        ;; broadcast surface
-        (broadcast-draw entity context #f #f)))))
+      ;; reset pipelines
+      (reset context)
+      ;; broadcast surface
+      (broadcast-draw entity context #f #f))))
 
 
 ;;;

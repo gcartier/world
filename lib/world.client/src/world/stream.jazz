@@ -14,7 +14,12 @@
 (module world.stream jazz
 
 
-(import (world)
+(import (jazz.cairo)
+        (jazz.graphic)
+        (jazz.platform)
+        (jazz.stream)
+        (jazz.syntax (phase syntax))
+        (world)
         (world.context)
         (world.settings))
 
@@ -27,6 +32,9 @@
 
 (definition protected media-stream
   (world-setting 'world.media-stream #f))
+
+(definition protected image-stream
+  (world-setting 'world.image-stream #f))
 
 
 (definition protected streaming?
@@ -58,4 +66,123 @@
            (let ((headers (list (list b1 t1 d1)
                                 (list b2 t2 d2)
                                 (list b3 t3 d3))))
-             (object->u8vector headers)))))))))
+             (object->u8vector headers))))))))
+
+
+;;;
+;;;; Draw
+;;;
+
+
+;; quantization
+;; chroma subsampling
+
+;; input 3686400
+;; output first frame
+;; quantizer=10 131874
+;; quantizer=20 131865
+;; quantizer=21 131865 (default)
+;; quantizer=30 70973
+;; quantizer=40 24978
+;; quantizer=50 6898
+
+;; just tune=zerolatency results in a beautiful image
+;; with almost no latency but very high cpu usage but
+;; adding speed-preset=superfast reduces cpu usage a lot
+
+
+(class Draw-Context extends Object
+  
+  
+  (slot surface        getter generate)
+  (slot color-pipeline getter generate)
+  (slot alpha-pipeline getter generate)
+  
+  
+  (method override (initialize self width height framerate bitrate)
+    (nextmethod self)
+    (set! surface (new Image-Surface (new Dimension width height)))
+    (set! color-pipeline (make-color-pipeline width height framerate bitrate))
+    (set! alpha-pipeline (make-alpha-pipeline width height framerate bitrate)))
+  
+  
+  (method override (destroy self)
+    (close surface)
+    (gst_element_release color-pipeline)
+    (gst_element_release alpha-pipeline)
+    (nextmethod self))
+  
+  
+  (method public (extract self)
+    (let ((width 640 @w 1280)
+          (height 360 @w 720))
+      (let ((start (real-time))
+            (pixels (* width height)))
+        (let ((color-src (gst_bin_get_by_name color-pipeline "src"))
+              (color-sink (gst_bin_get_by_name color-pipeline "sink"))
+              (alpha-src (gst_bin_get_by_name alpha-pipeline "src"))
+              (alpha-sink (gst_bin_get_by_name alpha-pipeline "sink")))
+          ;; feed drawing into src
+          (let ((data (cairo_image_surface_get_data (get-handle surface)))
+                (size (* pixels 4))
+                (alpha-size (/ (* pixels 12) 8))
+                (timestamp 0)
+                (duration 100))
+            (let ((color-buffer (make-u8vector size))
+                  (color-info (make-u64vector 2))
+                  (color-bytes #f)
+                  (alpha-buffer (make-u8vector alpha-size))
+                  (alpha-info (make-u64vector 2))
+                  (alpha-bytes #f)
+                  (alpha-data (heap-calloc alpha-size 1)))
+              (separate-alpha data alpha-data pixels)
+              (gst_app_src_write4 color-src data size timestamp duration)
+              (gst_app_src_write4 alpha-src alpha-data alpha-size timestamp duration)
+              ;; retrieve frames from sink
+              (let (loop)
+                (when (not color-bytes)
+                  (let ((size (gst_app_sink_read color-sink color-buffer color-info)))
+                    (when (/= size -1)
+                      (set! color-bytes size))))
+                (when (not alpha-bytes)
+                  (let ((size (gst_app_sink_read alpha-sink alpha-buffer alpha-info)))
+                    (when (/= size -1)
+                      (set! alpha-bytes size))))
+                (if (and color-bytes alpha-bytes)
+                    (let ((timestamp (u64vector-ref color-info 0))
+                          (duration (u64vector-ref color-info 1)))
+                      ;(debug (- (real-time) start) color-bytes alpha-bytes)
+                      (values (subu8vector color-buffer 0 color-bytes) (subu8vector alpha-buffer 0 alpha-bytes) timestamp duration))
+                  (sleep .001)
+                  (loop)))))))))
+  
+  
+  (method protected (reset self)
+    (gst_element_set_state color-pipeline GST_STATE_READY)
+    (gst_element_set_state color-pipeline GST_STATE_PLAYING)
+    (gst_element_set_state alpha-pipeline GST_STATE_READY)
+    (gst_element_set_state alpha-pipeline GST_STATE_PLAYING)))
+
+
+(definition (make-color-pipeline width height framerate bitrate)
+  (let ((pipeline (gst-launch "appsrc name=src"
+                              "videoconvert name=convert"
+                              (tie "video/x-raw, format=I420, width={width}, height={height}, framerate={framerate}/1")
+                              (tie "x264enc pass=qual quantizer=20 bitrate={bitrate} tune=zerolatency speed-preset=superfast name=enc")
+                              "appsink name=sink")))
+    (let ((src (gst_bin_get_by_name pipeline "src"))
+          (sink (gst_bin_get_by_name pipeline "sink")))
+      (gst-setup-source src "video/x-raw" "BGRA" width height framerate)
+      (gst_element_set_state pipeline GST_STATE_PLAYING))
+    pipeline))
+
+
+(definition (make-alpha-pipeline width height framerate bitrate)
+  (let ((pipeline (gst-launch "appsrc name=src"
+                              (tie "x264enc pass=qual quantizer=20 bitrate={bitrate} tune=zerolatency speed-preset=superfast name=enc")
+                              "appsink name=sink")))
+    (let ((src (gst_bin_get_by_name pipeline "src"))
+          (sink (gst_bin_get_by_name pipeline "sink")))
+      (gst-setup-source src "video/x-raw" "I420" width height framerate)
+      (gst_element_set_state pipeline GST_STATE_PLAYING))
+    pipeline)))
