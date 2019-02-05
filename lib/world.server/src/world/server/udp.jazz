@@ -95,17 +95,31 @@
   ;;;
   
   
-  (method package (find-server-channel self origin media-kind)
-    (let ((key (cons origin media-kind)))
+  (method package (find-server-channel self channel-no origin media-kind)
+    (let ((key (if (= channel-no -1)
+                   (cons origin media-kind)
+                 channel-no)))
       (table-ref server-channels key #f)))
   
   
   (method package (require-server-channel self origin media-kind)
     (let ((key (cons origin media-kind)))
       (or (table-ref server-channels key #f)
-          (let ((channel (new UDP-Server-Channel origin media-kind)))
+          (let ((channel (new UDP-Server-Channel #f origin media-kind #f)))
             (table-set! server-channels key channel)
             channel))))
+  
+  
+  (method package (register-server-channel self no channel)
+    (table-set! server-channels no channel))
+  
+  
+  (method package (close-server-channel self no)
+    (let ((channel (table-ref server-channels no #f)))
+      ;; lets be robust for now
+      (when channel
+        (close channel)
+        (table-clear server-channels no))))
   
   
   ;;;
@@ -228,37 +242,44 @@
   
   
   (method (receive-nack self data)
-    (let ((origin (read-udp-origin data))
+    (let ((channel-no (read-udp-channel data))
+          (origin (read-udp-origin data))
           (media-kind (read-udp-nack-media-kind data))
           (missing (u8vector->object (read-udp-nack-missing data))))
-      (send-missing self origin media-kind missing)))
+      (send-missing self channel-no origin media-kind missing)))
   
   
   (method (receive-media self kind data)
-    (let ((origin (read-udp-origin data)))
-      (let ((channel (require-server-channel self origin kind)))
-        (retain-media channel data)
-        (broadcast-media self origin kind data)
-        (let ((frame (read-udp-frame data))
-              (last-nacked-frame (get-last-nacked-frame channel)))
-          (when (or (not last-nacked-frame)
-                    (> frame last-nacked-frame))
-            (send-nacks self origin kind channel)
-            (set-last-nacked-frame channel frame))))))
+    (let ((channel-no (read-udp-channel data))
+          (origin (read-udp-origin data)))
+      (let ((channel (if (= channel-no -1)
+                       (require-server-channel self origin kind)
+                     (find-server-channel self channel-no origin kind))))
+        (when channel
+          (retain-media channel data)
+          (broadcast-media self channel-no origin kind data)
+          (let ((frame (read-udp-frame data))
+                (last-nacked-frame (get-last-nacked-frame channel)))
+            (when (or (not last-nacked-frame)
+                      (> frame last-nacked-frame))
+              (send-nacks self channel-no origin kind channel)
+              (set-last-nacked-frame channel frame)))))))
   
   
-  (method (send-nacks self origin kind channel)
+  (method (send-nacks self channel-no origin kind channel)
     (let ((missing (collect-missing channel)))
       (unless (null? missing)
         (let ((source-info (udp-source-socket-info udp-port)))
           (let ((source-host (socket-info-address source-info))
                 (source-port (socket-info-port-number source-info)))
             (let ((connection (host/port->connection self source-host source-port)))
-              (send-nack self connection origin kind missing)))))))
+              (send-nack self connection channel-no origin kind missing)))))))
   
   
-  (method (send-missing self origin media-kind missing)
-    (let ((channel (require-server-channel self origin media-kind)))
+  (method (send-missing self channel-no origin media-kind missing)
+    (let ((channel (if (= channel-no -1)
+                       (require-server-channel self origin media-kind)
+                     (find-server-channel self channel-no origin media-kind))))
       (let ((ring (get-retain-ring channel)))
         (for-each (lambda (sequence)
                     (let ((data (locate-data ring sequence)))
@@ -292,7 +313,7 @@
                   missing))))
   
   
-  (method (send-nack self connection origin media-kind missing)
+  (method (send-nack self connection channel-no origin media-kind missing)
     (when udp-show-nacks?
       (terminal remote-name (present-media-kind media-kind) '***send-nack*** missing))
     (let ((missing-vector (object->u8vector missing)))
@@ -301,6 +322,7 @@
           (write-udp-sent data (current-seconds))
           (write-udp-kind data udp-nack)
           (write-udp-origin data origin)
+          (write-udp-channel data channel-no)
           (write-udp-nack-media-kind data media-kind)
           (write-udp-nack-missing data missing-vector)
           (send-data self connection data)))))
@@ -338,7 +360,7 @@
                       (get-members group)))))))
   
   
-  (method (broadcast-media self origin kind data)
+  (method (broadcast-media self channel-no origin kind data)
     (let ((delegate (find-delegate-by-no (current-server) origin)))
       (when delegate
         (let ((group (get-group delegate)))
@@ -439,13 +461,15 @@
 (class UDP-Server-Channel extends UDP-Channel
   
   
+  (slot recipient         getter generate)
   (slot last-nacked-frame accessors generate)
   (slot retain-ring       getter generate)
   (slot release-task      getter generate)
   
   
-  (method override (initialize self origin media-kind)
-    (nextmethod self origin media-kind)
+  (method override (initialize self no origin media-kind recipient)
+    (nextmethod self no origin media-kind)
+    (set! self.recipient recipient)
     (set! self.last-nacked-frame #f)
     (set! self.retain-ring (new UDP-Ring origin media-kind udp-retain-size max-size: udp-retain-max-size overflow-proc: (udp-ring-overflow 'retain udp-ring-kind-retain)))
     (unless (simulation?)

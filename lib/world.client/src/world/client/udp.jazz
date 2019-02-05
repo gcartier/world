@@ -271,17 +271,25 @@
   ;;;
   
   
-  (method public (find-send-channel self media-kind)
-    (let ((key media-kind))
+  (method public (find-send-channel self channel-no media-kind)
+    (let ((key (if (= channel-no -1)
+                   media-kind
+                 channel-no)))
       (table-ref send-channels key #f)))
   
   
   (method package (require-send-channel self media-kind)
     (let ((key media-kind))
       (or (table-ref send-channels key #f)
-          (let ((channel (new UDP-Send-Channel client-no media-kind)))
+          (let ((channel (new UDP-Send-Channel #f client-no media-kind)))
             (table-set! send-channels key channel)
             channel))))
+  
+  
+  (method package (register-send-channel self channel-no media-kind)
+    (let ((channel (new UDP-Send-Channel channel-no client-no media-kind)))
+      (table-set! send-channels channel-no channel)
+      channel))
   
   
   (method package (close-send-channel self media-kind)
@@ -297,21 +305,32 @@
         (close-send-channel self media-kind))))
   
   
-  (method public (find-receive-channel self origin media-kind)
-    (let ((key (cons origin media-kind)))
+  (method public (find-receive-channel self channel-no origin media-kind)
+    (let ((key (if (= channel-no -1)
+                   (cons origin media-kind)
+                 channel-no)))
       (table-ref receive-channels key #f)))
   
   
   (method package (require-receive-channel self origin media-kind)
     (let ((key (cons origin media-kind)))
       (or (table-ref receive-channels key #f)
-          (let ((channel (new UDP-Receive-Channel origin media-kind)))
+          (let ((channel (new UDP-Receive-Channel #f origin media-kind)))
             (table-set! receive-channels key channel)
             channel))))
   
   
-  (method package (close-receive-channel self origin media-kind)
-    (let ((key (cons origin media-kind)))
+  (method package (register-receive-channel self name channel-no origin media-kind resolution)
+    (let ((channel (new UDP-Receive-Channel channel-no origin media-kind)))
+      (table-set! receive-channels channel-no channel)
+      channel))
+  
+  
+  (method package (close-receive-channel self channel-no origin media-kind)
+    (let ((key (if (or (not channel-no)
+                       (= channel-no -1))
+                   (cons origin media-kind)
+                 channel-no)))
       (let ((channel (table-ref receive-channels key #f)))
         (close channel)
         (table-clear receive-channels key))))
@@ -320,8 +339,10 @@
   (method package (close-receive-channels self)
     (iterate-table-safe receive-channels
       (lambda (key channel)
-        (bind (origin . media-kind) key
-          (close-receive-channel self origin media-kind)))))
+        (if (pair? key)
+            (bind (origin . media-kind) key
+              (close-receive-channel self #f origin media-kind))
+          (close-receive-channel self key #f #f)))))
   
   
   ;;;
@@ -329,17 +350,17 @@
   ;;;
   
   
-  (method (send-audio self buffer header? timestamp duration)
-    (send-media self udp-audio buffer header? timestamp duration))
+  (method (send-audio self channel-no buffer header? timestamp duration)
+    (send-media self channel-no udp-audio buffer header? timestamp duration))
   
   
-  (method (send-video self buffer header? timestamp duration)
-    (send-media self udp-video buffer header? timestamp duration))
+  (method (send-video self channel-no buffer header? timestamp duration)
+    (send-media self channel-no udp-video buffer header? timestamp duration))
   
   
-  (method package (send-media self kind buffer header? timestamp duration)
+  (method package (send-media self channel-no kind buffer header? timestamp duration)
     (mutex-lock! write-mutex)
-    (let ((channel (find-send-channel self kind)))
+    (let ((channel (find-send-channel self channel-no kind)))
       (when channel
         (let ()
           (define (send)
@@ -368,6 +389,7 @@
                                 (write-udp-sent data (current-seconds))
                                 (write-udp-kind data kind)
                                 (write-udp-origin data client-no)
+                                (write-udp-channel data channel-no)
                                 (write-udp-sequence data sequence)
                                 (write-udp-frame data frame)
                                 (write-udp-part data part)
@@ -536,7 +558,7 @@
   
   
   (method (maybe-reset-media self reset-origin media-kind last-header)
-    (let ((channel (find-send-channel self media-kind)))
+    (let ((channel (find-send-channel self -1 media-kind)))
       (define (locate-later-header last-header)
         (locate-latest (get-retain-ring channel)
           (lambda (packet)
@@ -660,15 +682,17 @@
   
   
   (method (receive-nack self data)
-    (let ((origin (read-udp-origin data))
+    (let ((channel-no (read-udp-channel data))
+          (origin (read-udp-origin data))
           (media-kind (read-udp-nack-media-kind data))
           (missing (u8vector->object (read-udp-nack-missing data))))
-      (send-missing self origin media-kind missing)))
+      (send-missing self channel-no origin media-kind missing)))
   
   
   (method protected (receive-media self kind data)
-    (let ((origin (read-udp-origin data)))
-      (let ((channel (find-receive-channel self origin kind)))
+    (let ((channel-no (read-udp-channel data))
+          (origin (read-udp-origin data)))
+      (let ((channel (find-receive-channel self channel-no origin kind)))
         (when channel
           (remember-media channel data)
           (insert-media channel data)
@@ -676,19 +700,19 @@
                 (last-nacked-frame (get-last-nacked-frame channel)))
             (when (or (not last-nacked-frame)
                       (> frame last-nacked-frame))
-              (send-nacks self origin kind channel)
+              (send-nacks self channel-no origin kind channel)
               (set-last-nacked-frame channel frame)))))))
   
   
-  (method protected (send-nacks self origin kind channel)
+  (method protected (send-nacks self channel-no origin kind channel)
     (unless (simulation?)
       (let ((missing (collect-missing channel)))
         (unless (null? missing)
-          (send-nack self origin kind missing)))))
+          (send-nack self channel-no origin kind missing)))))
   
   
-  (method (send-missing self origin media-kind missing)
-    (let ((channel (find-send-channel self media-kind)))
+  (method (send-missing self channel-no origin media-kind missing)
+    (let ((channel (find-send-channel self channel-no media-kind)))
       (when channel
         (let ((ring (get-retain-ring channel)))
           (for-each (lambda (sequence)
@@ -744,7 +768,7 @@
       (mutex-unlock! write-mutex)))
   
   
-  (method (send-nack self origin media-kind missing)
+  (method (send-nack self channel-no origin media-kind missing)
     (when udp-show-nacks?
       (terminal remote-name (present-media-kind media-kind) '***send-nack*** missing))
     (mutex-lock! write-mutex)
@@ -754,6 +778,7 @@
           (write-udp-sent data (current-seconds))
           (write-udp-kind data udp-nack)
           (write-udp-origin data origin)
+          (write-udp-channel data channel-no)
           (write-udp-nack-media-kind data media-kind)
           (write-udp-nack-missing data missing-vector)
           (send-data self data))))
@@ -770,7 +795,7 @@
       (for-each (lambda (info)
                   (bind (origin media-kind missing) info
                     (when (= origin client-no)
-                      (let ((channel (find-send-channel self media-kind)))
+                      (let ((channel (find-send-channel self -1 media-kind)))
                         (when channel
                           (let ((ring (get-replay-ring channel)))
                             (for-each (lambda (sequence)
@@ -822,8 +847,8 @@
   (slot release-task   getter generate)
   
   
-  (method override (initialize self origin media-kind)
-    (nextmethod self origin media-kind)
+  (method override (initialize self no origin media-kind)
+    (nextmethod self no origin media-kind)
     (set! self.data-sequence 0)
     (set! self.frame-sequence 0)
     (set! self.last-timestamp #f)
@@ -916,8 +941,8 @@
   (slot missing               getter generate)
   
   
-  (method override (initialize self origin media-kind)
-    (nextmethod self origin media-kind)
+  (method override (initialize self no origin media-kind)
+    (nextmethod self no origin media-kind)
     (set! self.last-nacked-frame #f)
     (set! self.last-processed-header #f)
     (set! self.replay-ring (new Remember-Ring 6000))
@@ -1014,6 +1039,7 @@
           (increase! processed count)
           (let ((kind (read-udp-kind first))
                 (origin (read-udp-origin first))
+                (channel-no (read-udp-channel first))
                 (frame (read-udp-frame first))
                 (total (read-udp-total first))
                 (timestamp (read-udp-media-timestamp first))
@@ -1021,30 +1047,34 @@
                 (header? (read-udp-media-header? first))
                 (off? (read-udp-media-off? first)))
             (define (process-audio)
-              (let ((buffer (assemble-chunks)))
+              (let ((buffer (assemble-chunks))
+                    (output (if (= channel-no -1)
+                                (or (simulation-audio) id)
+                              (cons 'channel channel-no))))
                 (if off?
-                    (receive-audio (current-audio) id #f #f #f)
-                  (let ((output (or (simulation-audio) id)))
-                    (if (and header? (eq? audio-codec 'vorbis))
-                        (let ((headers (u8vector->object buffer)))
-                          (set! replay-header buffer)
-                          (for-each (lambda (header)
-                                      (bind (buffer timestamp duration) header
-                                        ;; be very careful as timestamp is incorrect as it
-                                        ;; is the timestamp at time the header was captured
-                                        ;; this only works because gst_app_src_write3
-                                        ;; doesn't actually use the timestamp
-                                        (receive-audio (current-audio) output buffer timestamp duration)))
-                                    headers))
-                      (receive-audio (current-audio) output buffer timestamp duration)))
+                    (receive-audio (current-audio) output #f #f #f)
+                  (if (and header? (eq? audio-codec 'vorbis))
+                      (let ((headers (u8vector->object buffer)))
+                        (set! replay-header buffer)
+                        (for-each (lambda (header)
+                                    (bind (buffer timestamp duration) header
+                                      ;; be very careful as timestamp is incorrect as it
+                                      ;; is the timestamp at time the header was captured
+                                      ;; this only works because gst_app_src_write3
+                                      ;; doesn't actually use the timestamp
+                                      (receive-audio (current-audio) output buffer timestamp duration)))
+                                  headers))
+                    (receive-audio (current-audio) output buffer timestamp duration))
                   (record-play-frame origin frame header? timestamp))))
             
             (define (process-video)
-              (let ((buffer (assemble-chunks)))
+              (let ((buffer (assemble-chunks))
+                    (output (if (= channel-no -1)
+                                (or (simulation-video) id)
+                              (cons 'channel channel-no))))
                 (if off?
-                    (receive-video (current-video) id #f #f #f)
-                  (let ((output (or (simulation-video) id)))
-                    (receive-video (current-video) output buffer timestamp duration))
+                    (receive-video (current-video) output #f #f #f)
+                  (receive-video (current-video) output buffer timestamp duration)
                   (if (eq? (get-state process-ring) 'late)
                       (record-freeze-frame origin frame header? timestamp)
                     (record-play-frame origin frame header? timestamp)))))
