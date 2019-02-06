@@ -42,6 +42,7 @@
         (world.settings)
         (world.stream)
         (world.task)
+        (world.texture)
         (world.time))
 
 
@@ -364,7 +365,7 @@
     (or (table-ref outputs id #f)
         ;; the or is a quick hack to test self video
         (let ((player (or player (find-entity id))))
-          (let ((output (case (or layout video-layout)
+          (let ((output (case video-layout
                           ((overhead)
                            (new Camera-Video-Sink
                              player
@@ -374,20 +375,8 @@
                              codec: (or codec video-codec)
                              alpha-overlay: video-alpha
                              overlay?: video-overlay?))
-                          ((circle)
-                           (new Circle-Video-Sink
-                             id
-                             player
-                             resolution: (if (not id) self-resolution (or resolution video-resolution))
-                             framerate: video-framerate
-                             bitrate: video-bitrate
-                             codec: (or codec video-codec)
-                             alpha-overlay: video-alpha
-                             overlay?: video-overlay?
-                             needs-layout?: #t
-                             process?: id))
                           (else
-                           (new Sheet-Video-Sink
+                           (new Circle-Video-Sink
                              id
                              player
                              position: position
@@ -1860,7 +1849,6 @@
   
   (slot id         initialize #f accessors generate)
   (slot player     initialize #f accessors generate)
-  (slot size       initialize #f accessors generate)
   (slot sheet      initialize #f accessors generate)
   (slot draw-mode  initialize #f accessors generate)
   (slot draw-mutex initialize #f accessors generate)
@@ -1964,19 +1952,13 @@
 ;;;
 
 
-(definition protected circle-count
-  10)
-
-
-(definition protected (circle-radius count)
-  (/ (cast <fl> count) PI*2))
-
-
 (class Circle-Video-Sink extends Video-Sink
   
   
   (slot id         initialize #f accessors generate)
   (slot player     initialize #f accessors generate)
+  (slot texture    initialize #f accessors generate)
+  (slot sheet      initialize #f accessors generate)
   (slot pane       initialize #f accessors generate)
   (slot matrix     initialize #f accessors generate)
   (slot draw-mode  initialize #f accessors generate)
@@ -1985,23 +1967,55 @@
   
   
   (method override (initialize self id entity . rest)
-    (apply nextmethod self rest)
-    (let ((world (current-world)))
-      (let ((p (new World-Pane
-                 title: "Player"
-                 size: (new Dimension$fl$ 1. .5625)
-                 resolution: resolution)))
+    (bind-keywords ((position #f) (size #f) . others) rest
+      (apply nextmethod self others)
+      (let ((world (current-world)))
         (set! self.id id)
         (set! self.player entity)
-        (set! self.pane p)
-        (set! self.matrix (make-identity-matrix))
+        (set! self.texture (make-cairo-texture (get-width resolution) (get-height resolution)))
         (set! self.draw-mode 'draw)
         (set! self.draw-mutex (make-mutex 'draw))
-        (set! self.last-color #f))))
+        (set! self.last-color #f)
+        ;; sheet
+        (let ((pos (or position {Point 0 0}))
+              (size (or size {Dimension 320 180})))
+          (let ((s (make-world-sheet 'video World-Sheet size resolution: resolution texture: texture)))
+            (make-orthographic-matrix! (get-projection-matrix s) 0. (get-width world) 0. (get-height world) 0. 10.)
+            (set-position s pos)
+            (set-size s size)
+            (set! self.sheet s)))
+        ;; pane
+        (let ((p (new World-Pane
+                   title: "Player"
+                   size: (new Dimension$fl$ 1. .5625)
+                   resolution: resolution
+                   texture: texture)))
+          (set! self.pane p)
+          (set! self.matrix (make-identity-matrix))))))
+  
+  
+  (method override (sheet? self)
+    (memq? video-layout '(gallery fullscreen)))
+  
+  
+  (method package (resize self)
+    (when sheet
+      (let ((world (current-world)))
+        (let ((width (get-width world))
+              (height (get-height world)))
+          (make-orthographic-matrix! (get-projection-matrix sheet) 0. width 0. height 0. 10.)))))
+  
+  
+  (method package (move self rect)
+    (when sheet
+      (set-rect sheet rect)))
   
   
   (method override (release-element self)
     (nextmethod self)
+    (when sheet
+      (glDeleteTextures* (get-id (get-texture sheet)))
+      (set! sheet #f))
     (when pane
       (glDeleteTextures* (get-id (get-texture (cache-quad-texture pane))))
       (set! pane #f)))
@@ -2019,7 +2033,8 @@
   (method override (draw self color alpha timestamp duration)
     (mutex-lock! draw-mutex)
     (when (or (eq? draw-mode 'draw) (testing?))
-      (let ((texture (get-texture (cache-quad-texture pane))))
+      (let ((texture (cond ((sheet? self) (get-texture sheet))
+                           (else (get-texture (cache-quad-texture pane))))))
         (update self color alpha texture))
       (set! last-color color))
     (when id
@@ -2048,12 +2063,18 @@
   
   (method override (render self)
     (when (eq? stream-state 'drawn)
-    ;; QUICKY
-    (when pane
-      (maybe-update-layouts self)
-      (render-texture (cache-quad-texture pane) matrix)
-      @not-needed-i-think
-      (render-pane pane matrix)))))
+      ;; QUICKY
+      (cond ((sheet? self)
+             (maybe-update-layouts self)
+             (let ((world (current-world)))
+               (let ((x (cast <fl> (get-left sheet)))
+                     (y (cast <fl> (get-top sheet)))
+                     (h (cast <fl> (get-height sheet))))
+                 (let ((matrix (make-translation-matrix (vertex x (- (get-height world) y h) 0.))))
+                   (render-sheet sheet matrix)))))
+            (else
+             (maybe-update-layouts self)
+             (render-texture (cache-quad-texture pane) matrix))))))
 
 
 ;;;
