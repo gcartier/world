@@ -75,7 +75,7 @@
     ;; going with the clos oo
     (add 'jazz 'generic)
     (add 'jazz '%class)
-    (add 'jazz 'interface)
+    (add 'jazz '%interface)
     (add 'jazz '%slot)
     (add 'jazz '%property)
     (add 'jazz 'method)
@@ -120,7 +120,7 @@
     (add 'jazz 'specific)
     (add 'jazz 'class)
     (add 'jazz '%class)
-    (add 'jazz 'interface)
+    (add 'jazz '%interface)
     (add 'jazz 'slot)
     (add 'jazz 'property)
     (add 'jazz '%slot)
