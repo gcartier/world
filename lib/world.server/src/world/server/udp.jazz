@@ -37,21 +37,27 @@
   (slot udp-stopping?         initialize #f getter generate)
   (slot origin-connections    initialize #f getter generate)
   (slot host/port-connections initialize #f getter generate)
+  ;; mutex was not needed before server streaming...
+  (slot server-mutex          initialize #f getter generate)
   (slot server-channels       initialize #f getter generate)
+  (slot send-channels         initialize #f getter generate)
   (slot receive-task          initialize #f getter generate)
   
   
   (method package (start self host service)
     (if (simulation?)
         (begin
-          (set! server-channels (make-table)))
+          (set! server-channels (make-table))
+          (set! send-channels (make-table)))
     (set! udp-port (open-udp (list
                                local-address: host
                                local-port-number: service)))
     (set! udp-stopping? #f)
     (set! origin-connections (make-table))
     (set! host/port-connections (make-table))
+    (set! server-mutex (make-mutex 'server))
     (set! server-channels (make-table))
+    (set! send-channels (make-table))
     (unless (simulation?)
       (set! receive-task (new Task 'udp-receive (lambda (task)
                                                   (receive-loop self task))
@@ -111,6 +117,48 @@
         (table-clear server-channels no))))
   
   
+  (method public (find-send-channel self channel-no)
+    (table-ref send-channels channel-no #f))
+  
+  
+  (method package (register-send-channel self name channel-no media-kind)
+    (let ((channel (new UDP-Send-Channel name channel-no client-no media-kind)))
+      (table-set! send-channels channel-no channel)
+      channel))
+  
+  
+  (method package (close-send-channel self channel-no)
+    (let ((channel (table-ref send-channels channel-no #f)))
+      (close channel)
+      (server-unregister-channel (current-server) channel-no)
+      (table-clear send-channels channel-no)))
+  
+  
+  (method package (close-send-channels self)
+    (iterate-table-safe send-channels
+      (lambda (channel-no channel)
+        (close-send-channel self channel-no))))
+  
+  
+  ;;;
+  ;;;; Send
+  ;;;
+  
+  
+  (method package (send-media self channel-no buffer header? timestamp duration)
+    (mutex-lock! server-mutex)
+    (let ((channel (find-send-channel self channel-no)))
+      (when channel
+        (let ((origin (get-origin channel))
+              (kind (get-media-kind channel)))
+          ;; quick test really not sure about this
+          (let ((server-channel (find-server-channel self channel-no)))
+            (send-media channel buffer header? timestamp duration
+              (lambda (data)
+                (broadcast-media self server-channel origin kind data)))))))
+    (mutex-unlock! server-mutex))
+  
+  
   ;;;
   ;;;; Receive
   ;;;
@@ -147,6 +195,7 @@
   
   
   (method (receive-data self data)
+    (mutex-lock! server-mutex)
     (let ((origin (read-udp-origin data)))
       (let ((connection (origin->connection self origin)))
         (when connection
@@ -162,7 +211,8 @@
         ((udp-audio udp-video)
          (receive-media self kind data))
         (else
-         (error "Unknown UDP kind: {s}" kind)))))
+         (error "Unknown UDP kind: {s}" kind))))
+    (mutex-unlock! server-mutex))
   
   
   (method (connect-source self data)
@@ -351,30 +401,30 @@
       (when delegate
         (let ((group (get-group delegate)))
           (when group
-            (for-each (lambda (member)
-                        (let ((no (get-no member)))
-                          (let ((connection (table-ref origin-connections no #f)))
-                            (when connection
-                              (when (or (neq? member delegate)
-                                        (eq? (get-recipient channel) 'all))
-                                (let ((last-received-state (get-last-received-state connection)))
-                                  (when last-received-state
-                                    (unless (get-throttle-media? connection)
-                                      (let ((now (current-seconds)))
-                                        (if (and udp-throttle (> (- now last-received-state) udp-throttle))
-                                            (begin
-                                              (set-throttle-media? connection #t)
-                                              (record-event udp-id-throttle-on
-                                                            (fixnum->flonum no)
-                                                            -1.
-                                                            -1.
-                                                            -1.
-                                                            -1.
-                                                            -1.)
-                                              (when udp-show-throttle?
-                                                (format :terminal "{s} {s} {a} {s}{%}" remote-name 'THROTTLE (get-name member) 'ON)))
-                                          (send-data self connection data)))))))))))
-                      (get-members group)))))))
+            (let ((exclude-delegate (get-exclude-delegate channel)))
+              (for-each (lambda (member)
+                          (let ((no (get-no member)))
+                            (let ((connection (table-ref origin-connections no #f)))
+                              (when connection
+                                (unless (eq? member exclude-delegate)
+                                  (let ((last-received-state (get-last-received-state connection)))
+                                    (when last-received-state
+                                      (unless (get-throttle-media? connection)
+                                        (let ((now (current-seconds)))
+                                          (if (and udp-throttle (> (- now last-received-state) udp-throttle))
+                                              (begin
+                                                (set-throttle-media? connection #t)
+                                                (record-event udp-id-throttle-on
+                                                              (fixnum->flonum no)
+                                                              -1.
+                                                              -1.
+                                                              -1.
+                                                              -1.
+                                                              -1.)
+                                                (when udp-show-throttle?
+                                                  (format :terminal "{s} {s} {a} {s}{%}" remote-name 'THROTTLE (get-name member) 'ON)))
+                                            (send-data self connection data)))))))))))
+                        (get-members group))))))))
   
   
   (method (send-data self connection data)
@@ -450,15 +500,17 @@
   
   (slot resolution        getter generate)
   (slot recipient         getter generate)
+  (slot exclude-delegate  getter generate)
   (slot last-nacked-frame accessors generate)
   (slot retain-ring       getter generate)
   (slot release-task      getter generate)
   
   
-  (method override (initialize self name no origin media-kind resolution recipient)
+  (method override (initialize self name no origin media-kind resolution recipient exclude-delegate)
     (nextmethod self name no origin media-kind)
     (set! self.resolution resolution)
     (set! self.recipient recipient)
+    (set! self.exclude-delegate exclude-delegate)
     (set! self.last-nacked-frame #f)
     (set! self.retain-ring (new UDP-Ring origin media-kind udp-retain-size max-size: udp-retain-max-size overflow-proc: (udp-ring-overflow 'retain udp-ring-kind-retain)))
     (unless (simulation?)

@@ -25,10 +25,12 @@
         (jazz.process)
         (jazz.presence)
         (jazz.presence.transmission)
+        (jazz.stream)
         (jazz.syntax (phase syntax))
         (jazz.time)
         (jazz.zlib)
         (world)
+        (world.audio)
         (world.assets)
         (world.autoload)
         (world.chronology)
@@ -50,10 +52,12 @@
         (world.server.serving)
         (world.server.udp)
         (world.settings)
+        (world.streaming)
         (world.stub)
         (world.support)
         (world.task)
-        (world.udp))
+        (world.udp)
+        (world.video))
 
 
 (class Server-Tier extends Serving-Tier implements Server-Interface
@@ -667,62 +671,63 @@
             #f)))))
   
   
-  (method package (client-register-channel self client name media-kind resolution recipient)
+  (method package (client-register-channel self client name media-kind resolution recipient mirror?)
     (let ((client-delegate (find-delegate self client)))
       ;; together robust
       (if (not client-delegate)
           (format "Delegate not found")
-        (let ((recipients (recipient-delegates self client-delegate recipient)))
-          (if (string? recipients)
-              recipients
-            (let ((no (next-channel-no!))
-                  (origin (get-no client-delegate)))
-              (let ((channel (new UDP-Server-Channel name no origin media-kind resolution recipient)))
-                (register-server-channel udp-server no channel)
-                (for-each (lambda (delegate)
-                            (when (or (neq? delegate client-delegate)
-                                      (eq? recipient 'all))
-                              (when (eq? (get-state delegate) 'started)
-                                (let ((client (get-client delegate)))
-                                  (calling-client self delegate
-                                    (lambda ()
-                                      (add-channel client name no origin media-kind resolution)))))))
-                          recipients)
-                no)))))))
+        (let ((group (get-group client-delegate)))
+          (if (and (not recipient)
+                   (not group))
+              (format "You are not in a group")
+            (let ((origin (get-no client-delegate))
+                  (recipient (or recipient group))
+                  (exclude-delegate (if mirror? #f client-delegate)))
+              (server-register-channel self name origin media-kind resolution recipient exclude-delegate)))))))
+  
+  
+  (method package (server-register-channel self name origin media-kind resolution recipient exclude-delegate)
+    (let ((recipients (recipient-delegates self recipient)))
+      (let ((no (next-channel-no!)))
+        (let ((channel (new UDP-Server-Channel name no origin media-kind resolution recipient exclude-delegate)))
+          (register-server-channel udp-server no channel)
+          (for-each (lambda (delegate)
+                      (unless (eq? delegate exclude-delegate)
+                        (when (eq? (get-state delegate) 'started)
+                          (let ((client (get-client delegate)))
+                            (calling-client self delegate
+                              (lambda ()
+                                (add-channel client name no origin media-kind resolution)))))))
+                    recipients)
+          no))))
   
   
   (method package (client-unregister-channel self client channel-no)
-    (let ((client-delegate (find-delegate self client)))
+    (server-unregister-channel self channel-no))
+  
+  
+  (method package (server-unregister-channel self channel-no)
+    (let ((channel (find-server-channel udp-server channel-no)))
       ;; together robust
-      (if (not client-delegate)
-          (format "Delegate not found")
-        (let ((channel (find-server-channel udp-server channel-no)))
-          ;; together robust
-          (when channel
-            (let ((recipient (get-recipient channel)))
-              (let ((recipients (recipient-delegates self client-delegate recipient)))
-                (if (string? recipients)
-                    recipients
-                  (for-each (lambda (delegate)
-                              (when (or (neq? delegate client-delegate)
-                                        (eq? recipient 'all))
-                                (when (eq? (get-state delegate) 'started)
-                                  (let ((client (get-client delegate)))
-                                    (calling-client self delegate
-                                      (lambda ()
-                                        (remove-channel client channel-no)))))))
-                            recipients)
-                  (close-server-channel udp-server channel-no)
-                  #f))))))))
+      (when channel
+        (let ((recipient (get-recipient channel))
+              (exclude-delegate (get-exclude-delegate channel)))
+          (let ((recipients (recipient-delegates self recipient)))
+            (for-each (lambda (delegate)
+                        (unless (eq? delegate exclude-delegate)
+                          (when (eq? (get-state delegate) 'started)
+                            (let ((client (get-client delegate)))
+                              (calling-client self delegate
+                                (lambda ()
+                                  (remove-channel client channel-no)))))))
+                      recipients)
+            (close-server-channel udp-server channel-no)
+            #f)))))
   
   
-  (method (recipient-delegates self client-delegate recipient)
-    (if (or (not recipient)
-            (eq? recipient 'all))
-        (let ((group (get-group client-delegate)))
-          (if (not group)
-              "You are not in a group"
-            (get-members group)))
+  (method (recipient-delegates self recipient)
+    (if (is? recipient Server-Group)
+        (get-members recipient)
       (list (find-delegate-by-no recipient))))
   
   
@@ -734,8 +739,7 @@
           (let ((origin (get-origin channel)))
             (when (memv? origin origins)
               (let ((recipient (get-recipient channel)))
-                (when (or (not recipient)
-                          (eq? recipient 'all))
+                (when (eq? recipient group)
                   (let ((name (get-name channel))
                         (media-kind (get-media-kind channel))
                         (resolution (get-resolution channel)))
@@ -1030,17 +1034,11 @@
        (bind-optionals ((action #f) (what #f)) arguments
          (case action
            ((list)
-            (let ((dir {Directory Settings "streams"})
-                  (queue (new-queue)))
-              (iterate-directory dir
-                (lambda (file)
-                  (when (extension=? (get-extension file) "streamvideo")
-                    (enqueue queue (get-base file)))))
-              (queue-list queue)))
+            (stream-list self))
            ((start)
-            what)
+            (stream-start self client what))
            ((stop)
-            what))))
+            (stream-stop self client what)))))
       ((request)
        (bind (cookie who what action) arguments
          (let ((requester client))
@@ -1315,6 +1313,106 @@
                   (lambda ()
                     (detach-client (get-client delegate)))))
               delegates))
+  
+  
+  ;;;
+  ;;;; Stream
+  ;;;
+  
+  
+  (definition streams-dir
+    {Directory Settings "streams"})
+  
+  
+  (method (stream-list self)
+    (let ((queue (new-queue)))
+      (iterate-directory streams-dir
+        (lambda (file)
+          (when (extension=? (get-extension file) "streamvideo")
+            (let ((base (get-base file)))
+              (enqueue queue (list base (if (not-null? (find-stream-channels self base))
+                                            'playing
+                                          #f)))))))
+      (queue-list queue)))
+  
+  
+  (method (stream-start self client base)
+    (let ((client-delegate (find-delegate self client)))
+      ;; together robust
+      (if (not client-delegate)
+          "Delegate not found"
+        (let ((group (get-group client-delegate)))
+          (if (not group)
+              "You are not in a group"
+            (if (exists? (new-file streams-dir (add-extension base "streamvideo")))
+                (let ((audio-channel (make-server-audio-channel self group base base))
+                      (video-channel (make-server-video-channel self group base base)))
+                  ;; quicky
+                  (delay-event
+                    (lambda ()
+                      (sleep 1)
+                      (start audio-channel)
+                      (start video-channel)))
+                  #f)
+              "Stream file not found"))))))
+  
+  
+  (method (stream-stop self client base)
+    (let ((channels (find-stream-channels self base)))
+      (if (null? channels)
+          "Stream not found"
+        (for-each (lambda (channel)
+                    (close-send-channel udp-server (get-no channel)))
+                  channels)
+        #f)))
+  
+  
+  (method (find-stream-channels self base)
+    (let ((queue (new-queue)))
+      (iterate-table (get-send-channels udp-server)
+        (lambda (no channel)
+          (when (equal? (get-name channel) base)
+            (enqueue queue channel))))
+      (queue-list queue)))
+  
+  
+  (method (make-server-audio-channel self group location name)
+    (let ((channel-no (server-register-channel self name client-no udp-audio #f group #f)))
+      (let ((channel (register-send-channel udp-server name channel-no udp-audio)))
+        (let ((src (new File-Stream-Audio-Src
+                     location))
+              (sink (new Stream-Sink
+                      consumer: (lambda (buffer timestamp duration)
+                                  (case audio-codec
+                                    ((opus)
+                                     (let ((header? (and buffer (audio-buffer-header? buffer))))
+                                       (send-server-media self channel-no buffer header? timestamp duration)))
+                                    ((vorbis)
+                                     (if (pair? buffer)
+                                         (send-server-media self channel-no (car buffer) #t -1 GST_CLOCK_TIME_NONE)
+                                       (send-server-media self channel-no buffer #f timestamp duration))))))))
+          (let ((pipeline (pipeline src sink)))
+            (set-pipeline channel pipeline)
+            channel)))))
+  
+  
+  (method (make-server-video-channel self group location name)
+    (let ((channel-no (server-register-channel self name client-no udp-video #f group #f)))
+      (let ((channel (register-send-channel udp-server name channel-no udp-video)))
+        (let ((src (new File-Stream-Video-Src
+                     location))
+              (sink (new Stream-Sink
+                      consumer: (lambda (buffer timestamp duration)
+                                  (let ((header? (and buffer (video-buffer-header? buffer))))
+                                    (send-server-media self channel-no buffer header? timestamp duration))))))
+          (let ((pipeline (pipeline src sink)))
+            (set-pipeline channel pipeline)
+            channel)))))
+  
+  
+  (method package (send-server-media self channel-no buffer header? timestamp duration)
+    (when udp-server
+      (send-media udp-server channel-no buffer header? timestamp duration)))
   
   
   ;;;
