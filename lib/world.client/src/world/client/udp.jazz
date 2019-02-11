@@ -34,28 +34,17 @@
         (world.video))
 
 
-(definition (find-id-quick-hack no)
-  (let ((member (find-group-member-by-no (current-client) no)))
-    ;; quick solution for when logging in and starting receiving
-    ;; someone's media before the client is actually registered
-    ;; need to revisit this code for a cleaner solution
-    (and member
-         (second member))))
-
-
-(definition (state-callback origin media-kind)
+(definition (state-callback channel-no media-kind)
   (lambda (state)
     (when (= media-kind udp-video)
       (unless (or (simulation?) (emulation?))
-        (let ((id (find-id-quick-hack origin)))
-          (when id
-            (let ((output (find-output (current-video) id)))
-              (when output
-                (let ((mode (case state
-                              ((ok) 'draw)
-                              ((late) 'freeze)
-                              ((waiting) 'wait))))
-                  (change-draw-mode output mode))))))))))
+        (let ((output (find-output (current-video) channel-no)))
+          (when output
+            (let ((mode (case state
+                          ((ok) 'draw)
+                          ((late) 'freeze)
+                          ((waiting) 'wait))))
+              (change-draw-mode output mode))))))))
 
 
 (class UDP-Client extends Object
@@ -777,7 +766,7 @@
     (set! self.last-processed-header #f)
     (set! self.replay-ring (new Remember-Ring 6000))
     (set! self.replay-header #f)
-    (set! self.process-ring (new UDP-Ring origin media-kind udp-process-size max-size: udp-process-max-size state-proc: (state-callback origin media-kind) overflow-proc: (udp-ring-overflow 'process udp-ring-kind-process)))
+    (set! self.process-ring (new UDP-Ring origin media-kind udp-process-size max-size: udp-process-max-size state-proc: (state-callback no media-kind) overflow-proc: (udp-ring-overflow 'process udp-ring-kind-process)))
     (unless (simulation?)
       (set! self.process-task (new Task 'udp-process (lambda (task)
                                                        (process-loop self task))
@@ -862,57 +851,55 @@
                         -1.
                       (timestamp->flonum timestamp))))
     
-    (let ((id (find-id-quick-hack origin)))
-      (when (or id (simulation?))
-        (let ((count (length datas))
-              (first (car datas)))
-          (increase! processed count)
-          (let ((kind (read-udp-kind first))
-                (origin (read-udp-origin first))
-                (channel-no (read-udp-channel first))
-                (frame (read-udp-frame first))
-                (total (read-udp-total first))
-                (timestamp (read-udp-media-timestamp first))
-                (duration (read-udp-media-duration first))
-                (header? (read-udp-media-header? first))
-                (off? (read-udp-media-off? first)))
-            (define (process-audio)
-              (let ((buffer (assemble-chunks)))
-                (if off?
-                    (receive-audio (current-audio) channel-no #f #f #f)
-                  (if (and header? (eq? audio-codec 'vorbis))
-                      (let ((headers (u8vector->object buffer)))
-                        (set! replay-header buffer)
-                        (for-each (lambda (header)
-                                    (bind (buffer timestamp duration) header
-                                      ;; be very careful as timestamp is incorrect as it
-                                      ;; is the timestamp at time the header was captured
-                                      ;; this only works because gst_app_src_write3
-                                      ;; doesn't actually use the timestamp
-                                      (receive-audio (current-audio) channel-no buffer timestamp duration)))
-                                  headers))
-                    (receive-audio (current-audio) channel-no buffer timestamp duration))
-                  (record-play-frame origin frame header? timestamp))))
-            
-            (define (process-video)
-              (let ((buffer (assemble-chunks)))
-                (if off?
-                    (receive-video (current-video) channel-no #f #f #f)
-                  (receive-video (current-video) channel-no buffer timestamp duration)
-                  (if (eq? (get-state process-ring) 'late)
-                      (record-freeze-frame origin frame header? timestamp)
-                    (record-play-frame origin frame header? timestamp)))))
-            
-            (define (assemble-chunks)
-              (if (= total 1)
-                  (read-udp-media-payload first)
-                (let ((chunks (map read-udp-media-payload datas)))
-                  (apply u8vector-append chunks))))
-            
-            (ecase kind
-              ((udp-audio)
-               (process-audio))
-              ((udp-video)
-               (process-video)))
-            (when header?
-              (set! last-processed-header frame)))))))))
+    (let ((count (length datas))
+          (first (car datas)))
+      (increase! processed count)
+      (let ((kind (read-udp-kind first))
+            (origin (read-udp-origin first))
+            (channel-no (read-udp-channel first))
+            (frame (read-udp-frame first))
+            (total (read-udp-total first))
+            (timestamp (read-udp-media-timestamp first))
+            (duration (read-udp-media-duration first))
+            (header? (read-udp-media-header? first))
+            (off? (read-udp-media-off? first)))
+        (define (process-audio)
+          (let ((buffer (assemble-chunks)))
+            (if off?
+                (receive-audio (current-audio) channel-no #f #f #f)
+              (if (and header? (eq? audio-codec 'vorbis))
+                  (let ((headers (u8vector->object buffer)))
+                    (set! replay-header buffer)
+                    (for-each (lambda (header)
+                                (bind (buffer timestamp duration) header
+                                  ;; be very careful as timestamp is incorrect as it
+                                  ;; is the timestamp at time the header was captured
+                                  ;; this only works because gst_app_src_write3
+                                  ;; doesn't actually use the timestamp
+                                  (receive-audio (current-audio) channel-no buffer timestamp duration)))
+                              headers))
+                (receive-audio (current-audio) channel-no buffer timestamp duration))
+              (record-play-frame origin frame header? timestamp))))
+        
+        (define (process-video)
+          (let ((buffer (assemble-chunks)))
+            (if off?
+                (receive-video (current-video) channel-no #f #f #f)
+              (receive-video (current-video) channel-no buffer timestamp duration)
+              (if (eq? (get-state process-ring) 'late)
+                  (record-freeze-frame origin frame header? timestamp)
+                (record-play-frame origin frame header? timestamp)))))
+        
+        (define (assemble-chunks)
+          (if (= total 1)
+              (read-udp-media-payload first)
+            (let ((chunks (map read-udp-media-payload datas)))
+              (apply u8vector-append chunks))))
+        
+        (ecase kind
+          ((udp-audio)
+           (process-audio))
+          ((udp-video)
+           (process-video)))
+        (when header?
+          (set! last-processed-header frame)))))))
