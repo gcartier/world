@@ -101,13 +101,6 @@
   (world-setting 'world.video-show #f))
 
 
-(definition public capture-screen?
-  #f)
-
-(definition public (set-capture-screen? flag)
-  (set! capture-screen? flag))
-
-
 (definition draw-refresh
   (world-setting 'world.draw-refresh 1.))
 
@@ -809,12 +802,8 @@
           (self-width (get-width self-resolution))
           (self-height (get-height self-resolution)))
       (let ((pipeline (gst-launch (cond-expand
-                                    (mac (if capture-screen?
-                                             "avfvideosrc capture-screen=true"
-                                           "avfvideosrc"))
-                                    (windows (if capture-screen?
-                                                 "dx9screencapsrc"
-                                               "ksvideosrc"))
+                                    (mac "avfvideosrc")
+                                    (windows "ksvideosrc")
                                     (else "v4l2src"))
                                   (tie "videorate max-rate={framerate}")
                                   "videoscale"
@@ -909,7 +898,106 @@
 ;;;
 
 
-(class Screen-Video-Src extends Video-Src)
+(class Screen-Video-Src extends Video-Src
+  
+  
+  (slot resolution initialize #f accessors generate)
+  (slot framerate  initialize #f accessors generate)
+  (slot bitrate    initialize #f accessors generate)
+  (slot codec      initialize #f accessors generate)
+  (slot pipeline   initialize #f accessors generate)
+  
+  
+  (method override (initialize self (resolution: resolution #f) (framerate: framerate #f) (bitrate: bitrate #f) (codec: codec #f))
+    (nextmethod self)
+    (set! self.resolution resolution)
+    (set! self.framerate framerate)
+    (set! self.bitrate bitrate)
+    (set! self.codec codec))
+  
+  
+  (method override (setup-element self)
+    (nextmethod self)
+    (let ((width (get-width resolution))
+          (height (get-height resolution))
+          (self-width (get-width self-resolution))
+          (self-height (get-height self-resolution)))
+      (let ((pipeline (gst-launch (cond-expand
+                                    (mac "avfvideosrc capture-screen=true")
+                                    (windows "dx9screencapsrc")
+                                    (else "v4l2src"))
+                                  (tie "videorate max-rate={framerate}")
+                                  "videoscale"
+                                  "videoconvert"
+                                  ;; this tie is there so the camera knows what resolution to use
+                                  (tie "video/x-raw, width=1280, height=720, pixel-aspect-ratio=(fraction)1/1")
+                                  "videoscale"
+                                  "videoconvert"
+                                  (tie "video/x-raw, format=I420, width={width}, height={height}, pixel-aspect-ratio=(fraction)1/1")
+                                  "valve name=valve"
+                                  (and (eq? codec 'h264)
+                                       (let ((key-int-max (and video-key-period (fxround (* (cast <fl> framerate) video-key-period))))
+                                             (pass video-pass)
+                                             (psy-tune #f)
+                                             (quantizer #f)
+                                             (bitrate bitrate)
+                                             (tune "zerolatency")
+                                             (speed-preset "superfast"))
+                                         (let ((elem
+                                                 (gst-element "x264enc"
+                                                              key-int-max: key-int-max
+                                                              pass: pass
+                                                              psy-tune: psy-tune
+                                                              quantizer: quantizer
+                                                              bitrate: bitrate
+                                                              tune: tune
+                                                              speed-preset: speed-preset
+                                                              name: "enc")))
+                                           @w (format :terminal "size={a}x{a} framerate={a}{%}" width height framerate)
+                                           @w (format :terminal "{a}{%}" elem)
+                                           elem)))
+                                  "appsink name=sink")))
+        (gst_object_set_name pipeline "screen")
+        (let ((appsink (gst_bin_get_by_name pipeline "sink"))
+              (data (make-u8vector (* (max width self-width) (max height self-height) 4)))
+              (info (make-u64vector 2)))
+          (gst_element_set_state pipeline GST_STATE_READY)
+          (set! self.data data)
+          (set! self.info info)
+          (set! self.pipeline pipeline)
+          (set! self.appsink appsink)))))
+  
+  
+  (method override (start-element self)
+    (nextmethod self)
+    (task-start self 'screen)
+    (gst_element_set_state pipeline GST_STATE_PLAYING))
+  
+  
+  (method override (stop-element self)
+    (nextmethod self)
+    (task-stop self)
+    (gst_element_set_state pipeline GST_STATE_READY))
+  
+  
+  (method override (release-element self)
+    (nextmethod self)
+    (gst_element_release pipeline)
+    (set! info #f)
+    (set! data #f)
+    (set! pipeline #f)
+    (set! appsink #f)
+    (consume sink #f #f #f))
+  
+  
+  (method (reset self)
+    (when pipeline
+      (let ((valve (gst_bin_get_by_name pipeline "valve"))
+            (encoder (gst_bin_get_by_name pipeline "enc")))
+        (g_object_set valve "drop" (g_value_int 1))
+        (gst_element_set_state encoder GST_STATE_READY)
+        (gst_element_set_state encoder GST_STATE_PLAYING)
+        (g_object_set valve "drop" (g_value_int 0))))))
 
 
 ;;;
