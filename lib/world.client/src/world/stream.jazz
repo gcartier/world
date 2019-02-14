@@ -16,6 +16,7 @@
 
 (import (jazz.cairo)
         (jazz.graphic)
+        (jazz.io)
         (jazz.platform)
         (jazz.stream)
         (jazz.syntax (phase syntax))
@@ -39,6 +40,11 @@
 
 (definition protected streaming?
   (world-setting 'world.streaming? #f))
+
+
+;;;
+;;;; Stream
+;;;
 
 
 (definition public (read-frame port)
@@ -96,7 +102,9 @@
   
   (slot resolution     getter generate)
   (slot surface        getter generate)
+  (slot color-fifo     getter generate)
   (slot color-pipeline getter generate)
+  (slot alpha-fifo     getter generate)
   (slot alpha-pipeline getter generate)
   
   
@@ -104,14 +112,18 @@
     (nextmethod self)
     (set! self.resolution resolution)
     (set! self.surface (new Image-Surface resolution))
-    (set! self.color-pipeline (make-color-pipeline resolution framerate bitrate))
-    (set! self.alpha-pipeline (make-alpha-pipeline resolution framerate bitrate)))
+    (set! self.color-fifo (make-stream-fifo))
+    (set! self.color-pipeline (make-color-pipeline color-fifo resolution framerate bitrate))
+    (set! self.alpha-fifo (make-stream-fifo))
+    (set! self.alpha-pipeline (make-alpha-pipeline alpha-fifo resolution framerate bitrate)))
   
   
   (method override (destroy self)
     (close surface)
     (gst_element_release color-pipeline)
     (gst_element_release alpha-pipeline)
+    (close-stream-fifo color-fifo)
+    (close-stream-fifo alpha-fifo)
     (nextmethod self))
   
   
@@ -143,19 +155,16 @@
               ;; retrieve frames from sink
               (let (loop)
                 (when (not color-bytes)
-                  (let ((size (gst_app_sink_read color-sink color-buffer color-info)))
-                    (when (/= size -1)
-                      (set! color-bytes size))))
+                  (let ((size (gst_app_sink_read color-fifo color-sink color-buffer color-info)))
+                    (set! color-bytes size)))
                 (when (not alpha-bytes)
-                  (let ((size (gst_app_sink_read alpha-sink alpha-buffer alpha-info)))
-                    (when (/= size -1)
-                      (set! alpha-bytes size))))
+                  (let ((size (gst_app_sink_read alpha-fifo alpha-sink alpha-buffer alpha-info)))
+                    (set! alpha-bytes size)))
                 (if (and color-bytes alpha-bytes)
                     (let ((timestamp (u64vector-ref color-info 0))
                           (duration (u64vector-ref color-info 1)))
                       ;(debug (- (real-time) start) color-bytes alpha-bytes)
                       (values (subu8vector color-buffer 0 color-bytes) (subu8vector alpha-buffer 0 alpha-bytes) timestamp duration))
-                  (sleep .001)
                   (loop)))))))))
   
   
@@ -166,7 +175,7 @@
     (gst_element_set_state alpha-pipeline GST_STATE_PLAYING)))
 
 
-(definition (make-color-pipeline resolution framerate bitrate)
+(definition (make-color-pipeline fifo resolution framerate bitrate)
   (let ((width (get-width resolution))
         (height (get-height resolution)))
     (let ((pipeline (gst-launch "appsrc name=src"
@@ -176,12 +185,13 @@
                                 "appsink name=sink")))
       (let ((src (gst_bin_get_by_name pipeline "src"))
             (sink (gst_bin_get_by_name pipeline "sink")))
+        (gst_app_sink_signal_new_sample sink fifo)
         (gst-setup-source src "video/x-raw" "BGRA" width height framerate)
         (gst_element_set_state pipeline GST_STATE_PLAYING))
       pipeline)))
 
 
-(definition (make-alpha-pipeline resolution framerate bitrate)
+(definition (make-alpha-pipeline fifo resolution framerate bitrate)
   (let ((width (get-width resolution))
         (height (get-height resolution)))
     (let ((pipeline (gst-launch "appsrc name=src"
@@ -189,6 +199,7 @@
                                 "appsink name=sink")))
       (let ((src (gst_bin_get_by_name pipeline "src"))
             (sink (gst_bin_get_by_name pipeline "sink")))
+        (gst_app_sink_signal_new_sample sink fifo)
         (gst-setup-source src "video/x-raw" "I420" width height framerate)
         (gst_element_set_state pipeline GST_STATE_PLAYING))
       pipeline))))

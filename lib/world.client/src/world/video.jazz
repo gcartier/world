@@ -692,6 +692,8 @@
   (slot data     <u8vector+>  initialize #f accessors generate)
   (slot info     <u64vector+> initialize #f accessors generate)
   (slot task                  initialize #f accessors generate)
+  (slot fifo                  initialize #f accessors generate)
+  (slot selffifo              initialize #f accessors generate)
   
   
   (method (task-start self name)
@@ -725,51 +727,48 @@
                     (let ((history (current-history)))
                       (unless (get-paused? history)
                         (process self)))))))
-            (let ((duration (- (current-seconds) time)))
-              (task-wait task video-period duration exit))
+            (task-halt task exit)
             (iter time))))))
   
   
   (method override (process self)
-    (let ((size (gst_app_sink_read appsink data info)))
-      (when (/= size -1)
+    (let ((size (gst_app_sink_read fifo appsink data info)))
+      (let ((buffer (subu8vector data 0 size))
+            (timestamp (u64vector-ref info 0))
+            (duration (u64vector-ref info 1)))
+        (when (and video-show
+                   (or (eq? video-show 'all)
+                       (eq? video-show 'header)
+                       (>= size video-show)))
+          ;; h264 specific
+          (let ((type (if (video-buffer-header? buffer)
+                          '***header***
+                        'delta)))
+            (if (eq? video-show 'header)
+                (when (eq? type '***header***)
+                  (terminal size type))
+              (terminal size type))))
+        (consume sink buffer timestamp duration)
+        (record-event udp-id-src-media
+                      (fixnum->flonum client-no)
+                      (fixnum->flonum world.udp:udp-video)
+                      -1.
+                      (if (video-buffer-header? buffer) 1. -1.)
+                      (fixnum->flonum size)
+                      (timestamp->flonum timestamp))))
+    (when appsinkself
+      (let ((size (gst_app_sink_read selffifo appsinkself data info)))
         (let ((buffer (subu8vector data 0 size))
               (timestamp (u64vector-ref info 0))
               (duration (u64vector-ref info 1)))
-          (when (and video-show
-                     (or (eq? video-show 'all)
-                         (eq? video-show 'header)
-                         (>= size video-show)))
-            ;; h264 specific
-            (let ((type (if (video-buffer-header? buffer)
-                            '***header***
-                          'delta)))
-              (if (eq? video-show 'header)
-                  (when (eq? type '***header***)
-                    (terminal size type))
-                (terminal size type))))
-          (consume sink buffer timestamp duration)
-          (record-event udp-id-src-media
+          (consume sinkself buffer timestamp duration)
+          (record-event udp-id-src-self
                         (fixnum->flonum client-no)
                         (fixnum->flonum world.udp:udp-video)
                         -1.
-                        (if (video-buffer-header? buffer) 1. -1.)
+                        -1.
                         (fixnum->flonum size)
-                        (timestamp->flonum timestamp)))))
-    (when appsinkself
-      (let ((size (gst_app_sink_read appsinkself data info)))
-        (when (/= size -1)
-          (let ((buffer (subu8vector data 0 size))
-                (timestamp (u64vector-ref info 0))
-                (duration (u64vector-ref info 1)))
-            (consume sinkself buffer timestamp duration)
-            (record-event udp-id-src-self
-                          (fixnum->flonum client-no)
-                          (fixnum->flonum world.udp:udp-video)
-                          -1.
-                          -1.
-                          (fixnum->flonum size)
-                          (timestamp->flonum timestamp))))))))
+                        (timestamp->flonum timestamp)))))))
 
 
 ;;;
@@ -800,7 +799,9 @@
     (let ((width (get-width resolution))
           (height (get-height resolution))
           (self-width (get-width self-resolution))
-          (self-height (get-height self-resolution)))
+          (self-height (get-height self-resolution))
+          (fifo (make-stream-fifo))
+          (selffifo (make-stream-fifo)))
       (let ((pipeline (gst-launch (cond-expand
                                     (mac "avfvideosrc")
                                     (windows "ksvideosrc")
@@ -826,19 +827,15 @@
                                                (bitrate bitrate)
                                                (tune "zerolatency")
                                                (speed-preset "superfast"))
-                                           (let ((elem
-                                                   (gst-element "x264enc"
-                                                                key-int-max: key-int-max
-                                                                pass: pass
-                                                                psy-tune: psy-tune
-                                                                quantizer: quantizer
-                                                                bitrate: bitrate
-                                                                tune: tune
-                                                                speed-preset: speed-preset
-                                                                name: "enc")))
-                                             @w (format :terminal "size={a}x{a} framerate={a}{%}" width height framerate)
-                                             @w (format :terminal "{a}{%}" elem)
-                                             elem)))
+                                           (gst-element "x264enc"
+                                                        key-int-max: key-int-max
+                                                        pass: pass
+                                                        psy-tune: psy-tune
+                                                        quantizer: quantizer
+                                                        bitrate: bitrate
+                                                        tune: tune
+                                                        speed-preset: speed-preset
+                                                        name: "enc")))
                                     "appsink name=sink")
                                   (list
                                     "tee."
@@ -853,10 +850,14 @@
               (appsinkself (gst_bin_get_by_name pipeline "sinkself"))
               (data (make-u8vector (* (max width self-width) (max height self-height) 4)))
               (info (make-u64vector 2)))
+          (gst_app_sink_signal_new_sample appsink fifo)
+          (gst_app_sink_signal_new_sample appsinkself selffifo)
           (gst_element_set_state pipeline GST_STATE_READY)
           (set! self.data data)
           (set! self.info info)
           (set! self.pipeline pipeline)
+          (set! self.fifo fifo)
+          (set! self.selffifo selffifo)
           (set! self.appsink appsink)
           (set! self.appsinkself appsinkself)))))
   
@@ -880,7 +881,12 @@
     (set! data #f)
     (set! pipeline #f)
     (set! appsink #f)
-    (consume sink #f #f #f))
+    (consume sink #f #f #f)
+    (close-stream-fifo fifo)
+    (set! fifo #f)
+    (when selffifo
+      (close selffifo)
+      (set! selffifo #f)))
   
   
   (method (reset self)
@@ -920,8 +926,7 @@
     (nextmethod self)
     (let ((width (get-width resolution))
           (height (get-height resolution))
-          (self-width (get-width self-resolution))
-          (self-height (get-height self-resolution)))
+          (fifo (make-stream-fifo)))
       (let ((pipeline (gst-launch (cond-expand
                                     (mac "avfvideosrc capture-screen=true")
                                     (windows "dx9screencapsrc")
@@ -943,28 +948,26 @@
                                              (bitrate bitrate)
                                              (tune "zerolatency")
                                              (speed-preset "superfast"))
-                                         (let ((elem
-                                                 (gst-element "x264enc"
-                                                              key-int-max: key-int-max
-                                                              pass: pass
-                                                              psy-tune: psy-tune
-                                                              quantizer: quantizer
-                                                              bitrate: bitrate
-                                                              tune: tune
-                                                              speed-preset: speed-preset
-                                                              name: "enc")))
-                                           @w (format :terminal "size={a}x{a} framerate={a}{%}" width height framerate)
-                                           @w (format :terminal "{a}{%}" elem)
-                                           elem)))
+                                         (gst-element "x264enc"
+                                                      key-int-max: key-int-max
+                                                      pass: pass
+                                                      psy-tune: psy-tune
+                                                      quantizer: quantizer
+                                                      bitrate: bitrate
+                                                      tune: tune
+                                                      speed-preset: speed-preset
+                                                      name: "enc")))
                                   "appsink name=sink")))
         (gst_object_set_name pipeline "screen")
         (let ((appsink (gst_bin_get_by_name pipeline "sink"))
-              (data (make-u8vector (* (max width self-width) (max height self-height) 4)))
+              (data (make-u8vector (* width height 4)))
               (info (make-u64vector 2)))
+          (gst_app_sink_signal_new_sample appsink fifo)
           (gst_element_set_state pipeline GST_STATE_READY)
           (set! self.data data)
           (set! self.info info)
           (set! self.pipeline pipeline)
+          (set! self.fifo fifo)
           (set! self.appsink appsink)))))
   
   
@@ -1026,7 +1029,8 @@
   (method override (setup-element self)
     (nextmethod self)
     (let ((width (get-width resolution))
-          (height (get-height resolution)))
+          (height (get-height resolution))
+          (fifo (make-stream-fifo)))
       (let ((pipeline (gst-launch "videotestsrc"
                                   "videoscale"
                                   "videoconvert"
@@ -1037,6 +1041,7 @@
         (let ((appsink (gst_bin_get_by_name pipeline "sink"))
               (data (make-u8vector (* width height 4)))
               (info (make-u64vector 2)))
+          (gst_app_sink_signal_new_sample appsink fifo)
           (gst_element_set_state pipeline GST_STATE_READY)
           (set! self.data data)
           (set! self.info info)
@@ -1085,6 +1090,7 @@
   (slot audio-appsink           initialize #f accessors generate)
   (slot audio-data <u8vector+>  initialize #f accessors generate)
   (slot audio-info <u64vector+> initialize #f accessors generate)
+  (slot audio-fifo              initialize #f accessors generate)
   
   
   (method override (initialize self location (resolution: resolution #f) (framerate: framerate #f) (bitrate: bitrate #f) (codec: codec #f) (audio?: audio? #t))
@@ -1100,7 +1106,9 @@
   (method override (setup-element self)
     (nextmethod self)
     (let ((width (get-width resolution))
-          (height (get-height resolution)))
+          (height (get-height resolution))
+          (fifo (make-stream-fifo))
+          (audio-fifo (make-stream-fifo)))
       (let ((pipeline (gst-launch (tie "filesrc name=filesrc")
                                   "decodebin name=decoder"
                                   (and audio?
@@ -1125,16 +1133,20 @@
               (audio-appsink (and audio? (gst_bin_get_by_name pipeline "audioappsink")))
               (audio-data (and audio? (make-u8vector (* width height 4))))
               (audio-info (and audio? (make-u64vector 2))))
+          (gst_app_sink_signal_new_sample appsink fifo)
+          (gst_app_sink_signal_new_sample audio-appsink audio-fifo)
           (g_object_set_string filesrc "location" (path-normalize location))
           (gst_element_set_state pipeline GST_STATE_READY)
           (set! self.data data)
           (set! self.info info)
+          (set! self.fifo fifo)
           (set! self.pipeline pipeline)
           (set! self.appsink appsink)
           (when audio?
             (set! self.audio-appsink audio-appsink)
             (set! self.audio-data audio-data)
-            (set! self.audio-info audio-info))))))
+            (set! self.audio-info audio-info)
+            (set! self.audio-fifo audio-fifo))))))
   
   
   (method override (start-element self)
@@ -1167,12 +1179,11 @@
   (method override (process self)
     (nextmethod self)
     (when audio-sink
-      (let ((size (gst_app_sink_read audio-appsink audio-data audio-info)))
-        (when (/= size -1)
-          (let ((buffer (subu8vector audio-data 0 size))
-                (timestamp (u64vector-ref audio-info 0))
-                (duration (u64vector-ref audio-info 1)))
-            (consume audio-sink buffer timestamp duration)))))))
+      (let ((size (gst_app_sink_read audio-fifo audio-appsink audio-data audio-info)))
+        (let ((buffer (subu8vector audio-data 0 size))
+              (timestamp (u64vector-ref audio-info 0))
+              (duration (u64vector-ref audio-info 1)))
+          (consume audio-sink buffer timestamp duration))))))
 
 
 ;;;
@@ -1186,7 +1197,8 @@
   (method override (setup-element self)
     (nextmethod self)
     (let ((width (get-width resolution))
-          (height (get-height resolution)))
+          (height (get-height resolution))
+          (fifo (make-stream-fifo)))
       (let ((pipeline (gst-launch (tie "filesrc name=filesrc")
                                   "decodebin"
                                   (and framerate (tie "videorate max-rate={framerate}"))
@@ -1207,6 +1219,7 @@
               (appsink (gst_bin_get_by_name pipeline "appsink"))
               (data (make-u8vector (* width height 4)))
               (info (make-u64vector 2)))
+          (gst_app_sink_signal_new_sample appsink fifo)
           (g_object_set_string filesrc "location" (path-normalize location))
           (gst_element_set_state pipeline GST_STATE_READY)
           (set! self.data data)
@@ -1333,7 +1346,7 @@
                   (site (stream on?: #t)
                     (let ((effective-timestamp (flonum->timestamp (- (current-seconds) start-time))))
                       (consume sink color effective-timestamp duration))))))
-            (task-sleep task .1 @w draw-refresh exit)
+            (task-sleep task draw-refresh exit)
             (iter))))))
   
   
@@ -1432,6 +1445,7 @@
   (slot color-data     <u8vector+>  initialize #f accessors generate)
   (slot color-info     <u64vector+> initialize #f accessors generate)
   (slot color-bytes                 initialize #f accessors generate)
+  (slot color-fifo                  initialize #f accessors generate)
   (slot alpha?                      initialize #f accessors generate)
   (slot alpha-pipeline              initialize #f accessors generate)
   (slot alpha-appsrc                initialize #f accessors generate)
@@ -1439,6 +1453,7 @@
   (slot alpha-data     <u8vector+>  initialize #f accessors generate)
   (slot alpha-info     <u64vector+> initialize #f accessors generate)
   (slot alpha-bytes                 initialize #f accessors generate)
+  (slot alpha-fifo                  initialize #f accessors generate)
   (slot image-surface               initialize #f accessors generate)
   (slot image-inhibit?              initialize #f accessors generate)
   (slot task                        initialize #f accessors generate)
@@ -1478,7 +1493,8 @@
     (when process?
       (let ((width (get-width resolution))
             (height (get-height resolution)))
-        (let ((pipeline (gst-launch (tie "appsrc name=src")
+        (let ((fifo (make-stream-fifo))
+              (pipeline (gst-launch (tie "appsrc name=src")
                                     (and (eq? codec 'h264) (tie "avdec_h264"))
                                     "videoscale"
                                     "videoconvert"
@@ -1491,6 +1507,7 @@
                 (appsink (gst_bin_get_by_name pipeline "sink"))
                 (data (make-u8vector (* width height 4)))
                 (info (make-u64vector 2)))
+            (gst_app_sink_signal_new_sample appsink fifo)
             (case codec
               ((h264)
                (gst_app_src_set_caps appsrc
@@ -1517,9 +1534,11 @@
             (set! self.color-bytes #f)
             (set! self.color-pipeline pipeline)
             (set! self.color-appsrc appsrc)
-            (set! self.color-appsink appsink)))
+            (set! self.color-appsink appsink)
+            (set! self.color-fifo fifo)))
         (when alpha?
-          (let ((pipeline (gst-launch "appsrc name=src"
+          (let ((fifo (make-stream-fifo))
+                (pipeline (gst-launch "appsrc name=src"
                                       "avdec_h264 name=dec"
                                       "appsink name=sink")))
             (gst_object_set_name pipeline "output")
@@ -1527,6 +1546,7 @@
                   (appsink (gst_bin_get_by_name pipeline "sink"))
                   (data (make-u8vector (/ (* width height 12) 8)))
                   (info (make-u64vector 2)))
+              (gst_app_sink_signal_new_sample appsink fifo)
               (gst_app_src_set_caps appsrc
                                     (gst_caps "video/x-h264"
                                               "width"         (g_value_int width)
@@ -1545,6 +1565,7 @@
               (set! self.alpha-pipeline pipeline)
               (set! self.alpha-appsrc appsrc)
               (set! self.alpha-appsink appsink)
+              (set! self.alpha-fifo fifo)
               (set! self.image-surface (new Image-Surface (new Dimension width height)))))))))
   
   
@@ -1632,20 +1653,17 @@
                     (let ((history (current-history)))
                       (unless (get-paused? history)
                         (process self)))))))
-            (let ((duration (- (current-seconds) time)))
-              (task-wait task video-period duration exit))
+            (task-halt task exit)
             (iter time))))))
   
   
   (method override (process self)
     (when (not color-bytes)
-      (let ((size (gst_app_sink_read color-appsink color-data color-info)))
-        (when (/= size -1)
-          (set! color-bytes size))))
+      (let ((size (gst_app_sink_read color-fifo color-appsink color-data color-info)))
+        (set! color-bytes size)))
     (when (and alpha? (not alpha-bytes))
-      (let ((size (gst_app_sink_read alpha-appsink alpha-data alpha-info)))
-        (when (/= size -1)
-          (set! alpha-bytes size))))
+      (let ((size (gst_app_sink_read alpha-fifo alpha-appsink alpha-data alpha-info)))
+        (set! alpha-bytes size)))
     (when (and color-bytes (or (not alpha?) alpha-bytes))
       (let ((timestamp (u64vector-ref color-info 0))
             (duration (u64vector-ref color-info 1)))
@@ -1913,56 +1931,6 @@
   
   (method override (draw self surface)
     (clear surface)))
-
-
-;;;
-;;;; Texture-Video-Sink
-;;;
-
-
-(class Texture-Video-Sink extends Video-Sink
-  
-  
-  (slot quad-texture initialize #f getter generate)
-  (slot matrix       initialize #f getter generate)
-  
-  
-  (method override (initialize self matrix . rest)
-    (bind-keywords ((size #f) . others) rest
-      (define (determine-size)
-        (or size
-            (let ((ratio (/ (cast <fl> (get-width resolution)) (cast <fl> (get-height resolution)))))
-              (let ((w ratio)
-                    (h 1.))
-                (new Dimension$fl$ w h)))))
-      
-      (apply nextmethod self others)
-      (let ((size (determine-size)))
-        (let ((w (get-width size))
-              (h (get-height size)))
-          (let ((v1 (vertex (/ w -2.) (/ h -2.) 0.))
-                (v2 (vertex (/ w -2.) (/ h  2.) 0.))
-                (v3 (vertex (/ w  2.) (/ h  2.) 0.))
-                (v4 (vertex (/ w  2.) (/ h -2.) 0.)))
-            (let ((quad-texture (make-quad-texture (get-width resolution) (get-height resolution) v1 v2 v3 v4)))
-              (set! self.quad-texture quad-texture)
-              (set! self.matrix matrix)))))))
-  
-  
-  (method override (release-element self)
-    (nextmethod self)
-    (when quad-texture
-      (glDeleteTextures* (get-id (get-texture quad-texture)))
-      (set! quad-texture #f)))
-  
-  
-  (method override (draw self color alpha timestamp duration)
-    (update self color alpha (get-texture quad-texture)))
-  
-  
-  (method override (render self)
-    (when (eq? stream-state 'drawn)
-      (render-texture quad-texture matrix))))
 
 
 ;;;
