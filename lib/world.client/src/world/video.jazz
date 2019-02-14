@@ -404,7 +404,7 @@
                              alpha-overlay: video-alpha
                              overlay?: video-overlay?
                              needs-layout?: #t
-                             process?: id)))))
+                             process?: (boolean id))))))
             (table-set! outputs id output)
             (when (not id)
               (set! self-output output))
@@ -696,6 +696,13 @@
   (slot selffifo              initialize #f accessors generate)
   
   
+  (method package virtual (release-fifos self)
+    (when fifo
+      (release-stream-fifo fifo))
+    (when selffifo
+      (release-stream-fifo selffifo)))
+  
+  
   (method (task-start self name)
     (let ((procedure
             (lambda (task)
@@ -706,6 +713,7 @@
   
   
   (method (task-stop self)
+    (release-fifos self)
     (stop-task task)
     (set! task #f))
   
@@ -733,42 +741,44 @@
   
   (method override (process self)
     (let ((size (gst_app_sink_read fifo appsink data info)))
-      (let ((buffer (subu8vector data 0 size))
-            (timestamp (u64vector-ref info 0))
-            (duration (u64vector-ref info 1)))
-        (when (and video-show
-                   (or (eq? video-show 'all)
-                       (eq? video-show 'header)
-                       (>= size video-show)))
-          ;; h264 specific
-          (let ((type (if (video-buffer-header? buffer)
-                          '***header***
-                        'delta)))
-            (if (eq? video-show 'header)
-                (when (eq? type '***header***)
-                  (terminal size type))
-              (terminal size type))))
-        (consume sink buffer timestamp duration)
-        (record-event udp-id-src-media
-                      (fixnum->flonum client-no)
-                      (fixnum->flonum world.udp:udp-video)
-                      -1.
-                      (if (video-buffer-header? buffer) 1. -1.)
-                      (fixnum->flonum size)
-                      (timestamp->flonum timestamp))))
-    (when appsinkself
-      (let ((size (gst_app_sink_read selffifo appsinkself data info)))
+      (when size
         (let ((buffer (subu8vector data 0 size))
               (timestamp (u64vector-ref info 0))
               (duration (u64vector-ref info 1)))
-          (consume sinkself buffer timestamp duration)
-          (record-event udp-id-src-self
+          (when (and video-show
+                     (or (eq? video-show 'all)
+                         (eq? video-show 'header)
+                         (>= size video-show)))
+            ;; h264 specific
+            (let ((type (if (video-buffer-header? buffer)
+                            '***header***
+                          'delta)))
+              (if (eq? video-show 'header)
+                  (when (eq? type '***header***)
+                    (terminal size type))
+                (terminal size type))))
+          (consume sink buffer timestamp duration)
+          (record-event udp-id-src-media
                         (fixnum->flonum client-no)
                         (fixnum->flonum world.udp:udp-video)
                         -1.
-                        -1.
+                        (if (video-buffer-header? buffer) 1. -1.)
                         (fixnum->flonum size)
-                        (timestamp->flonum timestamp)))))))
+                        (timestamp->flonum timestamp)))))
+    (when appsinkself
+      (let ((size (gst_app_sink_read selffifo appsinkself data info)))
+        (when size
+          (let ((buffer (subu8vector data 0 size))
+                (timestamp (u64vector-ref info 0))
+                (duration (u64vector-ref info 1)))
+            (consume sinkself buffer timestamp duration)
+            (record-event udp-id-src-self
+                          (fixnum->flonum client-no)
+                          (fixnum->flonum world.udp:udp-video)
+                          -1.
+                          -1.
+                          (fixnum->flonum size)
+                          (timestamp->flonum timestamp))))))))
 
 
 ;;;
@@ -990,7 +1000,9 @@
     (set! data #f)
     (set! pipeline #f)
     (set! appsink #f)
-    (consume sink #f #f #f))
+    (consume sink #f #f #f)
+    (close-stream-fifo fifo)
+    (set! fifo #f))
   
   
   (method (reset self)
@@ -1068,7 +1080,9 @@
     (set! data #f)
     (set! pipeline #f)
     (set! appsink #f)
-    (consume sink #f #f #f)))
+    (consume sink #f #f #f)
+    (close-stream-fifo fifo)
+    (set! fifo #f)))
 
 
 ;;;
@@ -1101,6 +1115,12 @@
     (set! self.bitrate bitrate)
     (set! self.codec codec)
     (set! self.audio? audio?))
+  
+  
+  (method override (release-fifos self)
+    (nextmethod self)
+    (when audio-fifo
+      (release-stream-fifo audio-fifo)))
   
   
   (method override (setup-element self)
@@ -1169,21 +1189,27 @@
     (set! pipeline #f)
     (set! appsink #f)
     (consume sink #f #f #f)
+    (close-stream-fifo fifo)
+    (set! fifo #f)
     (set! audio-info #f)
     (set! audio-data #f)
     (set! audio-appsink #f)
     (when audio-sink
-      (consume audio-sink #f #f #f)))
+      (consume audio-sink #f #f #f))
+    (when audio-fifo
+      (close-stream-fifo audio-fifo)
+      (set! audio-fifo #f)))
   
   
   (method override (process self)
     (nextmethod self)
     (when audio-sink
       (let ((size (gst_app_sink_read audio-fifo audio-appsink audio-data audio-info)))
-        (let ((buffer (subu8vector audio-data 0 size))
-              (timestamp (u64vector-ref audio-info 0))
-              (duration (u64vector-ref audio-info 1)))
-          (consume audio-sink buffer timestamp duration))))))
+        (when size
+          (let ((buffer (subu8vector audio-data 0 size))
+                (timestamp (u64vector-ref audio-info 0))
+                (duration (u64vector-ref audio-info 1)))
+            (consume audio-sink buffer timestamp duration)))))))
 
 
 ;;;
@@ -1346,7 +1372,7 @@
                   (site (stream on?: #t)
                     (let ((effective-timestamp (flonum->timestamp (- (current-seconds) start-time))))
                       (consume sink color effective-timestamp duration))))))
-            (task-sleep task draw-refresh exit)
+            (task-sleep task .1 @too-slow-until-we-have-a-way-to-detect-changes-to-the-surface draw-refresh exit)
             (iter))))))
   
   
@@ -1478,6 +1504,13 @@
     (set! self.needs-layout? needs-layout?))
   
   
+  (method package virtual (release-fifos self)
+    (when color-fifo
+      (release-stream-fifo color-fifo))
+    (when alpha-fifo
+      (release-stream-fifo alpha-fifo)))
+  
+  
   (method package virtual (resize self)
     )
   
@@ -1569,34 +1602,37 @@
               (set! self.image-surface (new Image-Surface (new Dimension width height)))))))))
   
   
+  (method (task-start self name)
+    (let ((procedure
+            (lambda (task)
+              (video-loop self task))))
+      (let ((task (new Task name procedure priority: video-priority)))
+        (start-task task)
+        (set! self.task task))))
+  
+  
+  (method (task-stop self)
+    (release-fifos self)
+    (stop-task task)
+    (set! task #f))
+  
+  
   (method override (start-element self)
-    (define (task-start name)
-      (let ((procedure
-              (lambda (task)
-                (video-loop self task))))
-        (let ((task (new Task name procedure priority: video-priority)))
-          (start-task task)
-          (set! self.task task))))
-    
     (nextmethod self)
     (when process?
-      (task-start 'video)
+      (task-start self 'video)
       (gst_element_set_state color-pipeline GST_STATE_PLAYING)
       (when alpha?
         (gst_element_set_state alpha-pipeline GST_STATE_PLAYING))))
   
   
   (method override (stop-element self)
-    (define (task-stop)
-      (stop-task task)
-      (set! task #f))
-    
     (nextmethod self)
     (when process?
-      (task-stop)
       (gst_element_set_state color-pipeline GST_STATE_READY)
       (when alpha?
-        (gst_element_set_state alpha-pipeline GST_STATE_READY))))
+        (gst_element_set_state alpha-pipeline GST_STATE_READY))
+      (task-stop self)))
   
   
   (method override (release-element self)
@@ -1609,6 +1645,8 @@
       (set! color-pipeline #f)
       (set! color-appsrc #f)
       (set! color-appsink #f)
+      (close-stream-fifo color-fifo)
+      (set! color-fifo #f)
       (when alpha?
         (gst_element_release alpha-pipeline)
         (close image-surface)
@@ -1618,7 +1656,9 @@
         (set! alpha-pipeline #f)
         (set! alpha-appsrc #f)
         (set! alpha-appsink #f)
-        (set! image-surface #f))
+        (set! image-surface #f)
+        (close-stream-fifo alpha-fifo)
+        (set! alpha-fifo #f))
       (set-stream-state self 'off)))
   
   
