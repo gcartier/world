@@ -741,44 +741,42 @@
   
   (method override (process self task exit)
     (let ((size (gst_app_sink_wait task exit fifo appsink data info)))
-      (when size
+      (let ((buffer (subu8vector data 0 size))
+            (timestamp (u64vector-ref info 0))
+            (duration (u64vector-ref info 1)))
+        (when (and video-show
+                   (or (eq? video-show 'all)
+                       (eq? video-show 'header)
+                       (>= size video-show)))
+          ;; h264 specific
+          (let ((type (if (video-buffer-header? buffer)
+                          '***header***
+                        'delta)))
+            (if (eq? video-show 'header)
+                (when (eq? type '***header***)
+                  (terminal size type))
+              (terminal size type))))
+        (consume sink buffer timestamp duration)
+        (record-event udp-id-src-media
+                      (fixnum->flonum client-no)
+                      (fixnum->flonum world.udp:udp-video)
+                      -1.
+                      (if (video-buffer-header? buffer) 1. -1.)
+                      (fixnum->flonum size)
+                      (timestamp->flonum timestamp))))
+    (when appsinkself
+      (let ((size (gst_app_sink_wait task exit selffifo appsinkself data info)))
         (let ((buffer (subu8vector data 0 size))
               (timestamp (u64vector-ref info 0))
               (duration (u64vector-ref info 1)))
-          (when (and video-show
-                     (or (eq? video-show 'all)
-                         (eq? video-show 'header)
-                         (>= size video-show)))
-            ;; h264 specific
-            (let ((type (if (video-buffer-header? buffer)
-                            '***header***
-                          'delta)))
-              (if (eq? video-show 'header)
-                  (when (eq? type '***header***)
-                    (terminal size type))
-                (terminal size type))))
-          (consume sink buffer timestamp duration)
-          (record-event udp-id-src-media
+          (consume sinkself buffer timestamp duration)
+          (record-event udp-id-src-self
                         (fixnum->flonum client-no)
                         (fixnum->flonum world.udp:udp-video)
                         -1.
-                        (if (video-buffer-header? buffer) 1. -1.)
+                        -1.
                         (fixnum->flonum size)
-                        (timestamp->flonum timestamp)))))
-    (when appsinkself
-      (let ((size (gst_app_sink_wait task exit selffifo appsinkself data info)))
-        (when size
-          (let ((buffer (subu8vector data 0 size))
-                (timestamp (u64vector-ref info 0))
-                (duration (u64vector-ref info 1)))
-            (consume sinkself buffer timestamp duration)
-            (record-event udp-id-src-self
-                          (fixnum->flonum client-no)
-                          (fixnum->flonum world.udp:udp-video)
-                          -1.
-                          -1.
-                          (fixnum->flonum size)
-                          (timestamp->flonum timestamp))))))))
+                        (timestamp->flonum timestamp)))))))
 
 
 ;;;
@@ -1205,11 +1203,10 @@
     (nextmethod self task exit)
     (when audio-sink
       (let ((size (gst_app_sink_wait task exit audio-fifo audio-appsink audio-data audio-info)))
-        (when size
-          (let ((buffer (subu8vector audio-data 0 size))
-                (timestamp (u64vector-ref audio-info 0))
-                (duration (u64vector-ref audio-info 1)))
-            (consume audio-sink buffer timestamp duration)))))))
+        (let ((buffer (subu8vector audio-data 0 size))
+              (timestamp (u64vector-ref audio-info 0))
+              (duration (u64vector-ref audio-info 1)))
+          (consume audio-sink buffer timestamp duration))))))
 
 
 ;;;
@@ -1470,7 +1467,6 @@
   (slot color-appsink               initialize #f accessors generate)
   (slot color-data     <u8vector+>  initialize #f accessors generate)
   (slot color-info     <u64vector+> initialize #f accessors generate)
-  (slot color-bytes                 initialize #f accessors generate)
   (slot color-fifo                  initialize #f accessors generate)
   (slot alpha?                      initialize #f accessors generate)
   (slot alpha-pipeline              initialize #f accessors generate)
@@ -1478,7 +1474,6 @@
   (slot alpha-appsink               initialize #f accessors generate)
   (slot alpha-data     <u8vector+>  initialize #f accessors generate)
   (slot alpha-info     <u64vector+> initialize #f accessors generate)
-  (slot alpha-bytes                 initialize #f accessors generate)
   (slot alpha-fifo                  initialize #f accessors generate)
   (slot image-surface               initialize #f accessors generate)
   (slot image-inhibit?              initialize #f accessors generate)
@@ -1564,7 +1559,6 @@
             (gst_element_set_state pipeline GST_STATE_READY)
             (set! self.color-data data)
             (set! self.color-info info)
-            (set! self.color-bytes #f)
             (set! self.color-pipeline pipeline)
             (set! self.color-appsrc appsrc)
             (set! self.color-appsink appsink)
@@ -1594,7 +1588,6 @@
               (gst_element_set_state pipeline GST_STATE_READY)
               (set! self.alpha-data data)
               (set! self.alpha-info info)
-              (set! self.alpha-bytes #f)
               (set! self.alpha-pipeline pipeline)
               (set! self.alpha-appsrc appsrc)
               (set! self.alpha-appsink appsink)
@@ -1641,7 +1634,6 @@
       (gst_element_release color-pipeline)
       (set! color-info #f)
       (set! color-data #f)
-      (set! color-bytes #f)
       (set! color-pipeline #f)
       (set! color-appsrc #f)
       (set! color-appsink #f)
@@ -1652,7 +1644,6 @@
         (close image-surface)
         (set! alpha-info #f)
         (set! alpha-data #f)
-        (set! alpha-bytes #f)
         (set! alpha-pipeline #f)
         (set! alpha-appsrc #f)
         (set! alpha-appsink #f)
@@ -1698,18 +1689,11 @@
   
   
   (method override (process self task exit)
-    (when (not color-bytes)
-      (let ((size (gst_app_sink_wait task exit color-fifo color-appsink color-data color-info)))
-        (set! color-bytes size)))
-    (when (and alpha? (not alpha-bytes))
-      (let ((size (gst_app_sink_wait task exit alpha-fifo alpha-appsink alpha-data alpha-info)))
-        (set! alpha-bytes size)))
-    (when (and color-bytes (or (not alpha?) alpha-bytes))
+    (let ((color-bytes (gst_app_sink_wait task exit color-fifo color-appsink color-data color-info))
+          (alpha-bytes (and alpha? (gst_app_sink_wait task exit alpha-fifo alpha-appsink alpha-data alpha-info))))
       (let ((timestamp (u64vector-ref color-info 0))
             (duration (u64vector-ref color-info 1)))
         (draw self color-data (and alpha? alpha-data) timestamp duration)
-        (set! color-bytes #f)
-        (set! alpha-bytes #f)
         (when (eq? stream-state 'on)
           (set-stream-state self 'drawn)))))
   
