@@ -130,41 +130,6 @@
   (set! video-layout layout))
 
 
-;;;
-;;;; Video
-;;;
-
-
-(definition protected (new-world-video)
-  (let ((input-src (cond (video-stream
-                          (new File-Stream-Video-Src
-                            video-stream))
-                         (image-stream
-                          (new Image-Stream-Video-Src
-                            image-stream))
-                         (else
-                          (new Camera-Video-Src
-                            resolution: video-resolution
-                            framerate: video-framerate
-                            bitrate: video-bitrate
-                            codec: video-codec))))
-        (server-sink (new Stream-Sink
-                       consumer: (lambda (buffer timestamp duration)
-                                   (let ((video (current-video)))
-                                     (send-camera-video video buffer timestamp duration)))))
-        (self-sink (and (not streaming?)
-                        (new Stream-Sink
-                          consumer: (lambda (buffer timestamp duration)
-                                      (let ((video (current-video)))
-                                        (let ((sink (find-output video #f)))
-                                          (set-stream-state sink 'drawn)
-                                          (draw sink buffer #f timestamp duration))))))))
-    (new World-Video input: (pipeline input-src
-                                      (if self-sink
-                                          (list server-sink self-sink)
-                                        server-sink)))))
-
-
 ;; first four bytes are always 00 00 00 01
 (definition protected (video-buffer-header? buffer)
   (let ((pos 5))
@@ -172,75 +137,31 @@
          (= (u8vector-ref buffer pos) 16))))
 
 
+;;;
+;;;; Video
+;;;
+
+
 (class World-Video extends Object
   
   
-  (slot input             getter generate)
   (slot outputs           getter generate)
   (slot ordered-outputs   getter generate)
   ;; quicky to test
   (slot extra-outputs     getter generate)
   (slot fullscreen-output accessors generate)
   (slot self-output       getter generate)
-  (slot camera-mutex      getter generate)
   (slot render-hook       accessors generate)
   
   
-  (method override (initialize self (input: input #f))
+  (method override (initialize self)
     (nextmethod self)
-    (set! self.input input)
     (set! self.outputs (make-table test: equal?))
     (set! ordered-outputs '())
     (set! extra-outputs '())
     (set! fullscreen-output #f)
     (set! self-output #f)
-    (set! camera-mutex (make-mutex 'camera))
     (set! render-hook #f))
-  
-  
-  (method package (autostart self)
-    (when (world-setting 'world.video-autostart? #f)
-      (start self)))
-  
-  
-  (method package (start self)
-    (unless (and streaming?
-                 audio-stream
-                 (not video-stream)
-                 (not image-stream))
-      (start input)))
-  
-  
-  (method package (stop self)
-    (unless (and streaming?
-                 audio-stream
-                 (not video-stream)
-                 (not image-stream))
-      (release input)))
-  
-  
-  (method (with-camera-mutex self thunk)
-    (mutex-lock! camera-mutex)
-    (prog1 (thunk)
-      (mutex-unlock! camera-mutex)))
-  
-  
-  (method package (send-camera-video self buffer timestamp duration)
-    (with-camera-mutex self
-      (lambda ()
-        (let ((tier (current-client)))
-          (let ((channel-no (get-no (get-camera-channel tier)))
-                (header? (and buffer (video-buffer-header? buffer))))
-            (send-client-video tier channel-no buffer header? timestamp duration))))))
-  
-  
-  (method package (reset-camera self)
-    (with-camera-mutex self
-      (lambda ()
-        (let ((camera (car (get-elements input))))
-          ;; quicky for tests
-          (when (is? camera Camera-Video-Src)
-            (reset camera))))))
   
   
   (method package (resize self)
@@ -253,46 +174,6 @@
   ;; kind of hack because of an import conflict
   (method (video-layout-ref self)
     video-layout)
-  
-  
-  ;;;
-  ;;;; Input
-  ;;;
-  
-  
-  (method (on-toggle-video self evt)
-    (toggle-video self))
-  
-  
-  (method package (toggle-video self)
-    (when (client?)
-      (if (video-playing? self)
-          (stop-video self)
-        (start-video self))))
-  
-  
-  (method package (start-video self (feedback?: feedback? #t))
-    (when (client?)
-      (let ((world (current-world)))
-        (start self)
-        (update-parameter world 'video)
-        (when feedback?
-          (display-on/off world "Video" (playing? input))))))
-  
-  
-  (method package (stop-video self (feedback?: feedback? #t))
-    (when (client?)
-      (let ((world (current-world)))
-        (stop self)
-        (when self-output
-          (set-stream-state self-output 'off))
-        (update-parameter world 'video)
-        (when feedback?
-          (display-on/off world "Video" (playing? input))))))
-  
-  
-  (method package (video-playing? self)
-    (playing? input))
   
   
   ;;;
@@ -364,7 +245,7 @@
         (let ((player (or player (find-entity id))))
           (let ((output (case video-layout
                           ((overhead)
-                           (new Camera-Video-Sink
+                           (new Overhead-Video-Sink
                              player
                              resolution: (or resolution video-resolution)
                              framerate: video-framerate
@@ -424,12 +305,6 @@
     (release output)
     (when layout?
       (update-layouts self)))
-  
-  
-  (method package (close-outputs self)
-    (iterate-table-safe outputs
-      (lambda (id output)
-        (close-output self id output layout?: #f))))
   
   
   (method package (effective-fullscreen-output self)
@@ -757,7 +632,11 @@
                         -1.
                         -1.
                         (fixnum->flonum size)
-                        (timestamp->flonum timestamp)))))))
+                        (timestamp->flonum timestamp))))))
+  
+  
+  (method protected virtual (reset-media self)
+    ))
 
 
 ;;;
@@ -773,6 +652,7 @@
   (slot bitrate    initialize #f accessors generate)
   (slot codec      initialize #f accessors generate)
   (slot pipeline   initialize #f accessors generate)
+  (slot mutex                    getter generate)
   
   
   (method override (initialize self (resolution: resolution #f) (framerate: framerate #f) (bitrate: bitrate #f) (codec: codec #f))
@@ -780,7 +660,8 @@
     (set! self.resolution resolution)
     (set! self.framerate framerate)
     (set! self.bitrate bitrate)
-    (set! self.codec codec))
+    (set! self.codec codec)
+    (set! self.mutex (make-mutex 'camera)))
   
   
   (method override (setup-element self)
@@ -878,14 +759,31 @@
       (set! selffifo #f)))
   
   
-  (method (reset self)
-    (when pipeline
-      (let ((valve (gst_bin_get_by_name pipeline "valve"))
-            (encoder (gst_bin_get_by_name pipeline "enc")))
-        (g_object_set valve "drop" (g_value_int 1))
-        (gst_element_set_state encoder GST_STATE_READY)
-        (gst_element_set_state encoder GST_STATE_PLAYING)
-        (g_object_set valve "drop" (g_value_int 0))))))
+  (method (with-mutex self thunk)
+    (mutex-lock! mutex)
+    (prog1 (thunk)
+      (mutex-unlock! mutex)))
+  
+  
+  (method package (send-camera-video self buffer timestamp duration)
+    (with-mutex self
+      (lambda ()
+        (let ((tier (current-client)))
+          (let ((channel-no (get-no (get-camera-channel tier)))
+                (header? (and buffer (video-buffer-header? buffer))))
+            (send-client-video tier channel-no buffer header? timestamp duration))))))
+  
+  
+  (method override (reset-media self)
+    (with-mutex self
+      (lambda ()
+        (when pipeline
+          (let ((valve (gst_bin_get_by_name pipeline "valve"))
+                (encoder (gst_bin_get_by_name pipeline "enc")))
+            (g_object_set valve "drop" (g_value_int 1))
+            (gst_element_set_state encoder GST_STATE_READY)
+            (gst_element_set_state encoder GST_STATE_PLAYING)
+            (g_object_set valve "drop" (g_value_int 0))))))))
 
 
 ;;;
@@ -1428,6 +1326,36 @@
 
 
 ;;;
+;;;; Self-Sink
+;;;
+
+
+(class Self-Sink extends Stream-Sink
+  
+  
+  (slot self-output initialize #f getter generate)
+  
+  
+  (method override (start-element self)
+    (nextmethod self)
+    (let ((video (current-video))
+          (me (current-me)))
+      (set! self-output (player-output video #f player: me))))
+  
+  
+  (method override (stop-element self)
+    (let ((video (current-video)))
+      (close-output video #f self-output)
+      (set-stream-state self-output 'off))
+    (nextmethod self))
+  
+  
+  (method override (consume self buffer timestamp duration)
+    (set-stream-state self-output 'drawn)
+    (draw self-output buffer #f timestamp duration)))
+
+
+;;;
 ;;;; Video-Sink
 ;;;
 
@@ -1882,11 +1810,11 @@
 
 
 ;;;
-;;;; Camera-Video-Sink
+;;;; Overhead-Video-Sink
 ;;;
 
 
-(class Camera-Video-Sink extends Video-Sink
+(class Overhead-Video-Sink extends Video-Sink
   
   
   (slot player initialize #f accessors generate)
