@@ -90,11 +90,14 @@
 (definition layouts
   '(;;overhead
     sidebar
-    gallery
-    fullscreen))
+    gallery))
 
 (definition public video-layout
   (world-setting 'world.video-layout 'sidebar @currently-buggy-when-we-cycle 'overhead))
+
+
+(definition public video-focus?
+  (world-setting 'world.video-focus? #f))
 
 
 (definition public video-mode
@@ -129,15 +132,8 @@
 
 
 ;;;
-;;;; Access
+;;;; Header
 ;;;
-
-
-(definition public (get-video-layout)
-  video-layout)
-
-(definition public (set-video-layout layout)
-  (set! video-layout layout))
 
 
 ;; first four bytes are always 00 00 00 01
@@ -148,6 +144,28 @@
 
 
 ;;;
+;;;; Focused
+;;;
+
+
+(definition (adjust-focused bounds rect)
+  (if (eq? video-mode 'fit)
+      rect
+    ;; fill mode
+    (let ((ratio (fit-rects rect bounds 'fill)))
+      (let ((new-width (fxround (* (cast <fl> (rect-width rect)) ratio)))
+            (new-height (fxround (* (cast <fl> (rect-height rect)) ratio))))
+        (let ((pos (center (new Dimension new-width new-height) (rect-size bounds))))
+          (let ((h (get-h pos))
+                (v (get-v pos)))
+            (new Rect h v (+ h new-width) (+ v new-height))))))))
+
+
+(definition (focused-rect bounds)
+  (car (layout-tiles 1 bounds)))
+
+
+;;;
 ;;;; Video
 ;;;
 
@@ -155,18 +173,18 @@
 (class World-Video extends Object
   
   
-  (slot outputs           getter generate)
-  (slot ordered-outputs   getter generate)
-  (slot fullscreen-output accessors generate)
-  (slot self-output       getter generate)
-  (slot render-hook       accessors generate)
+  (slot outputs         getter generate)
+  (slot ordered-outputs getter generate)
+  (slot focused-output  accessors generate)
+  (slot self-output     getter generate)
+  (slot render-hook     accessors generate)
   
   
   (method override (initialize self)
     (nextmethod self)
     (set! self.outputs (make-table test: equal?))
     (set! ordered-outputs '())
-    (set! fullscreen-output #f)
+    (set! focused-output #f)
     (set! self-output #f)
     (set! render-hook #f))
   
@@ -181,6 +199,10 @@
   ;; kind of hack because of an import conflict
   (method (video-layout-ref self)
     video-layout)
+  
+  ;; kind of hack because of an import conflict
+  (method (video-focus?-ref self)
+    video-focus?)
   
   
   ;;;
@@ -295,17 +317,25 @@
     (set! ordered-outputs (remove! output ordered-outputs))
     (when (eq? output self-output)
       (set! self-output #f))
-    (when (eq? output fullscreen-output)
-      (set! fullscreen-output #f))
+    (when (eq? output focused-output)
+      (set! focused-output #f))
     (release output)
     (when layout?
       (update-layouts self)))
   
   
-  (method package (effective-fullscreen-output self)
-    (or fullscreen-output
+  (method package (effective-focused-output self)
+    (or focused-output
         (and (not-null? ordered-outputs)
              (car ordered-outputs))))
+  
+  
+  (method package (change-focused-output self output)
+    (when focused-output
+      (unfocus focused-output))
+    (set! focused-output output)
+    (when output
+      (focus output)))
   
   
   (method package (receive-server-video self id buffer timestamp duration)
@@ -357,10 +387,10 @@
   (method package (render-outputs self)
     (unless (and render-hook
                  (render-hook self))
-      (if (eq? video-layout 'fullscreen)
-          (let ((fullscreen-output (effective-fullscreen-output self)))
-            (when fullscreen-output
-              (render fullscreen-output)))
+      (if video-focus?
+          (let ((focused-output (effective-focused-output self)))
+            (when focused-output
+              (render focused-output)))
         ;; use ordered-outputs so order is stable
         (for-each render ordered-outputs))))
   
@@ -368,10 +398,10 @@
   (method package (render-minis self)
     (unless (and render-hook
                  (render-hook self))
-      (when (eq? video-layout 'fullscreen)
-        (let ((fullscreen-output (effective-fullscreen-output self)))
+      (when video-focus?
+        (let ((focused-output (effective-focused-output self)))
           (for-each (lambda (output)
-                      (unless (eq? output fullscreen-output)
+                      (unless (eq? output focused-output)
                         (render output)))
                     ordered-outputs)))))
   
@@ -394,9 +424,7 @@
       ((sidebar)
        (gallery-layout self))
       ((gallery)
-       (fullscreen-layout self))
-      ((fullscreen)
-       (overhead-layout self))
+       (circle-layout self))
       ((circle)
        (circle-layout self))))
   
@@ -409,10 +437,14 @@
        (sidebar-layout self))
       ((gallery)
        (gallery-layout self))
-      ((fullscreen)
-       (fullscreen-layout self))
       ((circle)
        (circle-layout self))))
+  
+  
+  (method protected (toggle-focus self)
+    (set! video-focus? (not video-focus?))
+    (change-focused-output self (and video-focus? (effective-focused-output self)))
+    (update-layouts self))
   
   
   (method (stop-renders self)
@@ -441,11 +473,6 @@
     (layout-outputs self))
   
   
-  (method package (fullscreen-layout self)
-    (set! video-layout 'fullscreen)
-    (layout-outputs self))
-  
-  
   (method package (layout-outputs self)
     (when (not-null? ordered-outputs)
       (let ((rectangles (layout self (length ordered-outputs))))
@@ -471,38 +498,26 @@
               (t (get-top bounds))
               (r (get-right bounds))
               (b (get-bottom bounds)))
-          (define (adjust-fullscreen rect)
-            (if (eq? video-mode 'fit)
-                rect
-              ;; fill mode
-              (let ((ratio (fit-rects rect bounds 'fill)))
-                (let ((new-width (fxround (* (cast <fl> (rect-width rect)) ratio)))
-                      (new-height (fxround (* (cast <fl> (rect-height rect)) ratio))))
-                  (let ((pos (center (new Dimension new-width new-height) (rect-size bounds))))
-                    (let ((h (get-h pos))
-                          (v (get-v pos)))
-                      (new Rect h v (+ h new-width) (+ v new-height))))))))
-          
           (case video-layout
             ((sidebar)
              (layout-tiles num-players (new Rect 10 70 210 (- b 100))))
             ((gallery)
-             (if (= num-players 1)
-                 (list (adjust-fullscreen (car (layout-tiles 1 bounds))))
-               (reverse (layout-tiles num-players bounds))))
-            ((fullscreen)
-             (let ((width (if (> num-players 2) 224 288))
-                   (height (if (> num-players 2) 126 162)))
-               (let ((full (car (layout-tiles 1 bounds)))
-                     (border 0))
-                 (let ((r (- r border))
-                       (fullscreen-output (effective-fullscreen-output self)))
-                   (map (lambda (output)
-                          (if (eq? output fullscreen-output)
-                              (adjust-fullscreen full)
-                            (prog1 (new Rect (- r width) (- b height) r b)
-                              (decrease! r (+ width border)))))
-                        ordered-outputs)))))
+             (let ((focused (focused-rect bounds)))
+               (if (not video-focus?)
+                   (if (= num-players 1)
+                       (list (adjust-focused bounds focused))
+                     (reverse (layout-tiles num-players bounds)))
+                 (let ((width (if (> num-players 2) 224 288))
+                       (height (if (> num-players 2) 126 162)))
+                   (let ((border 0))
+                     (let ((r (- r border))
+                           (focused-output (effective-focused-output self)))
+                       (map (lambda (output)
+                              (if (eq? output focused-output)
+                                  (adjust-focused bounds focused)
+                                (prog1 (new Rect (- r width) (- b height) r b)
+                                  (decrease! r (+ width border)))))
+                            ordered-outputs)))))))
             (else
              #f))))))
   
@@ -1472,6 +1487,14 @@
     )
   
   
+  (method package virtual (focus self)
+    )
+  
+  
+  (method package virtual (unfocus self)
+    )
+  
+  
   (method package (set-stream-state self state)
     (when (neq? state stream-state)
       (set! stream-state state)
@@ -2086,6 +2109,25 @@
     (set-rect sheet rect))
   
   
+  (method package (focused? self)
+    (neq? (get-texture sheet) texture))
+  
+  
+  (method override (focus self)
+    (unless (focused? self)
+      (let ((window (current-window)))
+        (let ((rect (focused-rect (get-bounds window))))
+          (let ((tex (make-cairo-texture (get-width resolution) (get-height resolution))))
+            (set-texture sheet tex)
+            (set-rect sheet rect))))))
+  
+  
+  (method override (unfocus self)
+    (when (focused? self)
+      (glDeleteTextures* (get-id (get-texture sheet)))
+      (set-texture sheet texture)))
+  
+  
   (method override (start-element self)
     (nextmethod self)
     (let ((zone (current-zone)))
@@ -2118,7 +2160,10 @@
     (mutex-lock! draw-mutex)
     (when (or (eq? draw-mode 'draw) (testing?))
       (update self color alpha texture)
-      (set! last-color color))
+      (set! last-color color)
+      (when (focused? self)
+        (assert (neq? texture (get-texture sheet)))
+        (update self color alpha (get-texture sheet))))
     (when id
       (record-event udp-id-draw-video
                     (fixnum->flonum client-no)
@@ -2147,7 +2192,7 @@
     (when (eq? stream-state 'drawn)
       ;; QUICKY
       (case video-layout
-        ((gallery fullscreen)
+        ((gallery)
          (maybe-update-layouts self)
          (let ((world (current-world)))
            (let ((x (cast <fl> (get-left sheet)))
@@ -2157,6 +2202,14 @@
                (render-sheet sheet matrix)))))
         (else
          (maybe-update-layouts self)
+         (when (focused? self)
+           (assert (neq? texture (get-texture sheet)))
+           (let ((world (current-world)))
+             (let ((x (cast <fl> (get-left sheet)))
+                   (y (cast <fl> (get-top sheet)))
+                   (h (cast <fl> (get-height sheet))))
+               (let ((matrix (make-translation-matrix (vertex x (- (get-height world) y h) 0.))))
+                 (render-sheet sheet matrix)))))
          (render-pane pane))))))
 
 
