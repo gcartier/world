@@ -1,0 +1,230 @@
+;;;===============
+;;;  WorldScheme
+;;;===============
+;;;
+;;;; Streamer
+;;;
+;;;  The Initial Developer of the Original Code is Guillaume Cartier.
+;;;  Portions created by the Initial Developer are Copyright (C) 2012-2018
+;;;  the Initial Developer. All Rights Reserved.
+;;;
+;;;  Contributor(s):
+
+
+(module world.streamer jazz
+
+
+(import (jazz.io)
+        (jazz.stream)
+        (world)
+        (world.audio)
+        (world.client.tier)
+        (world.client.udp)
+        (world.context)
+        (world.server.tier)
+        (world.server.udp)
+        (world.settings)
+        (world.streaming)
+        (world.task)
+        (world.udp)
+        (world.video))
+
+
+;;;
+;;;; Streams
+;;;
+
+
+(definition private-streams?
+  (world-setting 'world.private-streams? #f))
+
+
+(definition public images-dir
+  {Directory Settings "streams" "images"})
+
+(definition public videos-dir
+  {Directory Settings "streams" "videos"})
+
+(definition public musics-dir
+  {Directory Settings "streams" "musics"})
+
+
+(definition (available-images)
+  (let ((queue (new-queue)))
+    (define (scan-directory root dir)
+      (iterate-directory dir
+        (lambda (file)
+          (when (extension=? (get-extension file) "jpg")
+            (let ((base (get-base file)))
+              (enqueue queue (string-append root base)))))
+        recursive?: #f))
+    
+    (scan-directory "images/" images-dir)
+    (when private-streams?
+      (let ((private-dir (new-directory images-dir "private")))
+        (when (exists? private-dir)
+          (scan-directory "images/private/" private-dir))))
+    (queue-list queue)))
+
+
+(definition (available-videos)
+  (let ((queue (new-queue)))
+    (define (scan-directory root dir)
+      (iterate-directory dir
+        (lambda (file)
+          (when (extension=? (get-extension file) "streamvideo")
+            (let ((base (get-base file)))
+              (enqueue queue (string-append root base)))))
+        recursive?: #f))
+    
+    (scan-directory "videos/" videos-dir)
+    (when private-streams?
+      (let ((private-dir (new-directory videos-dir "private")))
+        (when (exists? private-dir)
+          (scan-directory "videos/private/" private-dir))))
+    (queue-list queue)))
+
+
+(definition (available-musics)
+  (let ((queue (new-queue)))
+    (define (scan-directory root dir)
+      (iterate-directory dir
+        (lambda (file)
+          (when (extension=? (get-extension file) "streamaudio")
+            (let ((base (get-base file)))
+              (enqueue queue (string-append root base)))))
+        recursive?: #f))
+    
+    (scan-directory "musics/" musics-dir)
+    (when private-streams?
+      (let ((private-dir (new-directory musics-dir "private")))
+        (when (exists? private-dir)
+          (scan-directory "musics/private/" private-dir))))
+    (queue-list queue)))
+
+
+(definition (tier-send-channels)
+  (if (client?)
+      (get-send-channels (get-udp-client (current-client)))
+    (get-send-channels (get-udp-server (current-server)))))
+
+
+(definition (find-audio-channel name)
+  (continuation-capture
+    (lambda (return)
+      (iterate-table (tier-send-channels)
+        (lambda (no channel)
+          (when (and (equal? (get-name channel) name)
+                     (= (get-media-kind channel) udp-audio))
+            (continuation-return return channel))))
+      #f)))
+
+
+(definition public (stream-image location name)
+  (list
+    (make-image-channel location name)))
+
+
+(definition public (stream-audio location name)
+  (list
+    (make-audio-channel location name)))
+
+
+(definition public (stream-screen name)
+  (list
+    (make-screen-channel name)))
+
+
+(definition public (stream-video location name (audio?: audio? #t))
+  (define (action channel action)
+    (let ((audio-channel (find-audio-channel (get-name channel))))
+      (cond ((playing? channel)
+             (pause channel)
+             (when audio-channel
+               (pause audio-channel)))
+            (else
+             (play channel)
+             (when audio-channel
+               (play audio-channel))))))
+  
+  (remove-false
+    (list
+      (and audio? (make-audio-channel location name))
+      (make-video-channel location name action-proc: action))))
+
+
+(definition public (play-stream stream)
+  (for-each play stream))
+
+
+(definition protected (streaming-channels)
+  (let ((tier (current-tier)))
+    (let ((queue (new-queue)))
+      (iterate-table (get-send-channels (get-udp-client tier))
+        (lambda (no channel)
+          (let ((name (get-name channel)))
+            (unless (equal? name "Live")
+              (enqueue queue channel)))))
+      (queue-list queue))))
+
+
+(definition protected (streaming-audio?)
+  (some? (lambda (channel)
+           (= (get-media-kind channel) udp-audio))
+         (streaming-channels)))
+
+
+(definition protected (streaming-names)
+  (map get-name (streaming-channels)))
+
+
+(definition protected (available-names lst)
+  (let ((names (streaming-names)))
+    (collect-if (lambda (location)
+                  (not (member? (filename-name location) names)))
+                lst)))
+
+
+(definition public (add-image)
+  (let ((locations (available-names (available-images))))
+    (when (not-null? locations)
+      (let ((location (random-element locations)))
+        (let ((image (add-extension location "jpg"))
+              (name (filename-name location)))
+          (let ((stream (stream-image image name)))
+            (play-stream stream)))))))
+
+
+(definition public (add-video)
+  (let ((locations (available-names (available-videos))))
+    (when (not-null? locations)
+      (let ((location (random-element locations)))
+        (let ((name (filename-name location)))
+          (let ((stream (stream-video location name audio?: (not (streaming-audio?)))))
+            (play-stream stream)))))))
+
+
+(definition public (add-music)
+  (if (streaming-audio?)
+      (bell)
+    (let ((locations (available-names (available-musics))))
+      (when (not-null? locations)
+        (let ((location (random-element locations)))
+          (let ((name (filename-name location)))
+            (let ((stream (stream-audio location name)))
+              (play-stream stream))))))))
+
+
+(definition public (remove-stream)
+  (let ((tier (current-tier)))
+    (let ((channels (streaming-channels)))
+      (if (null? channels)
+          (bell)
+        (let ((channel (random-element channels)))
+          (let ((name (get-name channel)))
+            (let ((all (collect-if (lambda (channel)
+                                     (equal? (get-name channel) name))
+                                   (streaming-channels))))
+              (for-each (lambda (channel)
+                          (close-send-channel (get-udp-client tier) (get-no channel)))
+                        all)))))))))
