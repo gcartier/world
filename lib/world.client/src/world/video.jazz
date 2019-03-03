@@ -106,8 +106,13 @@
 (definition public (set-video-mode mode)
   (let ((video (current-video)))
     (set! video-mode mode)
-    (layout-outputs video)
-    (invalidate-interface)))
+    (if (eq? video-layout 'circle)
+        (when video-focus?
+          (let ((focused-output (effective-focused-output video)))
+            (when focused-output
+              (move-focused focused-output))))
+      (layout-outputs video)
+      (invalidate-interface))))
 
 
 (definition video-show
@@ -180,12 +185,11 @@
 (class World-Video extends Object
   
   
-  (slot outputs          getter generate)
-  (slot ordered-outputs  getter generate)
-  (slot self-output      getter generate)
-  (slot focused-output   accessors generate)
-  (slot focused-textures accessors generate)
-  (slot render-hook      accessors generate)
+  (slot outputs         getter generate)
+  (slot ordered-outputs getter generate)
+  (slot self-output     getter generate)
+  (slot focused-output  accessors generate)
+  (slot render-hook     accessors generate)
   
   
   (method override (initialize self)
@@ -194,13 +198,7 @@
     (set! ordered-outputs '())
     (set! self-output #f)
     (set! focused-output #f)
-    (set! focused-textures (make-table test: equal?))
     (set! render-hook #f))
-  
-  
-  (method override (destroy self)
-    (delete-focused-textures self)
-    (nextmethod self))
   
   
   (method package (resize self)
@@ -210,8 +208,14 @@
     (when focused-output
       (resize focused-output))
     (layout-outputs self)
-    (when (eq? video-layout 'gallery)
-      (invalidate-interface)))
+    (case video-layout
+      ((gallery)
+       (invalidate-interface))
+      ((circle)
+       (when video-focus?
+         (let ((focused-output (effective-focused-output self)))
+           (when focused-output
+             (move-focused focused-output)))))))
   
   
   ;; kind of hack because of an import conflict
@@ -354,22 +358,6 @@
     (set! focused-output output)
     (when output
       (focus output)))
-  
-  
-  (method package (cache-focused-texture self resolution)
-    (let ((width (get-width resolution))
-          (height (get-height resolution)))
-      (let ((key (cons width height)))
-        (or (table-ref focused-textures key #f)
-            (let ((texture (make-cairo-texture width height)))
-              (table-set! focused-textures key texture)
-              texture)))))
-  
-  
-  (method package (delete-focused-textures self)
-    (iterate-table focused-textures
-      (lambda (resolution texture)
-        (glDeleteTextures* (get-id texture)))))
   
   
   (method package (receive-server-video self id buffer timestamp duration)
@@ -544,17 +532,15 @@
                    (if (= num-players 1)
                        (list (adjust-focused bounds focused))
                      (reverse (layout-tiles num-players bounds)))
-                 (let ((width (if (> num-players 2) 224 288))
-                       (height (if (> num-players 2) 126 162)))
-                   (let ((border 0))
-                     (let ((r (- r border))
-                           (focused-output (effective-focused-output self)))
-                       (map (lambda (output)
-                              (if (eq? output focused-output)
-                                  (adjust-focused bounds focused)
-                                (prog1 (new Rect (- r width) (- b height) r b)
-                                  (decrease! r (+ width border)))))
-                            ordered-outputs)))))))
+                 (let ((focused-output (effective-focused-output self))
+                       (mini-width (if (> num-players 2) 224 288))
+                       (mini-height (if (> num-players 2) 126 162)))
+                   (map (lambda (output)
+                          (if (eq? output focused-output)
+                              (adjust-focused bounds focused)
+                            (prog1 (new Rect (- r mini-width) (- b mini-height) r b)
+                              (decrease! r mini-width))))
+                        ordered-outputs)))))
             (else
              #f))))))
   
@@ -2102,20 +2088,23 @@
   
   
   (method package (focused? self)
-    (neq? (get-texture sheet) texture))
+    (and video-focus?
+         (eq? (effective-focused-output (current-video)) self)))
+  
+  
+  (method package (move-focused self)
+    (let ((bounds (get-bounds (current-window))))
+      (let ((focused (focused-rect bounds)))
+        (let ((adjusted (adjust-focused bounds focused)))
+          (move self adjusted)))))
   
   
   (method override (focus self)
-    (unless (focused? self)
-      (let ((window (current-window)))
-        (let ((rect (focused-rect (get-bounds window))))
-          (set-texture sheet (cache-focused-texture (current-video) resolution))
-          (set-rect sheet rect)))))
+    (move-focused self))
   
   
   (method override (unfocus self)
-    (when (focused? self)
-      (set-texture sheet texture)))
+    )
   
   
   (method override (start-element self)
@@ -2152,7 +2141,6 @@
       (update self color alpha texture)
       (set! last-color color)
       (when (focused? self)
-        (assert (neq? texture (get-texture sheet)))
         (update self color alpha (get-texture sheet))))
     (when id
       (record-event udp-id-draw-video
@@ -2194,7 +2182,6 @@
         (else
          (maybe-update-layouts self)
          (when (focused? self)
-           (assert (neq? texture (get-texture sheet)))
            (let ((world (current-world)))
              (let ((x (cast <fl> (get-left sheet)))
                    (y (cast <fl> (get-top sheet)))
