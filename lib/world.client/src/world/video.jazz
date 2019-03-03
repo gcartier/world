@@ -40,6 +40,7 @@
         (world.io)
         (world.layout)
         (world.pane)
+        (world.plane)
         (world.quad-texture)
         (world.settings)
         (world.stream)
@@ -178,6 +179,18 @@
 
 
 ;;;
+;;;; Circle
+;;;
+
+
+(definition protected layout-circle-hook
+  #f)
+
+(definition protected (set-layout-circle-hook proc)
+  (set! layout-circle-hook (and proc (new Hook proc))))
+
+
+;;;
 ;;;; Video
 ;;;
 
@@ -237,27 +250,6 @@
   
   (method package (register-output self id output)
     (table-set! outputs id output))
-  
-  
-  (method package (output-self? self output)
-    (not (get-id output)))
-  
-  (method package (ordered-output self n)
-    (element ordered-outputs n))
-  
-  (method package (ordered-output-self? self n)
-    (output-self? self (ordered-output self n)))
-  
-  (method package (pane->output self pane)
-    (find-if (lambda (output)
-               (and (is? output Circle-Video-Sink)
-                    (eq? (get-pane output) pane)))
-             ordered-outputs))
-  
-  (method package (pane->output-rank self pane)
-    (let ((output (pane->output self pane)))
-      (and output
-           (find-rank output ordered-outputs))))
   
   
   (method package (entity-output self id (position: position #f) (size: size #f) (resolution: resolution #f) (codec: codec #f))
@@ -342,6 +334,7 @@
     (when (eq? output focused-output)
       (set! focused-output #f))
     (release output)
+    (close output)
     (when layout?
       (update-layouts self)))
   
@@ -548,23 +541,17 @@
   (method package (circle-layout self)
     (set! video-layout 'circle)
     (let ((count (length ordered-outputs)))
-      (define (layout-default)
-        (for-each (lambda (output rank)
-                    (set-matrix (get-pane output) (default-circle-matrix count rank)))
-                  ordered-outputs
-                  (naturals 0 count)))
-      
-      (if layout-circle-hook
-          (with-safe-hook layout-circle-hook
-            (lambda (procedure)
-              (let ((matrices (procedure ordered-outputs)))
-                (for-each (lambda (output matrix)
-                            (set-matrix (get-pane output) matrix))
-                          ordered-outputs
-                          matrices)))
-            (lambda ()
-              (layout-default)))
-        (layout-default)))
+      (assert layout-circle-hook
+        (with-safe-hook layout-circle-hook
+          (lambda (procedure)
+            (let ((matrices (procedure ordered-outputs)))
+              (for-each (lambda (output placement)
+                          (bind (translation . rotation) placement
+                            (set-translation output translation)
+                            (set-rotation output rotation)
+                            (update-matrices output count)))
+                        ordered-outputs
+                        matrices))))))
     (when video-focus?
       (let ((focused-output (effective-focused-output self)))
         (when focused-output
@@ -1823,11 +1810,11 @@
 
 
 (definition public (make-draw-pane entity info)
-  (let ((size {Dimension$fl$ 6. 3.375})
+  (let ((expanse {Dimension$fl$ 6. 3.375})
         (resolution {Dimension 1280 720}))
     (let ((pane (new Draw-Pane
                   title: "Draw"
-                  size: size
+                  expanse: expanse
                   resolution: resolution
                   billboard: info
                   entity: entity)))
@@ -1918,7 +1905,7 @@
   (bind (me? resolution) billboard
     (new Camera-Pane
       title: "Camera"
-      size: (new Dimension$fl$ 1. .5625)
+      expanse: (new Dimension$fl$ 1. .5625)
       resolution: resolution
       billboard: billboard)))
 
@@ -2043,19 +2030,24 @@
 (class Circle-Video-Sink extends Video-Sink
   
   
-  (slot id         initialize #f accessors generate)
-  (slot player     initialize #f accessors generate)
-  (slot texture    initialize #f accessors generate)
-  (slot pane       initialize #f accessors generate)
-  (slot draw-mode  initialize #f accessors generate)
-  (slot draw-mutex initialize #f accessors generate)
-  (slot last-color initialize #f accessors generate)
+  (slot id             initialize #f accessors generate)
+  (slot player         initialize #f accessors generate)
+  (slot texture        initialize #f accessors generate)
+  (slot translation    initialize #f accessors generate)
+  (slot rotation       initialize #f accessors generate)
+  (slot plane          initialize #f accessors generate)
+  (slot media-pane     initialize #f accessors generate)
+  (slot interface-pane initialize #f accessors generate)
+  (slot draw-mode      initialize #f accessors generate)
+  (slot draw-mutex     initialize #f accessors generate)
+  (slot last-color     initialize #f accessors generate)
   
   
   (method override (initialize self id entity . rest)
     (bind-keywords ((position #f) (size #f) . others) rest
       (apply nextmethod self others)
-      (let ((world (current-world)))
+      (let ((world (current-world))
+            (zone (current-zone)))
         (set! self.id id)
         (set! self.player entity)
         (set! self.texture (make-cairo-texture (get-width resolution) (get-height resolution)))
@@ -2064,6 +2056,7 @@
         (set! self.last-color #f)
         (let ((position (or position {Point 0 0}))
               (size (or size {Dimension 320 180})))
+          ;; media
           (let ((pane (make-sheet-pane
                         title: "Player"
                         position: position
@@ -2071,18 +2064,69 @@
                         expanse: (new Dimension$fl$ 10. (/ 10. (/ 16. 9.)))
                         resolution: resolution
                         texture: texture)))
-            (set! self.pane pane))))))
+            (set! self.media-pane pane))
+          ;; interface
+          (let ((position {Point 0 0})
+                (size {Dimension 1280 720})
+                (expanse (new Dimension$fl$ 10. (/ 10. (/ 16. 9.))))
+                (resolution {Dimension 1280 720}))
+            (let ((texture (make-cairo-texture (get-width resolution) (get-height resolution))))
+              (let ((pane (make-sheet-pane
+                            class: Circle-Sheet
+                            title: "Interface"
+                            position: position
+                            size: size
+                            expanse: expanse
+                            resolution: resolution
+                            texture: texture)))
+                (set-output (get-sheet pane) self)
+                (set! self.interface-pane pane)
+                (register-pane zone pane))))))))
+  
+  
+  (method override (destroy self)
+    (let ((zone (current-zone)))
+      (unregister-pane zone interface-pane))
+    (nextmethod self))
+  
+  
+  (method package (update-matrices self count)
+    (update-media-matrix self count)
+    (update-interface-matrix self count))
+  
+  
+  (method package (update-media-matrix self count)
+    (let ((matrix (circle-matrix self translation (<= count 3))))
+      (set-matrix media-pane matrix)
+      (set! plane (new Plane (matrix-translation matrix) (matrix-direction matrix)))))
+  
+  
+  (method package (update-interface-matrix self count)
+    (when translation
+      (if (xor (>= (plane-to-point-distance& plane (get-position (current-camera))) 0.)
+               (> count 3))
+          (set-matrix interface-pane (circle-matrix self (+ translation .005) #f))
+        (set-matrix interface-pane (circle-matrix self (+ translation -.005) #t)))))
+  
+  
+  (method (circle-matrix self translation flip?)
+    (matrix-multiply&
+      (make-rotation-matrix& (vertex& 0. 1. 0.) rotation)
+      (make-translation-matrix& (vertex& 0. 0. translation))
+      (if flip?
+          (make-rotation-matrix (vertex& 0. 1. 0.) PI)
+        (make-identity-matrix&))))
   
   
   (method override (resize self)
     (let ((world (current-world)))
       (let ((width (get-width world))
             (height (get-height world)))
-        (make-orthographic-matrix! (get-projection-matrix (get-sheet pane)) 0. width 0. height 0. 10.))))
+        (make-orthographic-matrix! (get-projection-matrix (get-sheet media-pane)) 0. width 0. height 0. 10.))))
   
   
   (method override (move self rect)
-    (set-rect (get-sheet pane) rect))
+    (set-rect (get-sheet media-pane) rect))
   
   
   (method package (focused? self)
@@ -2108,12 +2152,12 @@
   (method override (start-element self)
     (nextmethod self)
     (let ((zone (current-zone)))
-      (register-pane zone pane)))
+      (register-pane zone media-pane)))
   
   
   (method override (stop-element self)
     (let ((zone (current-zone)))
-      (unregister-pane zone pane))
+      (unregister-pane zone media-pane))
     (nextmethod self))
   
   
@@ -2172,7 +2216,7 @@
         ((gallery)
          (maybe-update-layouts self)
          (let ((world (current-world)))
-           (let ((sheet (get-sheet pane)))
+           (let ((sheet (get-sheet media-pane)))
              (let ((x (cast <fl> (get-left sheet)))
                    (y (cast <fl> (get-top sheet)))
                    (h (cast <fl> (get-height sheet))))
@@ -2182,7 +2226,7 @@
          (maybe-update-layouts self)
          (when (focused? self)
            (let ((world (current-world)))
-             (let ((sheet (get-sheet pane)))
+             (let ((sheet (get-sheet media-pane)))
                (let ((x (cast <fl> (get-left sheet)))
                      (y (cast <fl> (get-top sheet)))
                      (h (cast <fl> (get-height sheet))))
@@ -2190,28 +2234,21 @@
                    (render-sheet sheet matrix))))))
          (when (or video-interface?
                    (not (focused? self)))
-           (render-pane pane)))))))
+           (render-pane media-pane))
+         (when video-interface?
+           (render-pane interface-pane)))))))
 
 
 ;;;
-;;;; Layout Circle
+;;;; Circle-Sheet
 ;;;
 
 
-(definition protected layout-circle-hook
-  #f)
-
-(definition protected (set-layout-circle-hook proc)
-  (set! layout-circle-hook (and proc (new Hook proc))))
-
-
-(definition (default-circle-matrix count n)
-  (matrix-multiply&
-    ;(make-translation-matrix (vertex 0. 7. 0.))
-    (make-scaling-matrix (vertex 10. 10. 10.))
-    (make-rotation-matrix (vertex 0. 1. 0.) (* (/ PI*2 (cast <fl> count)) (cast <fl> n)))
-    (make-translation-matrix (vertex 0. 0. (circle-radius count)))))
-
-
-(definition protected (circle-radius count)
-  (/ (cast <fl> count) PI*2)))
+(class Circle-Sheet extends World-Sheet
+  
+  
+  (slot output initialize #f accessors generate)
+  
+  
+  (method override (mouse-down self evt)
+    (world.circle:circle-switch-focus output))))
