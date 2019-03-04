@@ -509,10 +509,10 @@
     (let ((no
             (calling-server self
               (lambda ()
-                (client-register-channel remote-server remote-client name media-kind resolution recipient mirror?)))))
+                (client-register-channel remote-server remote-client character-name name media-kind resolution recipient mirror?)))))
       (if (string? no)
           no
-        (register-send-channel udp-client name no media-kind resolution))))
+        (register-send-channel udp-client character-name name no media-kind resolution))))
   
   
   (method package (unregister-channel self channel-no)
@@ -756,17 +756,20 @@
       (hierarchy-update-hook hierarchy)))
   
   
-  (method package (add-channel self name channel-no origin media-kind resolution)
-    (ecase media-kind
-      ((udp-audio)
-       (player-output (current-audio)
-                      channel-no))
-      ((udp-video)
-       (player-output (current-video)
-                      channel-no
-                      resolution: resolution
-                      player: (current-me))))
-    (register-receive-channel udp-client name channel-no origin media-kind resolution))
+  (method package (add-channel self sender name channel-no origin media-kind resolution)
+    (let ((output (ecase media-kind
+                    ((udp-audio)
+                     (player-output (current-audio)
+                                    channel-no))
+                    ((udp-video)
+                     (player-output (current-video)
+                                    channel-no
+                                    resolution: resolution
+                                    player: (current-me))))))
+      (register-receive-channel udp-client sender name channel-no origin media-kind resolution)
+      (when (= media-kind udp-video)
+        (invalidate-state output)
+        (update-layouts (current-video)))))
   
   
   (method package (remove-channel self channel-no)
@@ -988,7 +991,6 @@
   (method package (play-mic self)
     (let ((world (current-world)))
       (play mic-channel)
-      (invalidate-interface)
       (update-parameter world 'audio)
       (display-on/off world "Audio" (mic-playing? self))))
   
@@ -996,7 +998,7 @@
   (method package (stop-mic self)
     (let ((world (current-world)))
       (stop mic-channel)
-      (invalidate-interface)
+      (consume (get-sink (get-pipeline mic-channel)) #f #f #f)
       (update-parameter world 'audio)
       (display-on/off world "Audio" (mic-playing? self))))
     
@@ -1047,6 +1049,11 @@
   (method package (stop-camera self)
     (let ((world (current-world)))
       (stop camera-channel)
+      (let ((sink (get-sink (get-pipeline camera-channel)))
+            (sinkself (get-sinkself (get-pipeline camera-channel))))
+        (consume sink #f #f #f)
+        (when sinkself
+          (consume sinkself #f #f #f)))
       (update-parameter world 'video)
       (display-on/off world "Video" (camera-playing? self))))
   
@@ -1073,24 +1080,22 @@
   ;;;
   
   
-  (method package (determine-output-name self output)
-    (let ((id (get-id output)))
-      (if (not id)
-          "Me"
-        (let ((member (find-group-member-by-id self id)))
-          ;; quick temporary hack
-          (if (not member)
-              (let ((channel (find-receive-channel udp-client id)))
-                (if channel
-                    (get-name channel)
-                  ""))
-            (first member))))))
-  
-  
   (method package (draw-stream-state self output surface)
     (let ((video (current-video))
           (audio (current-audio))
           (interface (current-interface)))
+      (define (determine-output-name output)
+        (let ((id (get-id output)))
+          (if (not id)
+              "Me"
+            (let ((channel (find-receive-channel udp-client id)))
+              (if channel
+                  (let ((name (get-name channel)))
+                    (if (equal? name "Live")
+                        (get-sender channel)
+                      name))
+                "Unknown")))))
+      
       (define (audio-off? output)
         (if (eq? output (get-self-output video))
             (not (mic-playing? self))
@@ -1098,38 +1103,38 @@
             (or (not audio-output)
                 (eq? (get-stream-state audio-output) 'off)))))
       
-      (let ((name (determine-output-name self output)))
+      (let ((name (determine-output-name output)))
         (let ((texture (get-texture (get-interface-pane output))))
           (let ((surface (get-surface texture)))
             (clear surface)
-            (if (eq? (get-stream-state output) 'drawn)
-                (let ((view (if (and video-focus? (eq? video-mode 'fill)) interface (get-sheet (get-media-pane output)))))
-                  (set-font surface {Font font-name: tahoma point-size: 36 shadow: thin})
-                  (let ((extent (get-text-extent surface name)))
-                    (let ((pos {Point 0 0} @wait (get-position view))
-                          (offset (new Point 2 (- 720 @wait (get-height view) (get-height extent) 1))))
-                      (let ((h (+ (get-h pos) (get-h offset)))
-                            (v (+ (get-v pos) (get-v offset))))
-                        (draw-text surface h v name {Color White})
-                        (when (audio-off? output)
-                          (set-color surface {Color Dark-Red})
-                          (set-line-width surface 2)
-                          (line surface h (+ v (get-height extent)) (+ h (get-width extent)) v))))))
-              (let ((sheet (get-sheet (get-media-pane output))))
-                (let ((pos (get-position sheet))
-                      (rect (get-rect sheet)))
-                  (fill-rect surface (inflate-rect rect -1 -1) {Color red: 30 green: 30 blue: 30})
-                  (frame-rect surface rect {Color Dim-Gray})
-                  (set-font surface {Font font-name: tahoma point-size: 24 hint-style: slight hint-metrics: on})
-                  (let ((extent (get-text-extent surface name)))
-                    (let ((offset (center extent (get-size sheet))))
-                      (let ((h (+ (get-h pos) (get-h offset)))
-                            (v (+ (get-v pos) (get-v offset))))
-                        (draw-text surface h v name {Color White})
-                        (when (audio-off? output)
-                          (set-color surface {Color Dark-Red})
-                          (set-line-width surface 2)
-                          (line surface h (+ v (get-height extent)) (+ h (get-width extent)) v)))))))))
+            (cond ((eq? (get-stream-state output) 'drawn)
+                   (set-font surface {Font font-name: tahoma point-size: 36 shadow: thin})
+                   (let ((extent (get-text-extent surface name)))
+                     (let ((pos {Point 0 0})
+                           (offset (new Point 2 (- 720 (get-height extent) 1))))
+                       (let ((h (+ (get-h pos) (get-h offset)))
+                             (v (+ (get-v pos) (get-v offset))))
+                         (draw-text surface h v name {Color White})
+                         (when (audio-off? output)
+                           (set-color surface {Color Dark-Red})
+                           (set-line-width surface 2)
+                           (line surface h (+ v (get-height extent)) (+ h (get-width extent)) v))))))
+                  (else
+                   (let ((pos {Point 0 0})
+                         (size {Dimension 1280 720})
+                         (rect {Rect 0 0 1280 720}))
+                     (fill-rect surface (inflate-rect rect -1 -1) {Color red: 30 green: 30 blue: 30 alpha: .7})
+                     (frame-rect surface rect {Color Dim-Gray})
+                     (set-font surface {Font font-name: tahoma point-size: 48 hint-style: slight hint-metrics: on})
+                     (let ((extent (get-text-extent surface name)))
+                       (let ((offset (center extent size)))
+                         (let ((h (+ (get-h pos) (get-h offset)))
+                               (v (+ (get-v pos) (get-v offset))))
+                           (draw-text surface h v name {Color White})
+                           (when (audio-off? output)
+                             (set-color surface {Color Dark-Red})
+                             (set-line-width surface 2)
+                             (line surface h (+ v (get-height extent)) (+ h (get-width extent)) v)))))))))
           (map-texture texture)))))
   
   
