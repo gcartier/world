@@ -22,6 +22,7 @@
         (jazz.io)
         (jazz.stream)
         (jazz.syntax (phase syntax))
+        (jazz.time)
         (jazz.view)
         (jazz.window)
         (world)
@@ -259,7 +260,7 @@
             output))))
   
   
-  (method package (player-output self id (player: player #f) (position: position #f) (size: size #f) (resolution: resolution #f) (codec: codec #f))
+  (method package (player-output self id (channel: channel #f) (player: player #f) (position: position #f) (size: size #f) (resolution: resolution #f) (codec: codec #f))
     (define (add-output output)
       (if #f @wait-for-circle-tests (and self-output (neq? output self-output))
           ;; reposition so self output is always last
@@ -282,6 +283,7 @@
                           (else
                            (new Circle-Video-Sink
                              id
+                             channel
                              player
                              position: position
                              size: size
@@ -300,9 +302,15 @@
             output))))
   
   
+  (method package (channel-output self channel . rest)
+    (let ((output (apply player-output self (get-no channel) channel: channel rest)))
+      (invalidate-state output)
+      (update-layouts self)
+      output))
+  
+  
   (method package (visualizer-output self position size)
     (let ((output (new Sheet-Video-Sink
-                    #f
                     #f
                     position: position
                     size: size
@@ -532,8 +540,7 @@
                           (bind (translation . rotation) placement
                             (set-translation output translation)
                             (set-rotation output rotation)
-                            (update-matrices output count))
-                          (move-circle output))
+                            (update-matrices output count)))
                         ordered-outputs
                         matrices))))))
     (when video-focus?
@@ -1921,7 +1928,6 @@
 (class Sheet-Video-Sink extends Video-Sink
   
   
-  (slot id         initialize #f accessors generate)
   (slot player     initialize #f accessors generate)
   (slot sheet      initialize #f accessors generate)
   (slot draw-mode  initialize #f accessors generate)
@@ -1929,7 +1935,7 @@
   (slot last-color initialize #f accessors generate)
   
   
-  (method override (initialize self id entity . rest)
+  (method override (initialize self entity . rest)
     (bind-keywords ((position #f) (size #f) . others) rest
       (apply nextmethod self others)
       (let ((world (current-world)))
@@ -1939,7 +1945,6 @@
             (make-orthographic-matrix! (get-projection-matrix s) 0. (get-width world) 0. (get-height world) 0. 10.)
             (set-position s pos)
             (set-size s size)
-            (set! self.id id)
             (set! self.player entity)
             (set! self.sheet s)
             (set! self.draw-mode 'draw)
@@ -1980,22 +1985,11 @@
       (let ((texture (get-texture sheet)))
         (update self color alpha texture))
       (set! last-color color))
-    (when id
-      (record-event udp-id-draw-video
-                    -1.
-                    (fixnum->flonum client-no)
-                    (fixnum->flonum world.udp:udp-video)
-                    -1.
-                    -1.
-                    -1.
-                    (if (not timestamp)
-                        -1.
-                      (timestamp->flonum timestamp))))
     (mutex-unlock! draw-mutex))
   
   
   (method override (add-overlay self color alpha texture)
-    (when (and id (neq? draw-mode 'draw))
+    (when (neq? draw-mode 'draw)
       (case draw-mode
         ((freeze)
          (when world.udp:udp-freeze-overlay
@@ -2012,8 +2006,8 @@
     (let ((world (current-world)))
       (let ((x (cast <fl> (get-left sheet)))
             (y (cast <fl> (get-top sheet)))
-            (h (cast <fl> (get-height sheet))))
-        (let ((matrix (make-translation-matrix (vertex x (- (get-height world) y h) 0.))))
+            (height (cast <fl> (get-height sheet))))
+        (let ((matrix (make-translation-matrix (vertex x (- (get-height world) y height) 0.))))
           (render-sheet sheet matrix))))))))
 
 
@@ -2026,6 +2020,7 @@
   
   
   (slot id             initialize #f accessors generate)
+  (slot channel        initialize #f accessors generate)
   (slot player         initialize #f accessors generate)
   (slot texture        initialize #f accessors generate)
   (slot translation    initialize #f accessors generate)
@@ -2038,12 +2033,13 @@
   (slot last-color     initialize #f accessors generate)
   
   
-  (method override (initialize self id entity . rest)
+  (method override (initialize self id channel entity . rest)
     (bind-keywords ((position #f) (size #f) . others) rest
       (apply nextmethod self others)
       (let ((world (current-world))
             (zone (current-zone)))
         (set! self.id id)
+        (set! self.channel channel)
         (set! self.player entity)
         (set! self.texture (make-cairo-texture (get-width resolution) (get-height resolution)))
         (set! self.draw-mode 'draw)
@@ -2065,17 +2061,21 @@
                 (size {Dimension 1280 720})
                 (expanse (new Dimension$fl$ 10. (/ 10. (/ 16. 9.))))
                 (resolution {Dimension 1280 720}))
-            (let ((texture (make-cairo-texture (get-width resolution) (get-height resolution))))
+            (let ((texture (make-cairo-texture (get-width resolution) (get-height resolution)))
+                  (root (new world.circle:Circle-View position: position size: size)))
               (let ((pane (make-sheet-pane
-                            class: Circle-Sheet
+                            pane-class: world.circle:Circle-Pane
+                            sheet-class: world.circle:Circle-Sheet
                             title: "Interface"
                             position: position
                             size: size
                             expanse: expanse
                             resolution: resolution
-                            texture: texture)))
-                (set-output (get-sheet pane) self)
+                            texture: texture
+                            root: root)))
                 (set! self.interface-pane pane)
+                (set-output root self)
+                (update-volume root)
                 (register-pane zone pane))))))))
   
   
@@ -2083,6 +2083,13 @@
     (let ((zone (current-zone)))
       (unregister-pane zone interface-pane))
     (nextmethod self))
+  
+  
+  (method override (print self output readably)
+    (print-unreadable self output
+      (lambda (output)
+        (let ((effective-name (if (not channel) "Me" (get-name channel))))
+          (format output "{a}" effective-name)))))
   
   
   (method package (update-matrices self count)
@@ -2132,12 +2139,6 @@
     (set-rect (get-sheet interface-pane) rect))
   
   
-  (method package (move-circle self)
-    (let ((rect {Rect 0 0 1280 720}))
-      (set-rect (get-sheet media-pane) rect)
-      (set-rect (get-sheet interface-pane) rect)))
-  
-  
   (method package (focused? self)
     (and video-focus?
          (eq? (effective-focused-output (current-video)) self)))
@@ -2178,10 +2179,7 @@
   
   
   (method override (invalidate-state self)
-    (let ((client (current-client)))
-      (let ((texture (get-texture interface-pane)))
-        (draw-stream-state client self (get-surface texture))
-        (map-texture texture))))
+    (redraw-texture interface-pane))
   
   
   (method package (change-draw-mode self mode)
@@ -2198,7 +2196,7 @@
     (when (or (eq? draw-mode 'draw) (testing?))
       (update self color alpha texture)
       (set! last-color color))
-    (when id
+    (when channel
       (record-event udp-id-draw-video
                     -1.
                     (fixnum->flonum client-no)
@@ -2213,7 +2211,7 @@
   
   
   (method override (add-overlay self color alpha texture)
-    (when (and id (neq? draw-mode 'draw))
+    (when (and channel (neq? draw-mode 'draw))
       (case draw-mode
         ((freeze)
          (when world.udp:udp-freeze-overlay
@@ -2230,15 +2228,17 @@
           (let ((sheet (get-sheet media-pane)))
             (let ((x (cast <fl> (get-left sheet)))
                   (y (cast <fl> (get-top sheet)))
-                  (h (cast <fl> (get-height sheet))))
-              (let ((matrix (make-translation-matrix (vertex x (- (get-height world) y h) 0.))))
+                  (height (cast <fl> (get-height sheet))))
+              (let ((matrix (make-translation-matrix (vertex x (- (get-height world) y height) 0.))))
                 (render-sheet sheet matrix)))))
-        (let ((sheet (get-sheet interface-pane)))
-          (let ((x (cast <fl> (get-left sheet)))
-                (y (cast <fl> (get-top sheet)))
-                (h (cast <fl> (get-height sheet))))
-            (let ((matrix (make-translation-matrix (vertex x (- (get-height world) y h) 0.))))
-              (render-sheet sheet matrix)))))
+        (when (or video-interface?
+                  (neq? stream-state 'drawn))
+          (let ((sheet (get-sheet interface-pane)))
+            (let ((x (cast <fl> (get-left sheet)))
+                  (y (cast <fl> (get-top sheet)))
+                  (height (cast <fl> (get-height sheet))))
+              (let ((matrix (make-translation-matrix (vertex x (- (get-height world) y height) 0.))))
+                (render-sheet sheet matrix))))))
       
       (case video-layout
         ((gallery)
@@ -2252,23 +2252,4 @@
            (render-pane media-pane))
          (when (or video-interface?
                    (neq? stream-state 'drawn))
-           (render-pane interface-pane)))))))
-
-
-;;;
-;;;; Circle-Sheet
-;;;
-
-
-(class Circle-Sheet extends World-Sheet
-  
-  
-  (slot output initialize #f accessors generate)
-  
-  
-  (method override (mouse-down self evt)
-    (world.circle:circle-switch-focus output #t))
-  
-  
-  (method override (double-click self evt)
-    (world.circle:circle-switch-focus output #f))))
+           (render-pane interface-pane))))))))
