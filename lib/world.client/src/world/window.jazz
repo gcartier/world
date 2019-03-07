@@ -16,6 +16,7 @@
 
 (import (jazz.application)
         (jazz.debuggee)
+        (jazz.geometry)
         (jazz.opengl)
         (jazz.platform)
         (jazz.screen)
@@ -27,6 +28,8 @@
         (world.geometry)
         (world.hook)
         (world.interface)
+        (world.interface.sheet)
+        (world.pane)
         (world.ray)
         (world.settings)
         (world.support)
@@ -159,9 +162,11 @@
 (class World-Window extends OpenGL-Window
   
   
-  (slot window-cursor   initialize #f getter generate)
-  (slot mouse-pane      initialize #f getter generate)
-  (slot mouse-down-pane initialize #f getter generate)
+  (slot window-cursor initialize #f  getter generate)
+  (slot sheets        initialize '() getter generate)
+  (slot panes         initialize '() getter generate)
+  (slot down-mousable initialize #f  getter generate)
+  (slot last-mousable initialize #f  getter generate)
   
   
   (method override (destroy self)
@@ -248,6 +253,109 @@
   
   
   ;;;
+  ;;;; Sheets
+  ;;;
+  
+  
+  (method public (register-sheet self sheet)
+    (unless (memq? sheet sheets)
+      (set! sheets (cons sheet sheets))))
+  
+  
+  (method public (unregister-sheet self sheet)
+    (set! sheets (remove! sheet sheets)))
+  
+  
+  (method public (bring-sheet-to-front self sheet)
+    (set! sheets (cons sheet (remove! sheet sheets))))
+  
+  
+  (method public (send-sheet-to-back self sheet)
+    (set! sheets (append! (remove! sheet sheets) (list sheet))))
+  
+  
+  (method protected (find-sheet self x <fl> y <fl>)
+    (let ((pos (new Point (fxround x) (fxround y))))
+      (continuation-capture
+        (lambda (return)
+          (for-each (lambda (sheet)
+                      (when (and (mousable? sheet)
+                                 (in-rect? pos (get-rect sheet)))
+                        (let ((pos (screen->sheet-coordinates self sheet x y)))
+                          (continuation-return return (values sheet pos)))))
+                    sheets)
+          #f))))
+  
+  
+  (method protected (screen->sheet-coordinates self sheet x <fl> y <fl>)
+    (let ((position (get-position sheet))
+          (size (get-size sheet)))
+      (let ((x (- x (cast <fl> (get-h position))))
+            (y (- y (cast <fl> (get-v position)))))
+        (let ((sx (/ (* x 1280.) (cast <fl> (get-width size))))
+              (sy (/ (* y 720.) (cast <fl> (get-height size)))))
+          (new Point$fl$ sx sy)))))
+  
+  
+  ;;;
+  ;;;; Panes
+  ;;;
+  
+  
+  (method public (register-pane self pane)
+    (unless (memq? pane panes)
+      (set! panes (cons pane panes))))
+  
+  
+  (method public (unregister-pane self pane)
+    (set! panes (remove! pane panes)))
+  
+  
+  (method protected (find-pane self x <fl> y <fl>)
+    (bind-values (position direction) (screen->world (current-camera) x y)
+      (let ((hits (collect (lambda (pane)
+                             (and (mousable? pane)
+                                  (let ((expanse (get-expanse pane))
+                                        (resolution (get-resolution pane))
+                                        (matrix (get-matrix pane)))
+                                    (let ((info (ray-intersect-pane position direction expanse resolution matrix)))
+                                      (and info
+                                           (receive (point pos) info
+                                             (cons (cons pane pos) (vertex-distance position point))))))))
+                           panes)))
+        (and (not-null? hits)
+             (bind (pane . pos) (caar (sort < hits key: cdr))
+               (values pane pos))))))
+  
+  
+  (method protected (screen->pane-coordinates self pane x <fl> y <fl>)
+    (let ((expanse (get-expanse pane))
+          (resolution (get-resolution pane))
+          (matrix (get-matrix pane)))
+      (bind-values (position direction) (screen->world (current-camera) x y)
+        (let ((info (ray-intersect-pane position direction expanse resolution matrix)))
+          (and info
+               (receive (point pos) info
+                 pos))))))
+  
+  
+  ;;;
+  ;;;; Mousable
+  ;;;
+  
+  
+  (method (find-mousable self x <fl> y <fl>)
+    (or (find-pane self x y)
+        (find-sheet self x y)))
+  
+  
+  (method (screen->mousable-coordinates self mousable x <fl> y <fl>)
+    (if (is? mousable World-Pane)
+        (screen->pane-coordinates self mousable x y)
+      (screen->sheet-coordinates self mousable x y)))
+  
+  
+  ;;;
   ;;;; Mouse
   ;;;
   
@@ -270,12 +378,12 @@
                      (set-% view))
                     ((and view (is-not? view World-Interface))
                      (nextmethod self h v))
-                    ((find-pane h v)
+                    ((find-mousable self h v)
                      => (lambda (info)
-                          (receive (pane pos) info
-                            (set! mouse-pane pane)
-                            (set! mouse-down-pane pane)
-                            (mouse-down pane (get-h pos) (get-v pos)))))
+                          (receive (mousable pos) info
+                            (set! down-mousable mousable)
+                            (set! last-mousable mousable)
+                            (mousable-down mousable (get-h pos) (get-v pos)))))
                     (else
                      ;; weird showcase behavior
                      (cond-expand
@@ -306,12 +414,12 @@
                 (mouse-moved zone x y)
                 (cond ((get-explore-interface? world)
                        (display-status world (format "{a}" view)))
-                      ((and (not (get-down? world)) (not (is-moving? world)) (not mouse-pane) (or (get-mouse-down-view) (and view (is-not? view World-Interface))))
+                      ((and (not (get-down? world)) (not (is-moving? world)) (not down-mousable) (or (get-mouse-down-view) (and view (is-not? view World-Interface))))
                        (nextmethod self x y))
-                      (mouse-pane
-                       (let ((pos (screen->pane-coordinates mouse-pane x y)))
+                      (down-mousable
+                       (let ((pos (screen->mousable-coordinates self down-mousable x y)))
                          (when pos
-                           (mouse-moved mouse-pane (get-h pos) (get-v pos)))))
+                           (mousable-moved down-mousable (get-h pos) (get-v pos)))))
                       (else
                        (when (get-mouse-in)
                          (dispatch-mouse-leave (get-mouse-in)))
@@ -332,14 +440,14 @@
                            (lambda (procedure)
                              (procedure h v))))
               (mouse-up zone h v)
-              (cond ((and (not (get-down? world)) (not (is-moving? world)) (not mouse-pane) (or (get-mouse-down-view) (and view (is-not? view World-Interface))))
+              (cond ((and (not (get-down? world)) (not (is-moving? world)) (not down-mousable) (or (get-mouse-down-view) (and view (is-not? view World-Interface))))
                      (nextmethod self h v))
-                    (mouse-pane
-                     (let ((pane mouse-pane))
-                       (set! mouse-pane #f)
-                       (let ((pos (screen->pane-coordinates pane h v)))
+                    (down-mousable
+                     (let ((mousable down-mousable))
+                       (set! down-mousable #f)
+                       (let ((pos (screen->mousable-coordinates self mousable h v)))
                          (when pos
-                           (mouse-up pane (get-h pos) (get-v pos))))))
+                           (mousable-up mousable (get-h pos) (get-v pos))))))
                     (else
                      (release-capture self)
                      (set-mouse-down? #f)
@@ -358,19 +466,20 @@
                            (lambda (procedure)
                              (procedure h v))))
               (double-click zone h v)
-              (cond ((and (not (get-down? world)) (not (is-moving? world)) (not mouse-pane) view (is-not? view World-Interface))
+              (cond ((and (not (get-down? world)) (not (is-moving? world)) (not down-mousable) view (is-not? view World-Interface))
                      (nextmethod self h v))
-                    ((find-pane h v)
+                    ((find-mousable self h v)
                      => (lambda (info)
-                          (receive (pane pos) info
-                            (if #f @wait (eq? pane (get-window-focus))
+                          (receive (mousable pos) info
+                            (if #f @wait (eq? mousable (get-window-focus))
                                 (nextmethod self h v)
-                              (if (neq? pane mouse-down-pane)
-                                  (mouse-down pane (get-h pos) (get-v pos))
+                              (if (neq? mousable last-mousable)
+                                  (mousable-down mousable (get-h pos) (get-v pos))
                                 (if together?
-                                    (double-click pane (get-h pos) (get-v pos))
-                                  (when (get-root pane)
-                                    (look-at pane))))))))
+                                    (mousable-double mousable (get-h pos) (get-v pos))
+                                  (when (and (get-root mousable)
+                                             (is? mousable World-Pane))
+                                    (look-at mousable))))))))
                     (else
                      (release-capture self)
                      (double-click world h v)))))))))
@@ -390,12 +499,12 @@
               (multiple-click zone h v)
               (cond ((and (not (get-down? world)) (not (is-moving? world)) view (is-not? view World-Interface))
                      (nextmethod self count h v))
-                    ((find-pane h v)
+                    ((find-mousable self h v)
                      => (lambda (info)
-                          (receive (pane pos) info
-                            (if (neq? pane mouse-down-pane)
-                                (mouse-down pane (get-h pos) (get-v pos))
-                              (multiple-click pane count (get-h pos) (get-v pos))))))
+                          (receive (mousable pos) info
+                            (if (neq? mousable last-mousable)
+                                (mousable-down mousable (get-h pos) (get-v pos))
+                              (mousable-multiple mousable count (get-h pos) (get-v pos))))))
                     (else
                      (release-capture self)
                      (if (odd? count)
@@ -468,10 +577,10 @@
                              (procedure h v delta))))
               (cond ((get-mouse-in)
                      (nextmethod self h v delta))
-                    ((find-pane h v)
+                    ((find-mousable self h v)
                      => (lambda (info)
-                          (receive (pane pos) info
-                            (mouse-wheel pane (fxround (get-h pos)) (fxround (get-v pos)) delta))))
+                          (receive (mousable pos) info
+                            (mousable-wheel mousable (get-h pos) (get-v pos) delta))))
                     (else
                      (mouse-wheel world h v delta)))))))))
   
@@ -521,39 +630,6 @@
               (if (world-focused?)
                   (key-up world c)
                 (nextmethod self c)))))))))
-
-
-;;;
-;;;; Panes
-;;;
-
-
-(definition protected (find-pane x <fl> y <fl>)
-  (let ((zone (current-zone)))
-    (bind-values (position direction) (screen->world (current-camera) x y)
-      (let ((hits (collect (lambda (pane)
-                             (let ((expanse (get-expanse pane))
-                                   (resolution (get-resolution pane))
-                                   (matrix (get-matrix pane)))
-                               (let ((info (ray-intersect-pane position direction expanse resolution matrix)))
-                                 (and info
-                                      (receive (point pos) info
-                                        (cons (cons pane pos) (vertex-distance position point)))))))
-                           (get-panes zone))))
-        (and (not-null? hits)
-             (bind (pane . pos) (caar (sort < hits key: cdr))
-               (values pane pos)))))))
-
-
-(definition protected (screen->pane-coordinates pane x <fl> y <fl>)
-  (let ((expanse (get-expanse pane))
-        (resolution (get-resolution pane))
-        (matrix (get-matrix pane)))
-    (bind-values (position direction) (screen->world (current-camera) x y)
-      (let ((info (ray-intersect-pane position direction expanse resolution matrix)))
-        (and info
-             (receive (point pos) info
-               pos))))))
 
 
 ;;;
