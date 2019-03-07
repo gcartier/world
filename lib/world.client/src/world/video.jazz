@@ -139,10 +139,6 @@
   (world-setting 'world.speakers-xp? #f))
 
 
-(definition protected draw-refresh
-  (world-setting 'world.draw-refresh 1.))
-
-
 (definition protected slide-duration
   (world-setting 'world.slide-duration .2))
 
@@ -1276,7 +1272,7 @@
                 (site (stream on?: #t)
                   (let ((effective-timestamp (flonum->timestamp (- (current-seconds) start-time))))
                     (consume sink color effective-timestamp duration)))))
-            (task-sleep task .1 @too-slow-until-we-have-a-way-to-detect-changes-to-the-surface draw-refresh exit)
+            (task-sleep task .1 exit)
             (iter)))))))
   
   
@@ -1294,13 +1290,14 @@
 (class Image-Stream-Video-Src extends Draw-Video-Src
   
   
-  (slot location  getter generate)
-  (slot live?     getter generate)
-  (slot file      getter generate)
-  (slot color     getter generate)
-  (slot alpha     getter generate)
-  (slot timestamp getter generate)
-  (slot duration  getter generate)
+  (slot location      getter generate)
+  (slot live?         getter generate)
+  (slot file          getter generate)
+  (slot color         getter generate)
+  (slot alpha         getter generate)
+  (slot timestamp     getter generate)
+  (slot duration      getter generate)
+  (slot extract-mutex getter generate)
   
   
   (method override (initialize self location (live?: live? #t))
@@ -1311,7 +1308,8 @@
     (set! self.color #f)
     (set! self.alpha #f)
     (set! self.timestamp #f)
-    (set! self.duration #f))
+    (set! self.duration #f)
+    (set! self.extract-mutex (make-mutex 'extract)))
   
   
   (method override (new-draw-context self)
@@ -1319,16 +1317,19 @@
   
   
   (method (extract/cache self task exit)
-    (if color
-        (values color alpha timestamp duration)
-      (let ((surface (get-surface context)))
-        (draw-stream self surface)
-        (receive (color alpha timestamp duration) (extract context task exit)
-          (set! self.color color)
-          (set! self.alpha alpha)
-          (set! self.timestamp timestamp)
-          (set! self.duration duration)
-          (values color alpha timestamp duration)))))
+    (mutex-lock! extract-mutex)
+    (prog1
+        (if color
+            (values color alpha timestamp duration)
+          (let ((surface (get-surface context)))
+            (draw-stream self surface)
+            (receive (color alpha timestamp duration) (extract context task exit)
+              (set! self.color color)
+              (set! self.alpha alpha)
+              (set! self.timestamp timestamp)
+              (set! self.duration duration)
+              (values color alpha timestamp duration))))
+      (mutex-unlock! extract-mutex)))
   
   
   (method override (video-loop self task)
@@ -1336,19 +1337,14 @@
     (let ((tier (current-client)))
       (with-task task
         (lambda (exit)
-          (let (iter)
-          (if (stopping? task)
+          (receive (color alpha timestamp duration) (extract/cache self task exit)
+            (site (stream on?: #t)
+              (let ((effective-timestamp (flonum->timestamp (- (current-seconds) start-time))))
+                (consume sink color effective-timestamp duration))))
+          (if live?
               (task-done task exit)
-            (receive (color alpha timestamp duration) (extract/cache self task exit)
-              (site (stream on?: #t)
-                (let ((effective-timestamp (flonum->timestamp (- (current-seconds) start-time))))
-                  (consume sink color effective-timestamp duration))))
-            (if (not live?)
-                (begin
-                  (consume sink #f #f #f)
-                  (continuation-return exit #f))
-              (task-sleep task draw-refresh exit)
-              (iter))))))))
+            (consume sink #f #f #f)
+            (continuation-return exit #f))))))
   
   
   (method override (draw-stream self surface)
