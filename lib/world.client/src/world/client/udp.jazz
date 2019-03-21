@@ -45,6 +45,7 @@
   (slot server-host           initialize #f getter generate)
   (slot server-port           initialize #f getter generate)
   (slot write-mutex           initialize #f getter generate)
+  (slot receive-streams       initialize #f getter generate)
   (slot receive-channels      initialize #f getter generate)
   (slot receive-task          initialize #f getter generate)
   (slot state-task            initialize #f getter generate)
@@ -71,6 +72,7 @@
     (nextmethod self)
     (set! self.client-no client-no)
     (set! write-mutex (make-mutex 'write))
+    (set! receive-streams (make-table))
     (set! receive-channels (make-table)))
   
   
@@ -237,77 +239,80 @@
   
   
   ;;;
+  ;;;; Stream
+  ;;;
+  
+  
+  (method package (close-send-stream self stream)
+    (iterate-table (get-channels stream)
+      (lambda (no channel)
+        (close-send-channel self channel)))
+    (let ((stream-no (get-no stream)))
+      (close stream)
+      (unregister-stream (current-client) stream-no)
+      (table-clear send-streams stream-no)))
+  
+  
+  (method package (close-send-streams self)
+    (iterate-table-safe send-streams
+      (lambda (no stream)
+        (close-send-stream self stream))))
+  
+  
+  (method package (register-receive-stream self sender name stream-no origin source-kind)
+    (let ((stream (new UDP-Receive-Stream sender name stream-no origin source-kind)))
+      (table-set! receive-streams stream-no stream)
+      stream))
+  
+  
+  (method public (find-receive-stream self stream-no)
+    (table-ref receive-streams stream-no #f))
+  
+  
+  (method package (close-receive-stream self stream)
+    (let ((stream-no (get-no stream)))
+      (close stream)
+      (table-clear receive-streams stream-no)))
+  
+  
+  (method package (close-receive-streams self)
+    (iterate-table-safe receive-streams
+      (lambda (no stream)
+        (close-receive-stream self stream))))
+  
+  
+  ;;;
   ;;;; Channel
   ;;;
   
   
-  (method package (register-send-channel self sender name channel-no media-kind source-kind resolution framerate bitrate codec)
-    (let ((channel (new UDP-Send-Channel sender name channel-no client-no media-kind source-kind resolution framerate bitrate codec)))
-      (table-set! send-channels channel-no channel)
-      channel))
+  (method package (register-send-channel self stream-no channel-no media-kind source-kind resolution framerate bitrate codec)
+    (let ((stream (find-send-stream self stream-no)))
+      (let ((channel (new UDP-Send-Channel stream channel-no client-no media-kind source-kind resolution framerate bitrate codec)))
+        (table-set! send-channels channel-no channel)
+        channel)))
   
   
-  (method package (close-send-channel self channel-no)
-    (let ((channel (table-ref send-channels channel-no #f)))
+  (method package (close-send-channel self channel)
+    (let ((channel-no (get-no channel)))
       (close channel)
       (unregister-channel (current-client) channel-no)
       (table-clear send-channels channel-no)))
-  
-  
-  (method package (close-send-channels self)
-    (iterate-table-safe send-channels
-      (lambda (channel-no channel)
-        (close-send-channel self channel-no))))
   
   
   (method public (find-receive-channel self channel-no)
     (table-ref receive-channels channel-no #f))
   
   
-  (method public (find-receive-channels self name)
-    (let ((audio #f)
-          (video #f))
-      (iterate-table receive-channels
-        (lambda (channel-no channel)
-          (when (equal? (get-name channel) name)
-            (ecase (get-media-kind channel)
-              ((udp-audio) (set! audio channel))
-              ((udp-video) (set! video channel))))))
-      (values audio video)))
+  (method package (register-receive-channel self stream-no channel-no origin media-kind source-kind resolution framerate bitrate codec)
+    (let ((stream (find-receive-stream self stream-no)))
+      (let ((channel (new UDP-Receive-Channel stream channel-no origin media-kind source-kind resolution framerate bitrate codec)))
+        (table-set! receive-channels channel-no channel)
+        channel)))
   
   
-  (method protected (find-receive-audio-channel self origin name)
-    (continuation-capture
-      (lambda (return)
-        (iterate-table receive-channels
-          (lambda (no channel)
-            (when (and (= (get-origin channel) origin)
-                       (equal? (get-name channel) name)
-                       (= (get-media-kind channel) udp-audio))
-              (continuation-return return channel))))
-        #f)))
-  
-  
-  (method protected (find-receive-video-channel self origin name)
-    (continuation-capture
-      (lambda (return)
-        (iterate-table receive-channels
-          (lambda (no channel)
-            (when (and (= (get-origin channel) origin)
-                       (equal? (get-name channel) name)
-                       (= (get-media-kind channel) udp-video))
-              (continuation-return return channel))))
-        #f)))
-  
-  
-  (method package (register-receive-channel self sender name channel-no origin media-kind source-kind resolution framerate bitrate codec)
-    (let ((channel (new UDP-Receive-Channel sender name channel-no origin media-kind source-kind resolution framerate bitrate codec)))
-      (table-set! receive-channels channel-no channel)
-      channel))
-  
-  
-  (method package (close-receive-channel self channel-no)
-    (let ((channel (table-ref receive-channels channel-no #f)))
+  (method package (close-receive-channel self channel)
+    (let ((channel-no (get-no channel)))
       (close channel)
       (let ((kind (get-media-kind channel)))
         (ecase kind
@@ -324,12 +329,6 @@
                (when output
                  (close-output video id output)))))))
       (table-clear receive-channels channel-no)))
-  
-  
-  (method package (close-receive-channels self)
-    (iterate-table-safe receive-channels
-      (lambda (channel-no channel)
-        (close-receive-channel self channel-no))))
   
   
   ;;;
@@ -708,6 +707,14 @@
 
 
 ;;;
+;;;; Receive Stream
+;;;
+
+
+(class UDP-Receive-Stream extends UDP-Stream)
+
+
+;;;
 ;;;; Receive Channel
 ;;;
 
@@ -725,8 +732,8 @@
   (slot missing           getter generate)
   
   
-  (method override (initialize self sender name no origin media-kind source-kind resolution framerate bitrate codec)
-    (nextmethod self sender name no origin media-kind source-kind resolution framerate bitrate codec)
+  (method override (initialize self stream no origin media-kind source-kind resolution framerate bitrate codec)
+    (nextmethod self stream no origin media-kind source-kind resolution framerate bitrate codec)
     (set! self.last-nacked-frame #f)
     (set! self.replay-ring (new Remember-Ring 6000))
     (set! self.replay-header #f)
