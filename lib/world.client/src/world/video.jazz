@@ -450,7 +450,7 @@
           (record-event udp-id-sink-media
                         (fixnum->flonum id)
                         (fixnum->flonum client-no)
-                        (fixnum->flonum world.udp:udp-video)
+                        (fixnum->flonum udp-video)
                         -1.
                         -1.
                         -1.
@@ -665,29 +665,15 @@
 (class Video-Src extends Stream-Src
   
   
-  (slot appsink               initialize #f accessors generate)
-  (slot appsinkself           initialize #f accessors generate)
-  (slot data     <u8vector+>  initialize #f accessors generate)
-  (slot info     <u64vector+> initialize #f accessors generate)
-  (slot task                  initialize #f accessors generate)
-  (slot listener              initialize #f accessors generate)
-  (slot selfdata <u8vector+>  initialize #f accessors generate)
-  (slot selfinfo <u64vector+> initialize #f accessors generate)
-  (slot selflistener          initialize #f accessors generate)
+  (slot task initialize #f accessors generate)
   
   
-  (method package virtual (start-listeners self)
-    (when listener
-      (start-stream-listener listener))
-    (when selflistener
-      (start-stream-listener selflistener)))
+  (method (start-listeners self)
+    (for-each start-listener sinks))
   
   
-  (method package virtual (stop-listeners self)
-    (when listener
-      (stop-stream-listener listener))
-    (when selflistener
-      (stop-stream-listener selflistener)))
+  (method (stop-listeners self)
+    (for-each stop-listener sinks))
   
   
   (method (task-start self name)
@@ -719,54 +705,9 @@
   
   
   (method override (process self task exit)
-    (let ((size (gst_app_sink_wait task exit listener appsink data info (reset-action self) (eos-action self)))
-          (selfsize (and appsinkself (gst_app_sink_wait task exit selflistener appsinkself selfdata selfinfo #f #f))))
-      (site (video on?: #t)
-        (let ((buffer (subu8vector data 0 size))
-              (timestamp (u64vector-ref info 0))
-              (duration (u64vector-ref info 1)))
-          (when (and video-show
-                     (or (eq? video-show 'all)
-                         (eq? video-show 'header)
-                         (>= size video-show)))
-            ;; h264 specific
-            (let ((type (if (video-buffer-header? buffer)
-                            '***header***
-                          'delta)))
-              (if (eq? video-show 'header)
-                  (when (eq? type '***header***)
-                    (terminal size type))
-                (terminal size type))))
-          (consume sink buffer timestamp duration)
-          (record-event udp-id-src-media
-                        -1.
-                        (fixnum->flonum client-no)
-                        (fixnum->flonum world.udp:udp-video)
-                        -1.
-                        (if (video-buffer-header? buffer) 1. -1.)
-                        (fixnum->flonum size)
-                        (timestamp->flonum timestamp)))
-        (when selfsize
-          (let ((buffer (subu8vector selfdata 0 selfsize))
-                (timestamp (u64vector-ref selfinfo 0))
-                (duration (u64vector-ref selfinfo 1)))
-            (consume sinkself buffer timestamp duration)
-            (record-event udp-id-src-self
-                          -1.
-                          (fixnum->flonum client-no)
-                          (fixnum->flonum world.udp:udp-video)
-                          -1.
-                          -1.
-                          (fixnum->flonum selfsize)
-                          (timestamp->flonum timestamp)))))))
-  
-  
-  (method protected virtual (reset-action self)
-    #f)
-  
-  
-  (method protected virtual (eos-action self)
-    #f))
+    (for-each (lambda (consumer)
+                (gst_app_sink_process task exit consumer))
+              sinks)))
 
 
 ;;;
@@ -835,23 +776,13 @@
                                     "appsink name=sinkself"))))
         (gst_object_set_name pipeline "camera")
         (let ((appsink (gst_bin_get_by_name pipeline "sink"))
-              (appsinkself (gst_bin_get_by_name pipeline "sinkself"))
-              (data (make-u8vector (* width height 4)))
-              (info (make-u64vector 2))
-              (selfdata (make-u8vector (* width height 4)))
-              (selfinfo (make-u64vector 2)))
+              (appsinkself (gst_bin_get_by_name pipeline "sinkself")))
           (gst_app_sink_connect_signals appsink listener)
           (gst_app_sink_connect_signals appsinkself selflistener)
           (gst_element_set_state pipeline GST_STATE_READY)
-          (set! self.data data)
-          (set! self.info info)
           (set! self.pipeline pipeline)
-          (set! self.listener listener)
-          (set! self.selflistener selflistener)
-          (set! self.appsink appsink)
-          (set! self.appsinkself appsinkself)
-          (set! self.selfdata selfdata)
-          (set! self.selfinfo selfinfo)))))
+          (setup-consumer (find-consumer self #f) listener appsink (* width height 4))
+          (setup-consumer (find-consumer self 'self) selflistener appsinkself (* width height 4))))))
   
   
   (method override (start-element self)
@@ -879,16 +810,7 @@
   (method override (release-element self)
     (nextmethod self)
     (gst_element_release pipeline)
-    (set! info #f)
-    (set! data #f)
-    (set! pipeline #f)
-    (set! appsink #f)
-    (consume sink #f #f #f)
-    (close-stream-listener listener)
-    (set! listener #f)
-    (when selflistener
-      (close-stream-listener selflistener)
-      (set! selflistener #f)))
+    (release-consumers self))
   
   
   @replaced-by-frequent-keyframes
@@ -901,7 +823,50 @@
     (cond-expand
       (windows)
       (else
-       (gst_listener_reset (get-write-file listener)))))
+       (gst_listener_reset (get-write-file listener))))))
+
+
+;;;
+;;;; Camera-Video-Consumer
+;;;
+
+
+(class Camera-Video-Consumer extends Stream-Consumer
+  
+  
+  (slot channel-no getter generate)
+  
+  
+  (method override (initialize self channel-no . rest)
+    (apply nextmethod self rest)
+    (set! self.channel-no channel-no))
+
+
+  (method override (consume self buffer timestamp duration)
+    (let ((header? (and buffer (video-buffer-header? buffer))))
+      (send-client-video (current-client) channel-no buffer header? timestamp duration))
+    (when buffer
+      (let ((size (u8vector-length buffer)))
+        (when (and video-show
+                   (or (eq? video-show 'all)
+                       (eq? video-show 'header)
+                       (>= size video-show)))
+          ;; h264 specific
+          (let ((type (if (video-buffer-header? buffer)
+                          '***header***
+                        'delta)))
+            (if (eq? video-show 'header)
+                (when (eq? type '***header***)
+                  (terminal size type))
+              (terminal size type))))
+        (record-event udp-id-src-media
+                      -1.
+                      (fixnum->flonum client-no)
+                      (fixnum->flonum udp-video)
+                      -1.
+                      (if (video-buffer-header? buffer) 1. -1.)
+                      (fixnum->flonum size)
+                      (timestamp->flonum timestamp)))))
   
   
   @replaced-by-frequent-keyframes
@@ -970,16 +935,11 @@
                                                       name: "enc")))
                                   "appsink name=sink")))
         (gst_object_set_name pipeline "screen")
-        (let ((appsink (gst_bin_get_by_name pipeline "sink"))
-              (data (make-u8vector (* width height 4)))
-              (info (make-u64vector 2)))
+        (let ((appsink (gst_bin_get_by_name pipeline "sink")))
           (gst_app_sink_connect_signals appsink listener)
           (gst_element_set_state pipeline GST_STATE_READY)
-          (set! self.data data)
-          (set! self.info info)
           (set! self.pipeline pipeline)
-          (set! self.listener listener)
-          (set! self.appsink appsink)))))
+          (setup-consumer (find-consumer self #f) listener appsink (* width height 4))))))
   
   
   (method override (start-element self)
@@ -1007,13 +967,7 @@
   (method override (release-element self)
     (nextmethod self)
     (gst_element_release pipeline)
-    (set! info #f)
-    (set! data #f)
-    (set! pipeline #f)
-    (set! appsink #f)
-    (consume sink #f #f #f)
-    (close-stream-listener listener)
-    (set! listener #f))
+    (release-consumers self))
   
   
   @replaced-by-frequent-keyframes
@@ -1026,7 +980,28 @@
     (cond-expand
       (windows)
       (else
-       (gst_listener_reset (get-write-file listener)))))
+       (gst_listener_reset (get-write-file listener))))))
+
+
+;;;
+;;;; Screen-Video-Consumer
+;;;
+
+
+(class Screen-Video-Consumer extends Stream-Consumer
+  
+  
+  (slot channel-no getter generate)
+  
+  
+  (method override (initialize self channel-no . rest)
+    (apply nextmethod self rest)
+    (set! self.channel-no channel-no))
+
+
+  (method override (consume self buffer timestamp duration)
+    (let ((header? (and buffer (video-buffer-header? buffer))))
+      (send-client-video (current-client) channel-no buffer header? timestamp duration)))
   
   
   @replaced-by-frequent-keyframes
@@ -1070,18 +1045,13 @@
                                   "appsink name=appsink")))
         (gst_object_set_name pipeline "file")
         (let ((filesrc (gst_bin_get_by_name pipeline "filesrc"))
-              (appsink (gst_bin_get_by_name pipeline "appsink"))
-              (data (make-u8vector (* width height 4)))
-              (info (make-u64vector 5 @w 2)))
+              (appsink (gst_bin_get_by_name pipeline "appsink")))
           (gst_monitor pipeline 'events "appsink")
           (gst_app_sink_connect_signals appsink listener)
           (g_object_set_string filesrc "location" (path-normalize (parse (new-file {Directory Settings} (list "streams" (add-extension location "mp4"))))))
           (gst_element_set_state pipeline GST_STATE_READY)
-          (set! self.data data)
-          (set! self.info info)
-          (set! self.listener listener)
           (set! self.pipeline pipeline)
-          (set! self.appsink appsink)))))
+          (setup-consumer (find-consumer self #f) listener appsink (* width height 4))))))
   
   
   (method override (start-element self)
@@ -1109,21 +1079,7 @@
   (method override (release-element self)
     (nextmethod self)
     (gst_element_release pipeline)
-    (set! info #f)
-    (set! data #f)
-    (set! pipeline #f)
-    (set! appsink #f)
-    (consume sink #f #f #f)
-    (close-stream-listener listener)
-    (set! listener #f))
-  
-  
-  (method override (process self task exit)
-    (let ((size (gst_app_sink_wait task exit listener appsink data info (reset-action self) (eos-action self))))
-      (let ((buffer (subu8vector data 0 size))
-            (timestamp (u64vector-ref info 1))
-            (duration (u64vector-ref info 2)))
-        (consume sink buffer timestamp duration)))))
+    (release-consumers self)))
 
 
 ;;;
@@ -1184,17 +1140,12 @@
                                   "appsink name=appsink sync=false")))
         (gst_object_set_name pipeline "file")
         (let ((filesrc (gst_bin_get_by_name pipeline "filesrc"))
-              (appsink (gst_bin_get_by_name pipeline "appsink"))
-              (data (make-u8vector (* width height 4)))
-              (info (make-u64vector 2)))
+              (appsink (gst_bin_get_by_name pipeline "appsink")))
           (gst_app_sink_connect_signals appsink listener)
           (g_object_set_string filesrc "location" (path-normalize location))
           (gst_element_set_state pipeline GST_STATE_READY)
-          (set! self.data data)
-          (set! self.info info)
-          (set! self.listener listener)
           (set! self.pipeline pipeline)
-          (set! self.appsink appsink)))))
+          (setup-consumer (find-consumer self #f) listener appsink (* width height 4))))))
   
   
   (method override (start-element self)
@@ -1222,18 +1173,7 @@
   (method override (release-element self)
     (nextmethod self)
     (gst_element_release pipeline)
-    (set! info #f)
-    (set! data #f)
-    (set! pipeline #f)
-    (set! appsink #f)
-    (consume sink #f #f #f)
-    (close-stream-listener listener)
-    (set! listener #f))
-  
-  
-  (method override (eos-action self)
-    (lambda ()
-      (consume sink #f #f #f)))
+    (release-consumers self))
   
   
   (method override (video-loop self task)
@@ -1262,6 +1202,7 @@
   (slot file      getter generate)
   (slot port      getter generate)
   (slot time-base getter generate)
+  (slot consumer  getter generate)
   
   
   (method override (initialize self profile location)
@@ -1270,13 +1211,15 @@
     (set! self.location location)
     (set! self.file #f)
     (set! self.port #f)
-    (set! self.time-base (new Time-Base)))
+    (set! self.time-base (new Time-Base))
+    (set! self.consumer #f))
   
   
   (method override (start-element self)
     (nextmethod self)
     (set! file (new-file {Directory Settings} (list "streams" (add-extension location (get-extension profile)))))
     (set! port (open-input-file (path-settings file)))
+    (set! consumer (car sinks))
     (task-start self 'video-stream))
   
   
@@ -1324,7 +1267,7 @@
                   (let ((sendtime (remote->local time-base nanostamp)))
                     (task-sleep task (- sendtime time) exit)
                     (site (stream on?: #t)
-                      (consume sink buffer timestamp duration)))))))
+                      (consume consumer buffer timestamp duration)))))))
           (iter))))))
 
 
@@ -1353,6 +1296,7 @@
   (slot start-time initialize #f accessors generate)
   (slot resolution initialize #f accessors generate)
   (slot context    initialize #f accessors generate)
+  (slot consumer   initialize #f getter generate)
   
   
   (method override (initialize self (draw-proc: draw-proc #f))
@@ -1369,6 +1313,7 @@
     (nextmethod self)
     (set! context (new-draw-context self))
     (set! start-time (current-seconds))
+    (set! consumer (car sinks))
     (task-start self 'draw))
   
   
@@ -1405,7 +1350,7 @@
               (receive (color alpha timestamp duration) (extract context task exit)
                 (site (stream on?: #t)
                   (let ((effective-timestamp (flonum->timestamp (- (current-seconds) start-time))))
-                    (consume sink color effective-timestamp duration)))))
+                    (consume consumer color effective-timestamp duration)))))
             (task-sleep task .1 exit)
             (iter)))))))
   
@@ -1472,7 +1417,7 @@
           (receive (color alpha timestamp duration) (extract/cache self task exit)
             (site (stream on?: #t)
               (let ((effective-timestamp (flonum->timestamp (- (current-seconds) start-time))))
-                (consume sink color effective-timestamp duration))))
+                (consume consumer color effective-timestamp duration))))
           (free-context self)
           (continuation-return exit #f)))))
   
@@ -1487,31 +1432,32 @@
   (method override (reset-media self channel)
     (receive (color alpha timestamp duration) (extract/cache self task exit)
       (let ((effective-timestamp (flonum->timestamp (- (current-seconds) start-time))))
-        (consume sink color effective-timestamp duration)))))
+        (consume consumer color effective-timestamp duration)))))
 
 
 ;;;
-;;;; Self-Sink
+;;;; Self-Consumer
 ;;;
 
 
-(class Self-Sink extends Stream-Sink
+(class Self-Consumer extends Stream-Consumer
   
   
   (slot resolution  initialize #f getter generate)
   (slot self-output initialize #f getter generate)
   
   
-  (method override (initialize self (resolution: resolution #f))
-    (nextmethod self)
-    (assert resolution)
-    (set! self.resolution resolution)
-    (let ((video (current-video))
-          (me (current-me)))
-      (set! self-output (player-output video #f
-                          player: me
-                          resolution: resolution))
-      (invalidate-state self-output)))
+  (method override (initialize self . rest)
+    (bind-keywords ((resolution #f) . others) rest
+      (apply nextmethod self others)
+      (assert resolution)
+      (set! self.resolution resolution)
+      (let ((video (current-video))
+            (me (current-me)))
+        (set! self-output (player-output video #f
+                            player: me
+                            resolution: resolution))
+        (invalidate-state self-output))))
   
   
   (method override (destroy self)
@@ -2310,7 +2256,7 @@
       (record-event udp-id-draw-video
                     -1.
                     (fixnum->flonum client-no)
-                    (fixnum->flonum world.udp:udp-video)
+                    (fixnum->flonum udp-video)
                     -1.
                     -1.
                     -1.
