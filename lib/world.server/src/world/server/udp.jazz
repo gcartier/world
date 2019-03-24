@@ -103,8 +103,8 @@
   ;;;
   
   
-  (method package (register-server-stream self sender name no origin source-kind video-profile recipient exclude-stream exclude-broadcast)
-    (let ((stream (new UDP-Server-Stream sender name no origin source-kind video-profile recipient exclude-stream exclude-broadcast)))
+  (method package (register-server-stream self sender name no origin source-kind video-level recipient exclude-stream exclude-broadcast)
+    (let ((stream (new UDP-Server-Stream sender name no origin source-kind video-level recipient exclude-stream exclude-broadcast)))
       (table-set! server-streams no stream)
       stream))
   
@@ -141,9 +141,9 @@
     (table-ref server-channels channel-no #f))
   
   
-  (method package (register-server-channel self stream-no channel-no origin media-kind source-kind resolution framerate bitrate codec recipient exclude-channel exclude-broadcast)
+  (method package (register-server-channel self stream-no channel-no origin media-kind source-kind level resolution framerate bitrate codec recipient exclude-channel exclude-broadcast)
     (let ((stream (find-server-stream self stream-no)))
-      (let ((channel (new UDP-Server-Channel stream channel-no origin media-kind source-kind resolution framerate bitrate codec recipient exclude-channel exclude-broadcast)))
+      (let ((channel (new UDP-Server-Channel stream channel-no origin media-kind source-kind level resolution framerate bitrate codec recipient exclude-channel exclude-broadcast)))
         (table-set! server-channels channel-no channel)
         channel)))
   
@@ -154,9 +154,9 @@
       (table-clear server-channels channel-no)))
   
   
-  (method package (register-send-channel self stream-no channel-no media-kind source-kind resolution framerate bitrate codec)
+  (method package (register-send-channel self stream-no channel-no media-kind source-kind level resolution framerate bitrate codec)
     (let ((stream (find-send-stream self stream-no)))
-      (let ((channel (new UDP-Send-Channel stream channel-no client-no media-kind source-kind resolution framerate bitrate codec)))
+      (let ((channel (new UDP-Send-Channel stream channel-no client-no media-kind source-kind level resolution framerate bitrate codec)))
         (table-set! send-channels channel-no channel)
         channel)))
   
@@ -253,6 +253,7 @@
           (latency (read-udp-connect-latency data))
           (lag (read-udp-connect-lag data))
           (drop (read-udp-connect-drop data))
+          (video-level (read-udp-connect-video-level data))
           (source-info (udp-source-socket-info udp-port)))
       (define (udp-simulator)
         (let ((latency (and (/= latency -1.) latency))
@@ -282,7 +283,7 @@
         (let ((existing-connection (origin->connection self origin)))
           (if existing-connection
               (send-connected existing-connection)
-            (let ((connection (new UDP-Connection source-host source-port local-host local-port (udp-simulator))))
+            (let ((connection (new UDP-Connection source-host source-port local-host local-port (udp-simulator) video-level)))
               (register-connection self origin source-host source-port connection)
               (send-connected connection)))))))
   
@@ -433,31 +434,37 @@
   
   (method (broadcast-media self channel origin kind data)
     (let ((recipient (get-recipient channel))
-          (exclude-broadcast (get-exclude-broadcast channel)))
+          (exclude-broadcast (get-exclude-broadcast channel))
+          (stream-level (get-video-level (get-stream channel)))
+          (channel-level (get-level channel)))
       (let ((recipients (recipient-delegates (current-server) recipient)))
         (for-each (lambda (member)
                     (let ((no (get-no member)))
                       (let ((connection (table-ref origin-connections no #f)))
                         (when connection
                           (unless (eq? member exclude-broadcast)
-                            (let ((last-received-state (get-last-received-state connection)))
-                              (when last-received-state
-                                (unless (get-throttle-media? connection)
-                                  (let ((now (current-seconds)))
-                                    (if (and udp-throttle (> (- now last-received-state) udp-throttle))
-                                        (begin
-                                          (set-throttle-media? connection #t)
-                                          (record-event udp-id-throttle-on
-                                                        (fixnum->flonum (get-no channel))
-                                                        (fixnum->flonum no)
-                                                        -1.
-                                                        -1.
-                                                        -1.
-                                                        -1.
-                                                        -1.)
-                                          (when udp-show-throttle?
-                                            (format :terminal "{s} {s} {a} {s}{%}" remote-name 'THROTTLE (get-name member) 'ON)))
-                                      (send-data self connection data)))))))))))
+                            (let ((video-level (get-video-level connection)))
+                              (when (or (/= kind udp-video)
+                                        (not stream-level)
+                                        (= channel-level (min video-level stream-level)))
+                                (let ((last-received-state (get-last-received-state connection)))
+                                  (when last-received-state
+                                    (unless (get-throttle-media? connection)
+                                      (let ((now (current-seconds)))
+                                        (if (and udp-throttle (> (- now last-received-state) udp-throttle))
+                                            (begin
+                                              (set-throttle-media? connection #t)
+                                              (record-event udp-id-throttle-on
+                                                            (fixnum->flonum (get-no channel))
+                                                            (fixnum->flonum no)
+                                                            -1.
+                                                            -1.
+                                                            -1.
+                                                            -1.
+                                                            -1.)
+                                              (when udp-show-throttle?
+                                                (format :terminal "{s} {s} {a} {s}{%}" remote-name 'THROTTLE (get-name member) 'ON)))
+                                          (send-data self connection data)))))))))))))
                   recipients))))
   
   
@@ -487,19 +494,21 @@
   (slot local-host                        getter generate)
   (slot local-port                        getter generate)
   (slot simulator                         getter generate)
+  (slot video-level                       getter generate)
   (slot packets-sent        initialize 0  getter generate)
   (slot packets-received    initialize 0  getter generate)
   (slot last-received-state initialize #f accessors generate)
   (slot throttle-media?     initialize #f accessors generate)
   
   
-  (method override (initialize self host port local-host local-port simulator)
+  (method override (initialize self host port local-host local-port simulator video-level)
     (nextmethod self)
     (set! self.host host)
     (set! self.port port)
     (set! self.local-host local-host)
     (set! self.local-port local-port)
-    (set! self.simulator simulator))
+    (set! self.simulator simulator)
+    (set! self.video-level video-level))
   
   
   (method override (print self output readably)
@@ -537,8 +546,8 @@
   (slot exclude-broadcast getter generate)
   
   
-  (method override (initialize self sender name no origin source-kind video-profile recipient exclude-stream exclude-broadcast)
-    (nextmethod self sender name no origin source-kind video-profile)
+  (method override (initialize self sender name no origin source-kind video-level recipient exclude-stream exclude-broadcast)
+    (nextmethod self sender name no origin source-kind video-level)
     (set! self.recipient recipient)
     (set! self.exclude-stream exclude-stream)
     (set! self.exclude-broadcast exclude-broadcast)))
@@ -560,8 +569,8 @@
   (slot release-task      getter generate)
   
   
-  (method override (initialize self stream-no no origin media-kind source-kind resolution framerate bitrate codec recipient exclude-channel exclude-broadcast)
-    (nextmethod self stream-no no origin media-kind source-kind resolution framerate bitrate codec)
+  (method override (initialize self stream-no no origin media-kind source-kind level resolution framerate bitrate codec recipient exclude-channel exclude-broadcast)
+    (nextmethod self stream-no no origin media-kind source-kind level resolution framerate bitrate codec)
     (set! self.recipient recipient)
     (set! self.exclude-channel exclude-channel)
     (set! self.exclude-broadcast exclude-broadcast)
