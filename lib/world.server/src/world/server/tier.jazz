@@ -302,6 +302,16 @@
     (set! groups (remove! group groups)))
   
   
+  (method (maybe-delete-group self group)
+    (if (or (and (world-setting 'together.guillaume? #f)
+                 (equal? (get-name group) "Circle"))
+            (has-members? self group)
+            (has-streams? self group))
+        #f
+      (delete-group self group)
+      #t))
+  
+  
   (method (disband-group self group)
     (for-each (lambda (delegate)
                 (leave-group self group delegate))
@@ -313,6 +323,10 @@
     (not-null? (get-members group)))
   
   
+  (method (has-streams? self group)
+    (not-null? (get-streams group)))
+  
+  
   (method (join-group self group delegate)
     (set-group delegate group)
     (set-members group (cons delegate (get-members group))))
@@ -321,11 +335,7 @@
   (method (leave-group self group delegate)
     (set-group delegate #f)
     (set-members group (remove! delegate (get-members group)))
-    (when (not (has-members? self group))
-      (if (world-setting 'together.guillaume? #f)
-          (unless (equal? (get-name group) "Circle")
-            (delete-group self group))
-        (delete-group self group))))
+    (maybe-delete-group self group))
   
   
   ;;;
@@ -634,10 +644,12 @@
               (format "{a} {a} doesn't exist anymore" (group-domain-name self) name)
             (if (has-members? self group)
                 (format "{a} {a} still has members" (group-domain-name self) name)
-              (logger "Delete group {a} ({a})" name (get-name delegate))
-              (delete-group self name)
-              (broadcast-hierarchy self)
-              #f))))))
+              (if (has-streams? self group)
+                  (format "{a} {a} still has streams" (group-domain-name self) name)
+                (logger "Delete group {a} ({a})" name (get-name delegate))
+                (when (maybe-delete-group self name)
+                  (broadcast-hierarchy self))
+                #f)))))))
   
   
   (method package (client-disband-group self client name)
@@ -1145,15 +1157,19 @@
                    #f)))
            (case action
              ((list)
-              (stream-list self))
+              (stream-list self client))
              ((play)
               (stream-play self client what))
              ((stop)
               (stream-stop self client what))
              ((done)
-              (iterate-table (get-send-streams udp-server)
-                (lambda (no stream)
-                  (close-send-stream udp-server stream)))
+              (let ((broadcast-hierarchy? #f))
+                (iterate-table (get-send-streams udp-server)
+                  (lambda (no stream)
+                    (when (server-close-send-stream self stream)
+                      (set! broadcast-hierarchy? #t))))
+                (when broadcast-hierarchy?
+                  (broadcast-hierarchy self)))
               #f)))))
       ((request)
        (bind (cookie who what action) arguments
@@ -1475,6 +1491,7 @@
                       (when (and audio-file? (not streaming-audio?) (not stream-silent?))
                         (add-server-audio-channel self stream-no group location name))
                       (add-server-video-channels self stream-no group location name)
+                      (set-streams group (cons stream (get-streams group)))
                       (if delay-streaming?
                           (delay-streaming
                             (lambda ()
@@ -1489,9 +1506,13 @@
       (let ((streams (find-streams self name)))
         (if (null? streams)
             "Stream not found"
-          (for-each (lambda (stream)
-                      (close-send-stream udp-server stream))
-                    streams)
+          (let ((broadcast-hierarchy? #f))
+            (for-each (lambda (stream)
+                        (when (server-close-send-stream self stream)
+                          (set! broadcast-hierarchy? #t)))
+                      streams)
+            (when broadcast-hierarchy?
+              (broadcast-hierarchy self)))
           #f))))
   
   
@@ -1562,6 +1583,14 @@
   (method package (send-server-media self channel-no buffer header? timestamp duration)
     (when udp-server
       (send-media udp-server channel-no buffer header? timestamp duration)))
+  
+  
+  (method (server-close-send-stream self stream)
+    (let ((server-stream (find-server-stream udp-server (get-no stream))))
+      (let ((group (get-recipient server-stream)))
+        (close-send-stream udp-server stream)
+        (set-streams group (remove! server-stream (get-streams group)))
+        (maybe-delete-group self group))))
   
   
   ;;;
