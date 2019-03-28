@@ -143,9 +143,9 @@
     (table-ref server-channels channel-no #f))
   
   
-  (method package (register-server-channel self stream-no channel-no origin media-kind source-kind level resolution framerate bitrate codec recipient exclude-channel exclude-broadcast)
+  (method package (register-server-channel self stream-no channel-no origin media-kind source-kind level resolution framerate bitrate codec recipient exclude-channel exclude-broadcast server-sender?)
     (let ((stream (find-server-stream self stream-no)))
-      (let ((channel (new UDP-Server-Channel stream channel-no origin media-kind source-kind level resolution framerate bitrate codec recipient exclude-channel exclude-broadcast)))
+      (let ((channel (new UDP-Server-Channel stream channel-no origin media-kind source-kind level resolution framerate bitrate codec recipient exclude-channel exclude-broadcast server-sender?)))
         (table-set! server-channels channel-no channel)
         channel)))
   
@@ -181,7 +181,6 @@
       (when channel
         (let ((origin (get-origin channel))
               (kind (get-media-kind channel)))
-          ;; quick test really not sure about this
           (let ((server-channel (find-server-channel self channel-no)))
             (send-media channel buffer header? timestamp duration
               (lambda (data)
@@ -405,41 +404,42 @@
   
   
   (method (send-missing self channel-no origin media-kind missing)
-    (let ((channel (find-server-channel self channel-no)))
-      (when channel
-        (let ((ring (get-retain-ring channel)))
-          (for-each (lambda (sequence)
-                      (let ((data (locate-data ring sequence)))
-                        (if data
-                            (let ((source-info (udp-source-socket-info udp-port)))
-                              (let ((source-host (socket-info-address source-info))
-                                    (source-port (socket-info-port-number source-info)))
-                                (let ((connection (host/port->connection self source-host source-port)))
-                                  (when udp-show-nacks?
-                                    (terminal remote-name (present-media-kind media-kind) '***nack-found-on-server*** sequence))
-                                  (increase-udp-resent data)
-                                  (send-data self connection data)
-                                  (let ((frame (read-udp-frame data)))
-                                    (record-event udp-id-resend-packet
-                                                  (fixnum->flonum channel-no)
-                                                  (fixnum->flonum origin)
-                                                  (fixnum->flonum media-kind)
-                                                  (fixnum->flonum sequence)
-                                                  (fixnum->flonum frame)
-                                                  -1.
-                                                  -1.)))))
-                          (record-event udp-id-absent-packet
-                                        (fixnum->flonum channel-no)
-                                        (fixnum->flonum origin)
-                                        (fixnum->flonum media-kind)
-                                        (fixnum->flonum sequence)
-                                        -1.
-                                        -1.
-                                        -1.)
-                          ;; we already nacked the source early and will broadcast
-                          ;; when we receive the resent so we can ignore this nack
-                          )))
-                    missing)))))
+    (let ((ring (cond ((find-send-channel self channel-no) => get-retain-ring)
+                      ((find-server-channel self channel-no) => get-retain-ring)
+                      (else #f))))
+      (when ring
+        (for-each (lambda (sequence)
+                    (let ((data (locate-data ring sequence)))
+                      (if data
+                          (let ((source-info (udp-source-socket-info udp-port)))
+                            (let ((source-host (socket-info-address source-info))
+                                  (source-port (socket-info-port-number source-info)))
+                              (let ((connection (host/port->connection self source-host source-port)))
+                                (when udp-show-nacks?
+                                  (terminal remote-name (present-media-kind media-kind) '***nack-found-on-server*** sequence))
+                                (increase-udp-resent data)
+                                (send-data self connection data)
+                                (let ((frame (read-udp-frame data)))
+                                  (record-event udp-id-resend-packet
+                                                (fixnum->flonum channel-no)
+                                                (fixnum->flonum origin)
+                                                (fixnum->flonum media-kind)
+                                                (fixnum->flonum sequence)
+                                                (fixnum->flonum frame)
+                                                -1.
+                                                -1.)))))
+                        (record-event udp-id-absent-packet
+                                      (fixnum->flonum channel-no)
+                                      (fixnum->flonum origin)
+                                      (fixnum->flonum media-kind)
+                                      (fixnum->flonum sequence)
+                                      -1.
+                                      -1.
+                                      -1.)
+                        ;; we already nacked the source early and will broadcast
+                        ;; when we receive the resent so we can ignore this nack
+                        )))
+                  missing))))
   
   
   (method (send-nack self connection channel-no origin media-kind missing)
@@ -620,28 +620,32 @@
   (slot recipient         getter generate)
   (slot exclude-channel   getter generate)
   (slot exclude-broadcast getter generate)
+  (slot server-sender?    getter generate)
   (slot last-nacked-frame accessors generate)
   (slot retain-ring       getter generate)
   (slot release-task      getter generate)
   
   
-  (method override (initialize self stream-no no origin media-kind source-kind level resolution framerate bitrate codec recipient exclude-channel exclude-broadcast)
+  (method override (initialize self stream-no no origin media-kind source-kind level resolution framerate bitrate codec recipient exclude-channel exclude-broadcast server-sender?)
     (nextmethod self stream-no no origin media-kind source-kind level resolution framerate bitrate codec)
     (set! self.recipient recipient)
     (set! self.exclude-channel exclude-channel)
     (set! self.exclude-broadcast exclude-broadcast)
     (set! self.last-nacked-frame #f)
-    (set! self.retain-ring (new UDP-Ring self no origin media-kind udp-retain-size max-size: udp-retain-max-size overflow-proc: (udp-ring-overflow 'retain udp-ring-kind-retain)))
-    (unless (simulation?)
-      (set! self.release-task (new Task 'udp-release (lambda (task)
-                                                       (release-loop self task))
-                                   priority: udp-priority))
-      (start-task release-task)))
+    (if server-sender?
+        (set! self.retain-ring #f)
+      (set! self.retain-ring (new UDP-Ring self no origin media-kind udp-retain-size max-size: udp-retain-max-size overflow-proc: (udp-ring-overflow 'retain udp-ring-kind-retain)))
+      (unless (simulation?)
+        (set! self.release-task (new Task 'udp-release (lambda (task)
+                                                         (release-loop self task))
+                                     priority: udp-priority))
+        (start-task release-task))))
   
   
   (method override (destroy self)
-    (terminate retain-ring)
-    (thread-join! (get-thread release-task))
+    (unless server-sender?
+      (terminate retain-ring)
+      (thread-join! (get-thread release-task)))
     (nextmethod self))
   
   
