@@ -20,8 +20,10 @@
         (jazz.platform)
         (jazz.stream)
         (jazz.syntax (phase syntax))
+        (jazz.version)
         (world)
         (world.context)
+        (world.media)
         (world.settings)
         (world.task))
 
@@ -94,30 +96,64 @@
 (interface Media-Stream
   
   
-  (method public virtual abstract (set-stream? self flag)))
+  (method public virtual abstract (set-stream? self flag))
+  (method public virtual abstract (seek self pos)))
 
 
-(definition public (stream-reader port (timestamp-offset 0))
-  (let ((position 0)
-        (temporary (make-u8vector 8)))
-    (lambda (read-buffer?)
+;;;
+;;;; Format
+;;;
+
+
+(definition protected stream-version
+  {Version 1 0 0})
+
+
+;;;
+;;;; Reader
+;;;
+
+
+(class Stream-Reader extends Object
+  
+  
+  (slot port             getter generate)
+  (slot position         getter generate)
+  (slot temporary        getter generate)
+  (slot timestamp-offset getter generate)
+  
+  
+  (method override (initialize self file (timestamp-offset 0))
+    (nextmethod self)
+    (set! self.port (open-input-file (path-settings file)))
+    (set! self.position 0)
+    (set! self.temporary (make-u8vector 8))
+    (set! self.timestamp-offset timestamp-offset))
+  
+  
+  (method override (destroy self)
+    (close-port port)
+    (nextmethod self))
+  
+  
+  (method protected (read-frame self read-buffer?)
+    (read-subu8vector temporary 0 8 port)
+    (let ((timestamp (+ (scan-s64 temporary 0) timestamp-offset)))
       (read-subu8vector temporary 0 8 port)
-      (let ((timestamp (+ (scan-s64 temporary 0) timestamp-offset)))
-        (read-subu8vector temporary 0 8 port)
-        (let ((duration (scan-u64 temporary 0)))
-          (let ((size (read-32-bit-integer port)))
-            (if (eof-object? size)
-                (values #f #f #f)
-              (increase! position (+ 20 size))
-              (if read-buffer?
-                  (let ((buffer (make-u8vector size)))
-                    (read-subu8vector buffer 0 size port)
-                    (values buffer timestamp duration))
-                (input-port-byte-position port position)
-                (values #t timestamp duration)))))))))
+      (let ((duration (scan-u64 temporary 0)))
+        (let ((size (read-32-bit-integer port)))
+          (if (eof-object? size)
+              (values #f #f #f)
+            (increase! position (+ 20 size))
+            (if read-buffer?
+                (let ((buffer (make-u8vector size)))
+                  (read-subu8vector buffer 0 size port)
+                  (values buffer timestamp duration))
+              (input-port-byte-position port position)
+              (values #t timestamp duration))))))))
 
 
-(definition public (read-frame port)
+(definition public (read-frame-old port)
   (let ((temporary (make-u8vector 8)))
     (read-subu8vector temporary 0 8 port)
     (let ((timestamp (scan-s64 temporary 0)))
@@ -136,13 +172,371 @@
     ((opus)
      #f)
     ((vorbis)
-     (receive (b1 t1 d1) (read-frame port)
-       (receive (b2 t2 d2) (read-frame port)
-         (receive (b3 t3 d3) (read-frame port)
+     (receive (b1 t1 d1) (read-frame-old port)
+       (receive (b2 t2 d2) (read-frame-old port)
+         (receive (b3 t3 d3) (read-frame-old port)
            (let ((headers (list (list b1 t1 d1)
                                 (list b2 t2 d2)
                                 (list b3 t3 d3))))
              (object->u8vector headers))))))))
+
+
+;;;
+;;;; Writer
+;;;
+
+
+(class Stream-Writer extends Object
+  
+  
+  (slot port      getter generate)
+  (slot temporary getter generate)
+  
+  
+  (method override (initialize self file)
+    (nextmethod self)
+    (set! self.port (open-output-file (path-settings file)))
+    (set! self.temporary (make-u8vector 8)))
+  
+  
+  (method override (destroy self)
+    (close-port port)
+    (nextmethod self))
+  
+  
+  (method public (write-frame self buffer timestamp duration)
+    (put-s64 temporary 0 timestamp)
+    (write-subu8vector temporary 0 8 port)
+    (put-u64 temporary 0 duration)
+    (write-subu8vector temporary 0 8 port)
+    (let ((size (u8vector-length buffer)))
+      (write-32-bit-integer size port)
+      (write-subu8vector buffer 0 size port))))
+
+
+;;;
+;;;; Format2
+;;;
+
+
+(definition protected stream2?
+  (world-setting 'world.stream2? #f))
+
+
+(definition version-offset <fx>
+  0)
+
+(definition version-size <fx>
+  1024)
+
+
+(definition metadata-offset <fx>
+  (+ version-offset version-size))
+
+(definition metadata-size <fx>
+  3072)
+
+
+(definition index-offset <fx>
+  (+ metadata-offset metadata-size))
+
+(definition index-unit <fx>
+  8)
+
+(definition index-count <fx>
+  4096)
+
+(definition index-size <fx>
+  (* index-unit index-count))
+
+
+(definition sections-offset <fx>
+  (+ index-offset index-size))
+
+
+(definition header-unit <fx>
+  (+ 8 8 8 4 4))
+
+(definition header-count <fx>
+  4096)
+
+(definition header-size <fx>
+  (* header-unit header-count))
+
+
+;;;
+;;;; Reader2
+;;;
+
+
+(class Stream-Reader2 extends Object
+  
+  
+  (slot port             getter generate)
+  (slot frame            getter generate)
+  (slot position         getter generate)
+  (slot version          getter generate)
+  (slot metadata         getter generate)
+  (slot count            getter generate)
+  (slot start            getter generate)
+  (slot end              getter generate)
+  (slot duration         getter generate)
+  (slot kind             getter generate)
+  (slot level            getter generate)
+  (slot resolution       getter generate)
+  (slot framerate        getter generate)
+  (slot bitrate          getter generate)
+  (slot codec            getter generate)
+  (slot index            getter generate)
+  (slot temporary        getter generate)
+  (slot timestamp-offset getter generate)
+  
+  
+  (method override (initialize self file (timestamp-offset 0))
+    (nextmethod self)
+    (set! self.port (open-input-file (path-settings file)))
+    (set! self.frame 0)
+    (set! self.position 0)
+    (set! self.temporary (make-u8vector 8))
+    (set! self.timestamp-offset timestamp-offset)
+    (set! self.version (read-version self))
+    (set! self.metadata (read-metadata self))
+    (set! self.count (getf metadata count:))
+    (set! self.start (getf metadata start:))
+    (set! self.end (getf metadata end:))
+    (set! self.duration (getf metadata duration:))
+    (set! self.kind (getf metadata kind:))
+    (set! self.level (getf metadata level:))
+    (set! self.resolution (getf metadata resolution:))
+    (set! self.framerate (getf metadata framerate:))
+    (set! self.bitrate (getf metadata bitrate:))
+    (set! self.codec (require-codec (getf metadata codec:)))
+    (set! self.index (read-index self)))
+  
+  
+  (method override (destroy self)
+    (close-port port)
+    (nextmethod self))
+  
+  
+  (method (read-version self)
+    (input-port-byte-position port version-offset)
+    (read-binary port))
+  
+  
+  (method (read-metadata self)
+    (input-port-byte-position port metadata-offset)
+    (read-binary port))
+  
+  
+  (method (read-index self)
+    (input-port-byte-position port index-offset)
+    (let ((index (make-u64vector index-count)))
+      (loop (for n from 0 below index-count)
+            (read-subu8vector temporary 0 8 port)
+            (u64vector-set! index n (scan-u64 temporary 0)))
+      index))
+  
+  
+  (method protected (read-frame self read-buffer?)
+    (if (>= frame count)
+        (values #f #f #f)
+      (let ((section (quotient frame header-count))
+            (rank (modulo frame header-count)))
+        (increase! frame)
+        (set! position (+ (u64vector-ref index section) (* rank header-unit)))
+        (input-port-byte-position port position)
+        (read-subu8vector temporary 0 8 port)
+        (let ((timestamp (+ (scan-s64 temporary 0) timestamp-offset)))
+          (read-subu8vector temporary 0 8 port)
+          (let ((duration (scan-u64 temporary 0)))
+            (if read-buffer?
+                (begin
+                  (read-subu8vector temporary 0 8 port)
+                  (let ((offset (scan-u64 temporary 0)))
+                    (let ((size (read-32-bit-integer port)))
+                      (set! position offset)
+                      (input-port-byte-position port position)
+                      (let ((buffer (make-u8vector size)))
+                        (read-subu8vector buffer 0 size port)
+                        (values buffer timestamp duration)))))
+              (values #t timestamp duration)))))))
+  
+  
+  ;; test
+  (method protected (read-header self frame)
+    (let ((section (quotient frame header-count))
+          (rank (modulo frame header-count)))
+      (input-port-byte-position port (+ (u64vector-ref index section) (* rank header-unit)))
+      (read-subu8vector temporary 0 8 port)
+      (let ((timestamp (+ (scan-s64 temporary 0) timestamp-offset)))
+        (read-subu8vector temporary 0 8 port)
+        (let ((duration (scan-u64 temporary 0)))
+          (read-subu8vector temporary 0 8 port)
+          (let ((offset (scan-u64 temporary 0)))
+            (let ((size (read-32-bit-integer port)))
+              (let ((header? (= (read-32-bit-integer port) 1)))
+                (values timestamp duration size header?))))))))
+  
+  
+  ;; test
+  (method protected (read-header? self frame)
+    (let ((section (quotient frame header-count))
+          (rank (modulo frame header-count)))
+      (input-port-byte-position port (+ (u64vector-ref index section) (* rank header-unit) 8 8 8 4))
+      (= (read-32-bit-integer port) 1)))
+  
+  
+  (method protected (find-header self frame)
+    (declare (proper-tail-calls))
+    (let (loop (fr frame))
+      (if (< fr 0)
+          #f
+        (let ((header? (read-header? self fr)))
+          (if header?
+              fr
+            (loop (- fr 1)))))))
+  
+  
+  (method protected (seek self pos)
+    (let ((ts (inexact->exact (+ start (* duration pos))))
+          (fr (fxround (* (cast <fl> (- count 1)) pos))))
+      (if (eq? kind 'audio)
+          (set! frame fr)
+        (let ((hf (find-header self fr)))
+          (when hf
+            (set! frame hf)))))))
+
+
+;;;
+;;;; Writer2
+;;;
+
+
+(class Stream-Writer2 extends Object
+  
+  
+  (slot port            getter generate)
+  (slot kind            getter generate)
+  (slot level           getter generate)
+  (slot resolution      getter generate)
+  (slot framerate       getter generate)
+  (slot bitrate         getter generate)
+  (slot codec           getter generate)
+  (slot index           getter generate)
+  (slot header          getter generate)
+  (slot frame           getter generate)
+  (slot position        getter generate)
+  (slot temporary       getter generate)
+  (slot start-timestamp getter generate)
+  (slot end-timestamp   getter generate)
+  
+  
+  (method override (initialize self file kind level resolution framerate bitrate codec)
+    (nextmethod self)
+    (set! self.port (open-output-file (path-settings file)))
+    (set! self.kind kind)
+    (set! self.level level)
+    (set! self.resolution resolution)
+    (set! self.framerate framerate)
+    (set! self.bitrate bitrate)
+    (set! self.codec (require-codec codec))
+    (set! self.index (make-u64vector index-count))
+    (set! self.header (new-queue))
+    (set! self.frame 0)
+    (set! self.position 0)
+    (set! self.temporary (make-u8vector 8))
+    (set! self.start-timestamp #f)
+    (set! self.end-timestamp #f)
+    (write-start self))
+  
+  
+  (method override (destroy self)
+    (write-end self)
+    (close-port port)
+    (nextmethod self))
+  
+  
+  (method public (write-start self)
+    (set! position sections-offset)
+    (output-port-byte-position port position))
+  
+  
+  (method public (write-frame self buffer timestamp duration)
+    (when (= frame 0)
+      (set! start-timestamp timestamp))
+    (set! end-timestamp timestamp)
+    (when (= (modulo frame header-count) 0)
+      (let ((section (quotient frame header-count)))
+        (u64vector-set! index section position)
+        (increase! position header-size)
+        (output-port-byte-position port position)))
+    (let ((size (u8vector-length buffer))
+          (header? (buffer-header? codec buffer)))
+      (enqueue header (list timestamp duration position size header?))
+      (write-subu8vector buffer 0 size port)
+      (increase! frame)
+      (increase! position size))
+    (when (= (modulo frame header-count) 0)
+      (write-header self (- (quotient frame header-count) 1))))
+  
+  
+  (method (write-header self section)
+    (let ((pos (u64vector-ref index section)))
+      (output-port-byte-position port pos)
+      (loop (for n from 0 below header-count)
+            (for info in (queue-list header))
+            (bind (timestamp duration position size header?) info
+              (put-s64 temporary 0 timestamp)
+              (write-subu8vector temporary 0 8 port)
+              (put-u64 temporary 0 duration)
+              (write-subu8vector temporary 0 8 port)
+              (put-u64 temporary 0 position)
+              (write-subu8vector temporary 0 8 port)
+              (write-32-bit-integer size port)
+              (write-32-bit-integer (if header? 1 0) port)))
+      (set! header (new-queue))))
+  
+  
+  (method public (write-end self)
+    (when (/= (modulo frame header-count) 0)
+      (write-header self (quotient frame header-count)))
+    (write-version self)
+    (write-metadata self)
+    (write-index self))
+  
+  
+  (method (write-version self)
+    (output-port-byte-position port version-offset)
+    (write-binary stream-version port))
+  
+  
+  (method (write-metadata self)
+    (define (collect-metadata)
+      (let ((duration (and start-timestamp
+                           end-timestamp
+                           (- end-timestamp start-timestamp))))
+        (list
+          count: frame
+          start: start-timestamp
+          end: end-timestamp
+          duration: duration
+          kind: kind
+          level: level
+          resolution: resolution
+          framerate: framerate
+          bitrate: bitrate
+          codec: (get-name codec))))
+    
+    (output-port-byte-position port metadata-offset)
+    (write-binary (collect-metadata) port))
+  
+  
+  (method (write-index self)
+    (output-port-byte-position port index-offset)
+    (loop (for n from 0 below index-count)
+          (put-u64 temporary 0 (u64vector-ref index n))
+          (write-subu8vector temporary 0 8 port))))
 
 
 ;;;

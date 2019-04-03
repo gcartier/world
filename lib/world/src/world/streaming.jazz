@@ -21,7 +21,9 @@
         (world.audio)
         (world.context)
         (world.event)
+        (world.media)
         (world.settings)
+        (world.stream)
         (world.udp)
         (world.video))
 
@@ -65,7 +67,10 @@
 
 
 (definition (stream-seek stream pos)
-  )
+  (iterate-table (get-channels stream)
+    (lambda (no channel)
+      (let ((src (get-src (get-pipeline channel))))
+        (seek src pos)))))
 
 
 (definition (stream-mute stream)
@@ -318,4 +323,68 @@
       ;; because the channel-add calls use tcp, the first udp packets
       ;; will often arrive before them hence the need for a small delay
       (sleep (or delay .1))
-      (thunk)))))
+      (thunk))))
+
+
+;;;
+;;;; Convert
+;;;
+
+
+(definition protected (convert-streams dir (dry?: dry? #f))
+  (iterate-directory dir
+    (lambda (file)
+      (let ((extension (get-extension file)))
+        (when (member? extension '("streamaudio"
+                                   "streamvideo0"
+                                   "streamvideo1"
+                                   "streamvideo2"
+                                   "streamvideo3"
+                                   "streamvideo4"))
+          (convert-stream file dry?: dry?))))
+    files?: #t
+    directories?: #f
+    recursive?: #t))
+
+
+(definition protected (convert-stream file (dry?: dry? #f))
+  (declare (proper-tail-calls))
+  (let ((name (get-name file))
+        (base (get-base file))
+        (extension (get-extension file)))
+    (define (determine-information)
+      (cond ((starts-with? extension "streamaudio")
+             (values 'audio #f #f #f #f 'vorbis))
+            ((starts-with? extension "streamvideo")
+             (let ((level (string->number (substring extension (string-length "streamvideo") (string-length extension)))))
+               (let ((profile (level->video-profile level)))
+                 (values 'video level (get-resolution profile) (get-framerate profile) (get-bitrate profile) (get-codec profile)))))
+            (else
+             (error "Unable to convert stream: {a}" name))))
+    
+    (define (convert-to temp-file)
+      (receive (kind level resolution framerate bitrate codec) (determine-information)
+        (let ((start-time (current-seconds)))
+          (let ((reader (new Stream-Reader file))
+                (writer (new Stream-Writer2 temp-file kind level resolution framerate bitrate codec)))
+            (terminal-string (format "{a}" name))
+            (let (loop (count 0))
+              (receive (buffer timestamp duration) (read-frame reader #t)
+                (if buffer
+                    (begin
+                      (write-frame writer buffer timestamp duration)
+                      (when (= (modulo count 100) 0)
+                        (terminal-string "."))
+                      (loop (+ count 1)))
+                  (close reader)
+                  (close writer)
+                  (terminal-string (format "({a})" (present-seconds (- (current-seconds) start-time))))
+                  (terminal-newline))))))))
+    
+    (if dry?
+        (terminal name)
+      (let ((temp-extension (string-append "temp" extension)))
+        (let ((temp-file (new-brother file (add-extension base temp-extension))))
+          (convert-to temp-file)
+          (delete file)
+          (rename temp-file file)))))))
