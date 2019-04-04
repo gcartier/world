@@ -230,31 +230,25 @@
 (class Audio-Src extends Stream-Src
   
   
-  (slot audio-headers               initialize '() accessors generate)
-  (slot audio-header                initialize #f  accessors generate)
-  (slot audio-pipeline              initialize #f  accessors generate)
-  (slot audio-src                   initialize #f  accessors generate)
-  (slot audio-sink                  initialize #f  accessors generate)
-  (slot audio-data     <u8vector+>  initialize #f  accessors generate)
-  (slot audio-info     <u64vector+> initialize #f  accessors generate)
-  (slot audio-task                  initialize #f  accessors generate)
-  (slot audio-listener              initialize #f  accessors generate)
-  (slot audio-consumer              initialize #f  getter generate)
+  (slot pipeline initialize #f accessors generate)
+  (slot appsrc   initialize #f accessors generate)
+  (slot task     initialize #f accessors generate)
+  (slot consumer initialize #f getter generate)
   
   
   (method package virtual (start-listeners self)
-    (when audio-listener
-      (start-stream-listener audio-listener)))
+    (when consumer
+      (start-listener consumer)))
   
   
   (method package virtual (stop-listeners self)
-    (when audio-listener
-      (stop-stream-listener audio-listener)))
+    (when consumer
+      (stop-listener consumer)))
   
   
-  (method override (start-element self)
+  (method override (setup-element self)
     (nextmethod self)
-    (set! audio-consumer (car sinks)))
+    (set! consumer (car sinks)))
   
   
   (method (task-start self name)
@@ -264,13 +258,13 @@
       (let ((task (new Task name procedure priority: audio-priority)))
         (start-listeners self)
         (start-task task)
-        (set! self.audio-task task))))
+        (set! self.task task))))
   
   
   (method (task-stop self)
     (stop-listeners self)
-    (stop-task audio-task)
-    (set! audio-task #f))
+    (stop-task task)
+    (set! task #f))
   
   
   (method protected virtual (audio-loop self task)
@@ -286,56 +280,7 @@
   
   
   (method override (process self task exit)
-    (let ((size (gst_app_sink_wait task exit audio-listener audio-sink audio-data audio-info #f #f)))
-      (site (audio on?: #t)
-        (let ((buffer (subu8vector audio-data 0 size))
-              (timestamp (u64vector-ref audio-info 0))
-              (duration (u64vector-ref audio-info 1)))
-          (let ((header? (audio-buffer-header? buffer)))
-            (when audio-show
-              (if (eq? audio-codec 'vorbis)
-                  (let ((type (if header?
-                                  '***header***
-                                'data)))
-                    (terminal 'audio size type))
-                (terminal 'audio size)))
-            (consume-audio self buffer header? timestamp duration)
-            (record-event udp-id-src-media
-                          -1.
-                          (fixnum->flonum client-no)
-                          (fixnum->flonum udp-audio)
-                          -1.
-                          (if header? 1. -1.)
-                          (fixnum->flonum size)
-                          (timestamp->flonum timestamp)))))))
-  
-  
-  (method protected virtual (consume-audio self buffer header? timestamp duration)
-    (consume audio-consumer buffer timestamp duration))
-  
-  
-  (method protected (consume-audio/headers self buffer header? timestamp duration)
-    (case audio-codec
-      ;; opus has no headers
-      ((opus)
-       (consume audio-consumer buffer timestamp duration))
-      ((vorbis)
-       (if header?
-           (begin
-             (set! audio-headers (append! audio-headers (list (list buffer timestamp duration))))
-             (when (= (length audio-headers) 3)
-               (set! audio-header (object->u8vector audio-headers))
-               (consume audio-consumer (list audio-header) #f #f)))
-         (consume audio-consumer buffer timestamp duration)))))
-   
-   
-  (method protected (resend-audio-header self channel-no)
-    (when audio-header
-      (if (client?)
-          (let ((tier (current-client)))
-            (send-client-media tier channel-no audio-header #t -1 GST_CLOCK_TIME_NONE))
-        (let ((tier (current-server)))
-          (send-server-media tier channel-no audio-header #t -1 GST_CLOCK_TIME_NONE))))))
+    (gst_app_sink_process task exit consumer)))
 
 
 ;;;
@@ -369,7 +314,7 @@
           (set! self.mic-pipeline pipeline)
           (set! self.mic-sink appsink)))
       ;; audio
-      (let ((listener (open-stream-listener "micaudio"))
+      (let ((listener (open-stream-listener "mic"))
             (pipeline (gst-launch "appsrc name=src"
                                   (and (eq? audio-codec 'opus) (tie "opusenc {properties} name=enc"))
                                   (and (eq? audio-codec 'vorbis) "audioconvert")
@@ -378,9 +323,7 @@
                                   "appsink name=sink")))
         (gst_object_set_name pipeline "audio")
         (let ((appsrc (gst_bin_get_by_name pipeline "src"))
-              (appsink (gst_bin_get_by_name pipeline "sink"))
-              (data (make-u8vector 4096))
-              (info (make-u64vector 2)))
+              (appsink (gst_bin_get_by_name pipeline "sink")))
           (gst_app_src_set_caps appsrc
                                 (gst_caps "audio/x-raw"
                                           "format"   (g_value_string "S16LE")
@@ -392,68 +335,127 @@
                         "stream-type" (g_value_int GST_APP_STREAM_TYPE_STREAM)
                         "format"      (g_value_int GST_FORMAT_TIME))
           (gst_app_sink_connect_signals appsink listener)
+          (setup-consumer consumer listener appsink 4096)
           (gst_element_set_state pipeline GST_STATE_READY)
-          (set! self.audio-data data)
-          (set! self.audio-info info)
-          (set! self.audio-pipeline pipeline)
-          (set! self.audio-src appsrc)
-          (set! self.audio-sink appsink)
-          (set! self.audio-listener listener)))
+          (set! self.pipeline pipeline)
+          (set! self.appsrc appsrc)))
       ;; denoiser
-      (create-denoiser-thread mic-sink audio-src)))
+      (create-denoiser-thread mic-sink appsrc)))
   
   
   (method override (start-element self)
     (nextmethod self)
-    (gst_element_set_state audio-pipeline GST_STATE_PAUSED)
+    (gst_element_set_state pipeline GST_STATE_PAUSED)
     (gst_element_set_state mic-pipeline GST_STATE_PAUSED)
     (task-start self 'mic))
   
   
   (method override (play-element self)
     (nextmethod self)
-    (gst_element_set_state audio-pipeline GST_STATE_PLAYING)
+    (gst_element_set_state pipeline GST_STATE_PLAYING)
     (gst_element_set_state mic-pipeline GST_STATE_PLAYING))
   
   
   (method override (pause-element self)
     (nextmethod self)
-    (gst_element_set_state audio-pipeline GST_STATE_PAUSED)
+    (gst_element_set_state pipeline GST_STATE_PAUSED)
     (gst_element_set_state mic-pipeline GST_STATE_PAUSED))
   
   
   (method override (stop-element self)
     (nextmethod self)
     (task-stop self)
-    (gst_element_set_state audio-pipeline GST_STATE_READY)
+    (gst_element_set_state pipeline GST_STATE_READY)
     (gst_element_set_state mic-pipeline GST_STATE_READY))
   
   
   (method override (release-element self)
     (nextmethod self)
-    (consume audio-consumer #f #f #f)
-    (gst_element_release audio-pipeline)
-    (set! audio-info #f)
-    (set! audio-data #f)
-    (set! audio-pipeline #f)
-    (set! audio-src #f)
-    (set! audio-sink #f)
-    (set! audio-headers '())
-    (set! audio-header #f)
-    (close-stream-listener audio-listener)
-    (set! audio-listener #f)
+    (consume consumer #f #f #f)
+    (gst_element_release pipeline)
+    (set! pipeline #f)
+    (set! appsrc #f)
+    (release-consumer consumer)
     (gst_element_release mic-pipeline)
     (set! mic-pipeline #f)
     (set! mic-sink #f))
   
   
-  (method override (consume-audio self buffer header? timestamp duration)
-    (consume-audio/headers self buffer header? timestamp duration))
-  
-  
   (method override (reset-media self channel)
     (when (eq? audio-codec 'vorbis)
-      (resend-audio-header self (get-no channel)))))
+      (resend-header consumer (get-no channel)))))
+
+
+;;;
+;;;; Audio-Consumer
+;;;
+
+
+(class Audio-Consumer extends Stream-Consumer
+  
+  
+  (slot headers initialize '() accessors generate)
+  (slot header  initialize #f  accessors generate)
+  
+  
+  (method override (release-element self)
+    (nextmethod self)
+    (set! headers '())
+    (set! header #f))
+  
+  
+  (method override (consume self buffer timestamp duration)
+    (case audio-codec
+      ;; opus has no headers
+      ((opus)
+       (nextmethod self buffer timestamp duration))
+      ((vorbis)
+       (if (and buffer (audio-buffer-header? buffer))
+           (begin
+             (set! headers (append! headers (list (list buffer timestamp duration))))
+             (when (= (length headers) 3)
+               (set! header (object->u8vector headers))
+               (nextmethod self (list header) #f #f)))
+         (nextmethod self buffer timestamp duration)))))
+   
+   
+  (method protected (resend-header self channel-no)
+    (when header
+      (if (client?)
+          (let ((tier (current-client)))
+            (send-client-media tier channel-no header #t -1 GST_CLOCK_TIME_NONE))
+        (let ((tier (current-server)))
+          (send-server-media tier channel-no header #t -1 GST_CLOCK_TIME_NONE))))))
+
+
+;;;
+;;;; Mic-Audio-Consumer
+;;;
+
+
+(class Mic-Audio-Consumer extends Audio-Consumer
+  
+  
+  (method override (consume self buffer timestamp duration)
+    (nextmethod self buffer timestamp duration)
+    (when buffer
+      (let ((header? (audio-buffer-header? buffer))
+            (size (u8vector-length buffer)))
+        (when audio-show
+          (if (eq? audio-codec 'vorbis)
+              (let ((type (if header?
+                              '***header***
+                            'data)))
+                (terminal 'audio size type))
+            (terminal 'audio size)))
+        (record-event udp-id-src-media
+                      -1.
+                      (fixnum->flonum client-no)
+                      (fixnum->flonum udp-audio)
+                      -1.
+                      (if header? 1. -1.)
+                      (fixnum->flonum size)
+                      (timestamp->flonum timestamp))))))
 
 
 ;;;
@@ -486,39 +488,34 @@
                                   "appsink name=appsink sync=false")))
         (gst_object_set_name pipeline "file")
         (let ((filesrc (gst_bin_get_by_name pipeline "filesrc"))
-              (appsink (gst_bin_get_by_name pipeline "appsink"))
-              (data (make-u8vector 4096))
-              (info (make-u64vector 2)))
+              (appsink (gst_bin_get_by_name pipeline "appsink")))
           (gst_app_sink_connect_signals appsink listener)
           (g_object_set_string filesrc "location" (path-normalize location))
           (gst_element_set_state pipeline GST_STATE_READY)
-          (set! self.audio-data data)
-          (set! self.audio-info info)
-          (set! self.audio-listener listener)
-          (set! self.audio-pipeline pipeline)
-          (set! self.audio-sink appsink)))))
+          (set! self.pipeline pipeline)
+          (setup-consumer consumer listener appsink 4096)))))
   
   
   (method override (start-element self)
     (nextmethod self)
     (task-start self 'file)
-    (gst_element_set_state audio-pipeline GST_STATE_PAUSED))
+    (gst_element_set_state pipeline GST_STATE_PAUSED))
   
   
   (method override (play-element self)
     (nextmethod self)
-    (gst_element_set_state audio-pipeline GST_STATE_PLAYING))
+    (gst_element_set_state pipeline GST_STATE_PLAYING))
   
   
   (method override (pause-element self)
     (nextmethod self)
-    (gst_element_set_state audio-pipeline GST_STATE_PAUSED))
+    (gst_element_set_state pipeline GST_STATE_PAUSED))
   
   
   (method override (stop-element self)
     (nextmethod self)
     (task-stop self)
-    (gst_element_set_state audio-pipeline GST_STATE_READY))
+    (gst_element_set_state pipeline GST_STATE_READY))
   
   
   (method override (audio-loop self task)
@@ -575,16 +572,16 @@
   
   (method override (play-element self)
     (nextmethod self)
-    (task-wakeup (get-thread audio-task)
+    (task-wakeup (get-thread task)
       (lambda (exit)
         (reset time-base))))
   
   
   (method override (pause-element self)
     (nextmethod self)
-    (task-wakeup (get-thread audio-task)
+    (task-wakeup (get-thread task)
       (lambda (exit)
-        (task-sleep audio-task +inf.0 exit))))
+        (task-sleep task +inf.0 exit))))
   
   
   (method override (stop-element self)
@@ -596,7 +593,7 @@
   
   
   (method override (seek self pos)
-    (task-wakeup (get-thread audio-task)
+    (task-wakeup (get-thread task)
       (lambda (exit)
         (seek reader pos)
         (reset time-base))))
@@ -637,14 +634,13 @@
                       (when stream?
                         (site (stream on?: #t)
                           (unless mute?
-                            (let ((header? (audio-buffer-header? buffer)))
-                              (consume-audio/headers self buffer header? timestamp duration))))))))))
+                            (consume consumer buffer timestamp duration)))))))))
             (iter))))))
   
   
   (method override (reset-media self channel)
     (when (eq? audio-codec 'vorbis)
-      (resend-audio-header self (get-no channel)))))
+      (resend-header consumer (get-no channel)))))
 
 
 ;;;
