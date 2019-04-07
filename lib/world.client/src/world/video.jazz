@@ -200,7 +200,7 @@
     (nextmethod self)
     (set! self.name name)
     (set! self.level level)
-    (set! self.extension (format "streamvideo{a}" level))
+    (set! self.extension (format "streamvideo{a}" (or level "")))
     (set! self.resolution resolution)
     (set! self.framerate framerate)
     (set! self.bitrate bitrate)
@@ -248,8 +248,17 @@
   (get-extension (active-video-profile)))
 
 
-(definition public (streaming-video-profiles)
-  (streaming-profiles (active-video-profile)))
+(definition public (streaming-video-profiles location)
+  (let ((profile (active-video-profile)))
+    (if (not (get-level profile))
+        ;; PRIME
+        (if stream-compare?
+            (loop (for l from 4 downto 0)
+                  (when (exists? (new-file {Directory Settings} (list "streams" (add-extension location (get-extension (level->video-profile l))))))
+                    (return (list profile (level->video-profile l))))
+                  (finally (list profile)))
+          (list profile))
+      (streaming-profiles profile))))
 
 
 (definition public (streaming-profiles profile)
@@ -269,11 +278,13 @@
 
 
 (definition protected (stream-receive-video-level stream)
-  (let ((stream-level (get-video-level stream)))
+  (let ((stream-level (get-video-level stream))
+        (profile-level (video-profile-level)))
     (and stream-level
-         (min stream-level (video-profile-level)))))
+         (min stream-level profile-level))))
 
 
+(register-video-profile (new Video-Profile 'prime  #f #f #f #f 'h264))
 (register-video-profile (new Video-Profile 'high   4 {Dimension 1920 1080} 30 4096 'h264))
 (register-video-profile (new Video-Profile 'good   3 {Dimension 1280  720} 20 2048 'h264))
 (register-video-profile (new Video-Profile 'medium 2 {Dimension  640  360} 15 1024 'h264))
@@ -1154,6 +1165,7 @@
   
   
   (slot location   initialize #f accessors generate)
+  (slot level      initialize #f accessors generate)
   (slot resolution initialize #f accessors generate)
   (slot framerate  initialize #f accessors generate)
   (slot bitrate    initialize #f accessors generate)
@@ -1161,9 +1173,10 @@
   (slot pipeline   initialize #f accessors generate)
   
   
-  (method override (initialize self location (resolution: resolution #f) (framerate: framerate #f) (bitrate: bitrate #f) (codec: codec #f))
+  (method override (initialize self location (level: level #f) (resolution: resolution #f) (framerate: framerate #f) (bitrate: bitrate #f) (codec: codec #f))
     (nextmethod self)
     (set! self.location location)
+    (set! self.level level)
     (set! self.resolution resolution)
     (set! self.framerate framerate)
     (set! self.bitrate bitrate)
@@ -1172,31 +1185,39 @@
   
   (method override (setup-element self)
     (nextmethod self)
-    (let ((width (get-width resolution))
-          (height (get-height resolution))
+    ;; PRIME
+    ;; quicky for tests to make resolution as big as
+    ;; any video we will preprocess for the data size
+    (let ((width (if resolution (get-width resolution) 1920))
+          (height (if resolution (get-height resolution) 1080))
           (listener (open-stream-listener "preprocessvideo")))
-      (let ((pipeline (gst-launch (tie "filesrc name=filesrc")
-                                  ;; calls vtdec which generates errors in some files
-                                  ;; "decodebin"
-                                  "qtdemux"
-                                  "avdec_h264"
-                                  (and framerate (tie "videorate max-rate={framerate}"))
-                                  "videoscale method=sinc"
-                                  "videoconvert"
-                                  (tie "video/x-raw, format=I420, width={width}, height={height}, pixel-aspect-ratio=(fraction)1/1")
-                                  (let ((key-int-max (and stream-keyframes (fxround (* (cast <fl> framerate) stream-keyframes))))
-                                        (bitrate bitrate)
-                                        (tune "zerolatency")
-                                        (speed-preset "superfast"))
-                                    ;; no point using a slower speed until
-                                    ;; we can encode without tune=zerolatency
-                                    (gst-element "x264enc"
-                                                 key-int-max: key-int-max
-                                                 bitrate: bitrate
-                                                 tune: tune
-                                                 speed-preset: speed-preset
-                                                 name: "enc"))
-                                  "appsink name=appsink sync=false")))
+      (let ((pipeline (if (not level)
+                          (gst-launch (tie "filesrc name=filesrc")
+                                      "qtdemux"
+                                      "video/x-h264"
+                                      "appsink name=appsink sync=false")
+                        (gst-launch (tie "filesrc name=filesrc")
+                                    ;; calls vtdec which generates errors in some files
+                                    ;; "decodebin"
+                                    "qtdemux"
+                                    "avdec_h264"
+                                    (and framerate (tie "videorate max-rate={framerate}"))
+                                    "videoscale method=sinc"
+                                    "videoconvert"
+                                    (tie "video/x-raw, format=I420, width={width}, height={height}, pixel-aspect-ratio=(fraction)1/1")
+                                    (let ((key-int-max (and stream-keyframes (fxround (* (cast <fl> framerate) stream-keyframes))))
+                                          (bitrate bitrate)
+                                          (tune "zerolatency")
+                                          (speed-preset "superfast"))
+                                      ;; no point using a slower speed until
+                                      ;; we can encode without tune=zerolatency
+                                      (gst-element "x264enc"
+                                                   key-int-max: key-int-max
+                                                   bitrate: bitrate
+                                                   tune: tune
+                                                   speed-preset: speed-preset
+                                                   name: "enc"))
+                                    "appsink name=appsink sync=false"))))
         (gst_object_set_name pipeline "file")
         (let ((filesrc (gst_bin_get_by_name pipeline "filesrc"))
               (appsink (gst_bin_get_by_name pipeline "appsink")))
@@ -1244,7 +1265,8 @@
               (task-done task exit)
             (site (preprocess on?: #t)
               (process self task exit))
-            (task-sleep task .001 exit)
+            (when level
+              (task-sleep task .001 exit))
             (iter)))))))
 
 
@@ -1641,13 +1663,15 @@
   (method package virtual (setup-pipeline self)
     (when process?
       (let ((width (get-width resolution))
-            (height (get-height resolution)))
+            (height (get-height resolution))
+            (hardware? video-hardware?))
         (let ((listener (open-stream-listener "videocolor"))
-              (pipeline (gst-launch (tie "appsrc name=src")
-                                    (and (not video-hardware?) (eq? codec 'h264) (tie "avdec_h264"))
+              (pipeline (gst-launch ;; PRIME
+                                    (format "appsrc{? caps=\"{a}\"~} name=src" caps)
+                                    (and (not hardware?) (eq? codec 'h264) (tie "avdec_h264"))
                                     ;; try
-                                    (and video-hardware? "h264parse")
-                                    (and video-hardware? "vtdec_hw")
+                                    (and hardware? "h264parse")
+                                    (and hardware? "vtdec_hw")
                                     "videoscale"
                                     "videoconvert"
                                     (and alpha-overlay (tie "alpha alpha={alpha-overlay}"))
@@ -1659,25 +1683,24 @@
                 (data (make-u8vector (* width height 4)))
                 (info (make-u64vector 2)))
             (gst_app_sink_connect_signals appsink listener)
-            (case codec
-              ((h264)
-               (gst_app_src_set_caps appsrc
-                                     (gst_caps "video/x-h264"
-                                               "width"         (g_value_int width)
-                                               "height"        (g_value_int height)
-                                               "framerate"     (g_value_fraction framerate 1)
-                                               "stream-format" (g_value_string (if video-hardware?
-                                                                                   ;; try
-                                                                                   "byte-stream"
-                                                                                 "avc"))
-                                               "alignment"     (g_value_string "au"))))
-              (else
-               (gst_app_src_set_caps appsrc
-                                     (gst_caps "video/x-raw"
-                                               "format"    (g_value_string "I420")
-                                               "width"     (g_value_int width)
-                                               "height"    (g_value_int height)
-                                               "framerate" (g_value_fraction framerate 1)))))
+            ;; PRIME
+            (when (not caps)
+              (case codec
+                ((h264)
+                 (gst_app_src_set_caps appsrc
+                                       (gst_caps "video/x-h264"
+                                                 "width"         (g_value_int width)
+                                                 "height"        (g_value_int height)
+                                                 "framerate"     (g_value_fraction framerate 1)
+                                                 "stream-format" (g_value_string "byte-stream") ;; PRIME
+                                                 "alignment"     (g_value_string "au"))))
+                (else
+                 (gst_app_src_set_caps appsrc
+                                       (gst_caps "video/x-raw"
+                                                 "format"    (g_value_string "I420")
+                                                 "width"     (g_value_int width)
+                                                 "height"    (g_value_int height)
+                                                 "framerate" (g_value_fraction framerate 1))))))
             (g_object_set appsrc
                           "is-live"     (g_value_boolean #t)
                           "stream-type" (g_value_int GST_APP_STREAM_TYPE_STREAM)
@@ -1705,7 +1728,7 @@
                                               "width"         (g_value_int width)
                                               "height"        (g_value_int height)
                                               "framerate"     (g_value_fraction framerate 1)
-                                              "stream-format" (g_value_string "avc")
+                                              "stream-format" (g_value_string "byte-stream")
                                               "alignment"     (g_value_string "au")))
               (g_object_set appsrc
                             "is-live"     (g_value_boolean #t)
@@ -1804,6 +1827,14 @@
   (method override (consume self color timestamp duration (alpha #f))
     ;; QUICK TEST
     (when color-appsrc
+      @w
+      ;; PRIME
+      (when color
+        (present-nalus color 'stream
+          filter: (lambda (buffer start end)
+                    (let ((type (u8vector-ref buffer start)))
+                      (not (or (= type 65)
+                               (and (= type 9) (= (u8vector-ref buffer (+ start 1)) 48))))))))
     ;; QUICK TEST
       (when color
         (gst_app_src_write color-appsrc color (u8vector-length color) timestamp duration)))
