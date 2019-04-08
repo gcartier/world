@@ -330,14 +330,20 @@
   (method (join-group self group delegate)
     (set-group delegate group)
     (set-members group (cons delegate (get-members group)))
+    (wait-headers udp-server delegate (delegate->connection self delegate))
     (update-streaming udp-server group))
   
   
   (method (leave-group self group delegate)
+    (done-headers udp-server delegate (delegate->connection self delegate))
     (set-group delegate #f)
     (set-members group (remove! delegate (get-members group)))
     (update-streaming udp-server group)
     (maybe-delete-group self group))
+  
+  
+  (method (delegate->connection self delegate)
+    (origin->connection udp-server (get-no delegate)))
   
   
   ;;;
@@ -693,7 +699,7 @@
             #f)))))
   
   
-  (method package (client-register-stream self client sender name source-kind video-level recipient mirror?)
+  (method package (client-register-stream self client sender name source-kind video-level channels recipient mirror?)
     (let ((client-delegate (find-delegate self client)))
       ;; together robust
       (if (not client-delegate)
@@ -706,13 +712,17 @@
                   (recipient (or recipient group))
                   (exclude-stream (if mirror? client-delegate #f))
                   (exclude-broadcast client-delegate))
-              (get-no (server-register-stream self sender name origin source-kind video-level recipient exclude-stream exclude-broadcast))))))))
+              (get-no (server-register-stream self sender name origin source-kind video-level channels recipient exclude-stream exclude-broadcast))))))))
   
   
-  (method package (server-register-stream self sender name origin source-kind video-level recipient exclude-stream exclude-broadcast)
-    (let ((recipients (recipient-delegates self recipient)))
-      (let ((no (next-stream-no!)))
-        (let ((stream (register-server-stream udp-server sender name no origin source-kind video-level recipient exclude-stream exclude-broadcast)))
+  (method package (client-register-stream2 self client sender name source-kind video-level channels recipient mirror?)
+    )
+  
+  
+  (method package (server-register-stream self sender name origin source-kind video-level channels recipient exclude-stream exclude-broadcast)
+    (let ((no (next-stream-no!)))
+      (let ((stream (register-server-stream udp-server sender name no origin source-kind video-level recipient exclude-stream exclude-broadcast)))
+        (let ((recipients (stream-recipients self stream)))
           (for-each (lambda (delegate)
                       (unless (eq? delegate exclude-stream)
                         (when (eq? (get-state delegate) 'started)
@@ -732,19 +742,18 @@
     (let ((stream (find-server-stream udp-server stream-no)))
       ;; together robust
       (when stream
-        (let ((recipient (get-recipient stream))
+        (let ((recipients (stream-recipients self stream))
               (exclude-stream (get-exclude-stream stream)))
-          (let ((recipients (recipient-delegates self recipient)))
-            (for-each (lambda (delegate)
-                        (unless (eq? delegate exclude-stream)
-                          (when (eq? (get-state delegate) 'started)
-                            (let ((client (get-client delegate)))
-                              (calling-client self delegate
-                                (lambda ()
-                                  (stream-remove client stream-no)))))))
-                      recipients)
-            (close-server-stream udp-server stream)
-            #f)))))
+          (for-each (lambda (delegate)
+                      (unless (eq? delegate exclude-stream)
+                        (when (eq? (get-state delegate) 'started)
+                          (let ((client (get-client delegate)))
+                            (calling-client self delegate
+                              (lambda ()
+                                (stream-remove client stream-no)))))))
+                    recipients)
+          (close-server-stream udp-server stream)
+          #f))))
   
   
   (method package (client-stream-action self client stream-no action arguments)
@@ -765,35 +774,30 @@
                         (action-stream client stream-no action arguments))))))))))))
   
   
-  (method package (client-add-channel self client stream-no media-kind source-kind level resolution framerate bitrate codec caps recipient mirror?)
+  (method package (client-add-channel self client stream-no media-kind source-kind level resolution framerate bitrate codec caps)
     (let ((client-delegate (find-delegate self client)))
       ;; together robust
       (if (not client-delegate)
           (format "Delegate not found")
-        (let ((group (get-group client-delegate)))
-          (if (and (not recipient)
-                   (not group))
-              (format "You are not in a group")
-            (let ((origin (get-no client-delegate))
-                  (recipient (or recipient group))
-                  (exclude-channel (if mirror? client-delegate #f))
-                  (exclude-broadcast client-delegate))
-              (server-add-channel self stream-no origin media-kind source-kind level resolution framerate bitrate codec caps recipient exclude-channel exclude-broadcast #f)))))))
+        (let ((origin (get-no client-delegate)))
+          (server-add-channel self stream-no origin media-kind source-kind level resolution framerate bitrate codec caps #f)))))
   
   
-  (method package (server-add-channel self stream-no origin media-kind source-kind level resolution framerate bitrate codec caps recipient exclude-channel exclude-broadcast server-sender?)
-    (let ((recipients (recipient-delegates self recipient)))
-      (let ((no (next-channel-no!)))
-        (let ((channel (register-server-channel udp-server stream-no no origin media-kind source-kind level resolution framerate bitrate codec caps recipient exclude-channel exclude-broadcast server-sender?)))
-          (for-each (lambda (delegate)
-                      (unless (eq? delegate exclude-channel)
-                        (when (eq? (get-state delegate) 'started)
-                          (let ((client (get-client delegate)))
-                            (calling-client self delegate
-                              (lambda ()
-                                (channel-add client stream-no no origin media-kind source-kind level resolution framerate bitrate codec caps)))))))
-                    recipients)
-          no))))
+  (method package (server-add-channel self stream-no origin media-kind source-kind level resolution framerate bitrate codec caps server-sender?)
+    (let ((no (next-channel-no!)))
+      (let ((channel (register-server-channel udp-server stream-no no origin media-kind source-kind level resolution framerate bitrate codec caps server-sender?)))
+        (let ((stream (get-stream channel)))
+          (let ((recipients (stream-recipients self stream))
+                (exclude-stream (get-exclude-stream stream)))
+            (for-each (lambda (delegate)
+                        (unless (eq? delegate exclude-stream)
+                          (when (eq? (get-state delegate) 'started)
+                            (let ((client (get-client delegate)))
+                              (calling-client self delegate
+                                (lambda ()
+                                  (channel-add client stream-no no origin media-kind source-kind level resolution framerate bitrate codec caps)))))))
+                      recipients)
+            no)))))
   
   
   (method package (client-remove-channel self client channel-no)
@@ -817,11 +821,11 @@
     (let ((channel (find-server-channel udp-server channel-no)))
       ;; together robust
       (when channel
-        (let ((recipient (get-recipient channel))
-              (exclude-channel (get-exclude-channel channel)))
-          (let ((recipients (recipient-delegates self recipient)))
+        (let ((stream (get-stream channel)))
+          (let ((recipients (stream-recipients self stream))
+                (exclude-stream (get-exclude-stream stream)))
             (for-each (lambda (delegate)
-                        (unless (eq? delegate exclude-channel)
+                        (unless (eq? delegate exclude-stream)
                           (when (eq? (get-state delegate) 'started)
                             (let ((client (get-client delegate)))
                               (calling-client self delegate
@@ -832,10 +836,11 @@
             #f)))))
   
   
-  (method (recipient-delegates self recipient)
-    (if (is? recipient Server-Group)
-        (get-members recipient)
-      (list (find-delegate-by-no self recipient))))
+  (method (stream-recipients self stream)
+    (let ((recipient (get-recipient stream)))
+      (if (is? recipient Server-Group)
+          (get-members recipient)
+        (list (find-delegate-by-no self recipient)))))
   
   
   (method (group-streams self group)
@@ -1514,23 +1519,24 @@
               "You are not in a group"
             (let ((name (filename-name location))
                   (video-level (video-profile-level)))
-              (let ((stream (server-register-stream self server-sender name server-no 'stream video-level group #f #f)))
-                (let ((stream-no (get-no stream)))
-                  (let ((send-stream (register-send-stream udp-server server-sender name stream-no 'stream video-level)))
-                    (let ((streaming-audio? (streaming-audio? self))
-                          (audio-file? (exists? (new-file {Directory Settings} (list "streams" (add-extension location (audio-profile-extension)))))))
-                      (when (and audio-file? (not streaming-audio?) (not stream-silent?))
-                        (add-server-audio-channel self stream-no group location name))
-                      (add-server-video-channels self stream-no group location name)
-                      (set-action-proc send-stream stream-controller-action)
-                      (set-streams group (cons stream (get-streams group)))
-                      (if delay-streaming?
-                          (delay-streaming
-                            (lambda ()
-                              (play send-stream)))
-                        (sleep .1)
-                        (play send-stream))
-                      #f))))))))))
+              (let ((channels '()))
+                (let ((stream (server-register-stream self server-sender name server-no 'stream video-level channels group #f #f)))
+                  (let ((stream-no (get-no stream)))
+                    (let ((send-stream (register-send-stream udp-server server-sender name stream-no 'stream video-level)))
+                      (let ((streaming-audio? (streaming-audio? self))
+                            (audio-file? (exists? (new-file {Directory Settings} (list "streams" (add-extension location (audio-profile-extension)))))))
+                        (when (and audio-file? (not streaming-audio?) (not stream-silent?))
+                          (add-server-audio-channel self stream-no group location name))
+                        (add-server-video-channels self stream-no group location name)
+                        (set-action-proc send-stream stream-controller-action)
+                        (set-streams group (cons stream (get-streams group)))
+                        (if delay-streaming?
+                            (delay-streaming
+                              (lambda ()
+                                (play send-stream)))
+                          (sleep .1)
+                          (play send-stream))
+                        #f)))))))))))
   
   
   (method (stream-stop self client location)
@@ -1570,7 +1576,7 @@
   
   
   (method (add-server-audio-channel self stream-no group location name)
-    (let ((channel-no (server-add-channel self stream-no client-no udp-audio 'stream #f #f #f #f audio-codec #f group #f #f #t)))
+    (let ((channel-no (server-add-channel self stream-no client-no udp-audio 'stream #f #f #f #f audio-codec #f #t)))
       (let ((channel (register-send-channel udp-server stream-no channel-no udp-audio 'stream #f #f #f #f audio-codec #f)))
         (let ((src (new File-Stream-Audio-Src
                      location))
@@ -1601,7 +1607,7 @@
                                 (codec (get-codec profile))
                                 (caps (get-caps reader)))
                             (close reader)
-                            (let ((channel-no (server-add-channel self stream-no client-no udp-video 'stream level resolution framerate bitrate codec caps group #f #f #t)))
+                            (let ((channel-no (server-add-channel self stream-no client-no udp-video 'stream level resolution framerate bitrate codec caps #t)))
                               (let ((channel (register-send-channel udp-server stream-no channel-no udp-video 'stream level resolution framerate bitrate codec caps)))
                                 (let ((src (new File-Stream-Video-Src
                                              profile

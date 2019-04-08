@@ -92,11 +92,11 @@
     (table-clear host/port-connections (cons host port)))
   
   
-  (method (origin->connection self origin)
+  (method protected (origin->connection self origin)
     (table-ref origin-connections origin #f))
   
   
-  (method (host/port->connection self host port)
+  (method protected (host/port->connection self host port)
     (table-ref host/port-connections (cons host port) #f))
   
   
@@ -143,9 +143,9 @@
     (table-ref server-channels channel-no #f))
   
   
-  (method package (register-server-channel self stream-no channel-no origin media-kind source-kind level resolution framerate bitrate codec caps recipient exclude-channel exclude-broadcast server-sender?)
+  (method package (register-server-channel self stream-no channel-no origin media-kind source-kind level resolution framerate bitrate codec caps server-sender?)
     (let ((stream (find-server-stream self stream-no)))
-      (let ((channel (new UDP-Server-Channel stream channel-no origin media-kind source-kind level resolution framerate bitrate codec caps recipient exclude-channel exclude-broadcast server-sender?)))
+      (let ((channel (new UDP-Server-Channel stream channel-no origin media-kind source-kind level resolution framerate bitrate codec caps server-sender?)))
         (table-set! server-channels channel-no channel)
         channel)))
   
@@ -495,38 +495,62 @@
   
   
   (method (broadcast-media self channel origin kind data)
-    (let ((recipient (get-recipient channel))
-          (exclude-broadcast (get-exclude-broadcast channel))
-          (stream-level (get-video-level (get-stream channel)))
-          (channel-level (get-level channel)))
-      (let ((recipients (recipient-delegates (current-server) recipient)))
-        (for-each (lambda (member)
-                    (let ((no (get-no member)))
-                      (let ((connection (table-ref origin-connections no #f)))
-                        (when connection
-                          (unless (eq? member exclude-broadcast)
-                            (let ((video-level (get-video-level connection)))
-                              (unless (and (= kind udp-video)
-                                           (not (stream-video-channel? self stream-level channel-level video-level)))
-                                (let ((last-received-state (get-last-received-state connection)))
-                                  (when last-received-state
-                                    (unless (get-throttle-media? connection)
-                                      (let ((now (current-seconds)))
-                                        (if (and udp-throttle (> (- now last-received-state) udp-throttle))
-                                            (begin
-                                              (set-throttle-media? connection #t)
-                                              (record-event udp-id-throttle-on
-                                                            (fixnum->flonum (get-no channel))
-                                                            (fixnum->flonum no)
-                                                            -1.
-                                                            -1.
-                                                            -1.
-                                                            -1.
-                                                            -1.)
-                                              (when udp-show-throttle?
-                                                (format :terminal "{s} {s} {a} {s}{%}" remote-name 'THROTTLE (get-name member) 'ON)))
-                                          (send-data self connection data)))))))))))))
-                  recipients))))
+    (let ((server (current-server)))
+      (let ((stream (get-stream channel)))
+        (let ((recipients (stream-recipients server stream))
+              (exclude-broadcast (get-exclude-broadcast stream))
+              (stream-level (get-video-level stream))
+              (channel-level (get-level channel)))
+          (for-each (lambda (member)
+                      (let ((no (get-no member)))
+                        (let ((connection (table-ref origin-connections no #f)))
+                          (when connection
+                            (unless (eq? member exclude-broadcast)
+                              (let ((video-level (get-video-level connection)))
+                                (unless (and (= kind udp-video)
+                                             (not (stream-video-channel? self stream-level channel-level video-level)))
+                                  (let ((last-received-state (get-last-received-state connection)))
+                                    (when last-received-state
+                                      (unless (get-throttle-media? connection)
+                                        (if (waiting-header? connection channel)
+                                            (if (not (read-udp-media-header? data))
+                                                (when udp-show-skipping?
+                                                  (format :terminal "{s} {s} {s}{%}" remote-name 'SKIPPING (read-udp-frame data)))
+                                              (got-header connection channel)
+                                              (send-data self connection data))
+                                          (let ((now (current-seconds)))
+                                            (if (and udp-throttle (> (- now last-received-state) udp-throttle))
+                                                (begin
+                                                  (set-throttle-media? connection #t)
+                                                  (wait-headers self member connection)
+                                                  (record-event udp-id-throttle-on
+                                                                (fixnum->flonum (get-no channel))
+                                                                (fixnum->flonum no)
+                                                                -1.
+                                                                -1.
+                                                                -1.
+                                                                -1.
+                                                                -1.)
+                                                  (when udp-show-throttle?
+                                                    (format :terminal "{s} {s} {a} {s}{%}" remote-name 'THROTTLE (get-name member) 'ON)))
+                                              (send-data self connection data))))))))))))))
+                    recipients)))))
+  
+  
+  (method protected (wait-headers self delegate connection)
+    (let ((server (current-server)))
+      (iterate-table server-channels
+        (lambda (no channel)
+          (when (memq? delegate (stream-recipients server (get-stream channel)))
+            (wait-header connection channel))))))
+  
+  
+  (method protected (done-headers self delegate connection)
+    (let ((server (current-server)))
+      (iterate-table server-channels
+        (lambda (no channel)
+          (when (memq? delegate (stream-recipients server (get-stream channel)))
+            (done-header connection channel))))))
   
   
   (method (send-data self connection data)
@@ -562,6 +586,7 @@
   (slot bytes-received      initialize 0  getter generate)
   (slot last-received-state initialize #f accessors generate)
   (slot throttle-media?     initialize #f accessors generate)
+  (slot waiting-for-header                accessors generate)
   
   
   (method override (initialize self host port local-host local-port simulator video-level)
@@ -571,13 +596,31 @@
     (set! self.local-host local-host)
     (set! self.local-port local-port)
     (set! self.simulator simulator)
-    (set! self.video-level video-level))
+    (set! self.video-level video-level)
+    (set! self.waiting-for-header (make-table test: eq?)))
   
   
   (method override (print self output readably)
     (print-unreadable self output
       (lambda (output)
         (format output "{a} {a}" host port))))
+  
+  
+  (method protected (waiting-header? self channel)
+    (table-ref waiting-for-header channel #f))
+  
+  
+  (method protected (wait-header self channel)
+    (when (= (get-media-kind channel) udp-video)
+      (table-set! waiting-for-header channel #t)))
+  
+  
+  (method protected (got-header self channel)
+    (table-clear waiting-for-header channel))
+  
+  
+  (method protected (done-header self channel)
+    (table-clear waiting-for-header channel))
   
   
   (method protected (increase-sent self data)
@@ -618,20 +661,14 @@
 (class UDP-Server-Channel extends UDP-Channel
   
   
-  (slot recipient         getter generate)
-  (slot exclude-channel   getter generate)
-  (slot exclude-broadcast getter generate)
   (slot server-sender?    getter generate)
   (slot last-nacked-frame accessors generate)
   (slot retain-ring       getter generate)
   (slot release-task      getter generate)
   
   
-  (method override (initialize self stream-no no origin media-kind source-kind level resolution framerate bitrate codec caps recipient exclude-channel exclude-broadcast server-sender?)
+  (method override (initialize self stream-no no origin media-kind source-kind level resolution framerate bitrate codec caps server-sender?)
     (nextmethod self stream-no no origin media-kind source-kind level resolution framerate bitrate codec caps)
-    (set! self.recipient recipient)
-    (set! self.exclude-channel exclude-channel)
-    (set! self.exclude-broadcast exclude-broadcast)
     (set! self.last-nacked-frame #f)
     (if server-sender?
         (set! self.retain-ring #f)
