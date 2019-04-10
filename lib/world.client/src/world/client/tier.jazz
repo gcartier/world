@@ -504,19 +504,9 @@
   
   
   (method package (register-stream self name source-kind video-level channels recipient mirror?)
-    (let ((stream-no
-            (calling-server self
-              (lambda ()
-                (client-register-stream remote-server remote-client character-name name source-kind video-level channels recipient mirror?)))))
-      (if (string? stream-no)
-          stream-no
-        (register-send-stream udp-client character-name name stream-no source-kind video-level))))
-  
-  
-  (method package (register-stream2 self name source-kind video-level channels recipient mirror?)
     (calling-server self
       (lambda ()
-        (client-register-stream2 remote-server remote-client character-name name source-kind video-level channels recipient mirror?))))
+        (client-register-stream remote-server remote-client character-name name source-kind video-level channels recipient mirror?))))
   
   
   (method package (unregister-stream self stream-no)
@@ -529,22 +519,6 @@
     (calling-server self
       (lambda ()
         (client-stream-action remote-server remote-client stream-no action arguments))))
-  
-  
-  (method package (add-channel self stream-no media-kind source-kind level resolution framerate bitrate codec caps)
-    (let ((channel-no
-            (calling-server self
-              (lambda ()
-                (client-add-channel remote-server remote-client stream-no media-kind source-kind level resolution framerate bitrate codec caps)))))
-      (if (string? channel-no)
-          channel-no
-        (register-send-channel udp-client stream-no channel-no media-kind source-kind level resolution framerate bitrate codec caps))))
-  
-  
-  (method package (remove-channel self channel-no)
-    (calling-server self
-      (lambda ()
-        (client-remove-channel remote-server remote-client channel-no))))
   
   
   (method package (channel-action self channel-no action arguments)
@@ -782,8 +756,34 @@
       (hierarchy-update-hook hierarchy)))
   
   
-  (method package (stream-add self sender name stream-no origin source-kind video-level)
-    (register-receive-stream udp-client sender name stream-no origin source-kind video-level))
+  (method package (stream-add self sender name stream-no origin source-kind video-level channels)
+    (let ((stream (register-receive-stream udp-client sender name stream-no origin source-kind video-level)))
+      (for-each (lambda (info)
+                  (bind (channel-no media-kind source-kind level resolution framerate bitrate codec caps) info
+                    (ecase media-kind
+                      ((udp-audio)
+                       (let ((channel (register-receive-channel udp-client stream-no channel-no origin media-kind source-kind level resolution framerate bitrate codec caps)))
+                         (channel-output (current-audio)
+                                         channel)
+                         (let ((video-channel (locate-stream-video-channel (get-stream channel))))
+                           (when video-channel
+                             (let ((output (find-output (current-video) (get-no video-channel))))
+                               (when output
+                                 (update-volume (get-root (get-interface-pane output)))))))))
+                      ((udp-video)
+                       (let ((receive-level (stream-receive-video-level stream)))
+                         (when (or (not receive-level)
+                                   (= level receive-level))
+                           (let ((channel (register-receive-channel udp-client stream-no channel-no origin media-kind source-kind level resolution framerate bitrate codec caps)))
+                             (channel-output (current-video)
+                                             channel
+                                             player: (current-me)
+                                             resolution: resolution
+                                             framerate: framerate
+                                             bitrate: bitrate
+                                             codec: codec
+                                             caps: caps))))))))
+                channels)))
   
   
   (method package (stream-remove self stream-no)
@@ -800,33 +800,6 @@
         (let ((action-proc (get-action-proc stream)))
           (when action-proc
             (action-proc stream action arguments))))))
-  
-  
-  (method package (channel-add self stream-no channel-no origin media-kind source-kind level resolution framerate bitrate codec caps)
-    (ecase media-kind
-      ((udp-audio)
-       (let ((channel (register-receive-channel udp-client stream-no channel-no origin media-kind source-kind level resolution framerate bitrate codec caps)))
-         (channel-output (current-audio)
-                         channel)
-         (let ((video-channel (locate-stream-video-channel (get-stream channel))))
-           (when video-channel
-             (let ((output (find-output (current-video) (get-no video-channel))))
-               (when output
-                 (update-volume (get-root (get-interface-pane output)))))))))
-      ((udp-video)
-       (let ((stream (find-receive-stream udp-client stream-no)))
-         (let ((receive-level (stream-receive-video-level stream)))
-           (when (or (not receive-level)
-                     (= level receive-level))
-             (let ((channel (register-receive-channel udp-client stream-no channel-no origin media-kind source-kind level resolution framerate bitrate codec caps)))
-               (channel-output (current-video)
-                               channel
-                               player: (current-me)
-                               resolution: resolution
-                               framerate: framerate
-                               bitrate: bitrate
-                               codec: codec
-                               caps: caps))))))))
   
   
   (method package (channel-remove self channel-no)
@@ -1033,19 +1006,25 @@
   
   (method package (require-live-stream self)
     (or live-stream
-        (let ((channels '()))
-          (let ((stream (register-stream self "Live" 'live (video-profile-level) channels #f #t)))
-            (let ((stream-no (get-no stream)))
-              (let ((channel (add-mic-channel stream-no)))
-                (setup channel)
-                (set! mic-channel channel))
-              (let ((channels (add-camera-channels stream-no)))
+        (let ((channels (cons (make-mic-channel)
+                              (make-camera-channels))))
+          (let ((stream (make-stream "Live" 'live (video-profile-level) channels live-hack?: #t)))
+            ;; mic
+            (let ((channel (locate-audio-channel stream)))
+              (setup channel)
+              (set! mic-channel channel))
+            ;; camera
+            (let ((channels (collect-video-channels stream)))
+              (let ((pipeline (make-shared-camera-pipeline channels)))
+                (for-each (lambda (channel)
+                            (set-pipeline channel pipeline))
+                          channels)
                 ;; any channel will do as they all share the same pipeline
                 (let ((channel (car channels)))
                   (setup channel)
-                  (set! camera-channel channel)))
-              (set! live-stream stream)
-              stream)))))
+                  (set! camera-channel channel))))
+            (set! live-stream stream)
+            stream))))
   
   
   (method package (close-live-stream self)

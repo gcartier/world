@@ -29,23 +29,43 @@
 
 
 ;;;
+;;;; Channel
+;;;
+
+
+(class Channel-Creator extends Object
+  
+  
+  (slot descriptor     getter generate)
+  (slot create         getter generate)
+  (slot share-pipeline getter generate)
+  
+  
+  (method override (initialize self descriptor create (share-pipeline #f))
+    (nextmethod self)
+    (set! self.descriptor descriptor)
+    (set! self.create create)
+    (set! self.share-pipeline share-pipeline)))
+
+
+;;;
 ;;;; Stream
 ;;;
 
 
-(definition public (make-stream name source-kind video-level channels (can-local?: can-local? #f))
+(definition public (make-stream name source-kind video-level creators (can-local?: can-local? #f) (live-hack?: live-hack? #f))
   (let ((client (current-client)))
-    (let ((recipient (if (and can-local? stream-local?) client-no #f)))
-      (register-stream client name source-kind video-level channels recipient #f))))
-
-
-(definition public (make-stream2 name source-kind video-level channels (can-local?: can-local? #f))
-  @w
-  (let ((client (current-client)))
-    (let ((recipient (if (and can-local? stream-local?) client-no #f)))
-      (bind (stream-no . channel-nos) (register-stream2 client name source-kind video-level channels recipient #f)
-        (let ((stream (register-send-stream udp-client character-name name stream-no source-kind video-level)))
-          (cons stream channel-nos))))))
+    (let ((recipient (if live-hack? #f (if (and can-local? stream-local?) client-no #f)))
+          (mirror? (if live-hack? #t #f))
+          (channels (map get-descriptor creators)))
+      (bind (stream-no . channel-nos) (register-stream client name source-kind video-level channels recipient mirror?)
+        (let ((stream (register-send-stream (get-udp-client client) (get-character-name client) name stream-no source-kind video-level)))
+          (for-each (lambda (channel-no creator)
+                      (let ((create (get-create creator)))
+                        (create stream-no channel-no)))
+                    channel-nos
+                    creators)
+          stream)))))
 
 
 (definition protected (stream-controller-action stream action arguments)
@@ -125,29 +145,47 @@
                 (send-client-media client channel-no buffer #f timestamp duration))))))))
 
 
-(definition public (add-audio-channel stream-no location)
-  (let ((client (current-client)))
-    (let ((channel (add-channel client stream-no udp-audio 'stream #f #f #f #f audio-codec #f)))
-      (let ((channel-no (get-no channel)))
-        (let ((src (new File-Stream-Audio-Src
-                     location))
-              (sink (new Audio-Consumer
-                      consumer: (client-audio-consumer client channel-no mirror?: #t local?: stream-local?))))
-          (let ((pipeline (pipeline (list src sink))))
-            (set-pipeline channel pipeline)
-            channel))))))
+(definition public (make-audio-channel location)
+  (let ((media-kind udp-audio)
+        (source-kind 'stream)
+        (level #f)
+        (resolution #f)
+        (framerate #f)
+        (bitrate #f)
+        (codec audio-codec)
+        (caps #f))
+    (new Channel-Creator
+      (list media-kind source-kind level resolution framerate bitrate codec caps)
+      (lambda (stream-no channel-no)
+        (let ((client (current-client)))
+          (let ((channel (register-send-channel (get-udp-client client) stream-no channel-no media-kind source-kind level resolution framerate bitrate codec caps)))
+            (let ((src (new File-Stream-Audio-Src
+                         location))
+                  (sink (new Audio-Consumer
+                          consumer: (client-audio-consumer client channel-no mirror?: #t local?: stream-local?))))
+              (let ((pipeline (pipeline (list src sink))))
+                (set-pipeline channel pipeline)))))))))
 
 
-(definition public (add-mic-channel stream-no)
-  (let ((client (current-client)))
-    (let ((channel (add-channel client stream-no udp-audio 'live #f #f #f #f audio-codec #f)))
-      (let ((channel-no (get-no channel)))
-        (let ((src (new Mic-Audio-Src))
-              (sink (new Mic-Audio-Consumer
-                      consumer: (client-audio-consumer client channel-no))))
-          (let ((pipeline (pipeline (list src sink))))
-            (set-pipeline channel pipeline)
-            channel))))))
+(definition public (make-mic-channel)
+  (let ((media-kind udp-audio)
+        (source-kind 'live)
+        (level #f)
+        (resolution #f)
+        (framerate #f)
+        (bitrate #f)
+        (codec audio-codec)
+        (caps #f))
+    (new Channel-Creator
+      (list media-kind source-kind level resolution framerate bitrate codec caps)
+      (lambda (stream-no channel-no)
+        (let ((client (current-client)))
+          (let ((channel (register-send-channel (get-udp-client client) stream-no channel-no media-kind source-kind level resolution framerate bitrate codec caps)))
+            (let ((src (new Mic-Audio-Src))
+                  (sink (new Mic-Audio-Consumer
+                          consumer: (client-audio-consumer client channel-no))))
+              (let ((pipeline (pipeline (list src sink))))
+                (set-pipeline channel pipeline)))))))))
 
 
 ;;;
@@ -164,129 +202,149 @@
         (send-client-media client channel-no buffer header? timestamp duration)))))
 
 
-(definition public (add-draw-channel draw-proc action-proc)
-  (let ((client (current-client)))
-    (let ((channel (add-channel client udp-video 'draw #f draw-resolution #f draw-bitrate #f #f)))
-      (let ((channel-no (get-no channel)))
-        (let ((src (new Draw-Video-Src
-                     draw-proc: draw-proc))
-              (sink (new Stream-Consumer
-                      consumer: (client-video-consumer client channel-no mirror?: #t local?: stream-local?))))
-          (let ((pipeline (pipeline (list src sink))))
-            (set-pipeline channel pipeline)
-            (set-action-proc channel action-proc)
-            channel))))))
+(definition public (make-draw-channel draw-proc action-proc)
+  (let ((media-kind udp-video)
+        (source-kind 'draw)
+        (level #f)
+        (resolution draw-resolution)
+        (framerate #f)
+        (bitrate draw-bitrate)
+        (codec #f)
+        (caps #f))
+    (new Channel-Creator
+      (list media-kind source-kind level resolution framerate bitrate codec caps)
+      (lambda (stream-no channel-no)
+        (let ((client (current-client)))
+          (let ((channel (register-send-channel (get-udp-client client) stream-no channel-no media-kind source-kind level resolution framerate bitrate codec caps)))
+            (let ((src (new Draw-Video-Src
+                         draw-proc: draw-proc))
+                  (sink (new Stream-Consumer
+                          consumer: (client-video-consumer client channel-no mirror?: #t local?: stream-local?))))
+              (let ((pipeline (pipeline (list src sink))))
+                (set-pipeline channel pipeline)
+                (set-action-proc channel action-proc)))))))))
 
 
-(definition public (image-channel-descriptor)
-  (let ((recipient (if stream-local? client-no #f)))
-    (list udp-video 'image #f draw-resolution #f draw-bitrate #f #f recipient #f)))
+(definition public (make-image-channel location (action-proc: action-proc #f))
+  (let ((media-kind udp-video)
+        (source-kind 'image)
+        (level #f)
+        (resolution draw-resolution)
+        (framerate #f)
+        (bitrate draw-bitrate)
+        (codec #f)
+        (caps #f))
+    (new Channel-Creator
+      (list media-kind source-kind level resolution framerate bitrate codec caps)
+      (lambda (stream-no channel-no)
+        (let ((client (current-client)))
+          (let ((channel (register-send-channel (get-udp-client client) stream-no channel-no media-kind source-kind level resolution framerate bitrate codec caps)))
+            (let ((src (new Image-Stream-Video-Src
+                         location))
+                  (sink (new Stream-Consumer
+                          consumer: (client-video-consumer client channel-no mirror?: #t local?: stream-local?))))
+              (let ((pipeline (pipeline (list src sink))))
+                (set-pipeline channel pipeline)
+                (set-action-proc channel action-proc)))))))))
 
 
-(definition public (setup-image-channel stream-no channel-no location descriptor)
-  @w
-  (let ((udp (current-udp)))
-    (bind (media-kind source-kind level resolution framerate bitrate codec caps) descriptor
-      (let ((channel (register-send-channel udp stream-no channel-no media-kind source-kind level resolution framerate bitrate codec caps)))
-        (let ((src (new Image-Stream-Video-Src
-                     location))
-              (sink (new Stream-Consumer
-                      consumer: (client-video-consumer client channel-no mirror?: #t local?: stream-local?))))
-          (let ((pipeline (pipeline (list src sink))))
-            (set-pipeline channel pipeline)
-            (set-action-proc channel action-proc)))))))
+(definition public (make-video-channels location (action-proc: action-proc #f))
+  (collect (lambda (profile)
+             (let ((file (new-file {Directory Settings} (list "streams" (add-extension location (get-extension profile))))))
+               (and (exists? file)
+                    (let ((reader (new Stream-Reader file)))
+                      (let ((media-kind udp-video)
+                            (source-kind 'stream)
+                            (level (get-level profile)))
+                        (let ((resolution (if (not level) (get-resolution reader) (get-resolution profile)))
+                              (framerate (get-framerate profile))
+                              (bitrate (get-bitrate profile))
+                              (codec (get-codec profile))
+                              (caps (get-caps reader)))
+                          (close reader)
+                          (new Channel-Creator
+                            (list media-kind source-kind level resolution framerate bitrate codec caps)
+                            (lambda (stream-no channel-no)
+                              (let ((client (current-client)))
+                                (let ((channel (register-send-channel (get-udp-client client) stream-no channel-no media-kind source-kind level resolution framerate bitrate codec caps)))
+                                  (let ((src (new File-Stream-Video-Src
+                                               profile
+                                               location))
+                                        (sink (new Stream-Consumer
+                                                consumer: (client-video-consumer client channel-no mirror?: #t local?: stream-local?))))
+                                    (let ((pipeline (pipeline (list src sink))))
+                                      (set-pipeline channel pipeline)
+                                      (set-action-proc channel action-proc)))))))))))))
+           (streaming-video-profiles location)))
 
 
-(definition public (add-image-channel stream-no location (action-proc: action-proc #f))
-  (let ((client (current-client)))
-    (let ((channel (add-channel client stream-no udp-video 'image #f draw-resolution #f draw-bitrate #f #f)))
-      (let ((channel-no (get-no channel)))
-        (let ((src (new Image-Stream-Video-Src
-                     location))
-              (sink (new Stream-Consumer
-                      consumer: (client-video-consumer client channel-no mirror?: #t local?: stream-local?))))
-          (let ((pipeline (pipeline (list src sink))))
-            (set-pipeline channel pipeline)
-            (set-action-proc channel action-proc)
-            channel))))))
+(definition public (make-camera-channels)
+  (let ((camera-profile (name->video-profile camera-profile)))
+    (let ((profiles (streaming-profiles camera-profile)))
+      (map (lambda (profile)
+             (let ((media-kind udp-video)
+                   (source-kind 'live)
+                   (level (get-level profile))
+                   (resolution (get-resolution profile))
+                   (framerate (get-framerate profile))
+                   (bitrate (get-bitrate profile))
+                   (codec (get-codec profile))
+                   (caps #f))
+               (new Channel-Creator
+                 (list media-kind source-kind level resolution framerate bitrate codec caps)
+                 (lambda (stream-no channel-no)
+                   (let ((client (current-client)))
+                     (register-send-channel (get-udp-client client) stream-no channel-no media-kind source-kind level resolution framerate bitrate codec caps))))))
+           profiles))))
 
 
-(definition public (add-video-channels stream-no location (action-proc: action-proc #f))
-  (let ((client (current-client)))
-    (collect (lambda (profile)
-               (let ((file (new-file {Directory Settings} (list "streams" (add-extension location (get-extension profile))))))
-                 (and (exists? file)
-                      (let ((reader (new Stream-Reader file)))
-                        (let ((level (get-level profile)))
-                          (let ((resolution (if (not level) (get-resolution reader) (get-resolution profile)))
-                                (framerate (get-framerate profile))
-                                (bitrate (get-bitrate profile))
-                                (codec (get-codec profile))
-                                (caps (get-caps reader)))
-                            (close reader)
-                            (let ((channel (add-channel client stream-no udp-video 'stream level resolution framerate bitrate codec caps)))
-                              (let ((channel-no (get-no channel)))
-                                (let ((src (new File-Stream-Video-Src
-                                             profile
-                                             location))
-                                      (sink (new Stream-Consumer
-                                              consumer: (client-video-consumer client channel-no mirror?: #t local?: stream-local?))))
-                                  (let ((pipeline (pipeline (list src sink))))
-                                    (set-pipeline channel pipeline)
-                                    (set-action-proc channel action-proc)
-                                    channel))))))))))
-             (streaming-video-profiles location))))
+(definition protected (make-shared-camera-pipeline channels)
+  (let ((camera-profile (name->video-profile camera-profile)))
+    (let ((profiles (streaming-profiles camera-profile)))
+      (let ((src (new Camera-Video-Src
+                   resolution: (get-resolution camera-profile)
+                   framerate: (get-framerate camera-profile)
+                   bitrate: (get-bitrate camera-profile)
+                   codec: (get-codec camera-profile)))
+            (sinks (map (lambda (profile)
+                          (let ((channel (find-if (lambda (channel)
+                                                    (= (get-level channel) (get-level profile)))
+                                                  channels)))
+                            (new Camera-Video-Consumer
+                              (get-no channel)
+                              profile)))
+                        profiles))
+            (self-sink (new Self-Consumer
+                         caps: 'self
+                         resolution: (get-resolution camera-profile))))
+        (pipeline `(,src ,@sinks ,self-sink))))))
 
 
-(definition public (add-camera-channels stream-no)
-  (let ((client (current-client)))
-    (let ((camera-profile (name->video-profile camera-profile)))
-      (let ((profiles (streaming-profiles camera-profile)))
-        (let ((channels (map (lambda (profile)
-                               (let ((level (get-level profile))
-                                     (resolution (get-resolution profile))
-                                     (framerate (get-framerate profile))
-                                     (bitrate (get-bitrate profile))
-                                     (codec (get-codec profile)))
-                                 (add-channel client stream-no udp-video 'live level resolution framerate bitrate codec #f)))
-                             profiles)))
-          (let ((src (new Camera-Video-Src
-                       resolution: (get-resolution camera-profile)
-                       framerate: (get-framerate camera-profile)
-                       bitrate: (get-bitrate camera-profile)
-                       codec: (get-codec camera-profile)))
-                (sinks (map (lambda (channel profile)
-                              (new Camera-Video-Consumer
-                                (get-no channel)
-                                profile))
-                            channels
-                            profiles))
-                (self-sink (new Self-Consumer
-                             caps: 'self
-                             resolution: (get-resolution camera-profile))))
-            (let ((pipeline (pipeline `(,src ,@sinks ,self-sink))))
-              (for-each (lambda (channel)
-                          (set-pipeline channel pipeline))
-                        channels)
-              channels)))))))
-
-
-(definition public (add-screen-channel stream-no)
-  (let ((client (current-client)))
-    (let ((channel (add-channel client stream-no udp-video 'screen #f screen-share-resolution screen-share-framerate screen-share-bitrate screen-share-codec #f)))
-      (let ((channel-no (get-no channel)))
-        (let ((src (new Screen-Video-Src
-                     resolution: screen-share-resolution
-                     framerate: screen-share-framerate
-                     bitrate: screen-share-bitrate
-                     codec: screen-share-codec))
-              (sink (new Screen-Video-Consumer
-                      channel-no))
-              @wait (self-sink (new Self-Consumer
-                                 resolution: screen-share-resolution)))
-          (let ((pipeline (pipeline (list src sink) @wait (list src sink self-sink))))
-            (set-pipeline channel pipeline)
-            channel))))))
+(definition public (make-screen-channel)
+  (let ((media-kind udp-video)
+        (source-kind 'screen)
+        (level #f)
+        (resolution screen-share-resolution)
+        (framerate screen-share-framerate)
+        (bitrate screen-share-bitrate)
+        (codec screen-share-codec)
+        (caps #f))
+    (new Channel-Creator
+      (list media-kind source-kind level resolution framerate bitrate codec caps)
+      (lambda (stream-no channel-no)
+        (let ((client (current-client)))
+          (let ((channel (register-send-channel (get-udp-client client) stream-no channel-no media-kind source-kind level resolution framerate bitrate codec caps)))
+            (let ((src (new Screen-Video-Src
+                         resolution: screen-share-resolution
+                         framerate: screen-share-framerate
+                         bitrate: screen-share-bitrate
+                         codec: screen-share-codec))
+                  (sink (new Screen-Video-Consumer
+                          channel-no))
+                  @wait (self-sink (new Self-Consumer
+                                     resolution: screen-share-resolution)))
+              (let ((pipeline (pipeline (list src sink) @wait (list src sink self-sink))))
+                (set-pipeline channel pipeline)))))))))
 
 
 ;;;
