@@ -1457,22 +1457,23 @@
           "Delegate not found"
         (let ((group (get-group client-delegate))
               (queue (new-queue)))
-          (define (scan root extension)
+          (define (scan root extensions)
             (iterate-streams root
               (lambda (file)
-                (when (extension=? (get-extension file) extension)
+                (when (member? (get-extension file) extensions test: extension=?)
                   (let ((base (get-base file)))
                     (let ((location (filename-spine (join (subpath streams-dir file) "/"))))
-                      (enqueue queue (list location (if (some? (lambda (stream)
-                                                                 (or (not group)
-                                                                     (let ((server-stream (find-server-stream udp-server (get-no stream))))
-                                                                       (eq? (get-recipient server-stream) group))))
-                                                               (find-streams self base))
-                                                        'playing
-                                                      #f)))))))))
+                      (unless (member? location (queue-list queue) key: car test: filename=?)
+                        (enqueue queue (list location (if (some? (lambda (stream)
+                                                                   (or (not group)
+                                                                       (let ((server-stream (find-server-stream udp-server (get-no stream))))
+                                                                         (eq? (get-recipient server-stream) group))))
+                                                                 (find-streams self base))
+                                                          'playing
+                                                        #f))))))))))
           
-          (scan "video" (video-profile-extension))
-          (scan "music" (audio-profile-extension))
+          (scan "video" (video-profile-extensions))
+          (scan "music" (audio-profile-extensions))
           (queue-list queue)))))
   
   
@@ -1498,23 +1499,26 @@
           (if (not group)
               "You are not in a group"
             (let ((name (filename-name location))
-                  (video-level (video-profile-level))
                   (streaming-audio? (streaming-audio? self))
                   (audio-file? (exists? (new-file {Directory Settings} (list "streams" (add-extension location (audio-profile-extension)))))))
-              (let ((channels (if (and audio-file? (not streaming-audio?) (not stream-silent?))
-                                  (cons (make-server-audio-channel self location group)
-                                        (make-server-video-channels self location group))
-                                (make-server-video-channels self location group))))
-                (receive (stream send-stream) (make-server-stream self name 'stream video-level channels group)
-                  (set-action-proc send-stream stream-controller-action)
-                  (set-streams group (cons stream (get-streams group)))
-                  (if delay-streaming?
-                      (delay-streaming
-                        (lambda ()
-                          (play send-stream)))
-                    (sleep .1)
-                    (play send-stream))
-                  #f))))))))
+              (let ((audio-channels (if (and audio-file?
+                                             (not streaming-audio?)
+                                             (not stream-silent?))
+                                        (list (make-server-audio-channel self location group))
+                                      '()))
+                    (video-channels (make-server-video-channels self location group)))
+                (let ((video-level (determine-stream-video-level video-channels))
+                      (channels (append audio-channels video-channels)))
+                  (receive (stream send-stream) (make-server-stream self name 'stream video-level channels group)
+                    (set-action-proc send-stream stream-controller-action)
+                    (set-streams group (cons stream (get-streams group)))
+                    (if delay-streaming?
+                        (delay-streaming
+                          (lambda ()
+                            (play send-stream)))
+                      (sleep .1)
+                      (play send-stream))
+                    #f)))))))))
   
   
   (method (stream-stop self client location)
@@ -1583,34 +1587,38 @@
   
   
   (method (make-server-video-channels self location group)
-    (collect (lambda (profile)
+    (let ((profiles (streaming-video-profiles location)))
+      (let ((existing-profiles (collect-if (lambda (profile)
+                                             (let ((file (new-file {Directory Settings} (list "streams" (add-extension location (get-extension profile))))))
+                                               (exists? file)))
+                                           profiles)))
+        (map (lambda (profile)
                (let ((file (new-file {Directory Settings} (list "streams" (add-extension location (get-extension profile))))))
-                 (and (exists? file)
-                      (let ((reader (new Stream-Reader file)))
-                        (let ((media-kind udp-video)
-                              (source-kind 'stream)
-                              (level (get-level profile)))
-                          (let ((resolution (if (not level) (get-resolution reader) (get-resolution profile)))
-                                (framerate (get-framerate profile))
-                                (bitrate (get-bitrate profile))
-                                (codec (get-codec profile))
-                                (caps (get-caps reader)))
-                            (close reader)
-                            (new Channel-Creator
-                              (list media-kind source-kind level resolution framerate bitrate codec caps)
-                              (lambda (stream-no channel-no)
-                                (let ((channel (register-send-channel udp-server stream-no channel-no media-kind source-kind level resolution framerate bitrate codec caps)))
-                                  (let ((src (new File-Stream-Video-Src
-                                             profile
-                                             location
-                                             stream?: (stream-to-group? udp-server channel group)))
-                                      (sink (new Stream-Consumer
-                                              consumer: (lambda (buffer timestamp duration)
-                                                          (let ((header? (and buffer (video-buffer-header? buffer))))
-                                                            (send-server-media self channel-no buffer header? timestamp duration))))))
-                                  (let ((pipeline (pipeline (list src sink))))
-                                    (set-pipeline channel pipeline))))))))))))
-             (streaming-video-profiles location)))
+                 (let ((reader (new Stream-Reader file)))
+                   (let ((media-kind udp-video)
+                         (source-kind 'stream)
+                         (level (get-level profile)))
+                     (let ((resolution (if (not level) (get-resolution reader) (get-resolution profile)))
+                           (framerate (get-framerate profile))
+                           (bitrate (get-bitrate profile))
+                           (codec (get-codec profile))
+                           (caps (get-caps reader)))
+                       (close reader)
+                       (new Channel-Creator
+                         (list media-kind source-kind level resolution framerate bitrate codec caps)
+                         (lambda (stream-no channel-no)
+                           (let ((channel (register-send-channel udp-server stream-no channel-no media-kind source-kind level resolution framerate bitrate codec caps)))
+                             (let ((src (new File-Stream-Video-Src
+                                          profile
+                                          location
+                                          stream?: (stream-to-group? udp-server channel group)))
+                                   (sink (new Stream-Consumer
+                                           consumer: (lambda (buffer timestamp duration)
+                                                       (let ((header? (and buffer (video-buffer-header? buffer))))
+                                                         (send-server-media self channel-no buffer header? timestamp duration))))))
+                               (let ((pipeline (pipeline (list src sink))))
+                                 (set-pipeline channel pipeline)))))))))))
+             existing-profiles))))
   
   
   (method package (send-server-media self channel-no buffer header? timestamp duration)
