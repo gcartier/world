@@ -34,6 +34,10 @@
         (world.task))
 
 
+(definition post-paint-period <fl>
+  (/ 1. 30.))
+
+
 (definition public (clear-glass surface resolution (background: background #f))
   (let ((width (get-width resolution))
         (height (get-height resolution)))
@@ -65,7 +69,10 @@
   (slot view-focus     <View+>         initialize #f)
   (slot pushed-focuses                 initialize '())
   (slot invalid-region <Region>        initialize (new Region) getter generate)
-  (slot paint-delayed?                 initialize #f getter generate)
+  ;; so we can invalidate from a thread
+  (slot invalid-mutex                  initialize (make-mutex 'invalid) getter generate)
+  (slot paint-posted?                  initialize #f getter generate)
+  (slot paint-last                     initialize #f getter generate)
   
   
   (method override (print self output readably)
@@ -143,35 +150,51 @@
   ;;;
   
   
-  (method public (surface-region-invalid? self)
-    (not (empty? invalid-region)))
+  (method public (surface-retrieve-invalid self)
+    (mutex-lock! invalid-mutex)
+    (prog1 (if (empty? invalid-region)
+               #f
+             (prog1 (get-box invalid-region)
+               (empty! invalid-region)))
+      (mutex-unlock! invalid-mutex)))
   
   
   (method public (invalidate-surface-region self region)
-    (combine-or! invalid-region region))
+    (mutex-lock! invalid-mutex)
+    (combine-or! invalid-region region)
+    (mutex-unlock! invalid-mutex))
   
   
   (method public (invalidate-surface-rect self rect)
+    (mutex-lock! invalid-mutex)
     (with ((region (new Region rect: rect)))
-      (combine-or! invalid-region region)))
+      (combine-or! invalid-region region))
+    (mutex-unlock! invalid-mutex))
   
   
-  (method public (validate-surface-region self region)
-    (combine-diff! invalid-region region))
+  (method public (post-paint self)
+    (when (not paint-posted?)
+      (let ((now (current-seconds)))
+        (when (or (not paint-last)
+                  (> (- now paint-last) post-paint-period))
+          (post-event
+            (lambda ()
+              (with-task-mutex
+                (lambda ()
+                  (paint-texture self)
+                  (set! paint-posted? #f)
+                  (set! paint-last now)))))
+          (set! paint-posted? #t)))))
   
   
-  (method public (validate-surface self)
-    (empty! invalid-region))
-  
-  
-  (method public (delay-paint self)
-    (assert (primordial-thread?)
-      (when (not paint-delayed?)
-        (delay-event
-          (lambda ()
-            (paint-texture self)
-            (set! paint-delayed? #f)))
-        (set! paint-delayed? #t))))
+  (method (paint-texture self)
+    (let ((texture (get-texture (cache-quad-texture self))))
+      (let ((surface (get-surface texture)))
+        (let ((invalid (surface-retrieve-invalid self)))
+          (when invalid
+            (set-clipper surface invalid)
+            (draw self surface)
+            (map-texture texture))))))
   
   
   ;;;
@@ -330,12 +353,12 @@
   
   (method override (invalidate-rect self rect)
     (invalidate-surface-rect self rect)
-    (delay-paint self))
+    (post-paint self))
   
   
   (method override (invalidate-region self region)
     (invalidate-surface-region self region)
-    (delay-paint self))
+    (post-paint self))
   
   
   (method override (redraw-window self (rect: rect #f) (region: region #f))
@@ -366,16 +389,6 @@
         (reset-clipper surface)
         (draw self surface)
         (map-texture texture))))
-  
-  
-  (method public (paint-texture self)
-    (let ((texture (get-texture (cache-quad-texture self))))
-      (let ((surface (get-surface texture)))
-        (when (surface-region-invalid? self)
-          (set-clipper surface (get-box invalid-region))
-          (draw self surface)
-          (map-texture texture)
-          (validate-surface self)))))
   
   
   ;;;
