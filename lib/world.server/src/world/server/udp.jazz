@@ -20,10 +20,13 @@
         (jazz.presence)
         (jazz.stream)
         (jazz.syntax (phase syntax))
+        (jazz.zlib)
         (world)
+        (world.chronology)
         (world.configure)
         (world.context)
         (world.event)
+        (world.evolution)
         (world.ring)
         (world.server.group)
         (world.settings)
@@ -240,6 +243,10 @@
          (receive-nack self data))
         ((udp-audio udp-video)
          (receive-media self kind data))
+        ((udp-profile-heartbeat)
+         (receive-profile-heartbeat self data))
+        ((udp-profile-media)
+         (receive-profile-media self data))
         (else
          (error "Unknown UDP kind: {s}" kind))))
     (mutex-unlock! server-mutex))
@@ -460,23 +467,24 @@
   (method (send-ack self origin data)
     (let ((connection (origin->connection self origin)))
       (when connection
-        (let ((packets-sent (get-packets-sent connection))
-              (bytes-sent (get-bytes-sent connection))
-              (packets-received (get-packets-received connection))
-              (bytes-received (get-bytes-received connection)))
-          (let ((size (+ 8 4 4 4 4 4 4))
-                (sent (read-udp-sent data))
-                (state-sequence (read-udp-state-sequence data)))
-            (let ((data (make-u8vector size)))
-              (write-udp-sent data sent)
-              (write-udp-kind data udp-ack)
-              (write-udp-origin data origin)
-              (write-udp-ack-state-sequence data state-sequence)
-              (write-udp-ack-packets-sent data packets-sent)
-              (write-udp-ack-bytes-sent data bytes-sent)
-              (write-udp-ack-packets-received data packets-received)
-              (write-udp-ack-bytes-received data bytes-received)
-              (send-data self connection data)))))))
+        (let ((monitor (get-monitor connection)))
+          (let ((packets-sent (get-packets-sent monitor))
+                (bytes-sent (get-bytes-sent monitor))
+                (packets-received (get-packets-received monitor))
+                (bytes-received (get-bytes-received monitor)))
+            (let ((size (+ 8 4 4 4 4 4 4))
+                  (sent (read-udp-sent data))
+                  (state-sequence (read-udp-state-sequence data)))
+              (let ((data (make-u8vector size)))
+                (write-udp-sent data sent)
+                (write-udp-kind data udp-ack)
+                (write-udp-origin data origin)
+                (write-udp-ack-state-sequence data state-sequence)
+                (write-udp-ack-packets-sent data packets-sent)
+                (write-udp-ack-bytes-sent data bytes-sent)
+                (write-udp-ack-packets-received data packets-received)
+                (write-udp-ack-bytes-received data bytes-received)
+                (send-data self connection data))))))))
   
   
   (method (broadcast-state self origin data)
@@ -552,6 +560,38 @@
             (done-header connection channel))))))
   
   
+  (method package (send-profile-media self connection sequence payload)
+    (mutex-lock! server-mutex)
+    (let ((size (+ 8 4 4 4 4 (u8vector-length payload))))
+      (let ((data (make-u8vector size)))
+        (write-udp-sent data (current-seconds))
+        (write-udp-kind data udp-profile-media)
+        (write-udp-origin data server-no)
+        (write-udp-sequence data sequence)
+        (write-udp-profile-media-payload data payload)
+        (send-data self connection data)))
+    (mutex-unlock! server-mutex))
+  
+  
+  (method (receive-profile-heartbeat self data)
+    (let ((origin (read-udp-origin data)))
+      (let ((connection (origin->connection self origin)))
+        (when connection
+          (receive-profile-heartbeat connection data)
+          (send-data self connection data))))
+    (when udp-show-profile?
+      (format :terminal "{s} {s} {s}{%}" remote-name 'PROFILE 'HEARTBEAT)))
+  
+  
+  (method (receive-profile-media self data)
+    (let ((origin (read-udp-origin data)))
+      (let ((connection (origin->connection self origin)))
+        (when connection
+          (receive-profile-media connection data))))
+    (when udp-show-profile?
+      (format :terminal "{s} {s} {s}{%}" remote-name 'PROFILE 'MEDIA)))
+  
+  
   (method (send-data self connection data)
     (let ((simulator (get-simulator connection)))
       (if simulator
@@ -573,19 +613,22 @@
 (class UDP-Connection extends Object
   
   
-  (slot host                              getter generate)
-  (slot port                              getter generate)
-  (slot local-host                        getter generate)
-  (slot local-port                        getter generate)
-  (slot simulator                         getter generate)
-  (slot video-level                       getter generate)
-  (slot packets-sent        initialize 0  getter generate)
-  (slot bytes-sent          initialize 0  getter generate)
-  (slot packets-received    initialize 0  getter generate)
-  (slot bytes-received      initialize 0  getter generate)
-  (slot last-received-state initialize #f accessors generate)
-  (slot throttle-media?     initialize #f accessors generate)
-  (slot waiting-for-header                accessors generate)
+  (slot host                                 getter generate)
+  (slot port                                 getter generate)
+  (slot local-host                           getter generate)
+  (slot local-port                           getter generate)
+  (slot monitor                              getter generate)
+  (slot simulator                            getter generate)
+  (slot video-level                          getter generate)
+  (slot last-received-state    initialize #f accessors generate)
+  (slot throttle-media?        initialize #f accessors generate)
+  (slot waiting-for-header                   accessors generate)
+  (slot profile-base-time      initialize #f getter generate)
+  (slot profile-media-sequence initialize #f getter generate)
+  (slot profile-last-sequence  initialize #f getter generate)
+  (slot profile-monitor        initialize #f getter generate)
+  (slot profile-chronology     initialize #f getter generate)
+  (slot profile-evolution      initialize #f getter generate)
   
   
   (method override (initialize self host port local-host local-port simulator video-level)
@@ -594,6 +637,7 @@
     (set! self.port port)
     (set! self.local-host local-host)
     (set! self.local-port local-port)
+    (set! self.monitor (new UDP-Monitor))
     (set! self.simulator simulator)
     (set! self.video-level video-level)
     (set! self.waiting-for-header (make-table test: eq?)))
@@ -623,13 +667,101 @@
   
   
   (method protected (increase-sent self data)
-    (increase! packets-sent)
-    (increase! bytes-sent (u8vector-length data)))
+    (increase-sent monitor data))
   
   
   (method protected (increase-received self data)
-    (increase! packets-received)
-    (increase! bytes-received (u8vector-length data))))
+    (increase-received monitor data))
+  
+  
+  (method package (next-profile-media-sequence! self)
+    (prog1 profile-media-sequence
+      (increase! profile-media-sequence)))
+  
+  
+  (method package (profile-start self)
+    (set! profile-base-time (current-seconds))
+    (set! profile-media-sequence 0)
+    (set! profile-last-sequence #f)
+    (set! profile-monitor (new UDP-Monitor))
+    (set! profile-chronology (new Chronology 0))
+    (set! profile-evolution (new Evolution 5000)))
+  
+  
+  (method package (profile-test self test arguments)
+    (let ((send-thread
+            (new-thread
+              (lambda ()
+                (let ((recuperate .5))
+                  (define (record-bookmark)
+                    (parameterize ((simulation-evolution profile-evolution))
+                      (record-event udp-id-bookmark
+                                    -1.
+                                    -1.
+                                    -1.
+                                    -1.
+                                    -1.
+                                    -1.
+                                    -1.)))
+                  
+                  (let ((server (current-server)))
+                    (let ((mbps (car arguments)))
+                      (let ((size 1000)
+                            (duration 1.))
+                        (let ((delay (/ (cast <fl> size) (mbps->bytes mbps)))
+                              (udp-server (get-udp-server server)))
+                          (let ((iter (fxround (/ duration delay))))
+                            (let ((data (make-u8vector size)))
+                              (loop (repeat iter)
+                                    (send-profile-media udp-server self (next-profile-media-sequence! self) data)
+                                    (increase-sent profile-monitor data)
+                                    (sleep delay))))))))
+                  (sleep recuperate)))
+              'send)))
+      (thread-base-priority-set! send-thread udp-priority)
+      (thread-start! send-thread)))
+  
+  
+  (method package (profile-retrieve self)
+    (let ((metadata (list server-no "<server>" '() '() profile-base-time))
+          (chronology (copy-chronology profile-chronology))
+          (evolution (copy-evolution profile-evolution)))
+      (zlib-deflate (object->u8vector (list metadata chronology evolution) serialize))))
+  
+  
+  (method package (profile-stop self)
+    (set! profile-chronology #f)
+    (set! profile-evolution #f))
+  
+  
+  (method (receive-profile-heartbeat self data)
+    (let ((origin (read-udp-origin data)))
+      (increase-received profile-monitor data)
+      (write-udp-profile-heartbeat-packets-sent data (get-packets-sent profile-monitor))
+      (write-udp-profile-heartbeat-bytes-sent data (get-bytes-sent profile-monitor))
+      (write-udp-profile-heartbeat-packets-received data (get-packets-received profile-monitor))
+      (write-udp-profile-heartbeat-bytes-received data (get-bytes-received profile-monitor))
+      (increase-sent profile-monitor data)))
+  
+  
+  (method package (receive-profile-media self data)
+    (let ((origin (read-udp-origin data))
+          (sequence (read-udp-sequence data)))
+      (when profile-last-sequence
+        (let ((expected-sequence (+ profile-last-sequence 1)))
+          (when (/= sequence expected-sequence)
+            (parameterize ((simulation-evolution profile-evolution))
+              (loop (for seq from expected-sequence below sequence)
+                    (record-event udp-id-missing-packet
+                                  -1.
+                                  (fixnum->flonum origin)
+                                  (fixnum->flonum udp-audio)
+                                  (fixnum->flonum seq)
+                                  -1.
+                                  -1.
+                                  -1.))))))
+      (set! profile-last-sequence sequence)
+      (increase-received profile-monitor data))))
 
 
 ;;;

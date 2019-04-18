@@ -53,9 +53,15 @@
 (definition protected udp-video <fx>
   6)
 
+(definition protected udp-profile-heartbeat <fx>
+  7)
+
+(definition protected udp-profile-media <fx>
+  8)
+
 
 (definition udp-names
-  #(connect connected state ack nack audio video))
+  #(connect connected state ack nack audio video profile-heartbeat profile-media))
 
 (definition protected (udp-name kind)
   (vector-ref udp-names kind))
@@ -183,6 +189,9 @@
 (definition protected udp-show-nacks?
   (world-setting 'world.udp-show-nacks? #f))
 
+(definition protected udp-show-profile?
+  (world-setting 'world.udp-show-profile? #f))
+
 (definition protected udp-show-replay?
   (world-setting 'world.udp-show-replay? #f))
 
@@ -223,6 +232,9 @@
 
 (definition protected (bytes->mbps bytes <fl>) <fl>
   (/ bytes 131072.))
+
+(definition protected (mbps->bytes mbps <fl>) <fx>
+  (fxround (* mbps 131072.)))
 
 
 (definition public inline (evolutionary-udp-time    evolution <Evolution> n <fx>) <fl> (evolutionary-time  evolution n))
@@ -2018,6 +2030,100 @@
 
 
 ;;;
+;;;; Monitor
+;;;
+
+
+(class UDP-Monitor extends Object
+  
+  
+  (slot packets-sent     initialize 0 getter generate)
+  (slot bytes-sent       initialize 0 getter generate)
+  (slot packets-received initialize 0 getter generate)
+  (slot bytes-received   initialize 0 getter generate)
+  
+  
+  (method protected (increase-sent self data)
+    (increase! packets-sent)
+    (increase! bytes-sent (u8vector-length data)))
+  
+  
+  (method protected (increase-received self data)
+    (increase! packets-received)
+    (increase! bytes-received (u8vector-length data))))
+
+
+;;;
+;;;; UDP-Statistics
+;;;
+
+
+(class UDP-Statistics extends Object
+  
+  
+  (slot period                     initialize #f getter generate)
+  (slot last-bytes-sent            initialize 0  getter generate)
+  (slot last-bytes-received        initialize 0  getter generate)
+  (slot last-server-bytes-sent     initialize 0  getter generate)
+  (slot last-server-bytes-received initialize 0  getter generate)
+  (slot last-traffic-sent          initialize 0  getter generate)
+  (slot last-traffic-received      initialize 0  getter generate)
+  (slot last-traffic-time          initialize #f getter generate)
+  (slot last-send-rate             initialize #f getter generate)
+  (slot last-receive-rate          initialize #f getter generate)
+  (slot outgoing-dropped           initialize 0  getter generate)
+  (slot outgoing-drop              initialize 0  getter generate)
+  (slot incoming-dropped           initialize 0  getter generate)
+  (slot incoming-drop              initialize 0  getter generate)
+  
+  
+  (method override (initialize self period)
+    (nextmethod self)
+    (set! self.period period))
+  
+  
+  (method protected (update self now monitor round-trip server-packets-sent server-bytes-sent server-packets-received server-bytes-received)
+    (let ((packets-sent (get-packets-sent monitor))
+          (bytes-sent (get-bytes-sent monitor))
+          (packets-received (get-packets-received monitor))
+          (bytes-received (get-bytes-received monitor)))
+      (let ((fresh-bytes-sent (- bytes-sent last-bytes-sent))
+            (fresh-bytes-received (- bytes-received last-bytes-received))
+            (fresh-server-bytes-sent (- server-bytes-sent last-server-bytes-sent))
+            (fresh-server-bytes-received (- server-bytes-received last-server-bytes-received)))
+        (define (update-traffic-rate)
+          (if (not last-traffic-time)
+              (begin
+                (set! last-traffic-time now)
+                (set! last-send-rate -1.)
+                (set! last-receive-rate -1.))
+            (increase! last-traffic-sent fresh-bytes-sent)
+            (increase! last-traffic-received fresh-bytes-received)
+            (let ((elapse (- now last-traffic-time)))
+              ;; best try to smooth the jaggies that I think arise
+              ;; from the audio / video frequency, the right solution
+              ;; probably being to smooth all this in the graph
+              (when (>= elapse period)
+                (let ((send-rate (/ (cast <fl> last-traffic-sent) elapse))
+                      (receive-rate (/ (cast <fl> last-traffic-received) elapse)))
+                  (set! last-traffic-sent 0)
+                  (set! last-traffic-received 0)
+                  (set! last-traffic-time now)
+                  (set! last-send-rate send-rate)
+                  (set! last-receive-rate receive-rate))))))
+        
+        (set! last-bytes-sent bytes-sent)
+        (set! last-bytes-received bytes-received)
+        (set! last-server-bytes-sent server-bytes-sent)
+        (set! last-server-bytes-received server-bytes-received)
+        (update-traffic-rate)
+        (set! outgoing-dropped (- packets-sent server-packets-received))
+        (set! incoming-dropped (- server-packets-sent packets-received))
+        (set! outgoing-drop (and (> packets-sent 0) (percentage outgoing-dropped packets-sent)))
+        (set! incoming-drop (and (> server-packets-sent 0) (percentage incoming-dropped server-packets-sent)))))))
+
+
+;;;
 ;;;; Simulator
 ;;;
 
@@ -2207,12 +2313,12 @@
   (write-udp-resent data (+ (read-udp-resent data) 1)))
 
 ;; connect
-(definition public (read-udp-connect-local-host  data) (scan-host    data 16)) (definition public (write-udp-connect-local-host  data value) (put-host    data 16 value))
-(definition public (read-udp-connect-local-port  data) (scan-s32     data 20)) (definition public (write-udp-connect-local-port  data value) (put-s32     data 20 value))
-(definition public (read-udp-connect-latency     data) (scan-float   data 24)) (definition public (write-udp-connect-latency     data value) (put-float   data 24 value))
-(definition public (read-udp-connect-lag         data) (scan-float   data 28)) (definition public (write-udp-connect-lag         data value) (put-float   data 28 value))
-(definition public (read-udp-connect-drop        data) (scan-float   data 32)) (definition public (write-udp-connect-drop        data value) (put-float   data 32 value))
-(definition public (read-udp-connect-video-level data) (scan-s32     data 36)) (definition public (write-udp-connect-video-level data value) (put-s32     data 36 value))
+(definition public (read-udp-connect-local-host  data) (scan-host  data 16)) (definition public (write-udp-connect-local-host  data value) (put-host  data 16 value))
+(definition public (read-udp-connect-local-port  data) (scan-s32   data 20)) (definition public (write-udp-connect-local-port  data value) (put-s32   data 20 value))
+(definition public (read-udp-connect-latency     data) (scan-float data 24)) (definition public (write-udp-connect-latency     data value) (put-float data 24 value))
+(definition public (read-udp-connect-lag         data) (scan-float data 28)) (definition public (write-udp-connect-lag         data value) (put-float data 28 value))
+(definition public (read-udp-connect-drop        data) (scan-float data 32)) (definition public (write-udp-connect-drop        data value) (put-float data 32 value))
+(definition public (read-udp-connect-video-level data) (scan-s32   data 36)) (definition public (write-udp-connect-video-level data value) (put-s32   data 36 value))
 
 ;; state
 (definition public (read-udp-state-sequence data) (scan-s32      data 16)) (definition public (write-udp-state-sequence data value) (put-s32      data 16 value))
@@ -2226,5 +2332,14 @@
 (definition public (read-udp-ack-bytes-received   data) (scan-s32 data 32)) (definition public (write-udp-ack-bytes-received   data value) (put-s32 data 32 value))
 
 ;; nack
-(definition public (read-udp-nack-media-kind     data) (scan-s32      data 16)) (definition public (write-udp-nack-media-kind     data value) (put-s32      data 16 value))
-(definition public (read-udp-nack-missing        data) (scan-u8vector data 20)) (definition public (write-udp-nack-missing        data value) (put-u8vector data 20 value)))
+(definition public (read-udp-nack-media-kind data) (scan-s32      data 16)) (definition public (write-udp-nack-media-kind data value) (put-s32      data 16 value))
+(definition public (read-udp-nack-missing    data) (scan-u8vector data 20)) (definition public (write-udp-nack-missing    data value) (put-u8vector data 20 value))
+
+;; profile heartbeat
+(definition public (read-udp-profile-heartbeat-packets-sent     data) (scan-s32 data 20)) (definition public (write-udp-profile-heartbeat-packets-sent     data value) (put-s32 data 20 value))
+(definition public (read-udp-profile-heartbeat-bytes-sent       data) (scan-s32 data 24)) (definition public (write-udp-profile-heartbeat-bytes-sent       data value) (put-s32 data 24 value))
+(definition public (read-udp-profile-heartbeat-packets-received data) (scan-s32 data 28)) (definition public (write-udp-profile-heartbeat-packets-received data value) (put-s32 data 28 value))
+(definition public (read-udp-profile-heartbeat-bytes-received   data) (scan-s32 data 32)) (definition public (write-udp-profile-heartbeat-bytes-received   data value) (put-s32 data 32 value))
+
+;; profile media
+(definition public (read-udp-profile-media-payload data) (scan-u8vector data 20)) (definition public (write-udp-profile-media-payload data value) (put-u8vector data 20 value)))
