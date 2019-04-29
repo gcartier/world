@@ -73,6 +73,9 @@
 (definition protected video-profile
   (world-setting 'world.video-profile (find-setting 'caps.profile.video base-profile)))
 
+(definition protected video-initial-profile
+  video-profile)
+
 (definition protected video-single?
   (world-setting 'world.video-single? #f))
 
@@ -82,6 +85,9 @@
 
 (definition protected camera-profile
   (world-setting 'world.camera-profile (find-setting 'caps.profile.camera base-profile)))
+
+(definition protected camera-profile-override
+  camera-profile)
 
 (definition protected camera-keyframes
   (world-setting 'world.camera-keyframes 2))
@@ -300,8 +306,15 @@
 (register-video-profile (new Video-Profile 'medium   2  {Dimension  640  360} 15 1024 'h264))
 ;;(register-video-profile (new Video-Profile 'low 1 {Dimension  480 270} 12 768 'h264))
 (register-video-profile (new Video-Profile 'low      1  {Dimension  320  180} 12  768 'h264))
-(register-video-profile (new Video-Profile 'poor     0  {Dimension  224 	126}  8  512 'h264))
+(register-video-profile (new Video-Profile 'poor     0  {Dimension  224  126}  8  512 'h264))
 @RECOVERY (register-video-profile (new Video-Profile 'recovery #f {Dimension  224 	126}  2  384 'h264))
+
+
+@processpresent
+(processperiod-set!
+  (let ((profile (name->video-profile video-initial-profile)))
+    (let ((framerate (get-framerate profile)))
+      (/ 1000000000. (cast <fl> framerate)))))
 
 
 ;;;
@@ -309,8 +322,8 @@
 ;;;
 
 
-(definition protected (change-camera-profile profile)
-  (set! camera-profile profile))
+(definition protected (change-camera-profile-override profile)
+  (set! camera-profile-override profile))
 
 
 (definition protected (active-camera-profile)
@@ -319,6 +332,10 @@
 
 (definition protected (camera-profile-level)
   (get-level (active-camera-profile)))
+
+
+(definition protected (camera-profile-override-level)
+  (get-level (name->video-profile camera-profile-override)))
 
 
 ;;;
@@ -365,8 +382,9 @@
   
   (slot outputs         getter generate)
   (slot ordered-outputs getter generate)
-  (slot self-output     getter generate)
   (slot focused-output  accessors generate)
+  (slot self-output     accessors generate)
+  (slot self-consumer   accessors generate)
   (slot render-hook     accessors generate)
   
   
@@ -374,8 +392,9 @@
     (nextmethod self)
     (set! self.outputs (make-table test: equal?))
     (set! ordered-outputs '())
-    (set! self-output #f)
     (set! focused-output #f)
+    (set! self-output #f)
+    (set! self-consumer #f)
     (set! render-hook #f))
   
   
@@ -404,6 +423,14 @@
     (table-set! outputs id output))
   
   
+  (method package (install-output self id output (rank: rank #f))
+    (table-set! outputs id output)
+    (set! ordered-outputs (if rank
+                              (insert! ordered-outputs rank output)
+                            (append! ordered-outputs (list output))))
+    (play output))
+  
+  
   (method package (entity-output self id (position: position #f) (size: size #f) (resolution: resolution #f) (codec: codec #f))
     (or (table-ref outputs id #f)
         (let ((entity (find-entity id)))
@@ -419,11 +446,6 @@
   
   
   (method package (player-output self id (channel: channel #f) (player: player #f) (rank: rank #f) (position: position #f) (size: size #f) (level: level #f) (resolution: resolution #f) (framerate: framerate #f) (bitrate: bitrate #f) (codec: codec #f) (caps: caps #f) (sync-audio?: sync-audio? #f) (root-view: root-view #f))
-    (define (add-output output)
-      (set! ordered-outputs (if rank
-                                (insert! ordered-outputs rank output)
-                              (append! ordered-outputs (list output)))))
-    
     (or (table-ref outputs id #f)
         ;; the or is a quick hack to test self video
         (let ((player (or player (find-entity id))))
@@ -455,11 +477,7 @@
                              process?: (boolean id)
                              sync-audio?: sync-audio?
                              root-view: root-view)))))
-            (table-set! outputs id output)
-            (when (not id)
-              (set! self-output output))
-            (add-output output)
-            (play output)
+            (install-output self id output rank: rank)
             output))))
   
   
@@ -490,13 +508,6 @@
           output))))
   
   
-  (method package (replace-output self output new-channel)
-    (let ((id (get-id output)))
-      (let ((rank (find ordered-outputs output)))
-        (close-output self id output layout?: #f)
-        (channel-output self new-channel rank: rank))))
-  
-  
   (method package (visualizer-output self position size)
     (let ((output (new Sheet-Video-Sink
                     #f
@@ -512,17 +523,26 @@
       output))
   
   
+  (method package (replace-output self output new-channel (sync-audio?: sync-audio? #f))
+    (let ((id (get-id output)))
+      (let ((rank (find-output-rank self output)))
+        (close-output self id output layout?: #f)
+        (channel-output self new-channel rank: rank sync-audio?: sync-audio?))))
+  
+  
   (method package (close-output self id output (layout?: layout? #t))
     (table-clear outputs id)
     (set! ordered-outputs (remove! output ordered-outputs))
-    (when (eq? output self-output)
-      (set! self-output #f))
     (when (eq? output focused-output)
       (set! focused-output #f))
     (release output)
     (close output)
     (when layout?
       (update-layouts self)))
+  
+  
+  (method package (find-output-rank self output)
+    (find ordered-outputs output))
   
   
   (method package (effective-focused-output self)
@@ -542,20 +562,28 @@
   
   (method package (receive-server-video self id buffer timestamp duration)
     (let ((output (find-output self id)))
+      (define (receive)
+        (when (eq? (get-stream-state output) 'off)
+          (set-stream-state output 'on))
+        (consume output buffer timestamp duration)
+        (record-event udp-id-sink-media
+                      (fixnum->flonum id)
+                      (fixnum->flonum client-no)
+                      (fixnum->flonum udp-video)
+                      -1.
+                      -1.
+                      -1.
+                      (timestamp->flonum timestamp)))
+      
       (when output
-        (if (not buffer)
-            (set-stream-state output 'off)
-          (when (eq? (get-stream-state output) 'off)
-            (set-stream-state output 'on))
-          (consume output buffer timestamp duration)
-          (record-event udp-id-sink-media
-                        (fixnum->flonum id)
-                        (fixnum->flonum client-no)
-                        (fixnum->flonum udp-video)
-                        -1.
-                        -1.
-                        -1.
-                        (timestamp->flonum timestamp))))))
+        (cond ((not buffer)
+               (set-stream-state output 'off))
+              ((get-wait-header? output)
+               (when (video-buffer-header? buffer)
+                 (set-wait-header? output #f)
+                 (receive)))
+              (else
+               (receive))))))
   
   
   (method package (receive-visualizer-video self output buffer timestamp duration)
@@ -809,7 +837,8 @@
   
   (method override (process self task exit)
     (for-each (lambda (consumer)
-                (gst_app_sink_process task exit consumer))
+                (when (get-processing? consumer)
+                  (gst_app_sink_process task exit consumer)))
               sinks)))
 
 
@@ -823,92 +852,122 @@
   
   (slot resolution initialize #f accessors generate)
   (slot framerate  initialize #f accessors generate)
-  (slot bitrate    initialize #f accessors generate)
-  (slot codec      initialize #f accessors generate)
   (slot pipeline   initialize #f accessors generate)
   
   
-  (method override (initialize self (resolution: resolution #f) (framerate: framerate #f) (bitrate: bitrate #f) (codec: codec #f))
+  (method override (initialize self (resolution: resolution #f) (framerate: framerate #f))
     (nextmethod self)
     (set! self.resolution resolution)
-    (set! self.framerate framerate)
-    (set! self.bitrate bitrate)
-    (set! self.codec codec))
+    (set! self.framerate framerate))
   
   
   (method override (setup-element self)
     (nextmethod self)
-    (let ((width (get-width resolution))
-          (height (get-height resolution)))
-      (let ((pipeline (apply gst-launch
-                             (cond-expand
-                                    (mac "avfvideosrc")
-                                    (windows "ksvideosrc")
-                                    (else "v4l2src"))
-                                  (tie "videorate max-rate={framerate} name=rate")
-                                  ;; inform the camera to use high resolution
-                                  (tie "video/x-raw, width=1280, height=720, pixel-aspect-ratio=(fraction)1/1")
-                                  "videoscale method=sinc"
-                                  (tie "video/x-raw, width={width}, height={height}, pixel-aspect-ratio=(fraction)1/1")
-                                  "tee name=tee"
-                                  (list
-                                    "tee."
-                                    "queue"
-                                    "videoconvert"
-                                    (tie "video/x-raw, format=BGRA, width={width}, height={height}, pixel-aspect-ratio=(fraction)1/1")
-                                    "videoflip video-direction=horiz"
-                                    "appsink name=sinkself")
-                                  (collect (lambda (consumer)
-                                             (and (is? consumer Camera-Video-Consumer)
-                                                  (let ((profile (get-profile consumer)))
-                                                    (let ((consumer-name (get-name profile))
-                                                          (consumer-resolution (get-resolution profile)))
-                                                      (let ((consumer-width (get-width consumer-resolution))
-                                                            (consumer-height (get-height consumer-resolution))
-                                                            (needs-scaling? (nu/=? consumer-resolution resolution)))
-                                                        `("tee."
-                                                          "queue"
-                                                          ,(and needs-scaling? "videoscale method=sinc")
-                                                          "videoconvert"
-                                                          ,(tie "video/x-raw, format=I420, width={consumer-width}, height={consumer-height}, pixel-aspect-ratio=(fraction)1/1")
-                                                          @replaced-by-frequent-keyframes
-                                                          "valve name=valve"
-                                                          ,(and (eq? codec 'h264)
-                                                                (let ((key-int-max (and camera-keyframes (fxround (* (cast <fl> framerate) camera-keyframes))))
-                                                                      (bitrate bitrate)
-                                                                      (tune "zerolatency")
-                                                                      (speed-preset "ultrafast")
-                                                                      (threads #f @wait-threads (and needs-scaling? "1")))
-                                                                  (gst-element "x264enc"
-                                                                               key-int-max: key-int-max
-                                                                               bitrate: bitrate
-                                                                               tune: tune
-                                                                               speed-preset: speed-preset
-                                                                               threads: threads)))
-                                                          ,(format "appsink name=sink{a}" consumer-name)))))))
-                                           sinks))))
-        (gst_object_set_name pipeline "camera")
-        (for-each (lambda (consumer)
-                    (if (eq? (get-caps consumer) 'self)
-                        (let ((listener (open-stream-listener "cameraself"))
-                              (appsink (gst_bin_get_by_name pipeline "sinkself")))
-                          (gst_app_sink_connect_signals appsink listener)
-                          (setup-consumer consumer listener appsink (* width height 4)))
-                      (let ((profile (get-profile consumer)))
-                        (let ((name (get-name profile))
-                              (resolution (get-resolution profile)))
-                          (let ((listener (open-stream-listener (format "camera{a}" name)))
-                                (appsink (gst_bin_get_by_name pipeline (format "sink{a}" name))))
-                            (gst_app_sink_connect_signals appsink listener)
-                            (setup-consumer consumer listener appsink (* width height 4)))))))
-                  sinks)
-        (set! self.pipeline pipeline)
-        (gst_element_set_state pipeline GST_STATE_READY))))
+    (let ((max-resolution resolution)
+          (max-framerate framerate))
+      (let ((max-width (get-width max-resolution))
+            (max-height (get-height max-resolution)))
+        (let ((pipeline (apply gst-launch
+                               (cond-expand
+                                 (mac "avfvideosrc")
+                                 (windows "ksvideosrc")
+                                 (else "v4l2src"))
+                               ;; inform the camera to use high resolution
+                               (tie "video/x-raw, framerate={max-framerate}/1, width=1280, height=720, pixel-aspect-ratio=(fraction)1/1")
+                               "videoscale method=sinc"
+                               (tie "video/x-raw, width={max-width}, height={max-height}, pixel-aspect-ratio=(fraction)1/1")
+                               "tee name=tee"
+                               (append
+                                 (collect (lambda (consumer)
+                                            (and (is? consumer Camera-Self-Consumer)
+                                                 (let ((profile (get-profile consumer)))
+                                                   (let ((name (get-name profile))
+                                                         (resolution (get-resolution profile)))
+                                                     (let ((width (get-width resolution))
+                                                           (height (get-height resolution))
+                                                           (scale? (nu/=? resolution max-resolution)))
+                                                       (list
+                                                         "tee."
+                                                         (tie "queue name=queueself{name}")
+                                                         (and scale? "videoscale method=sinc")
+                                                         "videoconvert"
+                                                         (tie "video/x-raw, format=BGRA, width={width}, height={height}, pixel-aspect-ratio=(fraction)1/1")
+                                                         "videoflip video-direction=horiz"
+                                                         (tie "appsink async=false sync=false name=sinkself{name}")))))))
+                                          sinks)
+                                 (collect (lambda (consumer)
+                                            (and (is? consumer Camera-Video-Consumer)
+                                                 (let ((profile (get-profile consumer)))
+                                                   (let ((name (get-name profile))
+                                                         (resolution (get-resolution profile))
+                                                         (bitrate (get-bitrate profile))
+                                                         (codec (get-codec profile)))
+                                                     (let ((width (get-width resolution))
+                                                           (height (get-height resolution))
+                                                           (scale? (nu/=? resolution max-resolution)))
+                                                       `("tee."
+                                                         ,(tie "queue name=queue{name}")
+                                                         ,(and scale? "videoscale method=sinc")
+                                                         "videoconvert"
+                                                         ,(tie "video/x-raw, format=I420, width={width}, height={height}, pixel-aspect-ratio=(fraction)1/1")
+                                                         @replaced-by-frequent-keyframes
+                                                         "valve name=valve"
+                                                         ,(and (eq? codec 'h264)
+                                                               (let ((key-int-max (and camera-keyframes (fxround (* (cast <fl> framerate) camera-keyframes))))
+                                                                     (tune "zerolatency")
+                                                                     (speed-preset "ultrafast")
+                                                                     (threads #f @wait-threads (and needs-scaling? "1")))
+                                                                 (gst-element "x264enc"
+                                                                              key-int-max: key-int-max
+                                                                              bitrate: bitrate
+                                                                              tune: tune
+                                                                              speed-preset: speed-preset
+                                                                              threads: threads)))
+                                                         ,(tie "appsink async=false sync=false name=sink{name}")))))))
+                                          sinks)))))
+          (gst_object_set_name pipeline "camera")
+          (for-each (lambda (consumer)
+                      (if (eq? (get-caps consumer) 'self)
+                          (let ((profile (get-profile consumer)))
+                            (let ((name (get-name profile))
+                                  (profile (get-profile consumer)))
+                              (let ((resolution (get-resolution profile))
+                                    (framerate (get-framerate profile)))
+                                (let ((width (get-width resolution))
+                                      (height (get-height resolution))
+                                      (listener (open-stream-listener (format "cameraself{a}" name)))
+                                      (appsink (gst_bin_get_by_name pipeline (format "sinkself{a}" name))))
+                                  (gst_app_sink_connect_signals appsink listener)
+                                  (setup-consumer consumer listener appsink (* width height 4))
+                                  (let ((pad (gst_element_get_static_pad (gst_bin_get_by_name pipeline (tie "queueself{name}")) "sink")))
+                                    (if (get-processing? consumer)
+                                        (set-probe consumer (gst_pad_add_rate_probe pad framerate))
+                                      (set-probe consumer (gst_pad_add_drop_probe pad))))))))
+                        (let ((profile (get-profile consumer)))
+                          (let ((name (get-name profile))
+                                (resolution (get-resolution profile))
+                                (framerate (get-framerate profile)))
+                            (let ((width (get-width resolution))
+                                  (height (get-height resolution))
+                                  (listener (open-stream-listener (format "camera{a}" name)))
+                                  (appsink (gst_bin_get_by_name pipeline (format "sink{a}" name))))
+                              (gst_app_sink_connect_signals appsink listener)
+                              (setup-consumer consumer listener appsink (* width height 4))
+                              (let ((pad (gst_element_get_static_pad (gst_bin_get_by_name pipeline (tie "queue{name}")) "sink")))
+                                (if (get-processing? consumer)
+                                    (set-probe consumer (gst_pad_add_rate_probe pad framerate))
+                                  (set-probe consumer (gst_pad_add_drop_probe pad)))))))))
+                    sinks)
+          (set! self.pipeline pipeline)
+          (gst_element_set_state pipeline GST_STATE_READY)))))
   
   
   (method override (start-element self)
     (nextmethod self)
-    (task-start self 'camera)
+    (for-each (lambda (consumer)
+                (when (get-processing? consumer)
+                  (start-processing consumer video-priority)))
+              sinks)
     (gst_element_set_state pipeline GST_STATE_PAUSED))
   
   
@@ -924,7 +983,10 @@
   
   (method override (stop-element self)
     (nextmethod self)
-    (task-stop self)
+    (for-each (lambda (consumer)
+                (when (get-processing? consumer)
+                  (stop-processing consumer)))
+              sinks)
     (gst_element_set_state pipeline GST_STATE_READY))
   
   
@@ -957,12 +1019,26 @@
   
   (slot channel-no getter generate)
   (slot profile    getter generate)
+  (slot probe      accessors generate)
   
   
-  (method override (initialize self channel-no profile . rest)
-    (apply nextmethod self rest)
-    (set! self.channel-no channel-no)
-    (set! self.profile profile))
+  (method override (initialize self . rest)
+    (bind-keywords ((channel-no #f) (profile #f) . others) rest
+      (apply nextmethod self others)
+      (set! self.channel-no channel-no)
+      (set! self.profile profile)
+      (set! self.probe #f)))
+  
+  
+  (method override (print self output readably)
+    (print-unreadable self output
+      (lambda (output)
+        (format output "{a} {a}" (get-name profile) state))))
+  
+  
+  (method override (task-name self)
+    (let ((name (get-name profile)))
+      (string->symbol (format "camera{a}" name))))
 
 
   (method override (consume self buffer timestamp duration)
@@ -1012,35 +1088,89 @@
 (class Camera-Self-Consumer extends Stream-Consumer
   
   
-  (slot resolution  initialize #f getter generate)
-  (slot self-output initialize #f getter generate)
+  (slot profile initialize #f getter generate)
+  (slot output  initialize #f accessors generate)
+  (slot probe   initialize #f accessors generate)
   
   
   (method override (initialize self . rest)
-    (bind-keywords ((resolution #f) . others) rest
+    (bind-keywords ((profile #f) . others) rest
       (apply nextmethod self others)
-      (assert resolution)
-      (set! self.resolution resolution)
-      (let ((video (current-video))
-            (me (current-me)))
-        (set! self-output (player-output video #f
-                            player: me
-                            resolution: resolution))
-        (invalidate-state self-output))))
+      (set! self.profile profile)
+      (when (or processing? self-split?)
+        (open-self-output self))))
   
   
   (method override (destroy self)
-    (let ((video (current-video)))
-      (close-output video #f self-output)
-      (set-stream-state self-output 'off))
+    (close-self-output self)
     (nextmethod self))
   
   
+  (method override (print self output readably)
+    (print-unreadable self output
+      (lambda (output)
+        (format output "{a} {a}" (get-name profile) state))))
+  
+  
+  (method override (task-name self)
+    (let ((name (get-name profile)))
+      (string->symbol (format "cameraself{a}" name))))
+  
+  
+  (method protected (open-self-output self)
+    (unless output
+      (set! output (create-self-output self))
+      (install-self-output self)))
+  
+  
+  (method protected (install-self-output self (rank: rank #f))
+    (let ((video (current-video)))
+      (install-output video (get-id output) output rank: rank)
+      (set-self-output video output)
+      (set-self-consumer video self)
+      (update-layouts video)
+      (invalidate-state output)))
+  
+  
+  (method protected (create-self-output self)
+    (let ((me (current-me)))
+      (let ((level (get-level profile))
+            (resolution (get-resolution profile))
+            (framerate (get-framerate profile))
+            (bitrate (get-bitrate profile))
+            (codec (get-codec profile)))
+        (let ((id (list 'self level))
+              (channel #f)
+              (player me))
+          (new Circle-Video-Sink
+            id
+            channel
+            player
+            level: level
+            resolution: resolution
+            framerate: framerate
+            bitrate: bitrate
+            codec: codec
+            alpha-overlay: video-alpha
+            process?: #t)))))
+  
+  
+  (method protected (close-self-output self)
+    (let ((video (current-video)))
+      (when output
+        (close-output video (get-id output) output)
+        (set-stream-state output 'off)
+        (set-self-output video #f)
+        (set-self-consumer video #f)
+        (set! output #f))))
+  
+  
   (method override (consume self buffer timestamp duration)
-    (if (not buffer)
-        (set-stream-state self-output 'off)
-      (set-stream-state self-output 'drawn)
-      (draw self-output buffer #f timestamp duration))))
+    (when output
+      (if (not buffer)
+          (set-stream-state output 'off)
+        (set-stream-state output 'drawn)
+        (draw output buffer #f timestamp duration)))))
 
 
 ;;;
@@ -1666,6 +1796,7 @@
   (slot image-surface               initialize #f accessors generate)
   (slot image-inhibit?              initialize #f accessors generate)
   (slot task                        initialize #f accessors generate)
+  (slot wait-header?                initialize #t accessors generate)
   (slot stream-state                initialize 'off getter generate setter explicit)
   
   

@@ -47,6 +47,10 @@
   (world-setting 'world.stream-compare? #f))
 
 
+(definition protected self-split?
+  (world-setting 'world.self-split? #f))
+
+
 ;;;
 ;;;; Listener
 ;;;
@@ -55,24 +59,22 @@
 (definition public (gst_app_sink_wait task exit listener elem vec info reset-action eos-action)
   (declare (proper-tail-calls))
   (let (loop)
-    (if (get-stopped? listener)
-        (task-done task exit)
-      (let ((c (wait listener)))
-        (case c
-          ((#\!)
-           (when reset-action
-             (reset-action))
-           (loop))
-          ((#\^)
-           (when eos-action
-             (eos-action))
-           (loop))
-          ((#\@)
-           (task-done task exit))
-          (else
-           (let ((size (gst_app_sink_try_pull elem vec info)))
-             (assert (/= size -1)
-               size))))))))
+    (let ((c (wait listener)))
+      (case c
+        ((#\!)
+         (when reset-action
+           (reset-action))
+         (loop))
+        ((#\^)
+         (when eos-action
+           (eos-action))
+         (loop))
+        ((#\@)
+         (task-done task exit))
+        (else
+         (let ((size (gst_app_sink_try_pull elem vec info)))
+           (assert (/= size -1)
+             size)))))))
 
 
 ;; PRIME
@@ -80,24 +82,51 @@
 (definition public (gst_app_sink_wait2 task exit listener elem vec info reset-action eos-action)
   (declare (proper-tail-calls))
   (let (loop)
-    (if (get-stopped? listener)
-        (task-done task exit)
-      (let ((c (wait listener)))
-        (case c
-          ((#\!)
-           (when reset-action
-             (reset-action))
-           (loop))
-          ((#\^)
-           (when eos-action
-             (eos-action))
-           (loop))
-          ((#\@)
-           (task-done task exit))
-          (else
-           (let ((size (gst_app_sink_try_pull2 elem vec info)))
-             (assert (/= size -1)
-               size))))))))
+    (let ((c (wait listener)))
+      (case c
+        ((#\!)
+         (when reset-action
+           (reset-action))
+         (loop))
+        ((#\^)
+         (when eos-action
+           (eos-action))
+         (loop))
+        ((#\@)
+         (task-done task exit))
+        (else
+         (let ((size (gst_app_sink_try_pull2 elem vec info)))
+           (assert (/= size -1)
+             size)))))))
+
+
+@processpresent (
+(definition processpresent?
+  (world-setting 'world.processpresent? #f))
+
+(definition processmutex
+  (make-mutex 'process))
+
+(definition processperiod
+  #f)
+
+(definition protected (processperiod-set! period)
+  (set! processperiod period))
+
+(definition processfirst
+  #f)
+
+(definition protected (processreset)
+  (set! processfirst #f))
+
+(definition (processpresent timestamp)
+  (mutex-lock! processmutex)
+  (prog1 (begin
+           (when (not processfirst)
+             (set! processfirst timestamp))
+           (let ((diff (- timestamp processfirst)))
+             (fxround (/ (exact->inexact diff) processperiod))))
+    (mutex-unlock! processmutex))))
 
 
 (definition public (gst_app_sink_process task exit consumer)
@@ -107,7 +136,7 @@
         (data (get-data consumer))
         (info (get-info consumer)))
     (let (loop)
-      (if (get-stopped? listener)
+      (if (get-closed? listener)
           (task-done task exit)
         (let ((c (wait listener)))
           (case c
@@ -126,6 +155,115 @@
                        (timestamp (u64vector-ref info 0))
                        (duration (u64vector-ref info 1)))
                    (consume consumer buffer timestamp duration)))))))))))
+
+
+(definition public (gst_app_sink_process_one consumer)
+  (let ((listener (get-listener consumer))
+        (element (get-element consumer))
+        (data (get-data consumer))
+        (info (get-info consumer)))
+    (let ((c (wait listener)))
+      (assert (eqv? c #\.)
+        (let ((size (gst_app_sink_try_pull element data info)))
+          (assert (/= size -1)
+            (let ((buffer (subu8vector data 0 size))
+                  (timestamp (u64vector-ref info 0))
+                  (duration (u64vector-ref info 1)))
+              (consume consumer buffer timestamp duration))))))))
+
+
+;;;
+;;;; Consumer
+;;;
+
+
+(class Stream-Consumer extends Stream-Sink
+  
+  
+  (slot caps                  initialize #f accessors generate)
+  (slot listener              initialize #f accessors generate)
+  (slot element               initialize #f accessors generate)
+  (slot data     <u8vector+>  initialize #f accessors generate)
+  (slot info     <u64vector+> initialize #f accessors generate)
+  (slot task                  initialize #f accessors generate)
+  (slot processing?           initialize #t accessors generate)
+  
+  
+  (method override (initialize self (caps: caps #f) (processing?: processing? #t) (name: name #f) (consumer: consumer #f))
+    (nextmethod self name: name consumer: consumer)
+    (set! self.caps caps)
+    (set! self.processing? processing?))
+  
+  
+  (method override (consumer? self)
+    #t)
+  
+  
+  (method protected virtual (task-name self)
+    'consumer)
+  
+  
+  (method protected (setup-consumer self listener element size)
+    (set! self.listener listener)
+    (set! self.element element)
+    (set! self.data (make-u8vector size))
+    (set! self.info (make-u64vector 2)))
+  
+  
+  (method protected (release-consumer self)
+    (consume self #f #f #f)
+    (close-stream-listener listener)
+    (set! listener #f)
+    (set! element #f)
+    (set! data #f)
+    (set! info #f))
+  
+  
+  (method protected (start-listener self)
+    (when listener
+      (start-stream-listener listener)))
+  
+  
+  (method protected (stop-listener self)
+    (when listener
+      (stop-stream-listener listener)))
+  
+  
+  (method protected (start-processing self priority)
+    (let ((procedure
+            (lambda (task)
+              (consumer-loop self task))))
+      (let ((task (new Task (task-name self) procedure priority: priority)))
+        (start-listener self)
+        (start-task task)
+        (set! self.task task))))
+  
+  
+  (method protected (stop-processing self)
+    (stop-listener self)
+    (stop-task task)
+    (set! task #f))
+  
+  
+  (method protected (consumer-loop self task)
+    (declare (proper-tail-calls))
+    (with-task task
+      (lambda (exit)
+        (let (iter)
+          (process self task exit)
+          (iter)))))
+  
+  
+  (method override (process self task exit)
+    (gst_app_sink_process task exit self))
+  
+  
+  (method protected virtual (reset-action self)
+    )
+  
+  
+  (method protected virtual (eos-action self)
+    (consume self #f #f #f)))
 
 
 ;;;

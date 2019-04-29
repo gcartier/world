@@ -26,6 +26,7 @@
         (jazz.presence.transmission)
         (jazz.snapshot)
         (jazz.stream)
+        (jazz.syntax (phase syntax))
         (jazz.view)
         (jazz.zlib)
         (world)
@@ -799,6 +800,31 @@
         (close-receive-stream udp-client stream))))
   
   
+  (method package (streamer-update self origin video-level)
+    (let ((video (current-video)))
+      (iterate-table (get-receive-streams udp-client)
+        (lambda (no stream)
+          (when (= (get-origin stream) origin)
+            (set-video-level stream video-level)
+            (let ((receive-video-level (stream-receive-video-level stream)))
+              (define (find-output)
+                (find-if (lambda (output)
+                           (let ((channel (get-channel output)))
+                             (and channel
+                                  (eq? (get-stream channel) stream))))
+                         (get-ordered-outputs video)))
+              
+              (let ((output (find-output)))
+                (when output
+                  (let ((actual-channel (get-channel output)))
+                    (iterate-table (get-channels stream)
+                      (lambda (no channel)
+                        (when (and (= (get-media-kind channel) udp-video)
+                                   (= (get-level channel) receive-video-level)
+                                   (neq? channel actual-channel))
+                          (replace-output video output channel)))))))))))))
+  
+  
   (method package (action-stream self stream-no action arguments)
     (let ((stream (find-send-stream udp-client stream-no)))
       ;; lets be robust
@@ -1007,37 +1033,143 @@
   
   
   (method package (change-base-profile self profile)
-    (unless (eq? profile base-profile)
-      (set-base-profile profile)
-      (change-graphic-profile profile)
-      (change-video-profile profile)
-      (change-camera-profile profile)
-      (change-video-level self (video-profile-level))
-      (iterate-table (get-receive-streams udp-client)
-        (lambda (no stream)
-          (let ((video (current-video)))
-            (define (find-output)
-              (find-if (lambda (output)
-                         (eq? (get-stream (get-channel output)) stream))
-                       (get-ordered-outputs video)))
-            
-            (define (streaming-channel)
-              (continuation-capture
-                (lambda (return)
-                  (let ((receive-video-level (stream-receive-video-level stream)))
-                    (iterate-table (get-channels stream)
-                      (lambda (no channel)
-                        (let ((level (get-level channel)))
-                          (when (eqv? level receive-video-level)
-                            (continuation-return return channel))))))
-                  #f)))
-            
-            (let ((output (find-output)))
-              (when output
-                (let ((actual-channel (get-channel output))
-                      (streaming-channel (streaming-channel)))
-                  (when (neq? streaming-channel actual-channel)
-                    (replace-output video output streaming-channel))))))))))
+    (let ((video (current-video)))
+      (unless (eq? profile base-profile)
+        (set-base-profile profile)
+        (change-graphic-profile profile)
+        (change-video-profile profile)
+        (change-camera-profile-override profile)
+        (let ((video-profile (active-video-profile)))
+          (let ((new-video-level (get-level video-profile))
+                (new-video-name (get-name video-profile)))
+            (change-video-level self new-video-level)
+            ;; receive
+            (iterate-table (get-receive-streams udp-client)
+              (lambda (no stream)
+                (define (find-output)
+                  (find-if (lambda (output)
+                             (let ((channel (get-channel output)))
+                               (and channel
+                                    (eq? (get-stream channel) stream))))
+                           (get-ordered-outputs video)))
+                
+                (define (streaming-channel)
+                  (continuation-capture
+                    (lambda (return)
+                      (let ((receive-video-level (stream-receive-video-level stream)))
+                        (iterate-table (get-channels stream)
+                          (lambda (no channel)
+                            (when (= (get-media-kind channel) udp-video)
+                              (let ((level (get-level channel)))
+                                (when (eqv? level receive-video-level)
+                                  (continuation-return return channel)))))))
+                      #f)))
+                
+                (let ((output (find-output)))
+                  (when output
+                    (let ((actual-channel (get-channel output))
+                          (streaming-channel (streaming-channel)))
+                      (when (neq? streaming-channel actual-channel)
+                        (replace-output video output streaming-channel)))))))
+            ;; send
+            (iterate-table (get-send-streams udp-client)
+              (lambda (no stream)
+                (define (find-self-output)
+                  (find-if (lambda (output)
+                             (let ((channel (get-channel output)))
+                               (and channel
+                                    (eq? (get-stream channel) stream))))
+                           (get-ordered-outputs video)))
+                
+                (when (eq? (get-source-kind stream) 'stream)
+                  (let ((self-output (find-self-output)))
+                    (let ((self-channel (and self-output (get-channel self-output))))
+                      (iterate-table (get-channels stream)
+                        (lambda (no channel)
+                          (when (= (get-media-kind channel) udp-video)
+                            (let ((src (get-src (get-pipeline channel))))
+                              (when (is? src File-Stream-Video-Src)
+                                (let ((channel-level (get-level channel)))
+                                  (let ((stream? (<= channel-level new-video-level)))
+                                    (set-stream? src stream?)
+                                    (when (and self-channel
+                                               (neq? channel self-channel)
+                                               (= channel-level new-video-level))
+                                      (replace-output video self-output channel sync-audio?: #t))))))))))))))
+            ;; camera
+            (when (camera-playing? self)
+              (let ((camera-pipeline (get-pipeline camera-channel)))
+                (let ((pipeline (get-pipeline (get-src camera-pipeline))))
+                  (let ((elements (get-elements camera-pipeline)))
+                    (define (find-actual-consumer)
+                      (find-if (lambda (element)
+                                 (and (is? element Camera-Self-Consumer)
+                                      (get-processing? element)))
+                               elements))
+                    
+                    (define (find-new-consumer)
+                      (find-if (lambda (element)
+                                 (and (is? element Camera-Self-Consumer)
+                                      (= (get-level (get-profile element)) new-video-level)))
+                               elements))
+                    
+                    ;; self
+                    (let ((actual-consumer (find-actual-consumer))
+                          (new-consumer (find-new-consumer)))
+                      (define (update-probe consumer on?)
+                        (let ((profile (get-profile consumer)))
+                          (let ((name (get-name profile))
+                                (framerate (get-framerate profile)))
+                            (let ((pad (gst_element_get_static_pad (gst_bin_get_by_name pipeline (tie "queueself{name}")) "sink")))
+                              (let ((new-probe (if on?
+                                                   (gst_pad_add_rate_probe pad framerate)
+                                                 (gst_pad_add_drop_probe pad))))
+                                (let ((probe (get-probe consumer)))
+                                  (when probe
+                                    (gst_pad_remove_probe pad probe)))
+                                (set-probe consumer new-probe))))))
+                      
+                      (when (neq? new-consumer actual-consumer)
+                        (update-probe new-consumer #t)
+                        (let ((self-output (get-self-output video))
+                              (self-consumer (get-self-consumer video)))
+                          (let ((rank (if self-split? #f (and self-output (find-output-rank video self-output)))))
+                            (let ((new-output (if self-split? #f (create-self-output new-consumer))))
+                              (unless self-split?
+                                (set-output new-consumer new-output))
+                              (gst_app_sink_process_one new-consumer)
+                              (update-probe actual-consumer #f)
+                              (set-processing? actual-consumer #f)
+                              (stop-processing actual-consumer)
+                              (set-stream-state (get-output actual-consumer) #f)
+                              (unless self-split?
+                                (when self-output
+                                  (close-self-output self-consumer))
+                                (install-self-output new-consumer rank: rank)))))
+                        (set-processing? new-consumer #t)
+                        (start-processing new-consumer video-priority)))
+                    ;; media
+                    (for-each (lambda (element)
+                                (when (is? element Camera-Video-Consumer)
+                                  (let ((profile (get-profile element)))
+                                    (let ((name (get-name profile))
+                                          (level (get-level profile))
+                                          (framerate (get-framerate profile)))
+                                      (let ((processing? (<= level new-video-level)))
+                                        (when (neq? processing? (get-processing? element))
+                                          (let ((pad (gst_element_get_static_pad (gst_bin_get_by_name pipeline (tie "queue{name}")) "sink")))
+                                            (let ((new-probe (if processing?
+                                                                 (gst_pad_add_rate_probe pad framerate)
+                                                               (gst_pad_add_drop_probe pad))))
+                                              (let ((probe (get-probe element)))
+                                                (when probe
+                                                  (gst_pad_remove_probe pad probe)))
+                                              (set-probe element new-probe)))
+                                          (set-processing? element processing?)
+                                          (if processing?
+                                              (start-processing element video-priority)
+                                            (stop-processing element))))))))
+                              elements))))))))))
   
   
   ;;;
@@ -1123,6 +1255,8 @@
   
   
   (method package (toggle-camera self)
+    @processpresent
+    (processreset)
     (if (camera-playing? self)
         (release-camera self)
       (play-camera self)))
