@@ -224,6 +224,9 @@
 (definition protected udp-congestion-duration
   (world-setting 'world.udp-congestion-duration 5.))
 
+(definition protected udp-simulation
+  (world-setting 'world.udp-simulation #f))
+
 
 (definition protected udp-media-off
   #u8(111 102 102))
@@ -2175,6 +2178,9 @@
   (property congestion          accessors generate)
   (property congestion-duration accessors generate)
   
+  (slot simulation           getter generate)
+  (slot time-base            getter generate)
+  (slot packet-count         getter generate)
   (slot congestion-occuring? getter generate)
   (slot congestion-ends      accessors generate)
   (slot latency-last         getter generate)
@@ -2193,6 +2199,9 @@
     (set! self.congestion-duration udp-congestion-duration)
     (set! self.congestion-occuring? #f)
     (set! self.congestion-ends #f)
+    (set! self.simulation (and (client?) udp-simulation))
+    (set! self.time-base (and simulation (new Time-Base)))
+    (set! self.packet-count 0)
     (set! self.latency-last #f)
     (set! self.latency-count #f)
     (set! self.writer writer)
@@ -2216,43 +2225,63 @@
                   (set! congestion-ends ends)
                   (when udp-show-congestion?
                     (format :terminal "{s} {s} {s}{%}" remote-name 'CONGESTION 'ON)))
-              (writer info (drop? self)))
+              (send-writer self info (drop? self)))
           (when (or (not congestion-ends)
                     (>= (current-seconds) congestion-ends))
             (set! congestion-occuring? #f)
             (set! congestion-ends #f)
             (when udp-show-congestion?
               (format :terminal "{s} {s} {s}{%}" remote-name 'CONGESTION 'OFF))
-            (writer info (drop? self))))
-      ;; latency
-      (if latency
-          (let ()
-            (define (determine-latency)
-              (cond ((procedure? latency)
-                     (latency info))
-                    ((or (not latency-last)
-                         (= latency-count 0))
-                     (let ((latency (random-between 0. latency)))
-                       (set! latency-last latency)
-                       (set! latency-count (random udp-latency-count))
-                       latency))
-                    (else
-                     (decrease! latency-count)
-                     latency-last)))
-            
-            (insert ring (+ (current-seconds) (determine-latency)) info))
-        (writer info (drop? self)))))
+            (send-writer self info (drop? self))))
+      (cond (simulation
+             (let ((kind (read-udp-kind info)))
+               (if (or (= kind udp-audio)
+                       (= kind udp-video))
+                   (let ((latency (prog1 (car simulation)
+                                    (unless (null? (cdr simulation))
+                                      (set! simulation (cdr simulation))))))
+                     (let ((time (current-seconds))
+                           (nanostamp (timestamp->flonum (read-udp-media-timestamp info))))
+                       (update-start time-base time nanostamp)
+                       (let ((sendtime (+ (remote->local time-base nanostamp)
+                                          (* (read-udp-part info) .0001)
+                                          latency)))
+                         (insert ring sendtime info))))
+                 (send-writer self info (drop? self)))))
+            (latency
+             (let ()
+               (define (determine-latency)
+                 (cond ((procedure? latency)
+                        (latency info))
+                       ((or (not latency-last)
+                            (= latency-count 0))
+                        (let ((latency latency @w (random-between 0. latency)))
+                          (set! latency-last latency)
+                          (set! latency-count (random udp-latency-count))
+                          latency))
+                       (else
+                        (decrease! latency-count)
+                        latency-last)))
+               
+               (insert ring (+ (current-seconds) (determine-latency)) info)))
+            (else
+             (send-writer self info (drop? self))))))
   
   
   (method (drop? self)
     (and drop (< (random-real) (/ drop 100.))))
   
   
+  (method (send-writer self info drop?)
+    (writer info drop?)
+    (increase! packet-count))
+  
+  
   (method (send-loop self)
     (declare (proper-tail-calls))
     (let (loop)
       (let ((info (wait ring)))
-        (writer info (drop? self)))
+        (send-writer self info (drop? self)))
       (loop))))
 
 
