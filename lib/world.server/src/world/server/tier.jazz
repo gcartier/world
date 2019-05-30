@@ -47,6 +47,7 @@
         (world.network)
         (world.profiling)
         (world.scripting)
+        (world.script.remote)
         (world.server)
         (world.server.client)
         (world.server.group)
@@ -1270,40 +1271,56 @@
                 (when broadcast-hierarchy?
                   (broadcast-hierarchy self)))
               #f)))))
-      ((request)
-       (bind (cookie who what action) arguments
-         (let ((requester client))
-           (define (request-server (requester-group #f))
-             (admin-server-request self requester requester-group cookie what action))
-           
-           (define (request-client delegate)
-             (let ((client (get-client delegate)))
-               (calling-client self delegate
-                 (lambda ()
-                   (admin-request client requester cookie what action)))))
-           
+      (else
+       (let ((requester client))
+         (define (dispatch-who who dispatch-server dispatch-client)
            (cond ((equal? who "server")
-                  (request-server)
+                  (dispatch-server)
                   #f)
                  ((equal? who "all")
                   (let ((requester-delegate (find-delegate self requester)))
                     (let ((requester-group (and requester-delegate (get-group requester-delegate))))
                       (if (not requester-group)
                           "Not in a circle"
-                        (request-server requester-group)
-                        (for-each request-client (get-members requester-group))
+                        (dispatch-server requester-group)
+                        (for-each dispatch-client (get-members requester-group))
                         #f))))
                  (else
                   (let ((delegate (find-delegate-by-name self who)))
                     (if (not delegate)
                         (format "Unable to find {a}" who)
-                      (request-client delegate)
-                      #f)))))))
-      (else
-       (format "Unknown command: {s}" command))))
+                      (dispatch-client delegate)
+                      #f)))))
+         
+         (case command
+           ((request)
+            (bind (cookie who what action) arguments
+              (define (request-server (requester-group #f))
+                (admin-server-request self requester requester-group cookie what action))
+              
+              (define (request-client delegate)
+                (let ((client (get-client delegate)))
+                  (calling-client self delegate
+                    (lambda ()
+                      (admin-request client requester cookie what action)))))
+              
+              (dispatch-who who request-server request-client)))
+           ((run)
+            (bind (cookie script who) arguments
+              (define (run-server (requester-group #f))
+                (admin-server-run self requester cookie script))
+              
+              (define (run-client delegate)
+                (let ((client (get-client delegate)))
+                  (calling-client self delegate
+                    (lambda ()
+                      (admin-run client requester cookie script)))))
+              
+              (dispatch-who who run-server run-client)))
+           (else
+            (format "Unknown command: {s}" command)))))))
   
   
-  ;; to be unified with admin-request
   (method (admin-server-request self requester requester-group cookie what action)
     (define (send-caps)
       (let ((file {File Settings "caps" "server.caps"}))
@@ -1357,14 +1374,14 @@
               (new-thread
                 (lambda ()
                   (let ((sender "<server>"))
-                    (admin-result requester cookie sender name #f #f)
+                    (admin-chunk requester cookie sender name #f #f)
                     (let ((content (zlib-deflate (extract)))
                           (give-time .01))
                       (when missing
                         (let ((missing (missing)))
                           (for-each (lambda (missing)
                                       (sleep give-time)
-                                      (admin-chunk self requester cookie sender 'missing missing #f))
+                                      (admin-request-chunk self requester cookie sender 'missing missing #f))
                                     missing)))
                       (let ((content-size (u8vector-length content))
                             (max-size 8192))
@@ -1376,7 +1393,7 @@
                                 (let ((chunk (make-u8vector chunk-size))
                                       (done? (>= chunk-size remain)))
                                   (subu8vector-move! content pos (+ pos chunk-size) chunk 0)
-                                  (admin-chunk self requester cookie sender name chunk done?))
+                                  (admin-request-chunk self requester cookie sender name chunk done?))
                                 (loop-chunk (+ part 1) (+ pos chunk-size))))))))))
                 'request)))
         (thread-base-priority-set! thread background-priority)
@@ -1395,12 +1412,27 @@
          (send-settings)))))
   
   
-  (method (admin-chunk self requester cookie sender name chunk done?)
+  (method (admin-server-run self requester cookie script)
+    (run-remote-script script
+      (lambda (state data)
+        (let ((sender "<server>"))
+          (admin-run-return self requester cookie sender state data)))))
+  
+  
+  (method (admin-request-chunk self requester cookie sender name chunk done?)
     (let ((delegate (find-delegate self requester)))
       (when delegate
         (calling-client self delegate
           (lambda ()
-            (admin-result requester cookie sender name chunk done?))))))
+            (admin-chunk requester cookie sender name chunk done?))))))
+  
+  
+  (method (admin-run-return self requester cookie sender state data)
+    (let ((delegate (find-delegate self requester)))
+      (when delegate
+        (calling-client self delegate
+          (lambda ()
+            (admin-return requester cookie sender state data))))))
   
   
   (method (restart-server self delay)

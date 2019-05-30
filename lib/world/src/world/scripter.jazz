@@ -37,6 +37,7 @@
   (property text <object> initialize #f accessors generate)
   
   
+  (slot kind         <object> initialize 'server accessors generate)
   (slot module       <object> initialize #f accessors generate)
   (slot state        <object> initialize #f accessors generate)
   (slot state-time   <object> initialize #f accessors generate)
@@ -55,7 +56,6 @@
   (slot trail        <object> initialize #f accessors generate)
   (slot trail-color  <object> initialize #f accessors generate)
   (slot indicators   <object> initialize #f accessors generate)
-  (slot client?      <bool>   initialize #f accessors generate)
   
   
   (method override (print self output readably)
@@ -106,92 +106,94 @@
   
   
   (method package (run-script self task exit)
-    (let ((world (current-world)))
-      (define (determine-module)
-        ;; for the moment always generating a new module is by far the most robust
-        ;; way of ensuring any changes to the imports are resolved correctly and it
-        ;; might also uncover some weird module persistent data usage...
-        (gensym 'script)
-        #;
+    (define (determine-module)
+      ;; for the moment always generating a new module is by far the most robust
+      ;; way of ensuring any changes to the imports are resolved correctly and it
+      ;; might also uncover some weird module persistent data usage...
+      (gensym 'script)
+      #;
         (or module
             (let ((mod (gensym 'script)))
               (set! module mod)
               mod)))
-      
-      (define (extract-header)
-        (let ((prefix ";;; -*- "))
-          (and (starts-with? text prefix)
-               (let ((content (call-with-input-string text read-line)))
-                 (let ((header (substring content (string-length prefix) (string-length content))))
-                   (call-with-input-string header
-                     (lambda (port)
-                       (with-exception-filter
-                         (lambda (exc)
-                           (datum-parsing-exception? exc))
-                         (lambda (exc)
-                           #f)
-                         (lambda ()
-                           (read-all port))))))))))
-      
-      (define (extract-dialect header)
-        (let ((explicit (and header (even? (length header)) (getf header dialect:))))
-          (if explicit
-              (if (symbol? explicit)
-                  `(dialect ,explicit)
-                `(dialect ,@explicit))
-            'script)))
-      
-      (define (script-code module dialect)
-        (string-append "(module " (symbol->string module) " " (->string dialect) "\n" text "\n)"))
-      
-      (if (not text)
-          (begin
-            (set-task parent #f)
-            (continuation-return exit #f))
-        (let ((module (determine-module))
-              (header (extract-header)))
-          (let ((code (script-code module (extract-dialect header)))
-                (instance parent))
-            (define (state-change state data)
-              ;; kind of a quick test
-              (if client?
-                  (update-state self instance state data)
-                (with-task-mutex
+    
+    (define (extract-header)
+      (let ((prefix ";;; -*- "))
+        (and (starts-with? text prefix)
+             (let ((content (call-with-input-string text read-line)))
+               (let ((header (substring content (string-length prefix) (string-length content))))
+                 (call-with-input-string header
+                   (lambda (port)
+                     (with-exception-filter
+                       (lambda (exc)
+                         (datum-parsing-exception? exc))
+                       (lambda (exc)
+                         #f)
+                       (lambda ()
+                         (read-all port))))))))))
+    
+    (define (extract-dialect header)
+      (let ((explicit (and header (even? (length header)) (getf header dialect:))))
+        (if explicit
+            (if (symbol? explicit)
+                `(dialect ,explicit)
+              `(dialect ,@explicit))
+          'script)))
+    
+    (define (script-code module dialect)
+      (string-append "(module " (symbol->string module) " " (->string dialect) "\n" text "\n)"))
+    
+    (if (not text)
+        (begin
+          (set-task parent #f)
+          (continuation-return exit #f))
+      (let ((module (determine-module))
+            (header (extract-header)))
+        (let ((code (script-code module (extract-dialect header)))
+              (instance parent))
+          (define (state-change state data)
+            (case kind
+              ((client)
+               (update-state self instance state data))
+              ((server)
+               (with-task-mutex
+                 (lambda ()
+                   (world.changes:state-script-change (current-seconds) instance state data))))
+              ((remote)
+               (state-return parent state data))))
+          
+          (continuation-capture
+            (lambda (exit)
+              (parameterize ((%%current-instance instance)
+                             (current-task task)
+                             (current-exit exit))
+                (worker-run instance code
+                  ;; read
+                  (lambda (data)
+                    (state-change 'read data)
+                    (handle-events parent))
+                  ;; walk
+                  (lambda (data)
+                    (state-change 'walk data)
+                    (handle-events parent))
+                  ;; error
+                  (lambda (data)
+                    (state-change 'error data)
+                    (handle-events parent))
+                  ;; run
                   (lambda ()
-                    (world.changes:state-script-change (current-seconds) instance state data)))))
-            
-            (continuation-capture
-              (lambda (exit)
-                (parameterize ((%%current-instance instance)
-                               (current-task task)
-                               (current-exit exit))
-                  (worker-run instance code
-                    ;; read
-                    (lambda (data)
-                      (state-change 'read data)
-                      (handle-events parent))
-                    ;; walk
-                    (lambda (data)
-                      (state-change 'walk data)
-                      (handle-events parent))
-                    ;; error
-                    (lambda (data)
-                      (state-change 'error data)
-                      (handle-events parent))
-                    ;; run
-                    (lambda ()
-                      (state-change 'run #f))
-                    ;; result
-                    (lambda (result)
-                      (define (package-result)
-                        (cond ((unspecified? result)
-                               '())
-                              ((values? result)
-                               (map ->string (values->list result)))
-                              (else
-                               (list (->string result)))))
-                      
-                      (state-change 'result (package-result))))))))))))
+                    (state-change 'run #f))
+                  ;; result
+                  (lambda (result)
+                    (define (package-result)
+                      (cond ((unspecified? result)
+                             '())
+                            ((values? result)
+                             (map ->string (values->list result)))
+                            (else
+                             (list (->string result)))))
+                    
+                    (state-change 'result (package-result)))))))))))
 
 
   (method package (running-handler self thunk)
