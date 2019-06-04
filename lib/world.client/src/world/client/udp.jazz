@@ -859,6 +859,8 @@
   (slot process-task      getter generate)
   (slot process-average   getter generate)
   (slot last-nacked-frame accessors generate)
+  (slot last-playtime     accessors generate)
+  (slot last-timestamp    accessors generate)
   (slot replay-ring       getter generate)
   (slot replay-header     getter generate)
   (slot processed         getter generate)
@@ -868,6 +870,8 @@
   (method override (initialize self stream no origin media-kind source-kind level resolution framerate bitrate codec caps)
     (nextmethod self stream no origin media-kind source-kind level resolution framerate bitrate codec caps)
     (set! self.last-nacked-frame #f)
+    (set! self.last-playtime #f)
+    (set! self.last-timestamp #f)
     (set! self.replay-ring (new Remember-Ring 6000))
     (set! self.replay-header #f)
     (set! self.process-ring (new UDP-Ring self no origin media-kind udp-process-size max-size: udp-process-max-size overflow-proc: (udp-ring-overflow 'process udp-ring-kind-process)))
@@ -934,7 +938,8 @@
             (if (eq? info 'terminate)
                 (continuation-return exit #f)
               (site (udp-process on?: #t)
-                (present-audio self info))
+                (bind (presentation-time . datas) info
+                  (present-audio self presentation-time datas)))
               (looping)))))))
   
   
@@ -951,7 +956,7 @@
               (looping)))))))
   
   
-  (method (record-play-frame self sender frame header? timestamp)
+  (method (record-play-frame self sender frame header? timestamp adjustment)
     (record-event udp-id-play-frame
                   (fixnum->flonum no)
                   (fixnum->flonum sender)
@@ -961,7 +966,8 @@
                   (barbara-header-hack header?)
                   (if (= timestamp -1)
                       -1.
-                    (timestamp->flonum timestamp))))
+                    (timestamp->flonum timestamp))
+                  adjustment))
   
   
   (method (record-freeze-frame self sender frame header? timestamp)
@@ -984,7 +990,7 @@
         (apply u8vector-append chunks))))
   
   
-  (method protected (present-audio self datas)
+  (method protected (present-audio self presentation-time datas)
     (let ((first (car datas)))
       (let ((kind (read-udp-kind first))
             (sender (read-udp-sender first))
@@ -995,23 +1001,48 @@
             (duration (read-udp-media-duration first))
             (header? (read-udp-media-header? first))
             (off? (read-udp-media-off? first)))
+        @wait
+        (define (determine-effective-timestamp!)
+          (let ((now (current-seconds))
+                (timestamp (timestamp->flonum timestamp))
+                (count (cast <fl> (get-count process-ring))))
+            (let ((perfect-playtime (if (not last-playtime)
+                                        0.
+                                      (+ last-playtime (- timestamp last-timestamp)))))
+              ;;(terminal 'pp perfect-playtime)
+              ;;(terminal 'lp last-playtime)
+              ;;(terminal 't (- timestamp (or last-timestamp 0)))
+              ;;(terminal 'pres presentation-time)
+              (let ((adjustment
+                      (if (not last-playtime)
+                          0.
+                        (if (< (abs (- perfect-playtime presentation-time)) .05) ;; .05 is arbitrary tolerance
+                            (- now perfect-playtime)
+                          (- now (- perfect-playtime (/ (- perfect-playtime presentation-time) count)))))))
+                (set! last-timestamp timestamp)
+                (set! last-playtime presentation-time)
+                (- adjustment)))))
+        
         (increase! processed total)
-        (let ((buffer (assemble-chunks self datas first total)))
-          (if off?
-              (receive-audio (current-audio) channel-no #f #f #f)
-            (if (and header? (eq? audio-codec 'vorbis))
-                (let ((headers (u8vector->object buffer)))
-                  (set! replay-header buffer)
-                  (for-each (lambda (header)
-                              (bind (buffer timestamp duration) header
-                                ;; be very careful as timestamp is incorrect as it
-                                ;; is the timestamp at time the header was captured
-                                ;; this only works because gst_app_src_write
-                                ;; doesn't actually use the timestamp
-                                (receive-audio (current-audio) channel-no buffer timestamp duration)))
-                            headers))
-              (receive-audio (current-audio) channel-no buffer timestamp duration))
-            (record-play-frame self sender frame header? timestamp))))))
+        (let ((id/output (or (simulation-audio) channel-no)))
+          (let ((buffer (assemble-chunks self datas first total)))
+            (if off?
+                (receive-audio (current-audio) id/output #f #f #f)
+              (if (and header? (eq? audio-codec 'vorbis))
+                  (let ((headers (u8vector->object buffer)))
+                    (set! replay-header buffer)
+                    (for-each (lambda (header)
+                                (bind (buffer timestamp duration) header
+                                  ;; be very careful as timestamp is incorrect as it
+                                  ;; is the timestamp at time the header was captured
+                                  ;; this only works because gst_app_src_write
+                                  ;; doesn't actually use the timestamp
+                                  (receive-audio (current-audio) id/output buffer 0 duration)))
+                              headers)
+                    (record-play-frame self sender frame header? timestamp 0.))
+                (let ((adjustment 0. @wait (determine-effective-timestamp!)))
+                  (receive-audio (current-audio) id/output buffer 0 @wait (flonum->timestamp adjustment) duration)
+                  (record-play-frame self sender frame header? timestamp adjustment)))))))))
   
   
   (method protected (present-video self datas)
@@ -1033,4 +1064,4 @@
               (receive-video (current-video) id/output buffer timestamp duration)
               (if (eq? (get-state process-ring) 'late)
                   (record-freeze-frame self sender frame header? timestamp)
-                (record-play-frame self sender frame header? timestamp))))))))))
+                (record-play-frame self sender frame header? timestamp 0.))))))))))
