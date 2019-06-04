@@ -989,7 +989,12 @@
       (let ((chunks (map read-udp-media-payload datas)))
         (apply u8vector-append chunks))))
   
-  
+
+  ;;
+  ;; Two sanity checks are still needed:
+  ;; 1) ensure that adjustment does not send timestamps to gstreamer outside the range of its buffer
+  ;; 2) ensure that adjustment does not send timestamps to gstreamer that puts packets out of order
+  ;;
   (method protected (present-audio self presentation-time datas)
     (let ((first (car datas)))
       (let ((kind (read-udp-kind first))
@@ -1001,27 +1006,25 @@
             (duration (read-udp-media-duration first))
             (header? (read-udp-media-header? first))
             (off? (read-udp-media-off? first)))
-        @wait
         (define (determine-effective-timestamp!)
           (let ((now (current-seconds))
-                (timestamp (timestamp->flonum timestamp))
-                (count (cast <fl> (get-count process-ring))))
+                (timestamp (timestamp->flonum timestamp)))
             (let ((perfect-playtime (if (not last-playtime)
-                                        0.
-                                      (+ last-playtime (- timestamp last-timestamp)))))
-              ;;(terminal 'pp perfect-playtime)
-              ;;(terminal 'lp last-playtime)
-              ;;(terminal 't (- timestamp (or last-timestamp 0)))
-              ;;(terminal 'pres presentation-time)
-              (let ((adjustment
-                      (if (not last-playtime)
-                          0.
-                        (if (< (abs (- perfect-playtime presentation-time)) .05) ;; .05 is arbitrary tolerance
-                            (- now perfect-playtime)
-                          (- now (- perfect-playtime (/ (- perfect-playtime presentation-time) count)))))))
-                (set! last-timestamp timestamp)
-                (set! last-playtime presentation-time)
-                (- adjustment)))))
+                                        now
+                                      (+ last-playtime (- timestamp (or last-timestamp timestamp))))))
+              (let ((perfect (- perfect-playtime now)))
+                (let ((adjustment (if (< (abs (- perfect-playtime presentation-time)) 0.2)
+                                      perfect
+                                    (let ((latency-adjust (+ perfect (- presentation-time perfect-playtime))))
+                                      @w (terminal 'LATENCY 'ADJUSTMENT latency-adjust)
+                                      latency-adjust))))
+                  (set! last-timestamp timestamp)
+                  (set! last-playtime (+ now adjustment))
+                  @w (when (> adjustment .2)
+                    (terminal 'adjustment 'makes 'frame 'too 'late adjustment))
+                  @w (when (< adjustment -.2)
+                    (terminal 'adjustment 'makes 'frame 'too 'early adjustment))
+                  adjustment)))))
         
         (increase! processed total)
         (let ((id/output (or (simulation-audio) channel-no)))
@@ -1040,8 +1043,8 @@
                                   (receive-audio (current-audio) id/output buffer 0 duration)))
                               headers)
                     (record-play-frame self sender frame header? timestamp 0.))
-                (let ((adjustment 0. @wait (determine-effective-timestamp!)))
-                  (receive-audio (current-audio) id/output buffer 0 @wait (flonum->timestamp adjustment) duration)
+                (let ((adjustment (determine-effective-timestamp!)))
+                  (receive-audio (current-audio) id/output buffer (flonum->timestamp adjustment) duration)
                   (record-play-frame self sender frame header? timestamp adjustment)))))))))
   
   
