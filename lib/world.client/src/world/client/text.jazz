@@ -142,25 +142,28 @@
         
         (define (process-command/arguments all)
           (bind (command . arguments) all
+            (define (parse-who)
+              (if (null? arguments)
+                  (values (get-character-name client) '())
+                (bind (who . rest) arguments
+                  (values (if (eq? who 'me) (get-character-name client) who) rest))))
+            
             (case command
               ((caps)
-               (if (null? arguments)
-                   "Not enough arguments for caps"
-                 (bind (who) arguments
-                   (values 'request (list who 'caps)))))
+               (receive (who rest) (parse-who)
+                 (values 'request (list who 'caps))))
+              ((info)
+               (receive (who rest) (parse-who)
+                 (values 'request (list who 'info))))
               ((shared)
-               (if (null? arguments)
-                   "Not enough arguments for shared"
-                 (bind (who) arguments
-                   (values 'request (list who 'shared)))))
+               (receive (who rest) (parse-who)
+                 (values 'request (list who 'shared))))
               ((transfer)
                (values 'request arguments))
               ((settings)
-               (if (null? arguments)
-                   "Not enough arguments for settings"
-                 (bind (who . rest) arguments
-                   (bind-optionals ((action 'send)) rest
-                     (values 'request (list who 'settings action))))))
+               (receive (who rest) (parse-who)
+                 (bind-optionals ((action 'send)) rest
+                   (values 'request (list who 'settings action)))))
               (else
                (values command arguments)))))
         
@@ -260,35 +263,6 @@
                          (for-each (lambda (line)
                                      (insert-line line 'Output))
                                    (remove-trailing "" log test: equal?))))
-                     (insert-newline self)
-                     (display-prompt self))
-                    ((info)
-                     (stylize-range model range (locate-style self 'Input))
-                     (insert-newline self)
-                     (bind (host service clients disconnected processors groups threads live movable nonmovable outgoing) (admin-command client command arguments)
-                       (define (present-meg bytes)
-                         (format "{a}m" (meg bytes)))
-                       
-                       (define (meg bytes)
-                         (fxround (/ bytes 1024. 1024.)))
-                       
-                       (define (present-hierarchy hierarchy)
-                         (map (lambda (info)
-                                (bind (group . members) info
-                                  (cons group (map car members))))
-                              hierarchy))
-                       
-                       (insert-line (format "host         : {a}" host) 'Output)
-                       (insert-line (format "service      : {a}" service) 'Output)
-                       (insert-line (format "clients      : {a}" clients) 'Output)
-                       (insert-line (format "disconnected : {a}" disconnected) 'Output)
-                       (insert-line (format "processors   : {a}" processors) 'Output)
-                       (insert-line (format "groups       : {a}" (present-hierarchy groups)) 'Output)
-                       (insert-line (format "threads      : {a}" threads) 'Output)
-                       (insert-line (format "live         : {a}" live) 'Output)
-                       (insert-line (format "movable      : {a}" movable) 'Output)
-                       (insert-line (format "nonmovable   : {a}" nonmovable) 'Output)
-                       (insert-line (format "outgoing     : {a}" outgoing) 'Output))
                      (insert-newline self)
                      (display-prompt self))
                     ((threads)
@@ -473,7 +447,7 @@
                                  (let ((infos (make-table test: equal?))
                                        (missings (make-table test: equal?)))
                                    (define (receive-directory)
-                                     (cond ((eq? what 'shared)
+                                     (cond ((memq? what '(info shared))
                                             #f)
                                            ((string? what)
                                             (let ((directory {Directory Documents "requested"}))
@@ -524,130 +498,184 @@
                                                (new-file directory what)
                                              (new-file directory (add-extension sender (->string what)))))
                                          
-                                         (if (eq? what 'shared)
-                                             (when done?
-                                               (let ((filenames (u8vector->object (zlib-inflate chunk))))
-                                                 (for-each (lambda (filename)
-                                                             (let ((insert-range (new Range$Cell$ (new Cell insertion-line 0) (new Cell insertion-line 0))))
-                                                               (replace-styled self insert-range (list filename "")
-                                                                 (new Link-Style
-                                                                   base: 'Link
-                                                                   action: (lambda (text pos style)
-                                                                             (let ((start (get-start self)))
-                                                                               (insert-styled self (format "transfer {a} {s}" who filename) 'Entry)
-                                                                               (let ((end (get-end self)))
-                                                                                 (let ((range (new Range$Cell$ start end)))
-                                                                                   (console-evaluate self range)))))))
-                                                               (ensure-displayed self)
-                                                               (increase! insertion-line)))
-                                                           filenames)))
-                                           (let ((info (determine-info))
-                                                 (missings (determine-missings)))
-                                             (if (eq? name 'missing)
-                                                 (enqueue missings chunk)
-                                               (bind (file name-end line-end chunks) info
-                                                 (when (not chunk)
-                                                   (let ((insert-range (new Range$Cell$ (new Cell insertion-line 0) (new Cell insertion-line 0))))
-                                                     (let ((end (get-end (replace-styled self insert-range (list (format "  {a}" (get-name file))) 'Output))))
-                                                       (set-second! info end)
-                                                       (replace-styled self (new Range$Cell$ end end) (list "" "") 'Output)
-                                                       (ensure-displayed self)
-                                                       (increase! insertion-line))))
-                                                 (when chunk
-                                                   (enqueue chunks chunk))
-                                                 (when done?
-                                                   (let ((thread
-                                                           (new-thread
-                                                             (lambda ()
-                                                               (let ((deflated (apply u8vector-append (queue-list chunks))))
-                                                                 (if (string? what)
-                                                                     (save-binary file (zlib-inflate deflated))
-                                                                   (case what
-                                                                     ((caps)
-                                                                      (save-binary file (zlib-inflate deflated)))
-                                                                     ((settings)
-                                                                      (save-binary file (zlib-inflate deflated)))
-                                                                     ((replay)
-                                                                      (save-binary file deflated)))))
-                                                               (when (eq? what 'replay)
-                                                                 (let ((missings (queue-list missings)))
-                                                                   (for-each (lambda (missing)
-                                                                               (let ((channel-no (read-udp-channel missing))
-                                                                                     (sequence (read-udp-sequence missing)))
-                                                                                 (let ((info (table-ref receive-ring/header channel-no #f)))
-                                                                                   (when info
-                                                                                     (bind (channel-name origin kind source-kind ring header) info
-                                                                                       (let ((packet (locate-packet ring sequence)))
-                                                                                         (when (and packet
-                                                                                                    (not (get-data packet)))
-                                                                                           (set-data packet missing))))))))
-                                                                             missings)
-                                                                   (when udp-show-replay?
-                                                                     (let ((len (length missings)))
-                                                                       (when (> len 0)
-                                                                         (format :terminal "Got {a} from {a}{%}" len sender)))))
-                                                                 (let ()
-                                                                   (define (media-channel name source-kind)
-                                                                     (if (eq? source-kind 'live)
-                                                                         ""
-                                                                       (format ".{a}" name)))
-                                                                   
-                                                                   (define (media-extension kind)
-                                                                     (if (= kind udp-audio)
-                                                                         "replayaudio"
-                                                                       "replayvideo"))
-                                                                   
-                                                                   (iterate-table send-ring/header
-                                                                     (lambda (no info)
-                                                                       (bind (channel-name origin kind source-kind ring header) info
-                                                                         (unless (= (get-count ring) 0)
-                                                                           (let ((file (new-file directory (format "{a}{a}.{a}" (get-character-name client) (media-channel channel-name source-kind) (media-extension kind))))
-                                                                                 (content (object->u8vector (list ring header) serialize)))
-                                                                             (save-binary file content))))))
-                                                                   (iterate-table receive-ring/header
-                                                                     (lambda (no info)
-                                                                       (bind (channel-name origin kind source-kind ring header) info
-                                                                         (let ((member (find-group-member-by-no client origin)))
-                                                                           (let ((name (if member
-                                                                                           (first member)
-                                                                                         ;; quick hack
-                                                                                         (if (= origin server-no)
-                                                                                             "<server>"
-                                                                                           "<unknown>"))))
-                                                                             (unless (= (get-count ring) 0)
-                                                                               (let ((file (new-file directory (format "{a}{a}.{a}" name (media-channel channel-name source-kind) (media-extension kind))))
-                                                                                     (content (object->u8vector (list ring header) serialize)))
-                                                                                 (save-binary file content))))))))))
-                                                               (stylize-range self (new Range$Cell$ (new Cell (get-line name-end) 0) name-end)
-                                                                 (new Link-Style
-                                                                   base: 'Link
-                                                                   action: (lambda (text pos style)
-                                                                             (if (string? what)
-                                                                                 (bell)
-                                                                               (case what
-                                                                                 ((caps)
-                                                                                  (let ((lines (load-lines file)))
-                                                                                    (insert-line (format "show {a}" (get-name file)) 'Input)
-                                                                                    (for-each (lambda (line)
-                                                                                                (insert-line line 'Output))
-                                                                                              lines)
-                                                                                    (display-prompt self)))
-                                                                                 ((settings)
-                                                                                  (let ((lines (load-lines file)))
-                                                                                    (insert-line (format "show {a}" (get-name file)) 'Input)
-                                                                                    (for-each (lambda (line)
-                                                                                                (insert-line line 'Output))
-                                                                                              lines)
-                                                                                    (display-prompt self)))
-                                                                                 ((replay)
-                                                                                  (bell)))))))
-                                                               (let ((range (new Range$Cell$ name-end name-end)))
-                                                                 (let ((end (get-end (replace-styled self range (list " done") 'Output))))
-                                                                   (ensure-displayed self)
-                                                                   (set-third! info (new Range$Cell$ end end)))))
-                                                             'save)))
-                                                     (thread-base-priority-set! thread background-priority)
-                                                     (thread-start! thread))))))))))))))))))
+                                         (case what
+                                           ((info)
+                                            (when done?
+                                              (let ((info (u8vector->object (zlib-inflate chunk))))
+                                                (define (insert line)
+                                                  (let ((insert-range (new Range$Cell$ (new Cell insertion-line 0) (new Cell insertion-line 0))))
+                                                    (replace-styled self insert-range (list line "") 'Output)
+                                                    (ensure-displayed self)
+                                                    (increase! insertion-line)))
+                                                
+                                                (define (present-garbage-collect garbage-collect)
+                                                  (format "{a}ms" (seconds->milliseconds garbage-collect)))
+                                                
+                                                (define (present-cpu% cpu%)
+                                                  (format "{r precision: 1}%" cpu%))
+                                                
+                                                (define (present-meg bytes)
+                                                  (format "{a}m" (meg bytes)))
+                                                
+                                                (define (meg bytes)
+                                                  (fxround (/ bytes 1024. 1024.)))
+                                                
+                                                (if (eq? who 'server)
+                                                    (bind (host service clients disconnected processors groups garbage-collect cpu% threads live movable nonmovable outgoing) info
+                                                      (define (present-hierarchy hierarchy)
+                                                        (map (lambda (info)
+                                                               (bind (group . members) info
+                                                                 (cons group (map car members))))
+                                                             hierarchy))
+                                                      
+                                                      (insert (format "host         : {a}" host))
+                                                      (insert (format "service      : {a}" service))
+                                                      (insert (format "clients      : {a}" clients))
+                                                      (insert (format "disconnected : {a}" disconnected))
+                                                      (insert (format "processors   : {a}" processors))
+                                                      (insert (format "groups       : {a}" (present-hierarchy groups)))
+                                                      (insert (format "gc           : {a}" (present-garbage-collect garbage-collect)))
+                                                      (insert (format "cpu%         : {a}" (present-cpu% cpu%)))
+                                                      (insert (format "threads      : {a}" threads))
+                                                      (insert (format "live         : {a}" (present-meg live)))
+                                                      (insert (format "movable      : {a}" (present-meg movable)))
+                                                      (insert (format "nonmovable   : {a}" (present-meg nonmovable)))
+                                                      (insert (format "outgoing     : {a}" outgoing)))
+                                                  (bind (version release base-profile garbage-collect cpu% threads live movable nonmovable) info
+                                                    (insert (format "version      : {a}" version))
+                                                    (insert (format "release      : {a}" release))
+                                                    (insert (format "profile      : {a}" base-profile))
+                                                    (insert (format "gc           : {a}" (present-garbage-collect garbage-collect)))
+                                                    (insert (format "cpu%         : {a}" (present-cpu% cpu%)))
+                                                    (insert (format "threads      : {a}" threads))
+                                                    (insert (format "live         : {a}" (present-meg live)))
+                                                    (insert (format "movable      : {a}" (present-meg movable)))
+                                                    (insert (format "nonmovable   : {a}" (present-meg nonmovable))))))))
+                                           ((shared)
+                                            (when done?
+                                              (let ((filenames (u8vector->object (zlib-inflate chunk))))
+                                                (for-each (lambda (filename)
+                                                            (let ((insert-range (new Range$Cell$ (new Cell insertion-line 0) (new Cell insertion-line 0))))
+                                                              (replace-styled self insert-range (list filename "")
+                                                                (new Link-Style
+                                                                  base: 'Link
+                                                                  action: (lambda (text pos style)
+                                                                            (let ((start (get-start self)))
+                                                                              (insert-styled self (format "transfer {a} {s}" who filename) 'Entry)
+                                                                              (let ((end (get-end self)))
+                                                                                (let ((range (new Range$Cell$ start end)))
+                                                                                  (console-evaluate self range)))))))
+                                                              (ensure-displayed self)
+                                                              (increase! insertion-line)))
+                                                          filenames))))
+                                           (else
+                                            (let ((info (determine-info))
+                                                  (missings (determine-missings)))
+                                              (if (eq? name 'missing)
+                                                  (enqueue missings chunk)
+                                                (bind (file name-end line-end chunks) info
+                                                  (when (not chunk)
+                                                    (let ((insert-range (new Range$Cell$ (new Cell insertion-line 0) (new Cell insertion-line 0))))
+                                                      (let ((end (get-end (replace-styled self insert-range (list (format "  {a}" (get-name file))) 'Output))))
+                                                        (set-second! info end)
+                                                        (replace-styled self (new Range$Cell$ end end) (list "" "") 'Output)
+                                                        (ensure-displayed self)
+                                                        (increase! insertion-line))))
+                                                  (when chunk
+                                                    (enqueue chunks chunk))
+                                                  (when done?
+                                                    (let ((thread
+                                                            (new-thread
+                                                              (lambda ()
+                                                                (let ((deflated (apply u8vector-append (queue-list chunks))))
+                                                                  (if (string? what)
+                                                                      (save-binary file (zlib-inflate deflated))
+                                                                    (case what
+                                                                      ((caps)
+                                                                       (save-binary file (zlib-inflate deflated)))
+                                                                      ((settings)
+                                                                       (save-binary file (zlib-inflate deflated)))
+                                                                      ((replay)
+                                                                       (save-binary file deflated)))))
+                                                                (when (eq? what 'replay)
+                                                                  (let ((missings (queue-list missings)))
+                                                                    (for-each (lambda (missing)
+                                                                                (let ((channel-no (read-udp-channel missing))
+                                                                                      (sequence (read-udp-sequence missing)))
+                                                                                  (let ((info (table-ref receive-ring/header channel-no #f)))
+                                                                                    (when info
+                                                                                      (bind (channel-name origin kind source-kind ring header) info
+                                                                                        (let ((packet (locate-packet ring sequence)))
+                                                                                          (when (and packet
+                                                                                                     (not (get-data packet)))
+                                                                                            (set-data packet missing))))))))
+                                                                              missings)
+                                                                    (when udp-show-replay?
+                                                                      (let ((len (length missings)))
+                                                                        (when (> len 0)
+                                                                          (format :terminal "Got {a} from {a}{%}" len sender)))))
+                                                                  (let ()
+                                                                    (define (media-channel name source-kind)
+                                                                      (if (eq? source-kind 'live)
+                                                                          ""
+                                                                        (format ".{a}" name)))
+                                                                    
+                                                                    (define (media-extension kind)
+                                                                      (if (= kind udp-audio)
+                                                                          "replayaudio"
+                                                                        "replayvideo"))
+                                                                    
+                                                                    (iterate-table send-ring/header
+                                                                      (lambda (no info)
+                                                                        (bind (channel-name origin kind source-kind ring header) info
+                                                                          (unless (= (get-count ring) 0)
+                                                                            (let ((file (new-file directory (format "{a}{a}.{a}" (get-character-name client) (media-channel channel-name source-kind) (media-extension kind))))
+                                                                                  (content (object->u8vector (list ring header) serialize)))
+                                                                              (save-binary file content))))))
+                                                                    (iterate-table receive-ring/header
+                                                                      (lambda (no info)
+                                                                        (bind (channel-name origin kind source-kind ring header) info
+                                                                          (let ((member (find-group-member-by-no client origin)))
+                                                                            (let ((name (if member
+                                                                                            (first member)
+                                                                                          ;; quick hack
+                                                                                          (if (= origin server-no)
+                                                                                              "<server>"
+                                                                                            "<unknown>"))))
+                                                                              (unless (= (get-count ring) 0)
+                                                                                (let ((file (new-file directory (format "{a}{a}.{a}" name (media-channel channel-name source-kind) (media-extension kind))))
+                                                                                      (content (object->u8vector (list ring header) serialize)))
+                                                                                  (save-binary file content))))))))))
+                                                                (stylize-range self (new Range$Cell$ (new Cell (get-line name-end) 0) name-end)
+                                                                  (new Link-Style
+                                                                    base: 'Link
+                                                                    action: (lambda (text pos style)
+                                                                              (if (string? what)
+                                                                                  (bell)
+                                                                                (case what
+                                                                                  ((caps)
+                                                                                   (let ((lines (load-lines file)))
+                                                                                     (insert-line (format "show {a}" (get-name file)) 'Input)
+                                                                                     (for-each (lambda (line)
+                                                                                                 (insert-line line 'Output))
+                                                                                               lines)
+                                                                                     (display-prompt self)))
+                                                                                  ((settings)
+                                                                                   (let ((lines (load-lines file)))
+                                                                                     (insert-line (format "show {a}" (get-name file)) 'Input)
+                                                                                     (for-each (lambda (line)
+                                                                                                 (insert-line line 'Output))
+                                                                                               lines)
+                                                                                     (display-prompt self)))
+                                                                                  ((replay)
+                                                                                   (bell)))))))
+                                                                (let ((range (new Range$Cell$ name-end name-end)))
+                                                                  (let ((end (get-end (replace-styled self range (list " done") 'Output))))
+                                                                    (ensure-displayed self)
+                                                                    (set-third! info (new Range$Cell$ end end)))))
+                                                              'save)))
+                                                      (thread-base-priority-set! thread background-priority)
+                                                      (thread-start! thread)))))))))))))))))))
                     ;((run)
                     ; (stylize-range model range (locate-style self 'Input))
                     ; (insert-newline self)
