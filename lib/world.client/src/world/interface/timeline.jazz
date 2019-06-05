@@ -126,6 +126,8 @@
         (history (current-history)))
     (when interface
       (let ((panel (child interface 'timeline)))
+        (when (not (get-sites panel))
+          (setup-sites panel (sites-metadata)))
         @together
         (when (not (get-history panel))
           (set-history panel (current-history)))
@@ -149,46 +151,43 @@
 (class Site-Look extends Object
   
   
+  (slot name           getter generate)
   (slot rank  <fx+>    getter generate)
   (slot color <Color+> getter generate)
   
   
-  (method override (initialize self rank color)
+  (method override (initialize self name rank color)
     (nextmethod self)
+    (set! self.name name)
     (set! self.rank rank)
-    (set! self.color color)))
+    (set! self.color color))
+  
+  
+  (method override (print self output readably)
+    (print-unreadable self output
+      (lambda (output)
+        (format output "{a}" name)))))
 
 
 (definition protected site-looks <table>
   (make-table test: eq?))
 
-(definition protected default-site-look <Site-Look+>
+(definition protected default-site-rank <fx+>
   #f)
 
+(definition protected default-site-color <Color+>
+  #f)
+
+(definition public (default-site-look rank color)
+  (set! default-site-rank rank)
+  (set! default-site-color color))
+
 (definition public (register-site-look name rank color) <void>
-  (let ((look (new Site-Look rank color)))
-    (if name
-        (table-set! site-looks name look)
-      (set! default-site-look look))))
+  (let ((look (new Site-Look name rank color)))
+    (table-set! site-looks name look)))
 
 (definition public (registered-site-look name) <Site-Look+>
   (table-ref site-looks name #f))
-
-
-(proclaim (not check types))
-
-
-(definition protected id-site-looks <vector>
-  (make-vector 256 #t))
-
-(definition protected (id->site-look id <fx>) <Site-Look+>
-  (let ((value (vector-ref id-site-looks id)))
-    (if (eq? value #t)
-        (let ((site (id->site id)))
-          (let ((look (registered-site-look (get-name site))))
-            (vector-set! id-site-looks id look)
-            look))
-      value)))
 
 
 (proclaim (default check types))
@@ -279,6 +278,9 @@
   (slot to               <fl+>        initialize #f  accessors generate)
   (slot span             <fl>         initialize 5.  accessors generate)
   (slot now              <fl+>        initialize #f  accessors generate)
+  (slot sites                         initialize #f  getter generate)
+  (slot sites-count                   initialize #f  getter generate)
+  (slot id-site-looks    <vector>     initialize #f  getter generate)
   (slot base-time        <fl>         initialize 0.  accessors generate)
   (slot history          <History>    initialize #f  accessors generate)
   (slot chronology       <Chronology> initialize #f  accessors generate)
@@ -437,8 +439,33 @@
     (set! end #f))
   
   
+  (proclaim (not check types))
+  
+  
+  (method protected (setup-sites self alist)
+    (set! sites (list->table alist))
+    (set! sites-count (table-length sites))
+    (set! id-site-looks (make-vector 256 #f)))
+  
+  
+  (method (id->site-look self id <fx>) <Site-Look>
+    (or (vector-ref id-site-looks id)
+        (let ((name (table-ref sites id #f) @w (table-ref sites id)))
+          (when (not name)
+            (terminal 'site id 'not-found)
+            (error "YO"))
+          (let ((look (or (and name (registered-site-look name))
+                          (new Site-Look name default-site-rank default-site-color))))
+            (vector-set! id-site-looks id look)
+            look))))
+  
+  
+  (proclaim (default check types))
+
+  
   (method (live-information self)
     (unless live?
+      (setup-sites self (sites-metadata))
       @together
       (set! history (current-history))
       (set! chronology (current-chronology))
@@ -450,11 +477,12 @@
   
   (method (copy-information self)
     (when live?
+      (setup-sites self (sites-metadata))
       @together
       (set! history (copy-history (current-history)))
       (set! chronology (copy-chronology (current-chronology)))
       (set! evolution (copy-evolution (current-evolution)))
-      (set! cpu% (chronology-cpu% chronology))
+      (set! cpu% (chronology-cpu% chronology sites-count))
       (set! live? #f)))
   
   
@@ -473,7 +501,7 @@
       (set-replay? self #t)
       (set-live? self #f)
       (set! lowest-latency #f)
-      (set! cpu% (chronology-cpu% chronology))
+      (set! cpu% (chronology-cpu% chronology sites-count))
       (receive (var rtt) (estimate-variance evolution)
         (set! variance var)
         (set! variance-rtt rtt))
@@ -796,7 +824,7 @@
   (method (draw-timeline self surface <Surface>)
     (when (and @together history chronology evolution)
       (when live?
-        (set! cpu% (chronology-cpu% chronology)))
+        (set! cpu% (chronology-cpu% chronology sites-count)))
       (with-bounds self
         (lambda (from to)
           (let ((timer (new Timer))
@@ -1240,7 +1268,7 @@
           (span (min (- to from) span))
           (first (first-position chronology))
           (last (last-position chronology))
-          (starts (make-vector (site-id-count) #f)))
+          (starts (make-vector sites-count #f)))
       (define (find-head/starts!) <fx>
         (continuation-capture
           (lambda (return)
@@ -1298,7 +1326,7 @@
       
       (let ((head (find-head/starts!)))
         (let ((tail (find-tail head)))
-          (define (plot-call rank <fx> color <Color> id <fx> start <fl> end <fl>)
+          (define (plot-call name rank <fx> color <Color> start <fl> end <fl>)
             (let ((bar-height (* (cast <fl> rank) 7.)))
               (let ((f (* (/ (- start from) span) width))
                     (t (* (/ (- end from) span) width))
@@ -1316,8 +1344,7 @@
                       (fill-rect surface rect color)
                       (when (and now (between? now start end))
                         (set! boxes (cons rect boxes))
-                        (let ((name (get-name (id->site id)))
-                              (duration (- end start)))
+                        (let ((duration (- end start)))
                           (let ((text (format "{a} ({a})" name (present-seconds duration))))
                             (set! labels (cons (list 'right (- top 16) text) labels)))))))))))
           
@@ -1326,27 +1353,25 @@
                       (let ((id (flonum->fixnum (chronological-id chronology n)))
                             (marker (chronological-marker chronology n))
                             (time (chronological-time chronology n)))
-                        (let ((look (or (id->site-look id) default-site-look)))
-                          (when look
-                            (let ((rank (get-rank look)))
-                              (when (and rank (= rank layer))
-                                (if (even? (flonum->fixnum marker))
-                                    (vector-set! starts id time)
-                                  (let ((start (or (vector-ref starts id) from)))
-                                    (let ((end time))
-                                      (proclaim (not check types))
-                                      (plot-call rank (get-color look) id start end)))
-                                  (vector-set! starts id #f))))))))
-                (loop (for id from 0 below (site-id-count))
-                      (let ((look (or (id->site-look id) default-site-look)))
-                        (when look
+                        (let ((look (id->site-look self id)))
                           (let ((rank (get-rank look)))
                             (when (and rank (= rank layer))
-                              (let ((start (vector-ref starts id)))
-                                (when start
-                                  (let ()
+                              (if (even? (flonum->fixnum marker))
+                                  (vector-set! starts id time)
+                                (let ((start (or (vector-ref starts id) from)))
+                                  (let ((end time))
                                     (proclaim (not check types))
-                                    (plot-call rank (get-color look) id start to))))))))))))))
+                                    (plot-call (get-name look) rank (get-color look) start end)))
+                                (vector-set! starts id #f)))))))
+                (loop (for id from 0 below sites-count)
+                      (let ((look (id->site-look self id)))
+                        (let ((rank (get-rank look)))
+                          (when (and rank (= rank layer))
+                            (let ((start (vector-ref starts id)))
+                              (when start
+                                (let ()
+                                  (proclaim (not check types))
+                                  (plot-call (get-name look) rank (get-color look) start to)))))))))))))
   
   
   ;;;
