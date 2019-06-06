@@ -2043,7 +2043,8 @@
   
   (method package (render-task self task <Task>)
     (declare (proper-tail-calls))
-    (let ((window (current-window))
+    (let ((interface (current-interface))
+          (window (current-window))
           (zone (current-zone)))
       (with-task task
         (lambda (exit)
@@ -2054,17 +2055,32 @@
               (with-task-mutex
                 (lambda ()
                   (unless (stopping? task)
-                    (site (render on?: #t)
-                      (when window-active?
-                        (update-stable camera camera-stable-delay)
-                        (when render-trim?
-                          (let ((trimmed (trim-content 0)))
-                            (when (> trimmed 0)
-                              (decrease-sectors-generating zone trimmed)))
-                          (set! render-trim? #f))
-                        (render-frame self)
-                        (site (render-sync on?: #t parent: render)
-                          (render-sync window)))))))
+                    (let ((view? (view-interface? self)))
+                      ;; done outside of render site to
+                      ;; not impact profiler measurements
+                      (when (and view? (refresh-interface? self))
+                        (refresh-interface self)
+                        (set! interface-last-time time)
+                        (set! interface-refresh? #f))
+                      (site (render on?: #t)
+                        (when window-active?
+                          (update-stable camera camera-stable-delay)
+                          (when render-trim?
+                            (let ((trimmed (trim-content 0)))
+                              (when (> trimmed 0)
+                                (decrease-sectors-generating zone trimmed)))
+                            (set! render-trim? #f))
+                          (render-frame self)
+                          (unless (and view? (not interface-shown?))
+                            (site (render-sync on?: #t parent: render)
+                              (render-sync window)))))
+                      ;; done outside of render site to
+                      ;; not impact profiler measurements
+                      (when (and view? (not interface-shown?))
+                        (render-sheet interface)
+                        (when timeline-visible?
+                          (draw-timeline))
+                        (render-sync window))))))
               (unboost-render self)
               (let ((period (if application-active? render-period (if (server?) render-period-inactive-server render-period-inactive)))
                     (duration (- (current-monotonic) time)))
@@ -2072,29 +2088,11 @@
             (iter))))))
   
   
-  (method package virtual (render-frame self)
-    (let ((interface (current-interface))
-          (zone (current-zone))
+  (method package (render-frame self)
+    (let ((zone (current-zone))
           (video (current-video)))
-      (define (update-interface)
-        (when interface?
-          (let ((now (current-monotonic)))
-            (define (visible? name)
-              (let ((view (child interface name)))
-                (get-visible? view)))
-            
-            (when (> (- now interface-last-time) interface-refresh-rate)
-              (when (or (visible? 'info)
-                        (visible? 'target)
-                        (visible? 'profiler)
-                        (visible? 'timeline)
-                        refresh-interface?)
-                (unless interface-refresh?
-                  (refresh-interface self)))))))
-      
       (with-render-mutex
         (lambda ()
-          (update-interface)
           (when post-processing?
             (preprocess-render self))
           (glClear GL_COLOR_BUFFER_BIT)
@@ -2262,6 +2260,37 @@
   ;;;
   
   
+  (method (view-interface? self)
+    (let ((interface (current-interface)))
+      (define (visible? name)
+        (let ((view (child interface name)))
+          (get-visible? view)))
+      
+      (and interface?
+           (or (visible? 'info)
+               (visible? 'target)
+               (visible? 'profiler)
+               (visible? 'timeline)
+               always-refresh-interface?))))
+  
+  
+  (method (refresh-interface? self)
+    (let ((interface (current-interface)))
+      (and interface?
+           (let ((now (current-monotonic)))
+             (define (visible? name)
+               (let ((view (child interface name)))
+                 (get-visible? view)))
+             
+             (and (> (- now interface-last-time) interface-refresh-rate)
+                  (or (visible? 'info)
+                      (visible? 'target)
+                      (visible? 'profiler)
+                      (visible? 'timeline)
+                      always-refresh-interface?)
+                  (not interface-refresh?))))))
+  
+  
   (method package (refresh-interface self (condition: condition #f))
     (let ((interface (current-interface)))
       (when (or (not condition)
@@ -2287,27 +2316,29 @@
     (let ((interface (current-interface)))
       (when interface?
         (site (render-interface on?: #t parent: render)
-          (when interface-refresh?
-            (invalidate-view interface)
-            ;; update block at eye information
-            (target-update (current-zone) #f #f #f #t)
-            (set! interface-last-time (current-monotonic))
-            (set! interface-refresh? #f))
-          ;; removing slots background and drawing them first is
-          ;; a quick hack around slots being drawn over everything
-          (site (draw-slots on?: #f parent: render-interface)
-            (draw-slots))
-          (render-sheet interface)
-          (when compass-visible?
-            (draw-compass))
-          (when map-visible?
-            (draw-map))
-          (when timeline-visible?
-            (draw-timeline))
-          (when message
-            (draw-message self))
-          (when status
-            (draw-status self))))))
+          (when interface-shown?
+            (when interface-refresh?
+              (when always-refresh-interface?
+                (invalidate-view interface))
+              ;; update block at eye information
+              (target-update (current-zone) #f #f #f #t)
+              (set! interface-last-time (current-monotonic))
+              (set! interface-refresh? #f))
+            ;; removing slots background and drawing them first is
+            ;; a quick hack around slots being drawn over everything
+            (site (draw-slots on?: #f parent: render-interface)
+              (draw-slots))
+            (render-sheet interface)
+            (when compass-visible?
+              (draw-compass))
+            (when map-visible?
+              (draw-map))
+            (when timeline-visible?
+              (draw-timeline))
+            (when message
+              (draw-message self))
+            (when status
+              (draw-status self)))))))
   
   
   (method (explore-interface self)
