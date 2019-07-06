@@ -120,7 +120,7 @@
       (set-connection-problem-handler
         (lambda (process connection remote-uuid)
           (catch (connection-exception? exc
-                   (delay-bailout-client self exc))
+                   (bailout-client self exc))
             (process connection remote-uuid)))))
     (set! configuration (if local?
                             (get-client-configuration)
@@ -379,10 +379,7 @@
   
   
   (method package (detach-client self)
-    ;; together's login is not connected to the server
-    ;; so going to the welcome screen takes care of it
-    (unless together?
-      (detach-from-server self))
+    (detach-from-server self)
     (if (window?)
         (let ((world (current-world)))
           (open-welcome world exception-title: "Disconnected from server"))
@@ -390,29 +387,20 @@
   
   
   (method (bailout-client self exc)
-    (if (window?)
-        ;; this test is a simple solution
-        ;; to having multiple threads bailout
-        (let ((zone (current-zone+)))
-          (unless (and zone (welcome? zone))
-            ;; together's login is not connected to the server
-            ;; so going to the welcome screen takes care of it
-            (unless together?
-              (detach-from-server self))
-            (let ((world (current-world)))
-              (open-welcome world exception-title: "Disconnected from server" exception: exc))))
-      ;; too much for bots
-      (unless bot?
-        (snapshot-process exception: exc))
-      (quit)))
-  
-  
-  (method (delay-bailout-client self exc)
-    (delay-event
+    (with-reentrant-task-mutex
       (lambda ()
-        (with-reentrant-task-mutex
-          (lambda ()
-            (bailout-client self exc))))))
+        (if (window?)
+            ;; this test is a simple solution
+            ;; to having multiple threads bailout
+            (let ((zone (current-zone+)))
+              (unless (and zone (welcome? zone))
+                (detach-from-server self)
+                (let ((world (current-world)))
+                  (open-welcome world exception-title: "Disconnected from server" exception: exc))))
+          ;; too much for bots
+          (unless bot?
+            (snapshot-process exception: exc))
+          (quit)))))
   
   
   (method package (send-client-alive self)
@@ -558,8 +546,7 @@
   
   
   (method package (unregister-stream self stream-no)
-    ;; COMMUNICATION quicky around server closing the connection on shutdown
-    (when (remote-proxy-connected? remote-server)
+    (when remote-server
       (calling-server self
         (lambda ()
           (client-unregister-stream remote-server remote-client stream-no)))))
@@ -693,14 +680,12 @@
               (if restart
                   (continuation-graft restart
                     (lambda ()
-                      (with-reentrant-task-mutex
-                        (lambda ()
-                          (bailout-client self exc)))))
+                      (bailout-client self exc)))
                 (snapshot-process exception: (new Error message: "No exit"))
                 (quit)))
           (continuation-graft exit
             (lambda ()
-              (delay-bailout-client self exc)))))
+              (bailout-client self exc)))))
       
       (define (call)
         (let ((result (thunk)))
