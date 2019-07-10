@@ -861,8 +861,6 @@
   (slot process-task      getter generate)
   (slot process-average   getter generate)
   (slot last-nacked-frame accessors generate)
-  (slot last-playtime     accessors generate)
-  (slot last-timestamp    accessors generate)
   (slot replay-ring       getter generate)
   (slot replay-header     getter generate)
   (slot processed         getter generate)
@@ -875,8 +873,6 @@
   (method override (initialize self stream no origin media-kind source-kind level resolution framerate bitrate codec caps)
     (nextmethod self stream no origin media-kind source-kind level resolution framerate bitrate codec caps)
     (set! self.last-nacked-frame #f)
-    (set! self.last-playtime #f)
-    (set! self.last-timestamp #f)
     (set! self.replay-ring (and (developer?) (remember-ring media-kind source-kind level framerate)))
     (set! self.replay-header #f)
     (set! self.process-ring (new UDP-Ring self no origin media-kind udp-process-size max-size: udp-process-max-size overflow-proc: (udp-ring-overflow 'process udp-ring-kind-process)))
@@ -971,7 +967,7 @@
               (looping)))))))
   
   
-  (method (record-play-frame self sender frame header? timestamp adjustment)
+  (method (record-play-frame self sender frame header? timestamp)
     (record-event udp-id-play-frame
                   (fixnum->flonum no)
                   (fixnum->flonum sender)
@@ -981,8 +977,7 @@
                   (barbara-header-hack header?)
                   (if (= timestamp -1)
                       -1.
-                    (timestamp->flonum timestamp))
-                  adjustment))
+                    (timestamp->flonum timestamp))))
   
   
   (method (record-freeze-frame self sender frame header? timestamp)
@@ -1005,11 +1000,6 @@
         (apply u8vector-append chunks))))
   
 
-  ;;
-  ;; Two sanity checks are still needed:
-  ;; 1) ensure that adjustment does not send timestamps to gstreamer outside the range of its buffer
-  ;; 2) ensure that adjustment does not send timestamps to gstreamer that puts packets out of order
-  ;;
   (method protected (present-audio self presentation-time datas)
     (let ((first (car datas)))
       (let ((kind (read-udp-kind first))
@@ -1021,24 +1011,6 @@
             (duration (read-udp-media-duration first))
             (header? (read-udp-media-header? first))
             (off? (read-udp-media-off? first)))
-        (define (determine-effective-timestamp!)
-          (let ((now (current-seconds))
-                (timestamp (timestamp->flonum timestamp)))
-            (let ((perfect-playtime (if (not last-playtime)
-                                        now
-                                      (+ last-playtime (- timestamp (or last-timestamp timestamp))))))
-              (let ((perfect (- perfect-playtime now)))
-                (let ((adjustment (if (< (abs (- perfect-playtime presentation-time)) 0.2)
-                                      perfect
-                                    0.)))
-                  (set! last-timestamp timestamp)
-                  (set! last-playtime (+ now adjustment))
-                  @w (when (> adjustment .2)
-                    (terminal 'adjustment 'makes 'frame 'too 'late adjustment))
-                  @w (when (< adjustment -.2)
-                    (terminal 'adjustment 'makes 'frame 'too 'early adjustment))
-                  adjustment)))))
-        
         (increase! processed total)
         (let ((id/output (or (simulation-audio) channel-no)))
           (let ((buffer (assemble-chunks self datas first total)))
@@ -1052,14 +1024,13 @@
                                 (bind (buffer timestamp duration) header
                                   ;; be very careful as timestamp is incorrect as it
                                   ;; is the timestamp at time the header was captured
-                                  ;; this only works because gst_app_src_write
+                                  ;; this only works because gst_app_src_write_now
                                   ;; doesn't actually use the timestamp
-                                  (receive-audio (current-audio) id/output buffer 0 duration)))
+                                  (receive-audio (current-audio) id/output buffer timestamp duration)))
                               headers)
-                    (record-play-frame self sender frame header? timestamp 0.))
-                (let ((adjustment (determine-effective-timestamp!)))
-                  (receive-audio (current-audio) id/output buffer (flonum->timestamp adjustment) duration)
-                  (record-play-frame self sender frame header? timestamp adjustment)))))))))
+                    (record-play-frame self sender frame header? timestamp))
+                (receive-audio (current-audio) id/output buffer timestamp duration)
+                (record-play-frame self sender frame header? timestamp))))))))
   
   
   (method protected (present-video self datas)
@@ -1083,4 +1054,4 @@
                 (update process-rate framerate))
               (if (eq? (get-state process-ring) 'late)
                   (record-freeze-frame self sender frame header? timestamp)
-                (record-play-frame self sender frame header? timestamp 0.))))))))))
+                (record-play-frame self sender frame header? timestamp))))))))))
