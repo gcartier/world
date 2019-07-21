@@ -29,6 +29,7 @@
         (world.math)
         (world.ring)
         (world.settings)
+        (world.simulate)
         (world.task)
         (world.time))
 
@@ -239,14 +240,9 @@
 (definition protected udp-wait-overlay
   (world-setting 'world.udp-wait-overlay #f))
 
+
 (definition protected udp-latency
   (world-setting 'world.udp-latency #f))
-
-(definition protected udp-latency-count
-  (world-setting 'world.udp-latency-count 50))
-
-(definition protected udp-lag
-  (world-setting 'world.udp-lag #f))
 
 (definition protected udp-drop
   (world-setting 'world.udp-drop #f))
@@ -256,9 +252,6 @@
 
 (definition protected udp-congestion-duration
   (world-setting 'world.udp-congestion-duration 5.))
-
-(definition protected udp-simulation
-  (world-setting 'world.udp-simulation #f))
 
 
 (definition protected udp-media-off
@@ -2293,39 +2286,28 @@
   
   
   (property latency             getter generate)
-  (property lag                 getter generate)
   (property drop                getter generate)
   (property congestion          accessors generate)
   (property congestion-duration accessors generate)
   
-  (slot simulation           getter generate)
-  (slot time-base            getter generate)
-  (slot packet-count         getter generate)
+  (slot latency-proc         getter generate)
   (slot congestion-occuring? getter generate)
   (slot congestion-ends      accessors generate)
-  (slot latency-last         getter generate)
-  (slot latency-count        getter generate)
   (slot writer               getter generate)
   (slot ring                 getter generate)
   (slot thread               getter generate)
   
   
-  (method override (initialize self latency lag drop writer)
+  (method override (initialize self latency drop writer)
     (nextmethod self)
-    (set! self.latency latency)
-    (set! self.lag lag)
-    (set! self.drop drop)
+    (setup-latency self latency)
+    (setup-drop self drop)
     (set! self.congestion udp-congestion)
     (set! self.congestion-duration udp-congestion-duration)
     (set! self.congestion-occuring? #f)
     (set! self.congestion-ends #f)
-    (set! self.simulation (and (client?) udp-simulation))
-    (set! self.time-base (and simulation (new Time-Base)))
-    (set! self.packet-count 0)
-    (set! self.latency-last #f)
-    (set! self.latency-count #f)
     (set! self.writer writer)
-    (set! self.ring (new Time-Ring udp-simulator-size max-size: udp-simulator-max-size overflow-proc: (udp-ring-overflow 'simulator udp-ring-kind-simulator)))
+    (set! self.ring (new Time-Ring udp-simulator-size max-size: udp-simulator-max-size))
     (set! self.thread (new-thread
                         (lambda ()
                           (send-loop self))
@@ -2334,78 +2316,100 @@
     (thread-start! thread))
   
   
-  (method protected (send self info)
-    ;; congestion
-    (if congestion
-        (if (not congestion-occuring?)
-            (if (or (eq? congestion #t)
-                    (< (random-real) (/ congestion 100.)))
-                (let ((ends (if (eq? congestion-duration #t) +inf.0 (random-between 0. congestion-duration))))
-                  (set! congestion-occuring? #t)
-                  (set! congestion-ends ends)
-                  (when udp-show-congestion?
-                    (format :terminal "{s} {s} {s}{%}" remote-name 'CONGESTION 'ON)))
-              (send-writer self info (drop? self)))
-          (when (or (not congestion-ends)
-                    (>= (current-seconds) congestion-ends))
-            (set! congestion-occuring? #f)
-            (set! congestion-ends #f)
-            (when udp-show-congestion?
-              (format :terminal "{s} {s} {s}{%}" remote-name 'CONGESTION 'OFF))
-            (send-writer self info (drop? self))))
-      (cond (simulation
-             (let ((kind (read-udp-kind info)))
-               (if (or (= kind udp-audio)
-                       (= kind udp-video))
-                   (let ((latency (prog1 (car simulation)
-                                    (unless (null? (cdr simulation))
-                                      (set! simulation (cdr simulation))))))
-                     ;; quick hack until I understand why putting it in the time ring
-                     ;; with a latency of 0 seems to add some artifical latency somehow
-                     (if (not latency)
-                         (send-writer self info (drop? self))
-                       (let ((time (current-seconds))
-                             (nanostamp (timestamp->flonum (read-udp-media-timestamp info))))
-                         (update-start time-base time nanostamp)
-                         (let ((sendtime (+ (remote->local time-base nanostamp)
-                                            (* (read-udp-part info) .0001)
-                                            latency)))
-                           (insert ring sendtime info)))))
-                 (send-writer self info (drop? self)))))
-            (latency
-             (let ()
-               (define (determine-latency)
-                 (cond ((procedure? latency)
-                        (latency info))
-                       ((or (not latency-last)
-                            (= latency-count 0))
-                        (let ((latency latency @w (random-between 0. latency)))
-                          (set! latency-last latency)
-                          (set! latency-count (random udp-latency-count))
-                          latency))
-                       (else
-                        (decrease! latency-count)
-                        latency-last)))
-               
-               (insert ring (+ (current-seconds) (determine-latency)) info)))
-            (else
-             (send-writer self info (drop? self))))))
+  (method protected (setup-latency self lat)
+    (define (parse-latency lat)
+      (if (and (pair? lat) (eq? (car lat) 'add))
+          (add-latency (map determine-latency (cdr lat)))
+        (determine-latency lat)))
+    
+    (define (determine-latency lat)
+      (define (try name proc)
+        (cond ((eq? lat name)
+               (proc))
+              ((and (pair? lat) (eq? (car lat) name))
+               (apply proc (cdr lat)))
+              (else
+               #f)))
+      
+      (if (number? lat)
+          (fixed-latency lat)
+        (or (try 'rise rise-latency)
+            (try 'fall fall-latency)
+            (try 'updown updown-latency)
+            (try 'sin sin-latency)
+            (try 'random random-latency)
+            (try 'recorded recorded-latency)
+            lat)))
+    
+    (set! latency lat)
+    (set! latency-proc (and lat (parse-latency lat))))
+  
+  
+  (method protected (setup-drop self drp)
+    (set! drop (and drp (cast <fl> drp))))
+  
+  
+  (method protected (send self data info)
+    (define (insert-monotonic latency)
+      (let ((time (+ (current-seconds) latency)))
+        (let ((obj (cons data info)))
+          (let ((monotonic-time
+                  (if (= (get-count ring) 0)
+                      time
+                    (let ((latest (latest-time ring)))
+                      (if (>= time latest)
+                          time
+                        latest)))))
+            (insert ring monotonic-time obj)))))
+    
+    (cond (congestion
+           (if (not congestion-occuring?)
+               (if (or (eq? congestion #t)
+                       (< (random-real) (/ congestion 100.)))
+                   (let ((ends (if (eq? congestion-duration #t) +inf.0 (random-between 0. congestion-duration))))
+                     (set! congestion-occuring? #t)
+                     (set! congestion-ends ends)
+                     (when udp-show-congestion?
+                       (format :terminal "{s} {s} {s}{%}" remote-name 'CONGESTION 'ON)))
+                 (send-writer self data info))
+             (when (or (not congestion-ends)
+                       (>= (current-seconds) congestion-ends))
+               (set! congestion-occuring? #f)
+               (set! congestion-ends #f)
+               (when udp-show-congestion?
+                 (format :terminal "{s} {s} {s}{%}" remote-name 'CONGESTION 'OFF))
+               (send-writer self data info))))
+          (latency-proc
+           (let ((kind (read-udp-kind data)))
+             (if (or (= kind udp-audio)
+                     (= kind udp-video))
+                 (let ((latency (let ((time (- (current-monotonic) kernel-boot-monotonic)))
+                                  (latency-proc time))))
+                   (insert-monotonic latency))
+               (send-writer self data info))))
+          (else
+           (let ((kind (read-udp-kind data)))
+             (if (or (= kind udp-audio)
+                     (= kind udp-video))
+                 (insert-monotonic 0.)
+               (send-writer self data info))))))
   
   
   (method (drop? self)
     (and drop (< (random-real) (/ drop 100.))))
   
   
-  (method (send-writer self info drop?)
-    (writer info drop?)
-    (increase! packet-count))
+  (method (send-writer self data info)
+    (let ((drop? (drop? self)))
+      (writer data info drop?)))
   
   
   (method (send-loop self)
     (declare (proper-tail-calls))
     (let (loop)
-      (let ((info (wait ring)))
-        (send-writer self info (drop? self)))
+      (let ((pair (wait ring)))
+        (bind (data . info) pair
+          (send-writer self data info)))
       (loop))))
 
 
@@ -2515,10 +2519,7 @@
 (definition public (read-udp-connect-local-host  data) (scan-host  data 16)) (definition public (write-udp-connect-local-host  data value) (put-host  data 16 value))
 @peer2peer
 (definition public (read-udp-connect-local-port  data) (scan-s32   data 20)) (definition public (write-udp-connect-local-port  data value) (put-s32   data 20 value))
-(definition public (read-udp-connect-latency     data) (scan-float data 16)) (definition public (write-udp-connect-latency     data value) (put-float data 16 value))
-(definition public (read-udp-connect-lag         data) (scan-float data 20)) (definition public (write-udp-connect-lag         data value) (put-float data 20 value))
-(definition public (read-udp-connect-drop        data) (scan-float data 24)) (definition public (write-udp-connect-drop        data value) (put-float data 24 value))
-(definition public (read-udp-connect-video-level data) (scan-s32   data 28)) (definition public (write-udp-connect-video-level data value) (put-s32   data 28 value))
+(definition public (read-udp-connect-video-level data) (scan-s32   data 16)) (definition public (write-udp-connect-video-level data value) (put-s32   data 16 value))
 
 ;; state
 (definition public (read-udp-state-sequence data) (scan-s32      data 16)) (definition public (write-udp-state-sequence data value) (put-s32      data 16 value))
