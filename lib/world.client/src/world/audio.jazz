@@ -197,14 +197,14 @@
     (close output))
   
   
-  (method package (receive-server-audio self id buffer timestamp duration)
+  (method package (receive-server-audio self id buffer dts pts duration)
     (let ((output (find-output self id)))
       (when output
         (if (not buffer)
             (set-stream-state output 'off)
           (when (eq? (get-stream-state output) 'off)
             (set-stream-state output 'on))
-          (consume-audio output buffer timestamp duration)
+          (consume-audio output buffer dts pts duration)
           (when udp-record-src/sink?
             (let ((origin (get-origin (get-channel output))))
               (record-event udp-id-sink-media
@@ -214,21 +214,21 @@
                             -1.
                             -1.
                             -1.
-                            (timestamp->flonum timestamp))))))))
+                            (timestamp->flonum pts))))))))
   
   
-  (method package (receive-visualizer-audio self output buffer timestamp duration)
+  (method package (receive-visualizer-audio self output buffer dts pts duration)
     (if (not buffer)
         (set-stream-state output 'off)
       (when (eq? (get-stream-state output) 'off)
         (set-stream-state output 'on))
-      (consume-audio output buffer timestamp duration)))
+      (consume-audio output buffer dts pts duration)))
   
   
-  (method package (receive-audio self id/output buffer timestamp duration)
+  (method package (receive-audio self id/output buffer dts pts duration)
     (if (is? id/output Audio-Sink)
-        (receive-visualizer-audio self id/output buffer timestamp duration)
-      (receive-server-audio self id/output buffer timestamp duration))))
+        (receive-visualizer-audio self id/output buffer dts pts duration)
+      (receive-server-audio self id/output buffer dts pts duration))))
 
 
 ;;;
@@ -325,7 +325,7 @@
         (gst_object_set_name pipeline "mic")
         (with-unref ((appsink (gst_bin_get_by_name pipeline "sink")))
           (let ((data (make-u8vector 4096))
-                (info (make-u64vector 2)))
+                (info (make-u64vector 3)))
             (gst_element_set_state pipeline GST_STATE_READY)
             (set! self.mic-pipeline pipeline)
             (set! self.mic-sink appsink))))
@@ -386,7 +386,7 @@
   
   (method override (release-element self)
     (nextmethod self)
-    (consume consumer #f #f #f)
+    (consume consumer #f #f #f #f)
     (gst_element_release pipeline)
     (set! pipeline #f)
     (set! appsrc #f)
@@ -423,28 +423,28 @@
     (set! header #f))
   
   
-  (method override (consume self buffer timestamp duration)
+  (method override (consume self buffer dts pts duration)
     (case audio-codec
       ;; opus has no headers
       ((opus)
-       (nextmethod self buffer timestamp duration))
+       (nextmethod self buffer dts pts duration))
       ((vorbis)
        (if (and buffer (audio-buffer-header? buffer))
            (begin
-             (set! headers (append! headers (list (list buffer timestamp duration))))
+             (set! headers (append! headers (list (list buffer dts pts duration))))
              (when (= (length headers) 3)
                (set! header (object->u8vector headers))
-               (nextmethod self (list header) #f #f)))
-         (nextmethod self buffer timestamp duration)))))
+               (nextmethod self (list header) #f #f #f)))
+         (nextmethod self buffer dts pts duration)))))
    
    
   (method protected (resend-header self channel-no)
     (when header
       (if (client?)
           (let ((tier (current-client)))
-            (send-client-media tier channel-no header #t -1 GST_CLOCK_TIME_NONE))
+            (send-client-media tier channel-no header #t -1 -1 GST_CLOCK_TIME_NONE))
         (let ((tier (current-server)))
-          (send-server-media tier channel-no header #t -1 GST_CLOCK_TIME_NONE))))))
+          (send-server-media tier channel-no header #t -1 -1 GST_CLOCK_TIME_NONE))))))
 
 
 ;;;
@@ -455,8 +455,8 @@
 (class Mic-Audio-Consumer extends Audio-Consumer
   
   
-  (method override (consume self buffer timestamp duration)
-    (nextmethod self buffer timestamp duration)
+  (method override (consume self buffer dts pts duration)
+    (nextmethod self buffer dts pts duration)
     (when buffer
       (let ((header? (audio-buffer-header? buffer))
             (size (u8vector-length buffer)))
@@ -475,7 +475,7 @@
                         -1.
                         (if header? 1. -1.)
                         (fixnum->flonum size)
-                        (timestamp->flonum timestamp)))))))
+                        (timestamp->flonum pts)))))))
 
 
 ;;;
@@ -557,13 +557,13 @@
 (class File-Stream-Audio-Src extends Audio-Src implements Media-Stream
   
   
-  (slot location       getter generate)
-  (slot stream?        accessors explicit)
-  (slot file           getter generate)
-  (slot reader         getter generate)
-  (slot time-base      getter generate)
-  (slot last-timestamp getter generate)
-  (slot mute?          getter generate)
+  (slot location  getter generate)
+  (slot stream?   accessors explicit)
+  (slot file      getter generate)
+  (slot reader    getter generate)
+  (slot time-base getter generate)
+  (slot last-pts  getter generate)
+  (slot mute?     getter generate)
   
   
   (method override (initialize self location (stream?: stream? #t))
@@ -573,7 +573,7 @@
     (set! self.file #f)
     (set! self.reader #f)
     (set! self.time-base (new Time-Base))
-    (set! self.last-timestamp #f)
+    (set! self.last-pts #f)
     (set! self.mute? #f))
   
   
@@ -636,25 +636,25 @@
               (task-done task exit)
             ;; protect against stream? threaded change
             (let ((stream? stream?))
-              (receive (buffer timestamp duration) (read-frame reader stream?)
+              (receive (buffer dts pts duration) (read-frame reader stream?)
                 (if (not buffer)
                     (if stream-loop?
                         (begin
                           (close reader)
-                          (set! reader (new Stream-Reader file last-timestamp))
+                          (set! reader (new Stream-Reader file last-pts))
                           (set! time-base (new Time-Base))
                           (iter))
                       (task-done task exit))
-                  (set! last-timestamp timestamp)
+                  (set! last-pts pts)
                   (let ((time (current-seconds))
-                        (nanostamp (timestamp->flonum timestamp)))
-                    (update-start time-base time nanostamp)
-                    (let ((sendtime (remote->local time-base nanostamp)))
+                        (nanopts (timestamp->flonum pts)))
+                    (update-start time-base time nanopts)
+                    (let ((sendtime (remote->local time-base nanopts)))
                       (task-sleep task (- sendtime time) exit)
                       (when stream?
                         (site (stream)
                           (unless mute?
-                            (consume consumer buffer timestamp duration)))))))))
+                            (consume consumer buffer dts pts duration)))))))))
             (iter))))))
   
   
@@ -675,16 +675,27 @@
 (class Audio-Sink extends Stream-Sink
   
   
-  (slot channel          initialize #f accessors generate)
-  (slot codec            initialize #f accessors generate)
-  (slot provider         initialize #f accessors generate)
-  (slot volume           initialize #f accessors explicit)
-  (slot pipeline         initialize #f accessors generate)
-  (slot appsrc           initialize #f accessors generate)
-  (slot volelem          initialize #f accessors generate)
-  (slot panelem          initialize #f accessors generate)
-  (slot stream-state     initialize 'off getter generate setter explicit)
-  (slot timestamp-offset initialize #f accessors generate)
+  (slot channel             initialize #f accessors generate)
+  (slot codec               initialize #f accessors generate)
+  (slot provider            initialize #f accessors generate)
+  (slot volume              initialize #f accessors explicit)
+  (slot pipeline            initialize #f accessors generate)
+  (slot appsrc              initialize #f accessors generate)
+  (slot volelem             initialize #f accessors generate)
+  (slot panelem             initialize #f accessors generate)
+  (slot stream-state        initialize 'off getter generate setter explicit)
+  (slot first-pts           initialize #f getter generate)
+  (slot first-clocktime     initialize #f getter generate)
+  (slot base-pts            initialize #f getter generate)
+  (slot base-clocktime      initialize #f getter generate)
+  (slot expected-pts        initialize #f getter generate)
+  (slot timestamp-offset    initialize #f getter generate)
+  (slot expected-now        initialize #f getter generate)
+  (slot accumulated-latency initialize 0. getter generate)
+  (slot moving-drift        initialize 0. getter generate)
+  (slot state-machine       initialize 'start getter generate)
+  (slot buffer-count        initialize 0  getter generate)
+  (slot brand               initialize #f getter generate)
   
   
   (method override (initialize self (codec: codec #f) (provider: provider #f) (volume: volume #f))
@@ -783,13 +794,85 @@
     (set-stream-state self 'off))
   
   
-  (method protected virtual (consume-audio self buffer timestamp duration)
-    (cond ((audio-buffer-header? buffer)
-           (gst_app_src_write appsrc buffer (u8vector-length buffer) timestamp duration 0))
-          ((not timestamp-offset)
-           (set! timestamp-offset (gst_app_src_write appsrc buffer (u8vector-length buffer) timestamp duration -1)))
-          (else
-           (gst_app_src_write appsrc buffer (u8vector-length buffer) timestamp duration timestamp-offset))))
+  (method protected virtual (consume-audio self buffer dts pts duration)
+    (let ((now (current-monotonic))
+          (clocktime (gst_pipeline_get_time pipeline))
+          (positive-tolerance .1)
+          (negative-tolerance -.1))
+      (define (state-machine-change)
+        (let ((next-state #f))
+          (case state-machine
+            ((start)
+             (set! next-state 'clock-still))
+            ((clock-still)
+             (set! next-state 'clock-running))
+            (else
+             (terminal 'STATE-MACHINE 'ERROR)))
+          (when show-sync?
+            (terminal 'AUDIO state-machine '-> next-state))
+          (set! state-machine next-state)))
+      
+      (define (write)
+        (gst_app_src_write appsrc buffer (u8vector-length buffer) dts pts duration timestamp-offset)
+        (when (and duration pts (eq? state-machine 'clock-running))
+          (set! expected-now (+ now (timestamp->flonum duration)))
+          (set! expected-pts (+ pts duration))))
+      
+      (if (audio-buffer-header? buffer)
+          (gst_app_src_write appsrc buffer (u8vector-length buffer) dts pts duration 0)
+        (case state-machine
+          ((start)
+           (play-element self)
+           (set! first-pts pts)
+           (set! first-clocktime (gst_pipeline_get_time pipeline))
+           ;; subtracting first-pts is a hack around
+           ;; world streams timestamps not starting at 0
+           (set! timestamp-offset (- first-pts))
+           (state-machine-change)
+           (write))
+          ((clock-still)
+           (when (> clocktime first-clocktime)
+             (set! base-pts pts)
+             (set! base-clocktime clocktime)
+             (state-machine-change))
+           (write))
+        ((clock-running)
+         (let ((latency-change (- now expected-now))
+               (overshoot (- pts expected-pts)))
+           (define (debug prefix (adjustment #f))
+             (when show-sync?
+               (let ((adjusted-pts (+ pts timestamp-offset)))
+                 (format :terminal "{a} audio {r precision: 6} {r precision: 6} {r precision: 6} {? {r precision: 6}~}{%}"
+                   prefix (timestamp->flonum adjusted-pts) moving-drift latency-change accumulated-latency))))
+           
+           (set! accumulated-latency (+ accumulated-latency latency-change))
+           (cond ((> accumulated-latency positive-tolerance)
+                  (debug '>>>>>>>>>>)
+                  (increase! timestamp-offset (flonum->timestamp accumulated-latency))
+                  (set! accumulated-latency 0.)
+                  (write))
+                 ((< accumulated-latency negative-tolerance)
+                  (debug '<<<<<<<<<<<)
+                  (increase! timestamp-offset (flonum->timestamp accumulated-latency))
+                  (set! accumulated-latency 0.)
+                  (write))
+                 ((> overshoot 0)
+                  (decrease! timestamp-offset overshoot);; + accumulated-latency?
+                  (when show-sync?
+                    (format :terminal "$$$$$$$$$$ {r precision: 6}{%}"
+                      (timestamp->flonum overshoot)))
+                  (write))
+                 (else
+                  (write)))
+           (let ((pts-elapse (- pts base-pts))
+                 (clock-elapse (- clocktime base-clocktime)))
+             (let ((drift (timestamp->flonum (- pts-elapse clock-elapse))))
+               (if (not moving-drift)
+                   (set! moving-drift drift)
+                 (set! moving-drift (/ (+ (* 127. moving-drift) drift) 128.)))
+               (when (= (modulo buffer-count 100) 0)
+                 (debug '**********)))))))))
+    (increase! buffer-count))
   
   
   (method public (muted? self)

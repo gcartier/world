@@ -581,12 +581,12 @@
         (focus output))))
   
   
-  (method package (receive-server-video self id buffer timestamp duration)
+  (method package (receive-server-video self id buffer dts pts duration)
     (let ((output (find-output self id)))
       (define (receive)
         (when (eq? (get-stream-state output) 'off)
           (set-stream-state output 'on))
-        (consume output buffer timestamp duration)
+        (consume-video output buffer dts pts duration)
         (when udp-record-src/sink?
           (let ((origin (get-origin (get-channel output))))
             (record-event udp-id-sink-media
@@ -596,7 +596,7 @@
                           -1.
                           -1.
                           -1.
-                          (timestamp->flonum timestamp)))))
+                          (timestamp->flonum pts)))))
       
       (when output
         (cond ((not buffer)
@@ -609,21 +609,21 @@
                (receive))))))
   
   
-  (method package (receive-visualizer-video self output buffer timestamp duration)
+  (method package (receive-visualizer-video self output buffer dts pts duration)
     (if (not buffer)
         (set-stream-state output 'off)
       (when (eq? (get-stream-state output) 'off)
         (set-stream-state output 'on))
-      (consume output buffer timestamp duration)))
+      (consume-video output buffer dts pts duration)))
   
   
-  (method package (receive-video self id/output buffer timestamp duration)
+  (method package (receive-video self id/output buffer dts pts duration)
     (if (is? id/output Video-Sink)
-        (receive-visualizer-video self id/output buffer timestamp duration)
-      (receive-server-video self id/output buffer timestamp duration)))
+        (receive-visualizer-video self id/output buffer dts pts duration)
+      (receive-server-video self id/output buffer dts pts duration)))
   
   
-  (method package (receive-processor-draw self id color alpha timestamp duration background slide?)
+  (method package (receive-processor-draw self id color alpha dts pts duration background slide?)
     (if (not color)
         (let ((output (find-output self id)))
           (when output
@@ -631,11 +631,11 @@
       (let ((output (entity-output self id)))
         (set-background output background)
         (if (not slide?)
-            (consume output color timestamp duration alpha)
+            (consume output color dts pts duration alpha)
           (let ((texture (get-texture (cache-quad-texture (get-pane output)))))
             (with-slide output texture
               (lambda ()
-                (consume output color timestamp duration alpha))))))))
+                (consume output color dts pts duration alpha))))))))
   
   
   (method package (render-outputs self)
@@ -1070,9 +1070,9 @@
       (string->symbol (format "camera{a}" name))))
 
 
-  (method override (consume self buffer timestamp duration)
+  (method override (consume self buffer dts pts duration)
     (let ((header? (and buffer (video-buffer-header? buffer))))
-      (send-client-media (current-client) channel-no buffer header? timestamp duration)
+      (send-client-media (current-client) channel-no buffer header? dts pts duration)
       (update rate (get-framerate profile)))))
 
 
@@ -1164,12 +1164,12 @@
         (set! output #f))))
   
   
-  (method override (consume self buffer timestamp duration)
+  (method override (consume self buffer dts pts duration)
     (when output
       (if (not buffer)
           (set-stream-state output 'off)
         (set-stream-state output 'drawn)
-        (draw output buffer #f timestamp duration)
+        (draw output buffer #f dts pts duration)
         (let ((size (u8vector-length buffer)))
           (when (and video-show
                      (or (eq? video-show 'all)
@@ -1191,7 +1191,7 @@
                           -1.
                           (if (video-buffer-header? buffer) 1. -1.)
                           (fixnum->flonum size)
-                          (timestamp->flonum timestamp))))))))
+                          (timestamp->flonum pts))))))))
 
 
 ;;;
@@ -1298,9 +1298,9 @@
     (set! self.channel-no channel-no))
 
 
-  (method override (consume self buffer timestamp duration)
+  (method override (consume self buffer dts pts duration)
     (let ((header? (and buffer (video-buffer-header? buffer))))
-      (send-client-media (current-client) channel-no buffer header? timestamp duration))))
+      (send-client-media (current-client) channel-no buffer header? dts pts duration))))
 
 
 ;;;
@@ -1492,14 +1492,14 @@
 (class File-Stream-Video-Src extends Video-Src implements Media-Stream
   
   
-  (slot profile        getter generate)
-  (slot location       getter generate)
-  (slot stream?        accessors explicit)
-  (slot file           getter generate)
-  (slot reader         getter generate)
-  (slot time-base      getter generate)
-  (slot last-timestamp getter generate)
-  (slot consumer       getter generate)
+  (slot profile   getter generate)
+  (slot location  getter generate)
+  (slot stream?   accessors explicit)
+  (slot file      getter generate)
+  (slot reader    getter generate)
+  (slot time-base getter generate)
+  (slot last-pts  getter generate)
+  (slot consumer  getter generate)
   
   
   (method override (initialize self profile location (stream?: stream? #t))
@@ -1510,7 +1510,7 @@
     (set! self.file #f)
     (set! self.reader #f)
     (set! self.time-base (new Time-Base))
-    (set! self.last-timestamp #f)
+    (set! self.last-pts #f)
     (set! self.consumer #f))
   
   
@@ -1566,24 +1566,24 @@
               (task-done task exit)
             ;; protect against stream? threaded change
             (let ((stream? stream?))
-              (receive (buffer timestamp duration) (read-frame reader stream?)
+              (receive (buffer dts pts duration) (read-frame reader stream?)
                 (if (not buffer)
                     (if stream-loop?
                         (begin
                           (close reader)
-                          (set! reader (new Stream-Reader file last-timestamp))
+                          (set! reader (new Stream-Reader file last-pts))
                           (set! time-base (new Time-Base))
                           (iter))
                       (task-done task exit))
-                  (set! last-timestamp timestamp)
+                  (set! last-pts pts)
                   (let ((time (current-seconds))
-                        (nanostamp (timestamp->flonum timestamp)))
-                    (update-start time-base time nanostamp)
-                    (let ((sendtime (remote->local time-base nanostamp)))
+                        (nanopts (timestamp->flonum pts)))
+                    (update-start time-base time nanopts)
+                    (let ((sendtime (remote->local time-base nanopts)))
                       (task-sleep task (- sendtime time) exit)
                       (when stream?
                         (site (stream)
-                          (consume consumer buffer timestamp duration)))))))))
+                          (consume consumer buffer dts pts duration)))))))))
           (iter))))))
 
 
@@ -1663,10 +1663,10 @@
               (task-done task exit)
             (let ((surface (get-surface context)))
               (draw-stream self surface)
-              (receive (color alpha timestamp duration) (extract context task exit)
+              (receive (color alpha dts pts duration) (extract context task exit)
                 (site (stream)
-                  (let ((effective-timestamp (flonum->timestamp (- (current-seconds) start-time))))
-                    (consume consumer color effective-timestamp duration)))))
+                  (let ((effective-pts (flonum->timestamp (- (current-seconds) start-time))))
+                    (consume consumer color effective-pts duration)))))
             (task-sleep task .1 exit)
             (iter)))))))
   
@@ -1689,7 +1689,8 @@
   (slot file          getter generate)
   (slot color         getter generate)
   (slot alpha         getter generate)
-  (slot timestamp     getter generate)
+  (slot dts           getter generate)
+  (slot pts           getter generate)
   (slot duration      getter generate)
   (slot extract-mutex getter generate)
   
@@ -1700,7 +1701,8 @@
     (set! self.file (new-file {Directory Documents} location))
     (set! self.color #f)
     (set! self.alpha #f)
-    (set! self.timestamp #f)
+    (set! self.dts #f)
+    (set! self.pts #f)
     (set! self.duration #f)
     (set! self.extract-mutex (make-mutex 'extract)))
   
@@ -1713,15 +1715,16 @@
     (mutex-lock! extract-mutex)
     (prog1
         (if color
-            (values color alpha timestamp duration)
+            (values color alpha dts pts duration)
           (let ((surface (get-surface context)))
             (draw-stream self surface)
-            (receive (color alpha timestamp duration) (extract context task exit)
+            (receive (color alpha dts pts duration) (extract context task exit)
               (set! self.color color)
               (set! self.alpha alpha)
-              (set! self.timestamp timestamp)
+              (set! self.dts dts)
+              (set! self.pts pts)
               (set! self.duration duration)
-              (values color alpha timestamp duration))))
+              (values color alpha dts pts duration))))
       (mutex-unlock! extract-mutex)))
   
   
@@ -1730,10 +1733,10 @@
     (let ((tier (current-client)))
       (with-task task
         (lambda (exit)
-          (receive (color alpha timestamp duration) (extract/cache self task exit)
+          (receive (color alpha dts pts duration) (extract/cache self task exit)
             (site (stream)
-              (let ((effective-timestamp (flonum->timestamp (- (current-seconds) start-time))))
-                (consume consumer color effective-timestamp duration))))
+              (let ((effective-pts (flonum->timestamp (- (current-seconds) start-time))))
+                (consume consumer color effective-pts duration))))
           (free-context self)
           (continuation-return exit #f)))))
   
@@ -1758,9 +1761,9 @@
   
   
   (method override (reset-media self channel)
-    (receive (color alpha timestamp duration) (extract/cache self task exit)
-      (let ((effective-timestamp (flonum->timestamp (- (current-seconds) start-time))))
-        (consume consumer color effective-timestamp duration)))))
+    (receive (color alpha dts pts duration) (extract/cache self task exit)
+      (let ((effective-pts (flonum->timestamp (- (current-seconds) start-time))))
+        (consume consumer color effective-pts duration)))))
 
 
 ;;;
@@ -1799,6 +1802,14 @@
   (slot rate                        initialize #f accessors generate)
   (slot wait-header?                initialize #t accessors generate)
   (slot stream-state                initialize 'off getter generate setter explicit)
+  (slot first-pts                   initialize #f getter generate)
+  (slot first-clocktime             initialize #f getter generate)
+  (slot base-pts                    initialize #f getter generate)
+  (slot base-clocktime              initialize #f getter generate)
+  (slot timestamp-offset            initialize #f getter generate)
+  (slot state-machine               initialize 'start getter generate)
+  (slot moving-drift                initialize #f getter generate)
+  (slot buffer-count                initialize 0  getter generate)
   
   
   (method override (initialize self (level: level #f) (resolution: resolution #f) (framerate: framerate #f) (bitrate: bitrate #f) (codec: codec #f) (caps: caps #f) (process?: process? #t) (alpha-overlay: alpha-overlay #f) (alpha?: alpha? #f) (sync-audio?: sync-audio? #f))
@@ -1880,7 +1891,7 @@
           (with-unref ((appsrc (gst_bin_get_by_name pipeline "src"))
                        (appsink (gst_bin_get_by_name pipeline "sink")))
             (let ((data (make-u8vector (* width height 4)))
-                  (info (make-u64vector 2)))
+                  (info (make-u64vector 3)))
               (gst_app_sink_connect_signals appsink listener)
               ;; PRIME
               (when (not caps)
@@ -1918,7 +1929,7 @@
             (with-unref ((appsrc (gst_bin_get_by_name pipeline "src"))
                          (appsink (gst_bin_get_by_name pipeline "sink")))
               (let ((data (make-u8vector (/ (* width height 12) 8)))
-                    (info (make-u64vector 2)))
+                    (info (make-u64vector 3)))
                 (gst_app_sink_connect_signals appsink listener)
                 (gst-app-src-set-caps appsrc "video/x-h264"
                   "width"         'int      width
@@ -2020,26 +2031,90 @@
       (set-stream-state self 'off)))
   
   
-  (method override (consume self color timestamp duration (alpha #f))
+  (method protected virtual (consume-video self color dts pts duration (alpha #f))
+    (define (write)
+      (gst_app_src_write color-appsrc color (u8vector-length color) dts pts duration timestamp-offset))
+    
+    (define (state-machine-change)
+      (let ((next-state #f))
+        (case state-machine
+          ((start)
+           (set! next-state 'clock-still))
+          ((clock-still)
+           (set! next-state 'clock-running))
+          (else
+           (terminal 'VIDEO 'STATE-MACHINE 'ERROR)))
+        (when show-sync?
+          (terminal 'VIDEO state-machine '-> next-state))
+        (set! state-machine next-state)))
+    
     ;; QUICK TEST
     (when color-appsrc
-      @w
-      ;; PRIME
+      ;; QUICK TEST
       (when color
-        (present-nalus color 'stream
-          filter: (lambda (buffer start end)
-                    (let ((type (u8vector-ref buffer start)))
-                      (not (or (= type 65)
-                               (and (= type 9) (= (u8vector-ref buffer (+ start 1)) 48))))))))
-    ;; QUICK TEST
-      (when color
-        (gst_app_src_write_now color-appsrc color (u8vector-length color) 0 duration)))
+        (let ((now (flonum->timestamp (current-monotonic)))
+              (clocktime (gst_pipeline_get_time color-pipeline))
+              (positive-tolerance .05)
+              (negative-tolerance -.05))
+          
+          (case state-machine
+            ((start)
+             (play-element self)
+             (set! first-pts pts)
+             (set! first-clocktime clocktime)
+             ;; subtracting first-pts is a hack around
+             ;; world streams timestamps not starting at 0
+             (set! timestamp-offset (- first-pts))
+             (state-machine-change)
+             (write))
+            ((clock-still)
+             (when (> clocktime first-clocktime)
+               (set! base-pts pts)
+               (set! base-clocktime clocktime)
+               (state-machine-change))
+             (write))
+            ((clock-running)
+             (if (video-buffer-header? color)
+                 (write)
+               (let ((pts-elapse (- pts base-pts))
+                     (clock-elapse (- clocktime base-clocktime)))
+                 (let ((drift (timestamp->flonum (- pts-elapse clock-elapse))))
+                   (if (not moving-drift)
+                       (set! moving-drift drift)
+                     (set! moving-drift (/ (+ (* 127. moving-drift) drift) 128.)))
+                   (let ((adjusted-pts (+ pts timestamp-offset)))
+                     (define (debug prefix (adjustment #f))
+                       (when show-sync?
+                         (format :terminal "                            {a} video {r precision: 6} {r precision: 6} {r precision: 6} {? {r precision: 3}~}{%}"
+                           prefix (timestamp->flonum adjusted-pts) moving-drift (timestamp->flonum clock-elapse) (timestamp->flonum pts-elapse))))
+                     ;;prefix moving-drift (timestamp->flonum timestamp-offset) adjusted-drift (and adjustment (timestamp->flonum adjustment)))))
+                     ;; when drift is too large, pts-elapse > clock-elapse so we are seeing timestamps coming too fast
+                     ;; and we have to drop one
+                     ;; when drift is too small, timestamps are coming in too slowly as latency increases
+                     ;; for video, a drift should mean a dropped frame...
+                     ;; when we drop a frame we stop processing until we get a header...
+                     @w (cond ((> moving-drift positive-tolerance)
+                               (decrease! timestamp-offset (flonum->timestamp positive-tolerance))
+                               (debug '<<<<<<<<<<< positive-tolerance)
+                               (increase! moving-drift positive-tolerance)
+                               (write))
+                              ((< moving-drift negative-tolerance)
+                               (increase! timestamp-offset (- (flonum->timestamp negative-tolerance)))
+                               (debug '>>>>>>>>>> negative-tolerance)
+                               (decrease! moving-drift negative-tolerance)
+                               (write))
+                              (else
+                               (write)))
+                     (write)
+                     (when (and moving-drift (= (modulo buffer-count 100) 0))
+                       (debug '**********)))))))))))
+    (increase! buffer-count)
     (when alpha?
       ;; QUICK TEST
       (when alpha-appsrc
         ;; QUICK TEST
         (when alpha
-          (gst_app_src_write_now alpha-appsrc alpha (u8vector-length alpha) 0 duration)))))
+          (gst_app_src_write alpha-appsrc alpha (u8vector-length alpha) dts pts duration timestamp-offset)))))
   
   
   (method (video-loop self task)
@@ -2058,14 +2133,15 @@
     (let ((color-bytes (gst_app_sink_wait task exit color-listener color-appsink color-data color-info #f #f))
           (alpha-bytes (and alpha? (gst_app_sink_wait task exit alpha-listener alpha-appsink alpha-data alpha-info #f #f))))
       (site (video-output)
-        (let ((timestamp (u64vector-ref color-info 0))
-              (duration (u64vector-ref color-info 1)))
-          (draw self color-data (and alpha? alpha-data) timestamp duration)
+        (let ((dts (u64vector-ref color-info 0))
+              (pts (u64vector-ref color-info 1))
+              (duration (u64vector-ref color-info 2)))
+          (draw self color-data (and alpha? alpha-data) dts pts duration)
           (when (eq? stream-state 'on)
             (set-stream-state self 'drawn))))))
   
   
-  (method package virtual (draw self color alpha timestamp duration)
+  (method package virtual (draw self color alpha dts pts duration)
     )
   
   
@@ -2156,7 +2232,7 @@
       (set! pane #f)))
   
   
-  (method override (draw self color alpha timestamp duration)
+  (method override (draw self color alpha dts pts duration)
     ;; quicky
     (when pane
       (update self color alpha (get-texture (cache-quad-texture pane)) background: background)))
@@ -2280,7 +2356,7 @@
       (set! pane #f)))
   
   
-  (method override (draw self color alpha timestamp duration)
+  (method override (draw self color alpha dts pts duration)
     (update self color alpha (get-texture (cache-quad-texture pane))))
   
   
@@ -2354,7 +2430,7 @@
       (set! sheet #f)))
   
   
-  (method override (draw self color alpha timestamp duration)
+  (method override (draw self color alpha dts pts duration)
     (let ((texture (get-texture sheet)))
       (update self color alpha texture)))
   
@@ -2558,7 +2634,7 @@
       (invalidate-audio (get-root interface-pane))))
   
   
-  (method override (draw self color alpha timestamp duration)
+  (method override (draw self color alpha dts pts duration)
     (update self color alpha media-texture)
     (when channel
       (record-event udp-id-draw-video
@@ -2568,9 +2644,7 @@
                     -1.
                     -1.
                     -1.
-                    (if (not timestamp)
-                        -1.
-                      (timestamp->flonum timestamp)))))
+                    (if (not pts) -1. (timestamp->flonum pts)))))
   
   
   (method override (render self)

@@ -309,12 +309,12 @@
 (definition public (evolutionary-udp-update-time-effective-latency  evolution <Evolution> n <fx>) (evolutionary-udp-data5 evolution n))
 
 (definition public (evolutionary-udp-insert-packet-latency          evolution <Evolution> n <fx>) (evolutionary-udp-data3 evolution n))
-(definition public (evolutionary-udp-insert-packet-timestamp        evolution <Evolution> n <fx>) (evolutionary-udp-data4 evolution n))
+(definition public (evolutionary-udp-insert-packet-pts              evolution <Evolution> n <fx>) (evolutionary-udp-data4 evolution n))
 (definition public (evolutionary-udp-insert-packet-base             evolution <Evolution> n <fx>) (evolutionary-udp-data5 evolution n))
 (definition public (evolutionary-udp-insert-packet-last-latency     evolution <Evolution> n <fx>) (evolutionary-udp-data6 evolution n))
 
-(definition public (evolutionary-udp-play-frame-timestamp           evolution <Evolution> n <fx>) (evolutionary-udp-data4 evolution n))
-(definition public (evolutionary-udp-freeze-frame-timestamp         evolution <Evolution> n <fx>) (evolutionary-udp-data4 evolution n))
+(definition public (evolutionary-udp-play-frame-pts                 evolution <Evolution> n <fx>) (evolutionary-udp-data4 evolution n))
+(definition public (evolutionary-udp-freeze-frame-pts               evolution <Evolution> n <fx>) (evolutionary-udp-data4 evolution n))
 
 
 ;; relies on 0 reserved for #f in next-literal-id
@@ -734,7 +734,8 @@
   (slot action-proc    accessors generate)
   (slot data-sequence  accessors generate)
   (slot frame-sequence accessors generate)
-  (slot last-timestamp accessors generate)
+  (slot last-dts       accessors generate)
+  (slot last-pts       accessors generate)
   (slot last-reset     getter generate)
   (slot wait-header?   getter generate)
   (slot replay-ring    getter generate)
@@ -748,7 +749,8 @@
     (set! self.action-proc #f)
     (set! self.data-sequence 0)
     (set! self.frame-sequence 0)
-    (set! self.last-timestamp #f)
+    (set! self.last-dts #f)
+    (set! self.last-pts #f)
     (set! self.last-reset #f)
     (set! self.wait-header? (= media-kind udp-video))
     (set! self.replay-ring (remember-ring media-kind source-kind level framerate))
@@ -837,19 +839,23 @@
     (insert retain-ring data udp-id-retain-packet))
   
   
-  (method protected (send-media self buffer header? timestamp duration send)
+  (method protected (send-media self buffer header? dts pts duration send)
     (let ((off? (not buffer))
           (frame (next-frame-sequence! self))
-          ;; give media off a sequential timestamp so it gets inserted correctly
-          (timestamp (or timestamp (+ (or last-timestamp 0) 1)))
+          ;; last dts is a quick hack in the timestamp -> dts pts conversion
+          (dts (or dts (+ (or last-dts 0) 1)))
+          ;; give media off a sequential pts so it gets inserted correctly
+          (pts (or pts (+ (or last-pts 0) 1)))
           (duration (or duration 1))
           ;; udp-media-off is not really used for its content anymore
           ;; but it is still useful as an empty buffer ends the logic
           (buffer (or buffer udp-media-off)))
+      (unless (= dts -1)
+        (set! last-dts dts))
       ;; -1 means no timestamp used by vorbis header
-      (unless (= timestamp -1)
-        (set! last-timestamp timestamp))
-      (let ((header-size (+ 8 4 2 2 4 4 4 4 8 8 4))
+      (unless (= pts -1)
+        (set! last-pts pts))
+      (let ((header-size (+ 8 4 2 2 4 4 4 4 8 8 8 4))
             (payload-size (u8vector-length buffer)))
         (let ((max-content-size (- udp-datagram-max header-size)))
           (let ((total (fxceiling/ payload-size max-content-size)))
@@ -868,14 +874,15 @@
                         (write-udp-frame data frame)
                         (write-udp-part data part)
                         (write-udp-total data total)
-                        (write-udp-media-timestamp data timestamp)
+                        (write-udp-media-dts data dts)
+                        (write-udp-media-pts data pts)
                         (write-udp-media-duration data duration)
                         (write-udp-media-subpayload data buffer pos content-size)
                         (write-udp-media-header? data header?)
                         (write-udp-media-off? data off?)
                         (write-udp-resent data 0)
                         ;; quick hack to make media off and timeless more robust
-                        (if (or off? (= timestamp -1))
+                        (if (or off? (= pts -1))
                             (loop (repeat 3)
                                   (send data))
                           (send data))
@@ -886,11 +893,8 @@
                                       (fixnum->flonum sequence)
                                       (fixnum->flonum frame)
                                       (barbara-header-hack header?)
-                                      (if (= timestamp -1)
-                                          -1.
-                                        (timestamp->flonum timestamp))
-                                      ;; debugging rising latency bug
-                                      (current-monotonic))
+                                      (if (= dts -1) -1. (timestamp->flonum dts))
+                                      (if (= pts -1) -1. (timestamp->flonum pts)))
                         (record-event udp-id-create-info
                                       (fixnum->flonum no)
                                       (fixnum->flonum client-no)
@@ -956,7 +960,7 @@
                           -1.))
         (let ((sequence (read-udp-sequence data))
               (frame (read-udp-frame data))
-              (timestamp (read-udp-media-timestamp data)))
+              (pts (read-udp-media-pts data)))
           (record-event udp-id-release-packet
                         (fixnum->flonum no)
                         (fixnum->flonum origin)
@@ -964,7 +968,7 @@
                         (fixnum->flonum sequence)
                         (fixnum->flonum frame)
                         -1.
-                        (timestamp->flonum timestamp)))))))
+                        (timestamp->flonum pts)))))))
 
 
 ;;;
@@ -1119,7 +1123,8 @@
   
   (method public (remember self data)
     (mutex-lock! mutex)
-    (let ((timestamp (read-udp-media-seconds data))
+    (let ((dts (read-udp-media-dts-seconds data))
+          (pts (read-udp-media-pts-seconds data))
           (duration (read-udp-media-duration data))
           (sequence (read-udp-sequence data))
           (frame (read-udp-frame data))
@@ -1131,7 +1136,7 @@
         (cond ;; empty
               ((= count 0)
                (when in-order?
-                 (let ((packet (new UDP-Packet timestamp duration sequence frame part total header? data)))
+                 (let ((packet (new UDP-Packet dts pts duration sequence frame part total header? data)))
                    (insert-before self head packet)
                    (set! last-sequence sequence)
                    (set! lowest sequence)
@@ -1139,7 +1144,7 @@
                    (check self))))
               ;; insert
               (in-order?
-               (let ((packet (new UDP-Packet timestamp duration sequence frame part total header? data)))
+               (let ((packet (new UDP-Packet dts pts duration sequence frame part total header? data)))
                  (let ((expected (+ last-sequence 1)))
                    (let ((gap (- sequence expected)))
                      (if (and udp-max-gap (>= gap udp-max-gap))
@@ -1147,9 +1152,9 @@
                            (set! last-sequence sequence)
                            (remove-count self count))
                        (let ((highest-packet (highest-packet self)))
-                         (let ((highest-timestamp (get-timestamp highest-packet)))
+                         (let ((highest-pts (get-pts highest-packet)))
                            (loop (for seq from (+ highest 1) below sequence)
-                                 (insert-before self tail (new UDP-Packet #f #f seq #f #f #f #f #f)))))
+                                 (insert-before self tail (new UDP-Packet #f #f #f seq #f #f #f #f #f)))))
                        (insert-before self tail packet)
                        (set! last-sequence sequence)
                        (set! highest sequence)
@@ -1160,7 +1165,7 @@
                  (let ((pos (index self sequence)))
                    (let ((actual-packet (vector-ref packets pos)))
                      (when (not (get-data actual-packet))
-                       (let ((packet (new UDP-Packet timestamp duration sequence frame part total header? data)))
+                       (let ((packet (new UDP-Packet dts pts duration sequence frame part total header? data)))
                          (vector-set! packets pos packet))))))))))
     (mutex-unlock! mutex))
   
@@ -1385,7 +1390,8 @@
   
   (method public (insert self data (insert-event #f))
     (let ((now (current-seconds))
-          (timestamp (read-udp-media-seconds data)))
+          (dts (read-udp-media-dts-seconds data))
+          (pts (read-udp-media-pts-seconds data)))
       (mutex-lock! mutex)
       (let ((duration (read-udp-media-duration data))
             (sequence (read-udp-sequence data))
@@ -1395,8 +1401,8 @@
             (header? (read-udp-media-header? data)))
         (define (time-update)
           (unless (emulation?)
-            (when timestamp
-              (update-time time-base now timestamp
+            (when pts
+              (update-time time-base now pts
                 (lambda (current-latency effective-latency)
                   (condition-variable-signal! wait-condvar)
                   (let ((sender (read-udp-sender data)))
@@ -1407,7 +1413,7 @@
                                   (fixnum->flonum sequence)
                                   now
                                   current-latency
-                                  timestamp
+                                  pts
                                   effective-latency)
                     (when (and show-latency?
                                (client?)
@@ -1434,9 +1440,9 @@
                           (fixnum->flonum sequence)
                           (fixnum->flonum frame)
                           (or latency -1.)
-                          (if (not timestamp)
+                          (if (not pts)
                               -1.
-                            timestamp)
+                            pts)
                           (or base -1.)
                           (or last-latency -1.))))
         
@@ -1469,7 +1475,7 @@
                 ((= count 0)
                  (when in-order?
                    (time-update)
-                   (let ((packet (new UDP-Packet timestamp duration sequence frame part total header? data)))
+                   (let ((packet (new UDP-Packet dts pts duration sequence frame part total header? data)))
                      (record-insert)
                      (insert-before self head packet)
                      (set! last-sequence sequence)
@@ -1479,7 +1485,7 @@
                      (condition-variable-signal! wait-condvar))))
                 ;; insert
                 (in-order?
-                 (let ((packet (new UDP-Packet timestamp duration sequence frame part total header? data)))
+                 (let ((packet (new UDP-Packet dts pts duration sequence frame part total header? data)))
                    (let ((expected (+ last-sequence 1)))
                      (let ((gap (- sequence expected)))
                        (record-gap gap)
@@ -1491,11 +1497,11 @@
                              (condition-variable-signal! wait-condvar))
                          (time-update)
                          (let ((highest-packet (highest-packet self)))
-                           (let ((highest-timestamp (get-timestamp highest-packet)))
+                           (let ((highest-pts (get-pts highest-packet)))
                              (loop (for seq from (+ highest 1) below sequence)
-                                   (let ((timestamp (and timestamp highest-timestamp (interpolate seq highest sequence highest-timestamp timestamp))))
+                                   (let ((pts (and pts highest-pts (interpolate seq highest sequence highest-pts pts))))
                                      (record-missing seq)
-                                     (insert-before self tail (new UDP-Packet timestamp #f seq #f #f #f #f #f))))))
+                                     (insert-before self tail (new UDP-Packet dts pts #f seq #f #f #f #f #f))))))
                          (record-insert)
                          (insert-before self tail packet)
                          (set! last-sequence sequence)
@@ -1517,7 +1523,7 @@
                                              (fixnum->flonum frame)
                                              (fixnum->flonum resent)
                                              -1.))
-                           (let ((packet (new UDP-Packet timestamp duration sequence frame part total header? data)))
+                           (let ((packet (new UDP-Packet dts pts duration sequence frame part total header? data)))
                              (vector-set! packets pos packet)
                              (let ((resent (read-udp-resent data)))
                                (record-event udp-id-got-packet
@@ -1596,14 +1602,15 @@
         (let ((actual-packet (vector-ref packets pos)))
           (assert (eqv? (get-sequence actual-packet) sequence)
             (assert (not (get-data actual-packet))
-              (let ((timestamp (read-udp-media-seconds data))
+              (let ((dts (read-udp-media-dts-seconds data))
+                    (pts (read-udp-media-pts-seconds data))
                     (duration (read-udp-media-duration data))
                     (sequence (read-udp-sequence data))
                     (frame (read-udp-frame data))
                     (part (read-udp-part data))
                     (total (read-udp-total data))
                     (header? (read-udp-media-header? data)))
-                (let ((packet (new UDP-Packet timestamp duration sequence frame part total header? data)))
+                (let ((packet (new UDP-Packet dts pts duration sequence frame part total header? data)))
                   (vector-set! packets pos packet)))))))))
   
   
@@ -1655,10 +1662,10 @@
   
   
   (method (determine-release-time self packet)
-    (let ((timestamp (get-timestamp packet)))
-      (if (not timestamp)
+    (let ((pts (get-pts packet)))
+      (if (not pts)
           0.
-        (+ (remote->local time-base timestamp) retain-window))))
+        (+ (remote->local time-base pts) retain-window))))
   
   
   ;;;
@@ -1878,17 +1885,17 @@
   
   
   (method (determine-earliest-time self packet)
-    (let ((timestamp (get-timestamp packet)))
-      (if (not timestamp)
+    (let ((pts (get-pts packet)))
+      (if (not pts)
           0.
-        (remote->local time-base timestamp))))
+        (remote->local time-base pts))))
   
   
   (method (determine-presentation-time self packet process-window)
-    (let ((timestamp (get-timestamp packet)))
-      (if (not timestamp)
+    (let ((pts (get-pts packet)))
+      (if (not pts)
           0.
-        (+ (remote->local time-base timestamp) process-window))))
+        (+ (remote->local time-base pts) process-window))))
   
   
   (method protected (complete-frame? self)
@@ -1964,10 +1971,10 @@
       (let ((sequence (get-sequence earliest))
             (frame (get-frame earliest))
             (header? (get-header? earliest))
-            (timestamp (get-timestamp earliest)))
+            (pts (get-pts earliest)))
         (if (get-data earliest)
-            (record-discard-packet self sequence frame header? timestamp)
-          (record-lost-packet self sequence frame header? timestamp))
+            (record-discard-packet self sequence frame header? pts)
+          (record-lost-packet self sequence frame header? pts))
         (remove-packet self)
         (when frame
           ;; quick hack fix me
@@ -2036,7 +2043,7 @@
           (format :terminal "{s} {s} {s} {s}  - {a} ({a}){%}" remote-name (present-media-kind media-kind) 'STATE 'WAITING (effective-name (get-stream channel)) (get-no channel))))))
   
   
-  (method (record-lost-packet self sequence frame header? timestamp)
+  (method (record-lost-packet self sequence frame header? pts)
     (record-event udp-id-lost-packet
                   (fixnum->flonum no)
                   (fixnum->flonum origin)
@@ -2046,12 +2053,12 @@
                       -1.
                     (fixnum->flonum frame))
                   (barbara-header-hack header?)
-                  (if (not timestamp)
+                  (if (not pts)
                       -1.
-                    (timestamp->flonum timestamp))))
+                    (timestamp->flonum pts))))
   
   
-  (method (record-discard-packet self sequence frame header? timestamp)
+  (method (record-discard-packet self sequence frame header? pts)
     (record-event udp-id-discard-packet
                   (fixnum->flonum no)
                   (fixnum->flonum origin)
@@ -2059,9 +2066,9 @@
                   (fixnum->flonum sequence)
                   (fixnum->flonum frame)
                   (barbara-header-hack header?)
-                  (if (not timestamp)
+                  (if (not pts)
                       -1.
-                    (timestamp->flonum timestamp))))
+                    (timestamp->flonum pts))))
   
   
   (method public (locate-packet self sequence)
@@ -2152,7 +2159,8 @@
   
   (method override (marshall-object self object)
     (serialize-object (class-of object)
-                      (vector (serialize (get-timestamp object))
+                      (vector (serialize (get-dts object))
+                              (serialize (get-pts object))
                               (serialize (get-duration object))
                               (serialize (get-sequence object))
                               (serialize (get-frame object))
@@ -2163,9 +2171,10 @@
   
   
   (method override (unmarshall-object self content)
-    (bind-vector (timestamp duration sequence frame part total header? data) content
+    (bind-vector (dts pts duration sequence frame part total header? data) content
       (allocate self
-                (deserialize timestamp)
+                (deserialize dts)
+                (deserialize pts)
                 (deserialize duration)
                 (deserialize sequence)
                 (deserialize frame)
@@ -2178,7 +2187,8 @@
 (class UDP-Packet metaclass UDP-Packet-Class extends Object
   
   
-  (slot timestamp getter generate)
+  (slot dts       getter generate)
+  (slot pts       getter generate)
   (slot duration  getter generate)
   (slot sequence  getter generate)
   (slot frame     getter generate)
@@ -2188,9 +2198,10 @@
   (slot data      accessors generate)
   
   
-  (method override (initialize self timestamp duration sequence frame part total header? data)
+  (method override (initialize self dts pts duration sequence frame part total header? data)
     (nextmethod self)
-    (set! self.timestamp timestamp)
+    (set! self.dts dts)
+    (set! self.pts pts)
     (set! self.duration duration)
     (set! self.sequence sequence)
     (set! self.frame frame)
@@ -2470,24 +2481,31 @@
 (definition public (read-udp-frame           data) (scan-s32      data 20)) (definition public (write-udp-frame           data value) (put-s32      data 20 value))
 (definition public (read-udp-part            data) (scan-s32      data 24)) (definition public (write-udp-part            data value) (put-s32      data 24 value))
 (definition public (read-udp-total           data) (scan-s32      data 28)) (definition public (write-udp-total           data value) (put-s32      data 28 value))
-(definition public (read-udp-media-timestamp data) (scan-s64      data 32)) (definition public (write-udp-media-timestamp data value) (put-s64      data 32 value))
-(definition public (read-udp-media-duration  data) (scan-u64      data 40)) (definition public (write-udp-media-duration  data value) (put-u64      data 40 value))
-(definition public (read-udp-media-payload   data) (scan-u8vector data 48)) (definition public (write-udp-media-payload   data value) (put-u8vector data 48 value)) (definition public udp-media-buffer-offset (+ 48 4))
+(definition public (read-udp-media-dts       data) (scan-s64      data 32)) (definition public (write-udp-media-dts       data value) (put-s64      data 32 value))
+(definition public (read-udp-media-pts       data) (scan-s64      data 40)) (definition public (write-udp-media-pts       data value) (put-s64      data 40 value))
+(definition public (read-udp-media-duration  data) (scan-u64      data 48)) (definition public (write-udp-media-duration  data value) (put-u64      data 48 value))
+(definition public (read-udp-media-payload   data) (scan-u8vector data 56)) (definition public (write-udp-media-payload   data value) (put-u8vector data 56 value)) (definition public udp-media-buffer-offset (+ 56 4))
 (definition public (read-udp-media-header?   data) (scan-boolean  data  9)) (definition public (write-udp-media-header?   data value) (put-boolean  data  9 value))
 (definition public (read-udp-media-off?      data) (scan-boolean  data 10)) (definition public (write-udp-media-off?      data value) (put-boolean  data 10 value))
 (definition public (read-udp-resent          data) (scan-s8       data 11)) (definition public (write-udp-resent          data value) (put-s8       data 11 value))
 
-(definition public (read-udp-media-seconds data)
-  (let ((timestamp (read-udp-media-timestamp data)))
-    (if (= timestamp -1)
+(definition public (read-udp-media-dts-seconds data)
+  (let ((dts (read-udp-media-dts data)))
+    (if (= dts -1)
         #f
-      (/ timestamp nanosecond))))
+      (/ dts nanosecond))))
+
+(definition public (read-udp-media-pts-seconds data)
+  (let ((pts (read-udp-media-pts data)))
+    (if (= pts -1)
+        #f
+      (/ pts nanosecond))))
 
 (definition public (read-udp-media-payload-size data)
-  (scan-s32 data 48))
+  (scan-s32 data 56))
 
 (definition public (write-udp-media-subpayload data value offset count)
-  (put-subu8vector! data 48 value offset count))
+  (put-subu8vector! data 56 value offset count))
 
 (definition public (increase-udp-resent data)
   (write-udp-resent data (+ (read-udp-resent data) 1)))

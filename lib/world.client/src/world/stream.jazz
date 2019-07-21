@@ -157,9 +157,10 @@
              (let ((size (gst_app_sink_try_pull element data info)))
                (assert (/= size -1)
                  (let ((buffer (subu8vector data 0 size))
-                       (timestamp (u64vector-ref info 0))
-                       (duration (u64vector-ref info 1)))
-                   (consume consumer buffer timestamp duration)))))))))))
+                       (dts (u64vector-ref info 0))
+                       (pts (u64vector-ref info 1))
+                       (duration (u64vector-ref info 2)))
+                   (consume consumer buffer dts pts duration)))))))))))
 
 
 (definition public (gst_app_sink_process_one consumer)
@@ -172,9 +173,10 @@
         (let ((size (gst_app_sink_try_pull element data info)))
           (assert (/= size -1)
             (let ((buffer (subu8vector data 0 size))
-                  (timestamp (u64vector-ref info 0))
-                  (duration (u64vector-ref info 1)))
-              (consume consumer buffer timestamp duration))))))))
+                  (dts (u64vector-ref info 0))
+                  (pts (u64vector-ref info 1))
+                  (duration (u64vector-ref info 2)))
+              (consume consumer buffer dts pts duration))))))))
 
 
 ;;;
@@ -212,11 +214,11 @@
     (set! self.listener listener)
     (set! self.element element)
     (set! self.data (make-u8vector size))
-    (set! self.info (make-u64vector 2)))
+    (set! self.info (make-u64vector 3)))
   
   
   (method protected (release-consumer self)
-    (consume self #f #f #f)
+    (consume self #f #f #f #f)
     (close-stream-listener listener)
     (set! listener #f)
     (set! element #f)
@@ -268,7 +270,7 @@
   
   
   (method protected virtual (eos-action self)
-    (consume self #f #f #f)))
+    (consume self #f #f #f #f)))
 
 
 ;;;
@@ -331,7 +333,7 @@
 
 
 (definition header-unit <fx>
-  (+ 8 8 8 4 4))
+  (+ 8 8 8 8 4 4))
 
 (definition header-count <fx>
   4096)
@@ -418,46 +420,48 @@
   
   (method protected (read-frame self (read-buffer? #t))
     (if (>= frame count)
-        (values #f #f #f)
+        (values #f #f #f #f)
       (let ((section (quotient frame header-count))
             (rank (modulo frame header-count)))
         (increase! frame)
         (set! position (+ (u64vector-ref index section) (* rank header-unit)))
         (input-port-byte-position port position)
         (read-subu8vector temporary 0 8 port)
-        (let ((timestamp (+ (scan-s64 temporary 0) timestamp-offset)))
+        (let ((dts (+ (scan-u64 temporary 0) timestamp-offset)))
           (read-subu8vector temporary 0 8 port)
-          (let ((duration (scan-u64 temporary 0)))
-            (if read-buffer?
-                (begin
-                  (read-subu8vector temporary 0 8 port)
-                  (let ((offset (scan-u64 temporary 0)))
-                    (let ((size (read-32-bit-integer port)))
-                      (set! position offset)
-                      (input-port-byte-position port position)
-                      (let ((buffer (make-u8vector size)))
-                        (read-subu8vector buffer 0 size port)
-                        (values buffer timestamp duration)))))
-              (values #t timestamp duration)))))))
+          (let ((pts (+ (scan-u64 temporary 0) timestamp-offset)))
+            (read-subu8vector temporary 0 8 port)
+            (let ((duration (scan-u64 temporary 0)))
+              (if read-buffer?
+                  (begin
+                    (read-subu8vector temporary 0 8 port)
+                    (let ((offset (scan-u64 temporary 0)))
+                      (let ((size (read-32-bit-integer port)))
+                        (set! position offset)
+                        (input-port-byte-position port position)
+                        (let ((buffer (make-u8vector size)))
+                          (read-subu8vector buffer 0 size port)
+                          (values buffer dts pts duration)))))
+                (values #t dts pts duration))))))))
   
   
-  ;; test
   (method protected (read-header self frame)
     (let ((section (quotient frame header-count))
           (rank (modulo frame header-count)))
       (input-port-byte-position port (+ (u64vector-ref index section) (* rank header-unit)))
       (read-subu8vector temporary 0 8 port)
-      (let ((timestamp (+ (scan-s64 temporary 0) timestamp-offset)))
+      (let ((dts (+ (scan-u64 temporary 0) timestamp-offset)))
         (read-subu8vector temporary 0 8 port)
-        (let ((duration (scan-u64 temporary 0)))
+        (let ((pts (+ (scan-u64 temporary 0) timestamp-offset)))
           (read-subu8vector temporary 0 8 port)
-          (let ((offset (scan-u64 temporary 0)))
-            (let ((size (read-32-bit-integer port)))
-              (let ((header? (= (read-32-bit-integer port) 1)))
-                (values timestamp duration size header?))))))))
+          (let ((duration (scan-u64 temporary 0)))
+            (read-subu8vector temporary 0 8 port)
+            (let ((offset (scan-u64 temporary 0)))
+              (let ((size (read-32-bit-integer port)))
+                (let ((header? (= (read-32-bit-integer port) 1)))
+                  (values dts pts duration size header?)))))))))
   
   
-  ;; test
   (method protected (read-header? self frame)
     (let ((section (quotient frame header-count))
           (rank (modulo frame header-count)))
@@ -552,10 +556,12 @@
     (output-port-byte-position port position))
   
   
-  (method public (write-frame self buffer timestamp duration)
-    (when (= frame 0)
-      (set! start-timestamp timestamp))
-    (set! end-timestamp timestamp)
+  (method public (write-frame self buffer dts pts duration)
+    (when (and (not start-timestamp)
+               (/= pts GST_CLOCK_TIME_NONE))
+      (assert (= pts 0)
+        (set! start-timestamp pts)))
+    (set! end-timestamp pts)
     (when (= (modulo frame header-count) 0)
       (let ((section (quotient frame header-count)))
         (u64vector-set! index section position)
@@ -566,7 +572,7 @@
       ;; PRIME
       (when header?
         (increase! header-total))
-      (enqueue header (list timestamp duration position size header?))
+      (enqueue header (list dts pts duration position size header?))
       (write-subu8vector buffer 0 size port)
       (increase! frame)
       (increase! position size))
@@ -579,8 +585,10 @@
       (output-port-byte-position port pos)
       (loop (for n from 0 below header-count)
             (for info in (queue-list header))
-            (bind (timestamp duration position size header?) info
-              (put-s64 temporary 0 timestamp)
+            (bind (dts pts duration position size header?) info
+              (put-u64 temporary 0 dts)
+              (write-subu8vector temporary 0 8 port)
+              (put-u64 temporary 0 pts)
               (write-subu8vector temporary 0 8 port)
               (put-u64 temporary 0 duration)
               (write-subu8vector temporary 0 8 port)
@@ -715,9 +723,9 @@
                 (timestamp 0)
                 (duration 100))
             (let ((color-buffer (make-u8vector size))
-                  (color-info (make-u64vector 2))
+                  (color-info (make-u64vector 3))
                   (alpha-buffer (make-u8vector alpha-size))
-                  (alpha-info (make-u64vector 2))
+                  (alpha-info (make-u64vector 3))
                   (alpha-data (heap-calloc alpha-size 1)))
               (separate-alpha data alpha-data pixels)
               (gst_app_src_write_pointer_now color-src data size 0 duration)
