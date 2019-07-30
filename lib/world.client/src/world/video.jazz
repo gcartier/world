@@ -451,7 +451,7 @@
     (set! ordered-outputs (if rank
                               (insert! ordered-outputs rank output)
                             (append! ordered-outputs (list output))))
-    (play output))
+    (start output))
   
   
   (method package (entity-output self id (position: position #f) (size: size #f) (resolution: resolution #f) (codec: codec #f))
@@ -1815,14 +1815,9 @@
   (slot rate                        initialize #f accessors generate)
   (slot wait-header?                initialize #t accessors generate)
   (slot stream-state                initialize 'off getter generate setter explicit)
-  (slot first-pts                   initialize #f getter generate)
-  (slot first-clocktime             initialize #f getter generate)
-  (slot base-pts                    initialize #f getter generate)
-  (slot base-clocktime              initialize #f getter generate)
-  (slot timestamp-offset            initialize #f getter generate)
-  (slot state-machine               initialize 'start getter generate)
-  (slot moving-drift                initialize #f getter generate)
-  (slot buffer-count                initialize 0  getter generate)
+  (slot stream-playing?             initialize #f getter generate)
+  (slot moving-deviation            initialize 0. getter generate)
+  (slot timestamp-offset            initialize 0  getter generate)
   
   
   (method override (initialize self (level: level #f) (resolution: resolution #f) (framerate: framerate #f) (bitrate: bitrate #f) (codec: codec #f) (caps: caps #f) (process?: process? #t) (alpha-overlay: alpha-overlay #f) (alpha?: alpha? #f) (sync-audio?: sync-audio? #f))
@@ -2047,90 +2042,30 @@
   
   
   (method protected virtual (consume-video self color dts pts duration (alpha #f))
-    (define (write)
-      (gst_app_src_write color-appsrc color (u8vector-length color) dts pts duration timestamp-offset))
-    
-    (define (state-machine-change)
-      (let ((next-state #f))
-        (case state-machine
-          ((start)
-           (set! next-state 'clock-still))
-          ((clock-still)
-           (set! next-state 'clock-running))
-          (else
-           (terminal 'VIDEO 'STATE-MACHINE 'ERROR)))
-        (when show-sync?
-          (terminal 'VIDEO state-machine '-> next-state))
-        (set! state-machine next-state)))
-    
     ;; QUICK TEST
     (when color-appsrc
       ;; QUICK TEST
       (when color
-        (let ((now (flonum->timestamp (current-monotonic)))
-              (clocktime (gst_pipeline_get_time color-pipeline))
-              (positive-tolerance .05)
-              (negative-tolerance -.05))
-          
-          (case state-machine
-            ((start)
-             (play-element self)
-             (set! first-pts pts)
-             (set! first-clocktime clocktime)
-             ;; subtracting first-pts is a hack around
-             ;; world streams timestamps not starting at 0
-             (set! timestamp-offset (- first-pts))
-             (state-machine-change)
-             (write))
-            ((clock-still)
-             (when (> clocktime first-clocktime)
-               (set! base-pts pts)
-               (set! base-clocktime clocktime)
-               (state-machine-change))
-             (write))
-            ((clock-running)
-             (if (video-buffer-header? color)
-                 (write)
-               (let ((pts-elapse (- pts base-pts))
-                     (clock-elapse (- clocktime base-clocktime)))
-                 (let ((drift (timestamp->flonum (- pts-elapse clock-elapse))))
-                   (if (not moving-drift)
-                       (set! moving-drift drift)
-                     (set! moving-drift (/ (+ (* 127. moving-drift) drift) 128.)))
-                   (let ((adjusted-pts (+ pts timestamp-offset)))
-                     (define (debug prefix (adjustment #f))
-                       (when show-sync?
-                         (format :terminal "                            {a} video {r precision: 6} {r precision: 6} {r precision: 6} {? {r precision: 3}~}{%}"
-                           prefix (timestamp->flonum adjusted-pts) moving-drift (timestamp->flonum clock-elapse) (timestamp->flonum pts-elapse))))
-                     ;;prefix moving-drift (timestamp->flonum timestamp-offset) adjusted-drift (and adjustment (timestamp->flonum adjustment)))))
-                     ;; when drift is too large, pts-elapse > clock-elapse so we are seeing timestamps coming too fast
-                     ;; and we have to drop one
-                     ;; when drift is too small, timestamps are coming in too slowly as latency increases
-                     ;; for video, a drift should mean a dropped frame...
-                     ;; when we drop a frame we stop processing until we get a header...
-                     @w (cond ((> moving-drift positive-tolerance)
-                               (decrease! timestamp-offset (flonum->timestamp positive-tolerance))
-                               (debug '<<<<<<<<<<< positive-tolerance)
-                               (increase! moving-drift positive-tolerance)
-                               (write))
-                              ((< moving-drift negative-tolerance)
-                               (increase! timestamp-offset (- (flonum->timestamp negative-tolerance)))
-                               (debug '>>>>>>>>>> negative-tolerance)
-                               (decrease! moving-drift negative-tolerance)
-                               (write))
-                              (else
-                               (write)))
-                     (write)
-                     (when (and moving-drift (= (modulo buffer-count 100) 0))
-                       (debug '**********)))))))))))
-    (increase! buffer-count)
+        (when (not stream-playing?)
+          (play-element self)
+          (set! stream-playing? #t))
+        (let ((perfect-offset (- (gst_element_get_running_time color-appsrc) pts)))
+          (let ((deviation (timestamp->flonum (abs (- perfect-offset timestamp-offset))))
+                (tolerance .05))
+            (set! moving-deviation (/ (+ (* moving-deviation 31.) deviation) 32.))
+            (when (> moving-deviation tolerance)
+              (set! timestamp-offset perfect-offset)
+              (set! moving-deviation 0.)
+              (when show-sync?
+                (format :terminal "video timestamp-offset {r precision: 3}{%}" (timestamp->flonum timestamp-offset))))))
+        (gst_app_src_write color-appsrc color (u8vector-length color) dts pts duration timestamp-offset)))
     (when alpha?
       ;; QUICK TEST
       (when alpha-appsrc
         ;; QUICK TEST
         (when alpha
-          (gst_app_src_write alpha-appsrc alpha (u8vector-length alpha) dts pts duration timestamp-offset)))))
-  
+          (gst_app_src_write alpha-appsrc alpha (u8vector-length alpha) dts pts duration 0)))))
+      
   
   (method (video-loop self task)
     (declare (proper-tail-calls))
