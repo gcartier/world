@@ -167,7 +167,7 @@
           (setup output)
           (table-set! outputs id output)
           (set! ordered-outputs (append! ordered-outputs (list output)))
-          (play output)
+          (start output)
           output)))
   
   
@@ -179,7 +179,7 @@
   
   (method package (visualizer-output self)
     (let ((output (new Audio-Sink codec: audio-codec provider: audio-provider)))
-      (play output)
+      (start output)
       output))
   
   
@@ -700,18 +700,12 @@
   (slot volelem             initialize #f accessors generate)
   (slot panelem             initialize #f accessors generate)
   (slot stream-state        initialize 'off getter generate setter explicit)
-  (slot first-pts           initialize #f getter generate)
-  (slot first-clocktime     initialize #f getter generate)
-  (slot base-pts            initialize #f getter generate)
-  (slot base-clocktime      initialize #f getter generate)
-  (slot expected-pts        initialize #f getter generate)
-  (slot timestamp-offset    initialize #f getter generate)
-  (slot expected-now        initialize #f getter generate)
-  (slot accumulated-latency initialize 0. getter generate)
-  (slot moving-drift        initialize 0. getter generate)
-  (slot state-machine       initialize 'start getter generate)
+  (slot stream-playing?     initialize #f getter generate)
+  (slot moving-deviation    initialize 0. getter generate)
+  (slot timestamp-offset    initialize 0  getter generate)
+  (slot extra-offset        initialize 30000000 accessors generate)
   (slot buffer-count        initialize 0  getter generate)
-  (slot brand               initialize #f getter generate)
+  (slot brand               getter generate)
   (slot monitor             getter generate)
   
   
@@ -753,9 +747,9 @@
                                   "audio/x-raw, format=S16LE, layout=interleaved, rate=48000, channels=1"
                                   (cond-expand
                                     (windows (if (eq? provider 'directsound)
-                                                 "directsoundsink buffer-time=200000 name=sink"
-                                               "wasapisink buffer-time=200000 name=sink"))
-                                    (mac "osxaudiosink buffer-time=200000 name=sink")
+                                                 "directsoundsink buffer-time=200000 discont-wait=0 name=sink"
+                                               "wasapisink buffer-time=200000 discont-wait=0 name=sink"))
+                                    (mac "osxaudiosink buffer-time=200000 discont-wait=0 name=sink")
                                     (else "autoaudiosink name=sink")))))
       (gst_object_set_name pipeline "output")
       (with-unref ((appsrc (gst_bin_get_by_name pipeline "src"))
@@ -828,84 +822,23 @@
   
   
   (method protected virtual (consume-audio self buffer dts pts duration)
-    (let ((now (current-monotonic))
-          (clocktime (gst_pipeline_get_time pipeline))
-          (positive-tolerance .1)
-          (negative-tolerance -.1))
-      (define (state-machine-change)
-        (let ((next-state #f))
-          (case state-machine
-            ((start)
-             (set! next-state 'clock-still))
-            ((clock-still)
-             (set! next-state 'clock-running))
-            (else
-             (terminal 'STATE-MACHINE 'ERROR)))
-          (when show-sync?
-            (terminal 'AUDIO state-machine '-> next-state))
-          (set! state-machine next-state)))
-      
-      (define (write)
-        (gst_app_src_write appsrc buffer (u8vector-length buffer) dts pts duration timestamp-offset)
-        (when (and duration pts (eq? state-machine 'clock-running))
-          (set! expected-now (+ now (timestamp->flonum duration)))
-          (set! expected-pts (+ pts duration))))
-      
-      (if (audio-buffer-header? buffer)
-          (gst_app_src_write appsrc buffer (u8vector-length buffer) dts pts duration 0)
-        (case state-machine
-          ((start)
-           (play-element self)
-           (set! first-pts pts)
-           (set! first-clocktime (gst_pipeline_get_time pipeline))
-           ;; subtracting first-pts is a hack around
-           ;; world streams timestamps not starting at 0
-           (set! timestamp-offset (- first-pts))
-           (state-machine-change)
-           (write))
-          ((clock-still)
-           (when (> clocktime first-clocktime)
-             (set! base-pts pts)
-             (set! base-clocktime clocktime)
-             (state-machine-change))
-           (write))
-        ((clock-running)
-         (let ((latency-change (- now expected-now))
-               (overshoot (- pts expected-pts)))
-           (define (debug prefix (adjustment #f))
-             (when show-sync?
-               (let ((adjusted-pts (+ pts timestamp-offset)))
-                 (format :terminal "{a} audio {r precision: 6} {r precision: 6} {r precision: 6} {? {r precision: 6}~}{%}"
-                   prefix (timestamp->flonum adjusted-pts) moving-drift latency-change accumulated-latency))))
-           
-           (set! accumulated-latency (+ accumulated-latency latency-change))
-           (cond ((> accumulated-latency positive-tolerance)
-                  (debug '>>>>>>>>>>)
-                  (increase! timestamp-offset (flonum->timestamp accumulated-latency))
-                  (set! accumulated-latency 0.)
-                  (write))
-                 ((< accumulated-latency negative-tolerance)
-                  (debug '<<<<<<<<<<<)
-                  (increase! timestamp-offset (flonum->timestamp accumulated-latency))
-                  (set! accumulated-latency 0.)
-                  (write))
-                 ((> overshoot 0)
-                  (decrease! timestamp-offset overshoot);; + accumulated-latency?
-                  (when show-sync?
-                    (format :terminal "$$$$$$$$$$ {r precision: 6}{%}"
-                      (timestamp->flonum overshoot)))
-                  (write))
-                 (else
-                  (write)))
-           (let ((pts-elapse (- pts base-pts))
-                 (clock-elapse (- clocktime base-clocktime)))
-             (let ((drift (timestamp->flonum (- pts-elapse clock-elapse))))
-               (if (not moving-drift)
-                   (set! moving-drift drift)
-                 (set! moving-drift (/ (+ (* 127. moving-drift) drift) 128.)))
-               (when (= (modulo buffer-count 100) 0)
-                 (debug '**********)))))))))
-    (increase! buffer-count))
+    (when (and (not stream-playing?)
+               (> buffer-count 0))
+      (play-element self)
+      (set! stream-playing? #t))
+    (if (audio-buffer-header? buffer)
+        (gst_app_src_write appsrc buffer (u8vector-length buffer) dts pts duration 0)
+      (let ((perfect-offset (- (gst_element_get_running_time appsrc) pts)))
+        (let ((deviation (timestamp->flonum (abs (- perfect-offset timestamp-offset))))
+              (tolerance .05))
+          (set! moving-deviation (/ (+ (* moving-deviation 31.) deviation) 32.))
+          (when (> moving-deviation tolerance)
+            (set! timestamp-offset perfect-offset)
+            (set! moving-deviation 0.)
+            (when show-sync?
+              (format :terminal "audio timestamp-offset {r precision: 3} extra-offset {r precision: 3}{%}" (timestamp->flonum timestamp-offset) (timestamp->flonum extra-offset))))))
+      (gst_app_src_write appsrc buffer (u8vector-length buffer) dts pts duration (+ timestamp-offset extra-offset))
+      (increase! buffer-count)))
   
   
   (method public (muted? self)
