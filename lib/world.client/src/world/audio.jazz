@@ -53,13 +53,8 @@
 (definition protected audio-denoise?
   (world-setting 'world.audio-denoise? (= audio-rate 48000)))
 
-(definition protected (get-audio-denoise?)
-  (get-denoising?))
-
 (definition protected (set-audio-denoise? flag)
-  (set-denoising? flag))
-
-(set-audio-denoise? audio-denoise?)
+  (set! audio-denoise? flag))
 
 
 (definition protected audio-properties
@@ -300,18 +295,21 @@
 ;;;
 
 
-(definition protected audio-filter
-  "audiodynamic threshold=0.5 ratio=0.5 characteristics=soft-knee")
+;; denoiser only works in S16LE format and 48000 rate
+(definition protected denoiser-caps
+  "audio/x-raw, format=S16LE, layout=interleaved, rate=48000, channels=1")
 
-(definition protected (set-audio-filter filter)
-  (set! audio-filter filter))
+;; prevents sharp spikes that sound really harsh when denoised
+(definition protected denoiser-filter
+  "audiodynamic threshold=0.5 ratio=0.5 characteristics=soft-knee")
 
 
 (class Mic-Audio-Src extends Audio-Src
   
   
-  (slot mic-pipeline initialize #f  accessors generate)
-  (slot mic-sink     initialize #f  accessors generate)
+  (slot mic-pipeline initialize #f accessors generate)
+  (slot mic-sink     initialize #f accessors generate)
+  (slot denoiser     initialize #f accessors generate)
   
   
   (method override (setup-element self)
@@ -325,18 +323,15 @@
                                     (cond-expand
                                       (windows "directsoundsrc latency-time=30000 provide-clock=false name=src")
                                       (else "osxaudiosrc latency-time=30000 provide-clock=false name=src"))
-                                    ;; denoiser only works with S16LE format
                                     "audioresample"
-                                    (tie "audio/x-raw, format=S16LE, layout=interleaved, rate={audio-rate}, channels=1")
-                                    audio-filter
+                                    denoiser-caps
+                                    denoiser-filter
                                     "appsink sync=false name=sink")))
         (gst_object_set_name pipeline "mic")
         (with-unref ((appsink (gst_bin_get_by_name pipeline "sink")))
-          (let ((data (make-u8vector 4096))
-                (info (make-u64vector 3)))
-            (gst_element_set_state pipeline GST_STATE_READY)
-            (set! self.mic-pipeline pipeline)
-            (set! self.mic-sink appsink))))
+          (gst_element_set_state pipeline GST_STATE_READY)
+          (set! self.mic-pipeline pipeline)
+          (set! self.mic-sink appsink)))
       ;; audio
       (let ((listener (open-stream-listener "mic"))
             (pipeline (gst-pipeline "appsrc name=src"
@@ -363,7 +358,7 @@
           (set! self.pipeline pipeline)
           (set! self.appsrc appsrc)))
       ;; denoiser
-      (create-denoiser-thread mic-sink appsrc)))
+      (set! denoiser (create-denoiser mic-sink appsrc #f #f audio-denoise?))))
   
   
   (method override (start-element self)
@@ -401,7 +396,9 @@
     (release-consumer consumer)
     (gst_element_release mic-pipeline)
     (set! mic-pipeline #f)
-    (set! mic-sink #f))
+    (set! mic-sink #f)
+    (free-denoiser denoiser)
+    (set! denoiser #f))
   
   
   (method override (resettable? self)
@@ -494,7 +491,11 @@
 (class File-Preprocess-Audio-Src extends Audio-Src
   
   
-  (slot location initialize #f accessors generate)
+  (slot location      initialize #f accessors generate)
+  (slot file-pipeline initialize #f accessors generate)
+  (slot file-sink     initialize #f accessors generate)
+  (slot volume        initialize #f accessors generate)
+  (slot denoiser      initialize #f accessors generate)
   
   
   (method override (initialize self location)
@@ -506,44 +507,90 @@
     (nextmethod self)
     (let ((properties (or audio-properties ""))
           (listener (open-stream-listener "preprocessaudio")))
+      ;; file
       (let ((pipeline (gst-pipeline (tie "filesrc name=filesrc")
                                     "decodebin"
+                                    "audioconvert"
+                                    "audioresample"
+                                    denoiser-caps
+                                    denoiser-filter
+                                    "appsink sync=false name=sink")))
+        (gst_object_set_name pipeline "file")
+        (with-unref ((filesrc (gst_bin_get_by_name pipeline "filesrc"))
+                     (appsink (gst_bin_get_by_name pipeline "sink")))
+          (g_object_set_string filesrc "location" (path-normalize location))
+          (gst_element_set_state pipeline GST_STATE_READY)
+          (set! self.file-pipeline pipeline)
+          (set! self.file-sink appsink)))
+      ;; audio
+      (let ((listener (open-stream-listener "file"))
+            (pipeline (gst-pipeline "appsrc name=src"
+                                    "volume name=volume"
                                     (and (eq? audio-codec 'opus) (tie "opusenc {properties} name=enc"))
                                     (and (eq? audio-codec 'vorbis) "audioconvert")
                                     (and (eq? audio-codec 'vorbis) "audioresample")
                                     (and (eq? audio-codec 'vorbis) (tie "audio/x-raw, format=F32LE, layout=interleaved, rate={audio-rate}, channels=1"))
                                     (and (eq? audio-codec 'vorbis) (tie "vorbisenc {properties} name=enc"))
                                     "appsink name=appsink sync=false")))
-        (gst_object_set_name pipeline "file")
-        (with-unref ((filesrc (gst_bin_get_by_name pipeline "filesrc"))
-                     (appsink (gst_bin_get_by_name pipeline "appsink")))
+        (with-unref ((appsrc (gst_bin_get_by_name pipeline "src"))
+                     (appsink (gst_bin_get_by_name pipeline "appsink"))
+                     (volume (gst_bin_get_by_name pipeline "volume")))
+          (gst-app-src-set-caps appsrc "audio/x-raw"
+            "format"   'string "S16LE"
+            "layout"   'string "interleaved"
+            "rate"     'int    audio-rate
+            "channels" 'int    1)
+          (g-object-set appsrc
+            "is-live"     'boolean #t
+            "stream-type" 'int     GST_APP_STREAM_TYPE_STREAM
+            "format"      'int     GST_FORMAT_TIME)
           (gst_app_sink_connect_signals appsink listener)
-          (g_object_set_string filesrc "location" (path-normalize location))
+          (setup-consumer consumer listener appsink 4096)
           (gst_element_set_state pipeline GST_STATE_READY)
           (set! self.pipeline pipeline)
-          (setup-consumer consumer listener appsink 4096)))))
+          (set! self.appsrc appsrc)
+          (set! self.volume volume)))
+      ;; denoiser
+      (set! denoiser (create-denoiser file-sink appsrc volume #t #t))))
   
   
   (method override (start-element self)
     (nextmethod self)
     (task-start self 'file)
-    (gst_element_set_state pipeline GST_STATE_PAUSED))
+    (gst_element_set_state pipeline GST_STATE_PAUSED)
+    (gst_element_set_state file-pipeline GST_STATE_PAUSED))
   
   
   (method override (play-element self)
     (nextmethod self)
-    (gst_element_set_state pipeline GST_STATE_PLAYING))
+    (gst_element_set_state pipeline GST_STATE_PLAYING)
+    (gst_element_set_state file-pipeline GST_STATE_PLAYING))
   
   
   (method override (pause-element self)
     (nextmethod self)
-    (gst_element_set_state pipeline GST_STATE_PAUSED))
+    (gst_element_set_state pipeline GST_STATE_PAUSED)
+    (gst_element_set_state file-pipeline GST_STATE_PAUSED))
   
   
   (method override (stop-element self)
     (nextmethod self)
     (task-stop self)
-    (gst_element_set_state pipeline GST_STATE_READY))
+    (gst_element_set_state pipeline GST_STATE_READY)
+    (gst_element_set_state file-pipeline GST_STATE_READY))
+  
+  
+  (method override (release-element self)
+    (nextmethod self)
+    (gst_element_release pipeline)
+    (set! pipeline #f)
+    (set! appsrc #f)
+    (release-consumer consumer)
+    (gst_element_release file-pipeline)
+    (set! file-pipeline #f)
+    (set! file-sink #f)
+    (free-denoiser denoiser)
+    (set! denoiser #f))
   
   
   (method override (audio-loop self task)
