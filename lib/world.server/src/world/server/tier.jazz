@@ -393,24 +393,35 @@
           (begin
             (logger/activity self "Max connections reached ({a})" character-name)
             (format "Server max {a} connections reached" max-connections))
+        (cleanup-disconnected self)
         (let ((existing-delegate (find-delegate-by-name self character-name)))
           ;; open test first draft at reconnection
           (let ((reconnected-delegate
                   (and existing-delegate
                        (or (get-exception existing-delegate)
                            (not (live? (get-client existing-delegate))))
-                       existing-delegate)))
+                       existing-delegate))
+                (disconnected-delegate
+                  (find-if (lambda (delegate)
+                             (equal? (get-name delegate) character-name))
+                           disconnected)))
             (if (and existing-delegate
                      (not reconnected-delegate))
                 (begin
                   (logger/activity self "Name unavailable {a}" character-name)
                   (format "{a} {a} is unavailable" (registered-domain-name 'character "Character") character-name))
               ;; register client
-              (let ((delegate (if (not reconnected-delegate)
-                                  (let ((id (make-unique-id)))
-                                    (new Client-Delegate client 'connected client-uuid id (literal->id id self) character-name character-avatar character-script character-role character-sphere?))
-                                (client-reconnect self client reconnected-delegate)
-                                reconnected-delegate)))
+              (let ((delegate (cond (reconnected-delegate
+                                     (client-reconnected self client reconnected-delegate client-uuid)
+                                     (cleanup-client self reconnected-delegate)
+                                     reconnected-delegate)
+                                    (disconnected-delegate
+                                     (set! disconnected (remove! disconnected-delegate disconnected))
+                                     (client-reconnected self client disconnected-delegate client-uuid)
+                                     disconnected-delegate)
+                                    (else
+                                     (let ((id (make-unique-id)))
+                                       (new Client-Delegate client 'connected client-uuid id (literal->id id self) character-name character-avatar character-script character-role character-sphere?))))))
                 (logger/activity self "{a} {a}" (if reconnected-delegate "Reconnect" "Connect") character-name)
                 (unless reconnected-delegate
                   (set! delegates (cons delegate delegates)))
@@ -475,23 +486,15 @@
         (broadcast-exited self delegate))))
   
   
-  (method package (client-reconnect self client reconnected-delegate)
+  (method package (client-reconnected self client reconnected-delegate uuid)
     (set-client reconnected-delegate client)
     (set-alive reconnected-delegate (current-seconds))
     (set-exception reconnected-delegate #f)
     (set-exception-stack reconnected-delegate #f)
     (set-exception-time reconnected-delegate #f)
+    (set-uuid reconnected-delegate uuid)
     (broadcast-reconnected self reconnected-delegate)
-    ;; unregister existing streams
-    (let ((reconnected-no (get-no reconnected-delegate)))
-      (iterate-table (get-server-streams udp-server)
-        (lambda (no stream)
-          (when (= (get-origin stream) reconnected-no)
-            (server-unregister-stream self no)))))
-    ;; leave group
-    (let ((group (get-group reconnected-delegate)))
-      (when group
-        (leave-group self reconnected-delegate group))))
+    (set-preserved-group reconnected-delegate #f))
   
   
   (method package (client-disconnect self client character-name)
@@ -1596,22 +1599,38 @@
                       (disconnected-client self delegate)
                       (set! newly-disconnected (cons (cons delegate group) newly-disconnected)))))
                 delegates)
-      (set! disconnected (collect-if keep-disconnected? disconnected))
+      (cleanup-disconnected self)
       (when (not-null? newly-disconnected)
         (broadcast-disconnected self newly-disconnected))))
+  
+  
+  (method (cleanup-disconnected self)
+    (set! disconnected (collect-if keep-disconnected? disconnected)))
   
   
   (method (disconnected-client self delegate)
     (logger/activity self "Disconnected {a}" (get-name delegate))
     (set! delegates (remove! delegate delegates))
     (set! disconnected (cons delegate disconnected))
-    (let ((group (get-group delegate)))
-      (when group
-        (leave-group self delegate group)))
+    (cleanup-client self delegate)
     (calling-client self delegate
       (lambda ()
         (catch (connection-exception? exc)
           (detach-client (get-client delegate))))))
+  
+  
+  (method package (cleanup-client self delegate)
+    ;; unregister existing streams
+    (let ((reconnected-no (get-no delegate)))
+      (iterate-table (get-server-streams udp-server)
+        (lambda (no stream)
+          (when (= (get-origin stream) reconnected-no)
+            (server-unregister-stream self no)))))
+    ;; leave group
+    (let ((group (get-group delegate)))
+      (when group
+        (set-preserved-group delegate group)
+        (leave-group self delegate group))))
   
   
   (method override (delay-disconnected-client self delegate)
@@ -1641,7 +1660,7 @@
   
   
   (method (broadcast-reconnected self client-delegate)
-    (let ((client-group (get-group client-delegate)))
+    (let ((client-group (or (get-group client-delegate) (get-preserved-group client-delegate))))
       (when (and client-group (memq? client-group groups))
         (let ((client-name (get-name client-delegate)))
           (for-each (lambda (delegate)
