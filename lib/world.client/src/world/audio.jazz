@@ -288,7 +288,7 @@
 ;;;
 
 
-;; denoiser only works in S16LE format and 48000 rate
+;; denoiser only works in S16LE format, 48000 rate and 1 channel
 (definition protected denoiser-caps
   "audio/x-raw, format=S16LE, layout=interleaved, rate=48000, channels=1")
 
@@ -483,106 +483,62 @@
 (class File-Preprocess-Audio-Src extends Audio-Src
   
   
-  (slot location      initialize #f accessors generate)
-  (slot denoise?      initialize #f accessors generate)
-  (slot file-pipeline initialize #f accessors generate)
-  (slot file-sink     initialize #f accessors generate)
-  (slot volume        initialize #f accessors generate)
-  (slot denoiser      initialize #f accessors generate)
+  (slot location initialize #f accessors generate)
   
   
-  (method override (initialize self location denoise?)
+  (method override (initialize self location)
     (nextmethod self)
-    (set! self.location location)
-    (set! self.denoise? denoise?))
+    (set! self.location location))
   
   
   (method override (setup-element self)
     (nextmethod self)
-    ;; file
-    (let ((pipeline (gst-pipeline (tie "filesrc name=filesrc")
-                                  "decodebin"
-                                  "audioconvert"
-                                  "audioresample"
-                                  denoiser-caps
-                                  (and denoise? denoiser-filter)
-                                  "appsink sync=false name=sink")))
-      (gst_object_set_name pipeline "file")
-      (with-unref ((filesrc (gst_bin_get_by_name pipeline "filesrc"))
-                   (appsink (gst_bin_get_by_name pipeline "sink")))
-        (g_object_set_string filesrc "location" (path-normalize location))
-        (gst_element_set_state pipeline GST_STATE_READY)
-        (set! self.file-pipeline pipeline)
-        (set! self.file-sink appsink)))
-    ;; audio
-    (let ((listener (open-stream-listener "file"))
-          (pipeline (gst-pipeline "appsrc name=src"
-                                  (and denoise? "volume name=volume")
-                                  (and (eq? audio-codec 'opus) "opusenc name=enc")
-                                  (and (eq? audio-codec 'vorbis) "audioconvert")
-                                  (and (eq? audio-codec 'vorbis) "audioresample")
-                                  (and (eq? audio-codec 'vorbis) (tie "audio/x-raw, format=F32LE, layout=interleaved, rate={audio-rate}, channels=1"))
-                                  (and (eq? audio-codec 'vorbis) "vorbisenc name=enc")
-                                  "appsink name=appsink sync=false")))
-      (with-unref ((appsrc (gst_bin_get_by_name pipeline "src"))
-                   (appsink (gst_bin_get_by_name pipeline "appsink")))
-        (let ((volume (and denoise? (gst_bin_get_by_name pipeline "volume"))))
-          (gst-app-src-set-caps appsrc "audio/x-raw"
-            "format"   'string "S16LE"
-            "layout"   'string "interleaved"
-            "rate"     'int    audio-rate
-            "channels" 'int    1)
-          (g-object-set appsrc
-                        "is-live"     'boolean #t
-                        "stream-type" 'int     GST_APP_STREAM_TYPE_STREAM
-                        "format"      'int     GST_FORMAT_TIME)
+    (let ((listener (open-stream-listener "preprocessaudio")))
+      (let ((pipeline (gst-pipeline (tie "filesrc name=filesrc")
+                                    "decodebin"
+                                    (and (eq? audio-codec 'opus) "opusenc name=enc")
+                                    (and (eq? audio-codec 'vorbis) "audioconvert")
+                                    (and (eq? audio-codec 'vorbis) "audioresample")
+                                    (and (eq? audio-codec 'vorbis) (tie "audio/x-raw, format=F32LE, layout=interleaved, rate={audio-rate}, channels=1"))
+                                    (and (eq? audio-codec 'vorbis) "vorbisenc name=enc")
+                                    "appsink name=appsink sync=false")))
+        (gst_object_set_name pipeline "file")
+        (with-unref ((filesrc (gst_bin_get_by_name pipeline "filesrc"))
+                     (appsink (gst_bin_get_by_name pipeline "appsink")))
           (gst_app_sink_connect_signals appsink listener)
           (setup-consumer consumer listener appsink 4096)
+          (g_object_set_string filesrc "location" (path-normalize location))
           (gst_element_set_state pipeline GST_STATE_READY)
-          (set! self.pipeline pipeline)
-          (set! self.appsrc appsrc)
-          (set! self.volume volume))))
-    ;; denoiser
-    (set! denoiser (create-denoiser file-sink appsrc volume #t denoise?)))
+          (set! self.pipeline pipeline)))))
   
   
   (method override (start-element self)
     (nextmethod self)
     (task-start self 'file)
-    (gst_element_set_state pipeline GST_STATE_PAUSED)
-    (gst_element_set_state file-pipeline GST_STATE_PAUSED))
+    (gst_element_set_state pipeline GST_STATE_PAUSED))
   
   
   (method override (play-element self)
     (nextmethod self)
-    (gst_element_set_state pipeline GST_STATE_PLAYING)
-    (gst_element_set_state file-pipeline GST_STATE_PLAYING))
+    (gst_element_set_state pipeline GST_STATE_PLAYING))
   
   
   (method override (pause-element self)
     (nextmethod self)
-    (gst_element_set_state pipeline GST_STATE_PAUSED)
-    (gst_element_set_state file-pipeline GST_STATE_PAUSED))
+    (gst_element_set_state pipeline GST_STATE_PAUSED))
   
   
   (method override (stop-element self)
     (nextmethod self)
     (task-stop self)
-    (gst_element_set_state pipeline GST_STATE_READY)
-    (gst_element_set_state file-pipeline GST_STATE_READY))
+    (gst_element_set_state pipeline GST_STATE_READY))
   
   
   (method override (release-element self)
     (nextmethod self)
     (gst_element_release pipeline)
     (set! pipeline #f)
-    (set! appsrc #f)
-    (release-consumer consumer)
-    (gst_element_release file-pipeline)
-    (set! file-pipeline #f)
-    (set! file-sink #f)
-    (free-denoiser denoiser)
-    (set! denoiser #f))
+    (release-consumer consumer))
   
   
   (method override (audio-loop self task)
@@ -594,6 +550,99 @@
             (process self task exit))
           (sleep .001)
           (iter))))))
+
+
+;;;
+;;;; File-Preprocess-Denoise-Audio-Src
+;;;
+
+
+(class File-Preprocess-Denoise-Audio-Src extends File-Preprocess-Audio-Src
+  
+  
+  (slot file-pipeline initialize #f accessors generate)
+  (slot file-sink     initialize #f accessors generate)
+  (slot volume        initialize #f accessors generate)
+  (slot denoiser      initialize #f accessors generate)
+  
+  
+  (method override (setup-element self)
+    (nextmethod self)
+    ;; file
+    (let ((pipeline (gst-pipeline (tie "filesrc name=filesrc")
+                                  "decodebin"
+                                  "audioconvert"
+                                  "audioresample"
+                                  denoiser-caps
+                                  denoiser-filter
+                                  "appsink sync=false name=sink")))
+      (gst_object_set_name pipeline "file")
+      (with-unref ((filesrc (gst_bin_get_by_name pipeline "filesrc"))
+                   (appsink (gst_bin_get_by_name pipeline "sink")))
+        (g_object_set_string filesrc "location" (path-normalize location))
+        (gst_element_set_state pipeline GST_STATE_READY)
+        (set! self.file-pipeline pipeline)
+        (set! self.file-sink appsink)))
+    ;; audio
+    (let ((listener (open-stream-listener "file"))
+          (pipeline (gst-pipeline "appsrc name=src"
+                                  "volume name=volume"
+                                  (and (eq? audio-codec 'opus) "opusenc name=enc")
+                                  (and (eq? audio-codec 'vorbis) "audioconvert")
+                                  (and (eq? audio-codec 'vorbis) "audioresample")
+                                  (and (eq? audio-codec 'vorbis) (tie "audio/x-raw, format=F32LE, layout=interleaved, rate={audio-rate}, channels=1"))
+                                  (and (eq? audio-codec 'vorbis) "vorbisenc name=enc")
+                                  "appsink name=appsink sync=false")))
+      (with-unref ((appsrc (gst_bin_get_by_name pipeline "src"))
+                   (appsink (gst_bin_get_by_name pipeline "appsink"))
+                   (volume (gst_bin_get_by_name pipeline "volume")))
+        (gst-app-src-set-caps appsrc "audio/x-raw"
+          "format"   'string "S16LE"
+          "layout"   'string "interleaved"
+          "rate"     'int    48000
+          "channels" 'int    1)
+        (g-object-set appsrc
+                      "is-live"     'boolean #t
+                      "stream-type" 'int     GST_APP_STREAM_TYPE_STREAM
+                      "format"      'int     GST_FORMAT_TIME)
+        (gst_app_sink_connect_signals appsink listener)
+        (setup-consumer consumer listener appsink 4096)
+        (gst_element_set_state pipeline GST_STATE_READY)
+        (set! self.pipeline pipeline)
+        (set! self.appsrc appsrc)
+        (set! self.volume volume)))
+    ;; denoiser
+    (set! denoiser (create-denoiser file-sink appsrc volume #t #t)))
+  
+  
+  (method override (start-element self)
+    (nextmethod self)
+    (gst_element_set_state file-pipeline GST_STATE_PAUSED))
+  
+  
+  (method override (play-element self)
+    (nextmethod self)
+    (gst_element_set_state file-pipeline GST_STATE_PLAYING))
+  
+  
+  (method override (pause-element self)
+    (nextmethod self)
+    (gst_element_set_state file-pipeline GST_STATE_PAUSED))
+  
+  
+  (method override (stop-element self)
+    (nextmethod self)
+    (gst_element_set_state file-pipeline GST_STATE_READY))
+  
+  
+  (method override (release-element self)
+    (nextmethod self)
+    (set! appsrc #f)
+    (gst_element_release file-pipeline)
+    (set! file-pipeline #f)
+    (set! file-sink #f)
+    (free-denoiser denoiser)
+    (set! denoiser #f)))
 
 
 ;;;
