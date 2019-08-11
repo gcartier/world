@@ -23,6 +23,7 @@
         (jazz.stream.syntax (phase syntax))
         (jazz.syntax (phase syntax))
         (jazz.version)
+        (jazz.zlib)
         (world)
         (world.context)
         (world.media)
@@ -266,7 +267,7 @@
   (method public virtual abstract (set-stream? self flag))
   (method public virtual abstract (play-stream self))
   (method public virtual abstract (pause-stream self))
-  (method public virtual abstract (goto-stream self pos pts))
+  (method public virtual abstract (goto-stream self pos normalized-pts))
   (method public virtual abstract (backward-stream self))
   (method public virtual abstract (forward-stream self)))
 
@@ -277,7 +278,7 @@
 
 
 (definition protected stream-version
-  {Version 1 0 0})
+  {Version 1 0 1})
 
 
 (definition version-offset <fx>
@@ -335,6 +336,7 @@
   (slot version          getter generate)
   (slot metadata         getter generate)
   (slot count            getter generate)
+  (slot base             getter generate)
   (slot start            getter generate)
   (slot end              getter generate)
   (slot duration         getter generate)
@@ -358,6 +360,9 @@
     (set! self.version (read-version self))
     (set! self.metadata (read-metadata self))
     (set! self.count (getf metadata count:))
+    (set! self.base (if (nu=? version {Version 1 0 0})
+                        (getf metadata base: not-found: 0)
+                      (getf metadata base:)))
     (set! self.start (getf metadata start:))
     (set! self.end (getf metadata end:))
     (set! self.duration (getf metadata duration:))
@@ -383,7 +388,9 @@
   
   (method (read-metadata self)
     (input-port-byte-position port metadata-offset)
-    (read-binary port))
+    (if (nu=? version {Version 1 0 0})
+        (read-binary port)
+      (read-deflated port)))
   
   
   (method (read-index self)
@@ -458,6 +465,10 @@
             (loop (- fr 1)))))))
   
   
+  (method protected (normalize-timestamp self timestamp)
+    (- timestamp base))
+  
+  
   (method protected (goto-frame self fr)
     (set! frame fr))
   
@@ -480,9 +491,10 @@
         (set! frame fr))))
   
   
-  (method protected (goto self pos target-pts)
+  (method protected (goto self pos normalized-pts)
     (declare (proper-tail-calls))
-    (let ((fr (position->frame self pos)))
+    (let ((fr (position->frame self pos))
+          (target-pts (+ base normalized-pts)))
       (receive (dts pts duration size header?) (read-header self fr)
         (cond ((= pts target-pts)
                (set! frame fr))
@@ -571,23 +583,21 @@
   
   
   (method public (write-frame self buffer dts pts duration)
-    ;; having timestamps start at 0 is not
-    ;; necessary but makes seeking simpler
-    (when (and (not base-timestamp)
-               (/= pts GST_CLOCK_TIME_NONE))
-      (set! base-timestamp pts)
-      (when (and (/= dts GST_CLOCK_TIME_NONE)
-                 (< dts pts))
-        (set! base-timestamp dts)))
+    (when (and (/= dts GST_CLOCK_TIME_NONE)
+               (or (not base-timestamp)
+                   (< dts base-timestamp))
+      (set! base-timestamp dts)))
+    (when (and (/= pts GST_CLOCK_TIME_NONE)
+               (or (not base-timestamp)
+                   (< pts base-timestamp)))
+      (set! base-timestamp pts))
     ;; patch around a weird behavior new to adding denoising to audio
     ;; preprocessing where when dts and pts are GST_CLOCK_TIME_NONE in the
     ;; audio headers instead of 0 this makes the audio start with a delay
-    (cond ((and (eq? kind 'audio) (= duration GST_CLOCK_TIME_NONE))
-           (set! dts 0)
-           (set! pts 0))
-          (else
-           (set! dts (- dts base-timestamp))
-           (set! pts (- pts base-timestamp))))
+    (when (and (eq? kind 'audio)
+               (= duration GST_CLOCK_TIME_NONE))
+      (set! dts 0)
+      (set! pts 0))
     (when (not start-timestamp)
       (set! start-timestamp pts))
     (set! end-timestamp pts)
@@ -648,6 +658,7 @@
                            (- end-timestamp start-timestamp))))
         (list
           count: frame
+          base: base-timestamp
           start: start-timestamp
           end: end-timestamp
           duration: duration
@@ -659,7 +670,7 @@
           codec: (get-name codec))))
     
     (output-port-byte-position port metadata-offset)
-    (assert (<= (write-binary (append (stream-metadata) metadata) port) metadata-size)))
+    (assert (<= (write-deflated (append (stream-metadata) metadata) port) metadata-size)))
   
   
   (method (write-index self)
