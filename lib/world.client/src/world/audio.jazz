@@ -90,20 +90,6 @@
 
 
 ;;;
-;;;; Header
-;;;
-
-
-(definition protected (audio-buffer-header? buffer)
-  (if (eq? audio-codec 'vorbis)
-      (let ((size (u8vector-length buffer)))
-        (and (>= size 7)
-             (equal? (subu8vector buffer 1 7)
-                     #u8(118 111 114 98 105 115))))
-    #f))
-
-
-;;;
 ;;;; Profile
 ;;;
 
@@ -174,8 +160,8 @@
         output)))
   
   
-  (method package (visualizer-output self)
-    (let ((output (new Audio-Sink codec: audio-codec provider: audio-provider)))
+  (method package (visualizer-output self (caps: caps #f))
+    (let ((output (new Audio-Sink codec: audio-codec caps: caps provider: audio-provider)))
       (start output)
       output))
   
@@ -306,7 +292,33 @@
   
   (slot mic-pipeline initialize #f accessors generate)
   (slot mic-sink     initialize #f accessors generate)
-  (slot denoiser     initialize #f accessors generate)
+  (slot denoiser     initialize #f getter generate)
+  (slot cached-caps  initialize #f getter generate)
+  
+  
+  ;; we need to go in playing before the caps are available
+  (method protected (require-caps self)
+    (or cached-caps
+        (begin
+          (setup self)
+          (gst_element_set_state pipeline GST_STATE_PLAYING)
+          (gst_element_set_state mic-pipeline GST_STATE_PLAYING)
+          (let ((listener (get-listener consumer))
+                (element (get-element consumer))
+                (data (get-data consumer))
+                (info (get-info consumer)))
+            (gst_app_sink_read listener element data info)
+            (gst_app_sink_read listener element data info)
+            (gst_app_sink_read listener element data info))
+          (prog1 (with-unref ((sink (gst_bin_get_by_name pipeline "sink")))
+                   (with-unref ((pad (gst_element_get_static_pad sink "sink")))
+                     (let ((caps (gst_pad_get_current_caps pad)))
+                       (let ((caps-string (gst_caps_to_string caps)))
+                         (gst_caps_unref caps)
+                         (set! cached-caps caps-string)
+                         caps-string))))
+            (gst_element_set_state pipeline GST_STATE_READY)
+            (gst_element_set_state mic-pipeline GST_STATE_READY)))))
   
   
   (method override (setup-element self)
@@ -394,58 +406,7 @@
     (set! mic-pipeline #f)
     (set! mic-sink #f)
     (free-denoiser denoiser)
-    (set! denoiser #f))
-  
-  
-  (method override (resettable? self)
-    #t)
-  
-  
-  (method override (reset-media self channel)
-    (when (eq? audio-codec 'vorbis)
-      (resend-header consumer (get-no channel)))))
-
-
-;;;
-;;;; Audio-Consumer
-;;;
-
-
-(class Audio-Consumer extends Stream-Consumer
-  
-  
-  (slot headers initialize '() accessors generate)
-  (slot header  initialize #f  accessors generate)
-  
-  
-  (method override (release-element self)
-    (nextmethod self)
-    (set! headers '())
-    (set! header #f))
-  
-  
-  (method override (consume self buffer dts pts duration)
-    (case audio-codec
-      ;; opus has no headers
-      ((opus)
-       (nextmethod self buffer dts pts duration))
-      ((vorbis)
-       (if (and buffer (audio-buffer-header? buffer))
-           (begin
-             (set! headers (append! headers (list (list buffer dts pts duration))))
-             (when (= (length headers) 3)
-               (set! header (object->u8vector headers))
-               (nextmethod self (list header) #f #f #f)))
-         (nextmethod self buffer dts pts duration)))))
-   
-   
-  (method protected (resend-header self channel-no)
-    (when header
-      (if (client?)
-          (let ((tier (current-client)))
-            (send-client-media tier channel-no header #t GST_CLOCK_TIME_NONE GST_CLOCK_TIME_NONE GST_CLOCK_TIME_NONE))
-        (let ((tier (current-server)))
-          (send-server-media tier channel-no header #t GST_CLOCK_TIME_NONE GST_CLOCK_TIME_NONE GST_CLOCK_TIME_NONE))))))
+    (set! denoiser #f)))
 
 
 ;;;
@@ -453,28 +414,22 @@
 ;;;
 
 
-(class Mic-Audio-Consumer extends Audio-Consumer
+(class Mic-Audio-Consumer extends Stream-Consumer
   
   
   (method override (consume self buffer dts pts duration)
     (nextmethod self buffer dts pts duration)
     (when buffer
-      (let ((header? (audio-buffer-header? buffer))
-            (size (u8vector-length buffer)))
+      (let ((size (u8vector-length buffer)))
         (when audio-show
-          (if (eq? audio-codec 'vorbis)
-              (let ((type (if header?
-                              '***header***
-                            'data)))
-                (terminal 'audio size type))
-            (terminal 'audio size)))
+          (terminal 'audio size))
         (when udp-record-src/sink?
           (record-event udp-id-src-media
                         -1. ;; todo channel no
                         (fixnum->flonum client-no)
                         (fixnum->flonum udp-audio)
                         -1.
-                        (if header? 1. -1.)
+                        -1.
                         (fixnum->flonum size)
                         (timestamp->flonum pts)))))))
 
@@ -781,16 +736,7 @@
                           (site (stream)
                             (unless muted?
                               (consume consumer buffer dts pts duration))))))))))
-            (iter))))))
-  
-  
-  (method override (resettable? self)
-    #t)
-  
-  
-  (method override (reset-media self channel)
-    (when (eq? audio-codec 'vorbis)
-      (resend-header consumer (get-no channel)))))
+            (iter)))))))
 
 
 ;;;
@@ -861,7 +807,7 @@
   
   
   (method package virtual (setup-pipeline self)
-    (let ((pipeline (gst-pipeline (tie "appsrc name=src")
+    (let ((pipeline (gst-pipeline (format "appsrc{? caps=\"{a}\"~} name=src" caps)
                                   "queue"
                                   (and (eq? codec 'opus) "opusdec name=dec")
                                   (and (eq? codec 'vorbis) "vorbisdec name=dec")
@@ -883,12 +829,13 @@
       (with-unref ((appsrc (gst_bin_get_by_name pipeline "src"))
                    (volelem (gst_bin_get_by_name pipeline "volume"))
                    (panelem (gst_bin_get_by_name pipeline "panorama")))
-        (case codec
-          ((opus)
-           (gst-app-src-set-caps appsrc "audio/x-opus"
-             "channel-mapping-family" 'int 0))
-          ((vorbis)
-           (gst-app-src-set-caps appsrc "audio/x-vorbis")))
+        (when (not caps)
+          (case codec
+            ((opus)
+             (gst-app-src-set-caps appsrc "audio/x-opus"
+               "channel-mapping-family" 'int 0))
+            ((vorbis)
+             (gst-app-src-set-caps appsrc "audio/x-vorbis"))))
         (g-object-set appsrc
           "is-live"     'boolean #t
           "stream-type" 'int     GST_APP_STREAM_TYPE_STREAM
@@ -917,11 +864,7 @@
     ;; been created in response to the caps event yet
     (with-unref ((dec (gst_bin_get_by_name pipeline "dec")))
       (with-unref ((pad (gst_element_get_static_pad dec "src")))
-        (let ((caps (gst-new-caps "audio/x-raw"
-                                  "format" 'string "S16LE"
-                                  "layout" 'string "interleaved"
-                                  "rate" 'int 48000
-                                  "channels" 'int 2)))
+        (let ((caps (gst_caps_from_string caps)))
           (gst_pad_push_event pad (gst_event_new_stream_start "stream"))
           (gst_pad_push_event pad (gst_event_new_caps caps))))))
   
@@ -954,19 +897,17 @@
                (> buffer-count 0))
       (play-element self)
       (set! stream-playing? #t))
-    (if (audio-buffer-header? buffer)
-        (gst_app_src_write appsrc buffer (u8vector-length buffer) dts pts duration 0)
-      (let ((perfect-offset (- (gst_element_get_running_time appsrc) pts)))
-        (let ((deviation (timestamp->flonum (abs (- perfect-offset timestamp-offset))))
-              (tolerance .05))
-          (set! moving-deviation (/ (+ (* moving-deviation 31.) deviation) 32.))
-          (when (> moving-deviation tolerance)
-            (set! timestamp-offset perfect-offset)
-            (set! moving-deviation 0.)
-            (when show-sync?
-              (format :terminal "audio timestamp-offset {r precision: 3} extra-offset {r precision: 3}{%}" (timestamp->flonum timestamp-offset) (timestamp->flonum extra-offset))))))
-      (gst_app_src_write appsrc buffer (u8vector-length buffer) dts pts duration (+ timestamp-offset extra-offset))
-      (increase! buffer-count)))
+    (let ((perfect-offset (- (gst_element_get_running_time appsrc) pts)))
+      (let ((deviation (timestamp->flonum (abs (- perfect-offset timestamp-offset))))
+            (tolerance .05))
+        (set! moving-deviation (/ (+ (* moving-deviation 31.) deviation) 32.))
+        (when (> moving-deviation tolerance)
+          (set! timestamp-offset perfect-offset)
+          (set! moving-deviation 0.)
+          (when show-sync?
+            (format :terminal "audio timestamp-offset {r precision: 3} extra-offset {r precision: 3}{%}" (timestamp->flonum timestamp-offset) (timestamp->flonum extra-offset))))))
+    (gst_app_src_write appsrc buffer (u8vector-length buffer) dts pts duration (+ timestamp-offset extra-offset))
+    (increase! buffer-count))
   
   
   (method public (muted? self)
