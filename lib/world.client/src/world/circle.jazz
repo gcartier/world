@@ -729,16 +729,28 @@
   (method protected (toggle-paused self)
     (set! paused? (not paused?))
     (set-paused? (brother self 'stream-seek) paused?)
-    (let ((client (current-client)))
-      (let ((output (get-output parent)))
-        (let ((stream (get-stream (get-channel output))))
-          (stream-action client (get-no stream) (if paused? 'pause 'play) '()))))
+    (let ((output (get-output parent)))
+      (let ((stream (get-stream (get-channel output)))
+            (action (if paused? 'pause 'play)))
+        (if (is? stream UDP-Send-Stream)
+            (let ((action-proc (get-action-proc stream)))
+              (action-proc stream action '()))
+          (let ((client (current-client)))
+            (let ((stream (get-stream (get-channel output))))
+              (stream-action client (get-no stream) action '()))))))
     (invalidate-view self)))
 
 
 ;;;
 ;;;; Seek
 ;;;
+
+
+;; play -> pause     : pause on, seek on
+;; pause -> play     : pause off, seek off
+;; seek in play      : seek on -> seek -> seek off
+;; seek in pause     : pause off -> seek -> pause on
+;; navigate in pause : pause off -> navigate -> pause on
 
 
 (class Seek-View extends View
@@ -799,7 +811,8 @@
   (method override (mouse-down self evt)
     (set! tracking? #t)
     (acquire-capture self)
-    (when (not paused?)
+    (if paused?
+        (paused-off self)
       (seeking-on self))
     (adjust-seek self (get-h evt)))
   
@@ -812,7 +825,8 @@
   (method override (drag-up self evt . rest)
     (when tracking?
       (invoke-action self 'seek (list #f))
-      (when (not paused?)
+      (if paused?
+          (paused-on self)
         (seeking-off self))
       (release-capture self)
       (set! tracking? #f)))
@@ -839,17 +853,26 @@
   
   (method protected (set-paused? self flag)
     (set! paused? flag)
-    (if paused?
-        (seeking-on self)
-      (seeking-off self)))
+    (cond (paused?
+           (paused-on self)
+           (seeking-on self))
+          (else
+           (seeking-off self)
+           (paused-off self))))
   
   
   (method protected (seek-backward self)
-    (invoke-action self 'backward '()))
+    (when paused?
+      (with-playing self
+        (lambda ()
+          (invoke-action self 'backward '())))))
   
   
   (method protected (seek-forward self)
-    (invoke-action self 'forward '()))
+    (when paused?
+      (with-playing self
+        (lambda ()
+          (invoke-action self 'forward '())))))
   
   
   (method protected (seeking-on self)
@@ -872,7 +895,29 @@
           (with-unref ((queue (gst_bin_get_by_name (get-color-pipeline output) "queue"))
                        (appsink (gst_bin_get_by_name (get-color-pipeline output) "sink")))
             (g_object_set_uint64 queue "min-threshold-time" preserved-threshold)
-            (g_object_set_boolean appsink "sync" preserved-sync)))))))
+            (g_object_set_boolean appsink "sync" preserved-sync))))))
+  
+  
+  (method (with-playing self thunk)
+    (paused-off self)
+    (thunk)
+    ;; quick hack give a bit of time for frame to be processed
+    (sleep .05)
+    (paused-on self))
+  
+  
+  (method (paused-on self)
+    (let ((output (get-output parent)))
+      (let ((stream (get-stream (get-channel output))))
+        (when (is? stream UDP-Send-Stream)
+          (gst_element_set_state_blocking (get-color-pipeline output) GST_STATE_PAUSED)))))
+  
+  
+  (method (paused-off self)
+    (let ((output (get-output parent)))
+      (let ((stream (get-stream (get-channel output))))
+        (when (is? stream UDP-Send-Stream)
+          (gst_element_set_state_blocking (get-color-pipeline output) GST_STATE_PLAYING))))))
 
 
 ;;;
