@@ -190,16 +190,6 @@
 
 
 ;;;
-;;;; Keyframe
-;;;
-
-
-(definition protected (video-buffer-keyframe? buffer)
-  (assert (eq? video-codec 'h264)
-    (h264-buffer-keyframe? buffer)))
-
-
-;;;
 ;;;; Profile
 ;;;
 
@@ -580,12 +570,12 @@
         (focus output))))
   
   
-  (method package (receive-server-video self id buffer dts pts duration)
+  (method package (receive-server-video self id buffer dts pts duration keyframe?)
     (let ((output (find-output self id)))
       (define (receive)
         (when (eq? (get-stream-state output) 'off)
           (set-stream-state output 'on))
-        (consume-video output buffer dts pts duration)
+        (consume-video output buffer dts pts duration keyframe?)
         (when udp-record-src/sink?
           (let ((origin (get-origin (get-channel output))))
             (record-event udp-id-sink-media
@@ -601,25 +591,25 @@
         (cond ((not buffer)
                (set-stream-state output 'off))
               ((get-wait-keyframe? output)
-               (when (video-buffer-keyframe? buffer)
+               (when keyframe?
                  (set-wait-keyframe? output #f)
                  (receive)))
               (else
                (receive))))))
   
   
-  (method package (receive-visualizer-video self output buffer dts pts duration)
+  (method package (receive-visualizer-video self output buffer dts pts duration keyframe?)
     (if (not buffer)
         (set-stream-state output 'off)
       (when (eq? (get-stream-state output) 'off)
         (set-stream-state output 'on))
-      (consume-video output buffer dts pts duration)))
+      (consume-video output buffer dts pts duration keyframe?)))
   
   
-  (method package (receive-video self id/output buffer dts pts duration)
+  (method package (receive-video self id/output buffer dts pts duration keyframe?)
     (if (is? id/output Video-Sink)
-        (receive-visualizer-video self id/output buffer dts pts duration)
-      (receive-server-video self id/output buffer dts pts duration)))
+        (receive-visualizer-video self id/output buffer dts pts duration keyframe?)
+      (receive-server-video self id/output buffer dts pts duration keyframe?)))
   
   
   (method package (receive-processor-draw self id color alpha dts pts duration background slide?)
@@ -1069,10 +1059,9 @@
       (string->symbol (format "camera{a}" name))))
 
 
-  (method override (consume self buffer dts pts duration)
-    (let ((keyframe? (and buffer (video-buffer-keyframe? buffer))))
-      (send-client-media (current-client) channel-no buffer keyframe? dts pts duration)
-      (update rate (get-framerate profile)))))
+  (method override (consume self buffer dts pts duration keyframe?)
+    (send-client-media (current-client) channel-no buffer dts pts duration keyframe?)
+    (update rate (get-framerate profile))))
 
 
 ;;;
@@ -1163,7 +1152,7 @@
         (set! output #f))))
   
   
-  (method override (consume self buffer dts pts duration)
+  (method override (consume self buffer dts pts duration keyframe?)
     (when output
       (if (not buffer)
           (set-stream-state output 'off)
@@ -1172,23 +1161,15 @@
         (let ((size (u8vector-length buffer)))
           (when (and video-show
                      (or (eq? video-show 'all)
-                         (eq? video-show 'keyframe)
                          (>= size video-show)))
-            ;; h264 specific
-            (let ((type (if (video-buffer-keyframe? buffer)
-                            '***keyframe***
-                          'delta)))
-              (if (eq? video-show 'keyframe)
-                  (when (eq? type '***keyframe***)
-                    (terminal size type))
-                (terminal size type))))
+            (terminal size))
           (when udp-record-src/sink?
             (record-event udp-id-src-media
                           -1. ;; todo channel no
                           (fixnum->flonum client-no)
                           (fixnum->flonum udp-video)
                           -1.
-                          (if (video-buffer-keyframe? buffer) 1. -1.)
+                          -1.
                           (fixnum->flonum size)
                           (timestamp->flonum pts))))))))
 
@@ -1297,9 +1278,8 @@
     (set! self.channel-no channel-no))
 
 
-  (method override (consume self buffer dts pts duration)
-    (let ((keyframe? (and buffer (video-buffer-keyframe? buffer))))
-      (send-client-media (current-client) channel-no buffer keyframe? dts pts duration))))
+  (method override (consume self buffer dts pts duration keyframe?)
+    (send-client-media (current-client) channel-no buffer dts pts duration keyframe?)))
 
 
 ;;;
@@ -1563,8 +1543,8 @@
               (set! flush? #t))
           (goto-position reader pos normalized-pts)
           (when stream?
-            (receive (buffer dts pts duration) (read-frame reader stream? #f)
-              (consume consumer buffer dts pts duration)))
+            (receive (buffer dts pts duration keyframe?) (read-frame reader stream? #f)
+              (consume consumer buffer dts pts duration keyframe?)))
           (task-sleep task +inf.0 exit)))))
   
   
@@ -1574,8 +1554,8 @@
         (lambda (exit)
           (goto-frame reader frame normalized-pts)
           (when stream?
-            (receive (buffer dts pts duration) (read-frame reader stream? #f)
-              (consume consumer buffer dts pts duration)))
+            (receive (buffer dts pts duration keyframe?) (read-frame reader stream? #f)
+              (consume consumer buffer dts pts duration keyframe?)))
           (task-sleep task +inf.0 exit)))))
   
   
@@ -1585,8 +1565,8 @@
         (lambda (exit)
           (goto-frame reader frame normalized-pts)
           (when stream?
-            (receive (buffer dts pts duration) (read-frame reader stream? #f)
-              (consume consumer buffer dts pts duration)))
+            (receive (buffer dts pts duration keyframe?) (read-frame reader stream? #f)
+              (consume consumer buffer dts pts duration keyframe?)))
           (task-sleep task +inf.0 exit)))))
   
   
@@ -1599,7 +1579,7 @@
               (task-done task exit)
             ;; protect against stream? threaded change
             (let ((stream? stream?))
-              (receive (buffer dts pts duration) (read-frame reader stream?)
+              (receive (buffer dts pts duration keyframe?) (read-frame reader stream?)
                 (if (not buffer)
                     (if stream-loop?
                         (begin
@@ -1617,7 +1597,7 @@
                         (if flush?
                             (set! flush? #f)
                           (site (stream)
-                            (consume consumer buffer dts pts duration))))))))))
+                            (consume consumer buffer dts pts duration keyframe?))))))))))
           (iter))))))
 
 
@@ -1923,7 +1903,7 @@
           (with-unref ((appsrc (gst_bin_get_by_name pipeline "src"))
                        (appsink (gst_bin_get_by_name pipeline "sink")))
             (let ((data (make-u8vector (* width height 4)))
-                  (info (make-u64vector 3)))
+                  (info (make-u64vector 4)))
               (gst_app_sink_connect_signals appsink listener)
               ;; PRIME
               (when (not caps)
@@ -1961,7 +1941,7 @@
             (with-unref ((appsrc (gst_bin_get_by_name pipeline "src"))
                          (appsink (gst_bin_get_by_name pipeline "sink")))
               (let ((data (make-u8vector (/ (* width height 12) 8)))
-                    (info (make-u64vector 3)))
+                    (info (make-u64vector 4)))
                 (gst_app_sink_connect_signals appsink listener)
                 (gst-app-src-set-caps appsrc "video/x-h264"
                   "width"         'int      width
@@ -2063,7 +2043,7 @@
       (set-stream-state self 'off)))
   
   
-  (method protected virtual (consume-video self color dts pts duration (alpha #f))
+  (method protected virtual (consume-video self color dts pts duration keyframe? (alpha #f))
     ;; QUICK TEST
     (when color-appsrc
       ;; QUICK TEST
