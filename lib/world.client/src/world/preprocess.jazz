@@ -38,11 +38,33 @@
 (definition public (preprocess-file file (what: what #f) (profile: profile #f) (denoise?: denoise? #f) (prime?: prime? #f) (dry?: dry? #f) (force?: force? #f))
   (let ((profile (and profile (name->video-profile profile))))
     (define (maybe-audio file)
-      (let ((media-file (media-brother file 'audio profile)))
-        (when (or (not (exists? media-file)) force?)
-          (if dry?
-              (terminal 'audio file)
-            (preprocess-audio file media-file profile denoise?)))))
+      (define (maybe-profile)
+        (let ((media-file (media-brother file 'audio profile)))
+          (when (or (not (exists? media-file)) force?)
+            (if dry?
+                (terminal 'audio file)
+              (preprocess-audio file media-file profile denoise?)))))
+      
+      (define (maybe-prime)
+        (let ((info (discover-audio file)))
+          (when info
+            (bind (media-type bitrate sample_rate channels caps) info
+              (define (determine-codec media-type)
+                (cond ((equal? media-type "audio/mpeg")
+                       'aac)
+                      (else
+                       (error "Unsupported media type: {a}" media-type))))
+              
+              (let ((codec (determine-codec media-type)))
+                (let ((media-file (media-brother file 'audio profile)))
+                  (when (or (not (exists? media-file)) force?)
+                    (if dry?
+                        (terminal 'audio file)
+                      (preprocess-prime-audio file media-file profile codec)))))))))
+      
+      (if prime?
+          (maybe-prime)
+        (maybe-profile)))
     
     (define (maybe-video file)
       (define (maybe-profile profile)
@@ -55,23 +77,30 @@
       (define (maybe-prime)
         (let ((info (discover-video file)))
           (when info
-            (bind (resolution framerate bitrate caps) info
-              (define (resolution->area resolution)
-                (cast <fl> (* (get-width resolution) (get-height resolution))))
+            (bind (media-type resolution framerate bitrate caps) info
+              (define (determine-codec media-type)
+                (cond ((equal? media-type "video/x-h264")
+                       'h264)
+                      (else
+                       (error "Unsupported media type: {a}" media-type))))
               
-              (let ((area (resolution->area resolution)))
-                (define (estimate-profile info)
-                  (car (sort < (table-values video-profile-names)
-                         key: (lambda (profile)
-                                (let ((profile-area (resolution->area (get-resolution profile))))
-                                  (abs (- area profile-area)))))))
+              (let ((codec (determine-codec media-type)))
+                (define (resolution->area resolution)
+                  (cast <fl> (* (get-width resolution) (get-height resolution))))
                 
-                (let ((profile (estimate-profile info)))
-                  (let ((media-file (media-brother file 'video profile)))
-                    (when (or (not (exists? media-file)) force?)
-                      (if dry?
-                          (terminal 'video file (get-name profile))
-                        (preprocess-prime file media-file profile resolution framerate bitrate))))))))))
+                (let ((area (resolution->area resolution)))
+                  (define (estimate-profile info)
+                    (car (sort < (table-values video-profile-names)
+                           key: (lambda (profile)
+                                  (let ((profile-area (resolution->area (get-resolution profile))))
+                                    (abs (- area profile-area)))))))
+                  
+                  (let ((profile (estimate-profile info)))
+                    (let ((media-file (media-brother file 'video profile)))
+                      (when (or (not (exists? media-file)) force?)
+                        (if dry?
+                            (terminal 'video file (get-name profile))
+                          (preprocess-prime-video file media-file profile resolution framerate bitrate codec)))))))))))
       
       (if prime?
           (maybe-prime)
@@ -102,6 +131,15 @@
       (thread-join! (get-thread (get-task src))))))
 
 
+(definition public (preprocess-prime-audio file media-file profile codec)
+  (let ((media-file (or media-file (media-brother file 'audio profile))))
+    (let ((src (new File-Preprocess-Audio-Src
+                 (parse file)
+                 prime?: #t)))
+      (preprocess-media file media-file src "audio" 'audio #f #f #f #f codec)
+      (thread-join! (get-thread (get-task src))))))
+
+
 (definition public (preprocess-video file media-file profile)
   (let ((media-file (or media-file (media-brother file 'video profile)))
         (level (get-level profile))
@@ -120,10 +158,9 @@
       (thread-join! (get-thread (get-task src))))))
 
 
-(definition public (preprocess-prime file media-file profile resolution framerate bitrate)
+(definition public (preprocess-prime-video file media-file profile resolution framerate bitrate codec)
   (let ((media-file (or media-file (media-brother file 'video profile)))
-        (level (get-level profile))
-        (codec (get-codec profile)))
+        (level (get-level profile)))
     (let ((src (new File-Preprocess-Video-Src
                  (parse file)
                  prime?: #t
