@@ -836,8 +836,72 @@
 ;;;
 
 
-(define-setting camera-high-resolution?
-  #t)
+(definition public (camera-resolutions)
+  (let ((devices (camera-devices)))
+    (if (null? devices)
+        (error "No camera found")
+      ;; todo manage multiple cameras
+      (let ((device (car devices)))
+        (camera-device-resolutions device)))))
+
+
+(definition protected (camera-devices)
+  (with-unref ((monitor (gst_device_monitor_new)))
+    (let ((caps (gst_caps_new_empty_simple "video/x-raw")))
+      (gst_device_monitor_add_filter monitor "Video/Source" caps)
+      (gst_caps_unref caps))
+    (let ((queue (new-queue)))
+      (let (loop (devices (gst_device_monitor_get_devices monitor)))
+        (if (not devices)
+            (begin
+              (g_list_free devices)
+              (queue-list queue))
+          (enqueue queue (gst_device_monitor_device_list_data devices))
+          (loop (gst_device_monitor_device_list_next devices)))))))
+
+
+(definition protected (camera-device-resolutions device)
+  (let ((caps (gst_device_get_caps device)))
+    (prog1 (let ((all '()))
+             (loop (for i from 0 below (gst_caps_get_size caps))
+                   (let ((struc (gst_caps_get_structure caps i)))
+                     (let ((width (gst_structure_get_int struc "width"))
+                           (height (gst_structure_get_int struc "height")))
+                       (let ((resolution (new Dimension width height)))
+                         (when (not (member? resolution all test: nu=?))
+                           (set! all (cons resolution all)))))))
+             all)
+      (gst_caps_unref caps))))
+
+
+(definition protected (cache-camera-resolutions)
+  (or camera-resolutions
+      (let ((resolutions (sort > (camera-resolutions) key: get-area)))
+        (set! camera-resolutions resolutions)
+        resolutions)))
+
+
+(definition protected maximum-camera-resolution
+  (* 1280 720))
+
+(definition protected decreasing-camera-resolutions
+  #f)
+
+(definition protected current-camera-resolution
+  #f)
+
+(definition protected (determine-camera-resolution)
+  (define (keep-resolution? resolution)
+    (<= (get-area resolution) maximum-camera-resolution))
+  
+  (or current-camera-resolution
+      (begin
+        (set! decreasing-camera-resolutions (collect-if keep-resolution? (sort > (camera-resolutions) key: get-area)))
+        (set! current-camera-resolution (car decreasing-camera-resolutions))
+        current-camera-resolution)))
+
+(definition protected (change-camera-resolution resolution)
+  (set! current-camera-resolution resolution))
 
 
 (class Camera-Video-Src extends Video-Src
@@ -859,17 +923,19 @@
   
   (method override (setup-element self)
     (nextmethod self)
-    (let ((max-resolution resolution)
+    (let ((camera-resolution (determine-camera-resolution))
+          (max-resolution resolution)
           (max-framerate selfrate))
-      (let ((max-width (get-width max-resolution))
+      (let ((camera-width (get-width camera-resolution))
+            (camera-height (get-height camera-resolution))
+            (max-width (get-width max-resolution))
             (max-height (get-height max-resolution)))
         (let ((pipeline (apply gst-pipeline
                                (cond-expand
                                  (mac "avfvideosrc name=src")
                                  (windows "ksvideosrc name=src")
                                  (else "v4l2src name=src"))
-                               ;; inform the camera to use high resolution
-                               (and (camera-high-resolution?) (tie "video/x-raw, width=1280, height=720, pixel-aspect-ratio=(fraction)1/1"))
+                               (tie "video/x-raw, width={camera-width}, height={camera-height}, pixel-aspect-ratio=(fraction)1/1")
                                "videoscale method=sinc"
                                (tie "video/x-raw, width={max-width}, height={max-height}, pixel-aspect-ratio=(fraction)1/1")
                                "tee name=tee"
