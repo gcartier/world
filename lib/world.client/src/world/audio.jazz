@@ -615,6 +615,7 @@
   
   (slot location     getter generate)
   (slot stream?      accessors explicit)
+  (slot sound?       getter generate) ;; gambit30 revisit
   (slot file         getter generate)
   (slot reader       getter generate)
   (slot time-base    getter generate)
@@ -624,11 +625,12 @@
   (slot delayed-seek getter generate)
   
   
-  (method override (initialize self location (stream?: stream? #t))
+  (method override (initialize self location (file: file #f) (stream?: stream? #t) (sound?: sound? #f))
     (nextmethod self)
     (set! self.location location)
     (set! self.stream? stream?)
-    (set! self.file #f)
+    (set! self.sound? sound?)
+    (set! self.file file)
     (set! self.reader #f)
     (set! self.time-base (new Time-Base))
     (set! self.muted? #f)
@@ -639,7 +641,7 @@
   
   (method override (start-element self)
     (nextmethod self)
-    (set! file (new-file {Directory Documents} (add-extension location (audio-profile-extension))))
+    (set! file (or file (new-file {Directory Documents} (add-extension location (audio-profile-extension)))))
     (set! reader (new Stream-Reader file))
     (task-start self 'audio-stream))
   
@@ -672,6 +674,14 @@
       (lambda (exit)
         (set! pause? #t)
         (task-sleep task +inf.0 exit))))
+  
+  
+  (method override (rewind-stream self)
+    (task-wakeup (get-thread task)
+      (lambda (exit)
+        (goto-frame reader 0)
+        (reset time-base)
+        (set! flush? #t))))
   
   
   (method override (goto-delayed self pos normalized-dts)
@@ -745,7 +755,10 @@
                         (nanodts (timestamp->flonum dts)))
                     (update-start time-base time nanodts)
                     (let ((sendtime (remote->local time-base nanodts)))
-                      (task-sleep task (- sendtime time) exit)
+                      (if (not sound?)
+                          (task-sleep task (- sendtime time) exit)
+                        (sleep (- sendtime time))
+                        (task-sleep task 0 exit))
                       (when stream?
                         (if flush?
                             (set! flush? #f)
@@ -782,6 +795,7 @@
   (slot caps                initialize #f accessors generate)
   (slot provider            initialize #f accessors generate)
   (slot volume              initialize #f accessors explicit)
+  (slot sound?              initialize #f accessors explicit) ;; gambit30 revisit
   (slot pipeline            initialize #f accessors generate)
   (slot appsrc              initialize #f accessors generate)
   (slot volelem             initialize #f accessors generate)
@@ -795,12 +809,13 @@
   (slot brand               getter generate)
   
   
-  (method override (initialize self (codec: codec #f) (caps: caps #f) (provider: provider #f) (volume: volume #f))
+  (method override (initialize self (codec: codec #f) (caps: caps #f) (provider: provider #f) (volume: volume #f) (sound?: sound? #f))
     (nextmethod self)
     (set! self.codec codec)
     (set! self.caps caps)
     (set! self.provider provider)
     (set! self.volume volume)
+    (set! self.sound? sound?)
     (set! self.monitor (new Audio-Monitor))
     (if (not coke-vs-pepsi?)
         (set! self.brand #f)
@@ -823,7 +838,7 @@
   
   (method package virtual (setup-pipeline self)
     (let ((pipeline (gst-pipeline (format "appsrc{? caps=\"{a}\"~} name=src" caps)
-                                  "queue"
+                                  (and (not sound?) "queue")
                                   (and (eq? codec 'aac) "avdec_aac name=dec")
                                   (and (eq? codec 'opus) "opusdec name=dec")
                                   (and (eq? codec 'vorbis) "vorbisdec name=dec")
@@ -835,12 +850,14 @@
                                   ;; hardcoded caps for now that must match
                                   ;; the event caps pushed on the decoder pad
                                   "audio/x-raw, format=S16LE, layout=interleaved, rate=48000, channels=2"
-                                  (cond-expand
-                                    (windows (if (eq? provider 'directsound)
-                                                 "directsoundsink buffer-time=200000 discont-wait=0 name=sink"
-                                               "wasapisink buffer-time=200000 discont-wait=0 name=sink"))
-                                    (mac "osxaudiosink buffer-time=200000 discont-wait=0 name=sink")
-                                    (else "autoaudiosink name=sink")))))
+                                  (gst-element (cond-expand (windows (if (eq? provider 'directsound)
+                                                                         "directsoundsink"
+                                                                       "wasapisink"))
+                                                            (mac "osxaudiosink")
+                                                            (else "autoaudiosink"))
+                                               buffer-time: 200000
+                                               discont-wait: (and (not sound?) 0)
+                                               name: "sink"))))
       (gst_object_set_name pipeline "output")
       (with-unref ((appsrc (gst_bin_get_by_name pipeline "src"))
                    (volelem (gst_bin_get_by_name pipeline "volume"))

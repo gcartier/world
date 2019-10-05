@@ -17,6 +17,7 @@
 (import (jazz.audio)
         (jazz.geometry)
         (jazz.io)
+        (jazz.stream)
         (jazz.syntax (phase syntax))
         (world)
         (world.audio)
@@ -25,7 +26,9 @@
         (world.geometry)
         (world.id)
         (world.math)
+        (world.preprocess)
         (world.settings)
+        (world.stream)
         (world.task))
 
 
@@ -85,14 +88,116 @@
           (let ((elapse (- time previous)))
             (unless (stopping? task)
               (site (sound)
-                (update-playing-sounds)))
+                (update-playing-songs)))
             (let ((duration (- (current-monotonic) time)))
               (task-wait task sound-period duration exit))
             (iter time)))))))
 
 
 ;;;
-;;;; Sound
+;;;; Songs
+;;;
+
+
+(definition protected named-songs
+  (make-table test: eq?))
+
+(definition public (register-song name path)
+  (table-set! named-songs name path))
+
+(definition public (registered-song name)
+  (table-ref named-songs name #f))
+
+
+(definition protected songs
+  (make-table test: equal?))
+
+
+(definition protected (reset-songs)
+  (empty-table songs))
+
+
+(definition protected (cache-song name/path)
+  (define (cache-path path)
+    (let ((cached (table-ref songs path 'not-found)))
+      (if (neq? cached 'not-found)
+          cached
+        (let ((file (find-song-file path)))
+          (let ((song (and file (new-song file))))
+            (table-set! songs path song)
+            song)))))
+  
+  (if (symbol? name/path)
+      (let ((path (registered-song name/path)))
+        (when path
+          (cache-path path)))
+    (cache-path name/path)))
+
+
+(definition (find-song-file path)
+  (let ((world (current-world)))
+    (continuation-capture
+      (lambda (return)
+        (iterate-assets world
+          (lambda (assets)
+            (let ((dir (get-directory assets)))
+              (let ((wav (new-file dir (add-extension path "wav"))))
+                (if (exists? wav)
+                    (continuation-return return wav)
+                  (let ((mp3 (new-file dir (add-extension path "mp3"))))
+                     (if (exists? mp3)
+                         (continuation-return return mp3)
+                       (let ((ogg (new-file dir (add-extension path "ogg"))))
+                         (when (exists? ogg)
+                           (continuation-return return ogg))))))))))
+        #f))))
+
+(definition (require-song-file path)
+  (or (find-song-file path)
+      (error "Unable to find song: {s}" path)))
+
+
+(definition protected (effective-cache-song path/song)
+  (and (not (processing?))
+       (neq? path/song 'none)
+       (if (is? path/song Song)
+           path/song
+         (cache-song path/song))))
+
+
+;;;
+;;;; Playing
+;;;
+
+
+(definition package playing-songs
+  (make-table test: eq?))
+
+(definition public (register-playing-song song (ended-proc #f))
+  (table-set! playing-songs song ended-proc))
+
+(definition public (unregister-playing-song song)
+  (table-clear playing-songs song))
+
+
+(definition package (update-playing-songs)
+  (with-task-mutex
+    (lambda ()
+      (let ((ended '()))
+        (iterate-table playing-songs
+          (lambda (song ended-proc)
+            (when (ended? song)
+              (set! ended (cons song ended)))))
+        (for-each (lambda (song)
+                    (let ((ended-proc (table-ref playing-songs song)))
+                      (when ended-proc
+                        (ended-proc song)))
+                    (table-clear playing-songs song))
+                  ended)))))
+
+
+;;;
+;;;; Sounds
 ;;;
 
 
@@ -132,22 +237,33 @@
 
 
 (definition (find-sound-file path)
-  (let ((world (current-world)))
-    (continuation-capture
-      (lambda (return)
-        (iterate-assets world
-          (lambda (assets)
-            (let ((dir (get-directory assets)))
-              (let ((wav (new-file dir (add-extension path "wav"))))
-                (if (exists? wav)
-                    (continuation-return return wav)
-                  (let ((mp3 (new-file dir (add-extension path "mp3"))))
-                     (if (exists? mp3)
-                         (continuation-return return mp3)
-                       (let ((ogg (new-file dir (add-extension path "ogg"))))
-                         (when (exists? ogg)
-                           (continuation-return return ogg))))))))))
-        #f))))
+  (define (find-file)
+    (let ((world (current-world)))
+      (continuation-capture
+        (lambda (return)
+          (iterate-assets world
+            (lambda (assets)
+              (let ((dir (get-directory assets)))
+                (let ((wav (new-file dir (add-extension path "wav"))))
+                  (if (exists? wav)
+                      (continuation-return return wav)
+                    (let ((mp3 (new-file dir (add-extension path "mp3"))))
+                      (if (exists? mp3)
+                          (continuation-return return mp3)
+                        (let ((ogg (new-file dir (add-extension path "ogg"))))
+                          (when (exists? ogg)
+                            (continuation-return return ogg))))))))))
+          #f))))
+  
+  (let ((file (find-file)))
+    (and file
+         (let ((media-file (new-file {Directory Settings "work" "caches" "sound"} (tokenise-filename (add-extension path "streamaudio")))))
+           (if (exists? media-file)
+               media-file
+             (create-directories media-file)
+             (preprocess-audio file media-file #f #f #f)
+             media-file)))))
+
 
 (definition (require-sound-file path)
   (or (find-sound-file path)
@@ -164,34 +280,65 @@
 
 
 ;;;
-;;;; Playing
+;;;; Sound
 ;;;
 
 
-(definition package playing-sounds
-  (make-table test: eq?))
-
-(definition public (register-playing-sound sound (ended-proc #f))
-  (table-set! playing-sounds sound ended-proc))
-
-(definition public (unregister-playing-sound sound)
-  (table-clear playing-sounds sound))
+(definition public (new-sound file)
+  (new Sound file))
 
 
-(definition package (update-playing-sounds)
-  (with-task-mutex
-    (lambda ()
-      (let ((ended '()))
-        (iterate-table playing-sounds
-          (lambda (sound ended-proc)
-            (when (ended? sound)
-              (set! ended (cons sound ended)))))
-        (for-each (lambda (sound)
-                    (let ((ended-proc (table-ref playing-sounds sound)))
-                      (when ended-proc
-                        (ended-proc sound)))
-                    (table-clear playing-sounds sound))
-                  ended)))))
+(class Sound extends Audible
+  
+  
+  (slot input  getter generate)
+  (slot output getter generate)
+  
+  
+  (method override (initialize self file)
+    (nextmethod self)
+    (let ((reader (new Stream-Reader file)))
+      (let ((codec (get-codec reader))
+            (caps (get-caps reader)))
+        (close reader)
+        (let ((output (new Audio-Sink
+                        codec: codec
+                        caps: caps
+                        sound?: #t)))
+          (let ((src (new File-Stream-Audio-Src
+                       #f
+                       file: file
+                       sound?: #t))
+                (sink (new Stream-Consumer
+                        consumer: (lambda (buffer dts pts duration keyframe?)
+                                    (consume-audio output buffer dts pts duration)))))
+            (let ((input (pipeline (list src sink))))
+              (setup output)
+              (setup input)
+              (set! self.input input)
+              (set! self.output output)))))))
+  
+  
+  (method override (destroy self)
+    (nextmethod self))
+  
+  
+  (method override (play self)
+    (play output)
+    (play input))
+  
+  
+  (method override (rewind self)
+    (when (playing? input)
+      (rewind-stream (get-src input))))
+  
+  
+  (method override (get-volume self)
+    (get-volume output))
+  
+  
+  (method override (set-volume self vol)
+    (set-volume output vol)))
 
 
 ;;;
@@ -206,6 +353,7 @@
           (error "Unable to find sound: {a}" path/sound))
       (when volume
         (set-volume sound volume))
+      @gambit30
       (register-playing-sound sound)
       (rewind sound)
       (play sound))))
@@ -224,12 +372,15 @@
 ;;;
 
 
+@convert-sound
 (definition package 3d-sounds
   (make-table test: eq?))
 
+@convert-sound
 (definition public (register-3d-sound sound position)
   (table-set! 3d-sounds sound position))
 
+@convert-sound
 (definition public (unregister-3d-sound sound)
   (table-clear 3d-sounds sound))
 
@@ -254,6 +405,7 @@
   1.)
 
 
+@convert-sound
 (definition package (update-3d-sounds position sight)
   (when (and (window?)
              (or (not listener-position)
@@ -340,14 +492,19 @@
 
 
 (definition public (play-3d-sound path/sound pos (volume: volume #f) (close?: close? #f))
+  (play-ambient-sound path/sound)
+  @gambit30-has-a-leak
   (let ((sound (effective-cache-sound path/sound)))
     (when sound
       (set-volume sound (or volume universe-volume))
+      @convert-sound
       (register-playing-sound sound (lambda (sound)
                                       (unregister-3d-sound sound)
                                       (when close?
                                         (close sound))))
+      @convert-sound
       (register-3d-sound sound pos)
+      @convert-sound
       (update-3d-sound sound pos)
       (rewind sound)
       (play sound))))
@@ -356,6 +513,28 @@
 (definition public (play-3d-sound-if path pos)
   (when path
     (play-3d-sound path pos)))
+
+
+(definition public (play-3d-song path/song pos (volume: volume #f) (close?: close? #f))
+  (let ((song (effective-cache-song path/song)))
+    (when song
+      (set-volume song (or volume universe-volume))
+      (register-playing-song song (lambda (song)
+                                    @convert-sound
+                                    (unregister-3d-song song)
+                                    (when close?
+                                      (close song))))
+      @convert-sound
+      (register-3d-song song pos)
+      @convert-sound
+      (update-3d-song song pos)
+      (rewind song)
+      (play song))))
+
+
+(definition public (play-3d-song-if path pos)
+  (when path
+    (play-3d-song path pos)))
 
 
 ;;;
