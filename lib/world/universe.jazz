@@ -1,0 +1,1179 @@
+;;;===============
+;;;  WorldScheme
+;;;===============
+;;;
+;;;; World Universe
+;;;
+;;;  The Initial Developer of the Original Code is Guillaume Cartier.
+;;;  Portions created by the Initial Developer are Copyright (C) 2012-2018
+;;;  the Initial Developer. All Rights Reserved.
+;;;
+;;;  Contributor(s):
+
+
+(module world.universe jazz
+
+
+(import (jazz.component)
+        (jazz.geometry)
+        (world)
+        (world.actor)
+        (world.autoload)
+        (world.change)
+        (world.context)
+        (world.creature)
+        (world.element)
+        (world.entity)
+        (world.generation)
+        (world.generation.block)
+        (world.generation.building)
+        (world.generation.decoration)
+        (world.generation.redstone)
+        (world.generation.vegetation)
+        (world.geometry)
+        (world.history)
+        (world.index)
+        (world.interface.inventory)
+        (world.polygon)
+        (world.redstone)
+        (world.settings)
+        (world.sound)
+        (world.spawn)
+        (world.syntax (phase syntax))
+        (world.travel))
+
+
+;;;
+;;;; Universe
+;;;
+
+
+(class Universe extends Object
+  
+  
+  (slot repeaters    initialize '()          accessors generate)
+  (slot plates       initialize (make-table) accessors generate)
+  (slot lava-blocks  initialize (new-queue)  accessors generate)
+  (slot water-blocks initialize (new-queue)  accessors generate)
+  (slot fall-blocks  initialize (new-queue)  accessors generate)
+
+  
+  ;;;
+  ;;;; Add
+  ;;;
+  
+  
+  (method (with-interaction self h v proc (filter: filter #f) (ignore-non-physical?: ignore-non-physical? #f))
+    ;; quick revert until I look into why Lever, ... are physical? #f
+    (set! ignore-non-physical? #f)
+    (let ((world (current-world))
+          (camera (current-camera)))
+      (bind-values (position direction) (screen->world camera h v)
+        (let ((max-distance (get-view-radius world)))
+          (let ((closest (ray-closest-polygon (get-position camera) direction max-distance filter: filter ignore-non-physical?: ignore-non-physical? ignore-entities?: #f ignore-players?: #t)))
+            (and closest
+                 (let ((poly (car closest)))
+                   (proc (or (get-element poly)
+                             poly)))))))))
+  
+  
+  (method package (with-polygon-interaction self poly proc)
+    (let ((center (get-center poly))
+          (normal (get-normal poly)))
+      (let ((block (polygon-position poly))
+            (fore (vertex+ center (vertex-scalar*& normal .5))))
+        (proc poly block fore))))
+  
+  
+  (method package (add-block-at self poly fore block)
+    (let ((zone (current-zone)))
+      (updating-sections zone
+        (lambda (add-section)
+          (add-block-at-updating self poly fore block add-section)))))
+  
+  
+  (method package (add-block-at-updating self poly fore block add-section)
+    (let ((zone (current-zone)))
+      (call-with-position zone fore
+        (lambda (section block-id <fx> data-id <fx> i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!)
+          (add-block self (get-variant-id block) poly (get-id block) section block-id data-id i j k x y z add-section with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!)))))
+  
+  
+  (method package (apply-add-block self pos new-block new-data)
+    (let ((zone (current-zone)))
+      (updating-sections zone
+        (lambda (add-section)
+          (call-with-position zone pos
+            (lambda (section block-id <fx> data-id <fx> i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!)
+              (add-block self new-data #f new-block section block-id data-id i j k x y z add-section with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!))))
+        delay-update?: #t)))
+  
+  
+  (method package (apply-restore-block self pos new-block new-data)
+    (apply-add-block self pos new-block new-data))
+
+  
+  (method package (add-block self apply-data poly id section block-id data-id i j k x y z add-section with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!)
+    (with-field i j k
+      (lambda (section index)
+        (let ((can-add? #t)
+              (changed #f)
+              (changed-data 0))
+          (define (change-block section index id)
+            (block-set! section index id)
+            (set! changed id))
+          
+          (define (change-data section index id)
+            (data-set! section index id)
+            (set! changed-data id))
+          
+          (define (set-blockid id)
+            (define (determine-torch-rotation)
+              (case (polygon-orientation)
+                ((up down) 5)
+                ((east) 1)
+                ((west) 2)
+                ((south) 3)
+                ((north) 4)))
+            
+            (define (determine-lever-rotation)
+              (case (polygon-orientation)
+                ((up) 5)
+                ((down) 7)
+                ((east) 1)
+                ((west) 2)
+                ((south) 3)
+                ((north) 4)))
+            
+            (define (determine-button-rotation)
+              (case (polygon-orientation)
+                ((up) 5)
+                ((down) 0)
+                ((east) 1)
+                ((west) 2)
+                ((south) 3)
+                ((north) 4)))
+            
+            (define (determine-ladder-rotation)
+              (case (polygon-orientation)
+                ((up down) 2)
+                ((north) 2)
+                ((south) 3)
+                ((west) 4)
+                ((east) 5)))
+            
+            (define (polygon-orientation)
+              (let ((normal (get-normal poly)))
+                (if (> (vertex-y normal) 0.)
+                    'up
+                  (if (< (vertex-y normal) 0.)
+                      'down
+                    (let ((angle (plane-angle 1. 0. (vertex-x normal) (vertex-z normal))))
+                      (cond ((or (between? angle 0. PI/4) (between? angle (- PI*2 PI/4) PI*2)) 'east)
+                            ((between? angle PI/4 (* 3. PI/4)) 'north)
+                            ((between? angle (* 3. PI/4) (* 5. PI/4)) 'west)
+                            (else 'south)))))))
+            
+            (define (determine-piston-rotation)
+              (let ((normal (get-normal poly)))
+                (cond ((> (vertex-y normal) 0.) 1)
+                      ((< (vertex-y normal) 0.) 0)
+                      ((> (vertex-x normal) 0.) 5)
+                      ((< (vertex-x normal) 0.) 4)
+                      ((> (vertex-z normal) 0.) 3)
+                      ((< (vertex-z normal) 0.) 2))))
+            
+            (define (camera-orientation (dir #f))
+              (define (get-direction)
+                (let ((camera (current-camera)))
+                  (let ((sight (get-sight (get-lookat camera))))
+                    (vertex-normalize (vertex (vertex-x sight) 0. (vertex-z sight))))))
+              
+              (let ((direction (or dir (get-direction))))
+                (let ((angle (plane-angle 1. 0. (vertex-x direction) (vertex-z direction))))
+                  (cond ((or (between? angle 0. PI/4) (between? angle (* 7 PI/4) (* 2 PI)))
+                         'east)
+                        ((between? angle PI/4 (* 3 PI/4))
+                         'north)
+                        ((between? angle (* 3 PI/4) (* 5 PI/4))
+                         'west)
+                        (else
+                         'south)))))
+            
+            (define (determine-sign-rotation)
+              (let ((sight (get-sight (get-lookat (current-camera)))))
+                (let ((direction (vertex-normalize (vertex (vertex-x sight) 0. (vertex-z sight)))))
+                  (let ((angle (plane-angle 1. 0. (vertex-x direction) (vertex-z direction))))
+                    (modulo (- 4 (fxround (* 8. (/ angle PI)))) 16)))))
+            
+            (define (determine-repeater-rotation)
+              (case (camera-orientation)
+                ((north) 0)
+                ((south) 2)
+                ((west) 3)
+                ((east) 1)))
+            
+            (define (determine-stairs-rotation)
+              (case (camera-orientation)
+                ((north) 3)
+                ((south) 2)
+                ((west) 1)
+                ((east) 0)))
+            
+            (define (add-bed)
+              (let ((orientation (camera-orientation)))
+                (define (bed-data)
+                  (case orientation
+                    ((north) 2)
+                    ((south) 0)
+                    ((east) 3)
+                    ((west) 1)))
+                
+                (define (add-top a b c data)
+                  (with-field (+ i a) (+ j b) (+ k c)
+                    (lambda (section index)
+                      (if (id? (block-ref section index) Air TallGrass DeadBush Vines Snow)
+                          (begin
+                            (change-block section index BedBlock)
+                            (change-data section index (bit-set data 3 #t))) ;; redstone update
+                        (set! can-add? #f)))))
+                
+                (apply add-top (case (bed-data)
+                                 ((0) (list  0 0  1 0))
+                                 ((1) (list -1 0  0 1))
+                                 ((2) (list  0 0 -1 2))
+                                 ((3) (list  1 0  0 3))))
+                (when can-add?
+                  (change-data section index (bed-data)))))
+            
+            (define (add-door)
+              (with-field i (- j 1) k
+                (lambda (section index)
+                  (let ((block (id->block (block-ref section index))))
+                    (set! can-add? (and (get-cube? block) (get-opaque-cube? block))))))
+              (with-field i (+ j 1) k
+                (lambda (section index)
+                  (set! can-add? (and can-add? (id? (block-ref section index) Air Vines)))
+                  (when can-add?
+                    (change-block section index id)
+                    (change-data section index 8)))) ;; todo left or right hinge
+              (when can-add?
+                (change-data section index (case (camera-orientation)
+                                             ((north) 3)
+                                             ((south) 1)
+                                             ((east) 0)
+                                             ((west) 2)))))
+            
+            
+            (define (add-lily-pad poly)
+              (set! can-add? (/= (vertex-y (get-normal poly)) 0.)))
+            
+            (cond (apply-data
+                   (change-data section index apply-data))
+                  (poly
+                   (ccase id ;; polygon orientation
+                     ((RedstoneTorchOn Torch)
+                      (change-data section index (determine-torch-rotation)))
+                     ((Lever)
+                      (change-data section index (determine-lever-rotation)))
+                     ((WoodenButton StoneButton)
+                      (change-data section index (determine-button-rotation)))
+                     ((Ladder WallSign)
+                      (change-data section index (determine-ladder-rotation)))
+                     ((SignPost)
+                      (change-data section index (determine-sign-rotation)))
+                     ((Piston StickyPiston)
+                      (change-data section index (determine-piston-rotation)))
+                     ((LilyPad)
+                      (add-lily-pad poly))))
+                  (else
+                   (change-data section index 0)))
+            
+            (ccase id ;; camera orientation or special blocks
+              ((RedstoneRepeaterBlockOff)
+               (change-data section index (determine-repeater-rotation)))
+              ((WoodenStairs StoneBrickStairs JungleWoodStairs BirchWoodStairs SpruceWoodStairs BrickStairs NetherBrickStairs CobblestoneStairs SandstoneStairs QuartzStairs)
+               (change-data section index (determine-stairs-rotation)))
+              ((BedBlock)
+               (add-bed))
+              ((WoodenDoorBlock IronDoorBlock)
+               (add-door))
+              ((SandBlock Gravel)
+               (add-fall-block self section i j k))
+              ((Rail)
+               (change-data section index (rail-configuration i j k add-section with-field block-ref data-ref data-set!))))
+            
+            (when (or apply-data can-add?)
+              (change-block section index id)
+              (when (get-liquid-cube? (id->block id))
+                (if (id? id Lava StationaryLava)
+                    (enqueue lava-blocks (cons section (index->coordinates index)))
+                  (enqueue water-blocks (cons section (index->coordinates index)))))
+              (redstone-update section (list i j k id) add-section with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set!)))
+          
+          (if (and poly (id? (decode-id (get-data1 poly)) Vines DeadBush RedMushroom BrownMushroom TallGrass DoublePlant))
+              (call-with-position (current-zone) (vertex (get-data2 poly)
+                                                          (get-data3 poly)
+                                                          (get-data4 poly))
+                (lambda (section block-id data-id i j k x y z with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!)
+                  (let ((new-poly (new world.polygon:Polygon (get-element poly) (vector (vertex& (- x .5) (- y 1.) (- z .5)) (vertex& (- x .5) (- y 1.) (+ z .5)) (vertex& (+ x .5) (- y 1.) (- z .5)) (vertex& (+ x .5) (- y 1.) (+ z .5))))))
+                    (with-field i j k
+                      (lambda (section index)
+                        (add-section section)
+                        (block-set! section index Air)))
+                    (set-data1 new-poly (cast <fl> (encode-id 1 -1)))
+                    (add-block self #f id #f section block-id data-id i j k x y z add-section with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!))))
+            (begin
+              (case id
+                ((52)
+                 (set-modified-spawners? #t))
+                ((54)
+                 (block-entity-add section (indexed i j k))))
+              
+              (let ((brightness (get-brightness (id->block id)))
+                    (replaced (block-ref section index))
+                    (replaced-data (data-ref section index)))
+                (when (or apply-data (id? replaced Air Water Lava StationaryWater StationaryLava))
+                  (cond (brightness
+                         (inverse-propagate-light self i j k add-section with-field block-ref blocklight-ref blocklight-set!)
+                         (propagate-light self i j k brightness add-section with-field block-ref blocklight-ref blocklight-set!)
+                         (set-blockid id)
+                         (inverse-propagate-skylight self i j k (skylight-ref section index) add-section with-field block-ref skylight-ref skylight-set!))
+                        (else
+                         (set-blockid id)
+                         (inverse-propagate-skylight self i j k (skylight-ref section index) add-section with-field block-ref skylight-ref skylight-set!)
+                         (inverse-propagate-light self i j k add-section with-field block-ref blocklight-ref blocklight-set!)
+                         (when (get-opaque? (id->block id))
+                           (blocklight-set! section index 0))))
+                  (unless apply-data
+                    (when (and changed changed-data)
+                      (let ((history (current-history)))
+                        (unless (or (and (get-paused? history) (not (stepping-history?))) (admin?))
+                          (let ((position (vertex& x y z)))
+                            (bidirectional-change 'add-block (current-seconds)
+                              (lambda (store push)
+                                (store push position changed changed-data))
+                              (lambda (store push)
+                                (store push position changed changed-data))
+                              (lambda (store push)
+                                (store push position replaced replaced-data))))))))))
+              (add-section section)))))))
+  
+  
+  (method package (add-element self apply-data element name position lookat scale model script-text properties)
+    (let ((zone (current-zone)))
+      (set-position element position)
+      (when script-text
+        (new Script parent: element text: script-text))
+      (add-element zone element)
+      (unless (or (is? element Missile) (is? element Spawn))
+        (with-designer zone element
+          (lambda (designer container)
+            (set-parent element container)
+            (add-child designer element container import: '(world.data) name: name properties: `(position: ,position lookat: ,lookat scale: ,scale model: ,model ,@properties))
+            ;; quick test
+            (when (and (is? element Entity) (processing?))
+              (set-property designer element 'id (get-id element)))
+            (when script-text
+              (let ((script (get-script element)))
+                (add-child designer script element properties: `(text: ,script-text)))))))
+      (unless apply-data
+        ;; quicky
+        (when (is? element Entity)
+          (let ((history (current-history)))
+            (unless (or (and (get-paused? history) (not (stepping-history?))) (admin?))
+              (bidirectional-change 'add-entity (current-seconds)
+                (lambda (store push)
+                  (store push))
+                (lambda (store push)
+                  (store push element name position lookat scale))
+                (lambda (store push)
+                  (store push element)))))))
+      element))
+  
+  
+  (method package (remove-element self apply-data element)
+    (let ((world (current-world))
+          (zone (current-zone)))
+      (unless (or (is? element Missile) (is? element Spawn))
+        ;; sejour quicky
+        (if (not (designable? zone element))
+            (remove-element world element)
+          (with-designer zone element
+            (lambda (designer container)
+              (remove-element world element)
+              (remove-child designer element)))))
+      (unless apply-data
+        ;; quicky
+        (when (is? element Entity)
+          (let ((history (current-history)))
+            (unless (or (and (get-paused? history) (not (stepping-history?))) (admin?))
+              (bidirectional-change 'remove-entity (current-seconds)
+                (lambda (store push)
+                  (store push element))
+                (lambda (store push)
+                  (store push element))
+                (lambda (store push)
+                  (store push element)))))))))
+  
+  
+  (method package (apply-add-entity self class id name position lookat scale model script-text)
+    (let ((world (current-world)))
+      (let ((properties (if id (list id: id) '())))
+        (let ((entity (apply new class id: id name: name position: position lookat: lookat scale: scale model: model properties)))
+          (add-element self #t entity name position lookat scale model script-text properties)
+          entity))))
+  
+  
+  (method package (apply-remove-entity self entity)
+    (remove-element self #t entity))
+  
+  
+  ;;;
+  ;;;; Delete
+  ;;;
+  
+  
+  (method package (apply-delete-block self pos)
+    (let ((zone (current-zone)))
+      (updating-sections zone
+        (lambda (add-section)
+          (call-with-position zone pos
+            (lambda (section block-id <fx> data-id <fx> i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!)
+              (delete-block self #t section block-id data-id i j k x y z add-section with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!))))
+        delay-update?: #t)))
+  
+
+  (method package (delete-block-at self block)
+    (let ((world (current-world))
+          (zone (current-zone)))
+      (updating-sections zone
+        (lambda (add-section)
+          (delete-block-at-updating self block add-section)))
+      (reset-selection world)))
+  
+
+  (method package (delete-block-at-updating self block add-section)
+    (let ((zone (current-zone)))
+      (call-with-position zone block
+        (lambda (section block-id <fx> data-id <fx> i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!)
+          (delete-block self #f section block-id data-id i j k x y z add-section with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!)))))
+  
+  
+  @wait
+  (method (explose-blocks-at block)
+    (let ((world (current-world))
+          (zone (current-zone)))
+      (updating-sections zone
+        (lambda (add-section)
+          (call-with-position zone block
+            (lambda (section block-id <fx> data-id <fx> i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!)
+              (let ((radius 2.)
+                    (center (vertex x y z)))
+                (loop (for a from -2 to 2)
+                      (loop (for b from -2 to 2)
+                            (loop (for c from -2 to 2)
+                                  (let ((pos (vertex (+ x (cast <fl> a)) (+ y (cast <fl> b)) (+ z (cast <fl> c)))))
+                                    (when (<= (vertex-distance center pos) radius)
+                                      (delete-block #f section block-id data-id (+ i a) (+ j b) (+ k c) (vertex-x pos) (vertex-y pos) (vertex-z pos) add-section with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!)))))))))))))
+  
+  
+  (method package (delete-block self apply-data section block-id data-id i j k x y z add-section with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!)
+    ;; can be improved by testing for opaque blocks in all directions
+    ;; and then testing that every block in all directions is opaque
+    (define (add-neighbors add-section)
+      (define (add i j k)
+        (with-field i j k
+          (lambda (section index)
+            (when section
+              (add-section section)
+              @w(when (memq? (block-ref section index) '(8 9))
+                (enqueue water-blocks (cons section (index->coordinates index))))
+              @w(when (memq? (block-ref section index) '(10 11))
+                (enqueue lava-blocks (cons section (index->coordinates index))))))))
+      
+      (add (- i 1) j k)
+      (add (+ i 1) j k)
+      (add i (- j 1) k)
+      (add i (+ j 1) k)
+      (add i j (- k 1))
+      (add i j (+ k 1)))
+    
+    (add-neighbors add-section)
+    (with-field i j k
+      (lambda (section index)
+        (define (find-max-light-around i j k)
+          (define (find-light i j k)
+            (with-field i j k
+              (lambda (section index)
+                (if (not section)
+                    0
+                  (blocklight-ref section index)))))
+          
+          (let ((left (find-light (- i 1) j k))
+                (right (find-light (+ i 1) j k))
+                (down (find-light i (- j 1) k))
+                (up (find-light i (+ j 1) k))
+                (back (find-light i j (- k 1)))
+                (front (find-light i j (+ k 1))))
+            (max left right down up back front)))
+        
+        (define (get-skylight i j k)
+          (define (top-skylight)
+            (with-field i (+ j 1) k
+              (lambda (section index)
+                (or (and section
+                         (let ((light (skylight-ref section index)))
+                           (if (= light 15) 15 (- light 1))))
+                    0))))
+          
+          (define (side-skylight i j k)
+            (with-field i j k
+              (lambda (section index)
+                (or (and section
+                         (- (skylight-ref section index) 1))
+                    0))))
+          
+          (max (top-skylight)
+               (side-skylight (- i 1) j k)
+               (side-skylight (+ i 1) j k)
+               (side-skylight i j (- k 1))
+               (side-skylight i j (+ k 1))
+               (side-skylight i (- j 1) k)
+               0))
+        
+        (define (delete-bed)
+          (let ((top? (bit-set? 3 data-id)))
+            (define (other-part)
+              (case (bit-set data-id 3 #f)
+                ((0) (list  0  1))
+                ((1) (list -1  0))
+                ((2) (list  0 -1))
+                ((3) (list  1  0))
+                (else (list 0 0))))
+            
+            (bind (a c) (other-part)
+              (with-field (+ i (* a (if top? -1 1))) j (+ k (* c (if top? -1 1)))
+                (lambda (section index)
+                  (block-set! section index 0)
+                  (data-set! section index 0))))))
+        
+        (define (delete-piston)
+          (let ((top? (id? block-id PistonHead)))
+            (define (other-part)
+              (case (bit-set data-id 3 #f)
+                ((0) (list  0 -1  0))
+                ((1) (list  0  1  0))
+                ((2) (list  0  0 -1))
+                ((3) (list  0  0  1))
+                ((4) (list -1  0  0))
+                ((5) (list  1  0  0))
+                (else (list 0 0 0))))
+            
+            (bind (a b c) (other-part)
+              (with-field (+ i (* a (if top? -1 1))) (+ j (* b (if top? -1 1))) (+ k (* c (if top? -1 1)))
+                (lambda (section index)
+                  (block-set! section index 0)
+                  (data-set! section index 0))))))
+        
+        (let ((brightness (get-brightness (id->block block-id))))
+          (block-set! section index 0)
+          (when (id? block-id IronDoorBlock WoodenDoorBlock DoublePlant)
+            (with-field i ((if (bit-set? 3 data-id) - +) j 1) k
+              (lambda (section index)
+                (block-set! section index 0)
+                (data-set! section index 0))))
+          (when (id? block-id BedBlock)
+            (delete-bed))
+          (when (or (and (id? block-id Piston StickyPiston) (bit-set? 3 data-id)) (id? block-id PistonHead))
+            (delete-piston))
+          (when (id? block-id MonsterSpawner)
+            (set-modified-spawners? #t))
+          (if brightness
+              (inverse-propagate-light self i j k add-section with-field block-ref blocklight-ref blocklight-set!)
+            (begin
+              (blocklight-set! section index 0)
+              (propagate-light self i j k (- (find-max-light-around i j k) 1) add-section with-field block-ref blocklight-ref blocklight-set!)))
+          (inverse-propagate-light self i j k add-section with-field block-ref blocklight-ref blocklight-set!)
+          (skylight-set! section index (get-skylight i j k))
+          (propagate-skylight self i j k add-section with-field block-ref skylight-ref skylight-set!)
+          (redstone-update section (list i j k block-id) add-section with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set!)
+          (data-set! section index 0)
+          (unless apply-data
+            (let ((history (current-history)))
+              (unless (or (and (get-paused? history) (not (stepping-history?))) (admin?))
+                (let ((position (vertex& x y z)))
+                  (bidirectional-change 'delete-block (current-seconds)
+                    (lambda (store push)
+                      (store push position))
+                    (lambda (store push)
+                      (store push position))
+                    (lambda (store push)
+                      (store push position block-id data-id)))))))))))
+  
+  
+  ;;;
+  ;;;; Light
+  ;;;
+  
+  
+  (method (propagate-light self i j k light add-section with-field block-ref blocklight-ref blocklight-set!)
+    (let ((queue (new-queue)))
+      (define (propagate i j k light)
+        (with-field i j k
+          (lambda (section index)
+            (when section
+              ;; always adding the section covers the case where the light changes
+              ;; and we need to update all neighboring sections even if no light changes for
+              ;; them like when putting a torch next to a wall that is in the next section
+              (add-section section)
+              (when (and (> light 0)
+                         (< (blocklight-ref section index) light)
+                         (not (get-opaque? (id->block (block-ref section index)))))
+                (blocklight-set! section index light)
+                (let ((light (- light 1)))
+                  (define (add-queue i j k)
+                    (enqueue queue (list i j k light)))
+                  
+                  (add-queue (- i 1) j k)
+                  (add-queue (+ i 1) j k)
+                  (add-queue i (- j 1) k)
+                  (add-queue i (+ j 1) k)
+                  (add-queue i j (- k 1))
+                  (add-queue i j (+ k 1))))
+              (let (iter)
+                (unless (queue-empty? queue)
+                  (apply propagate (dequeue queue))
+                  (iter)))))))
+      
+      (propagate i j k light)))
+  
+  
+  (method package (inverse-propagate-light self i j k add-section with-field block-ref blocklight-ref blocklight-set!)
+    (let ((queue (new-queue)))
+      (define (inverse-propagate i j k)
+        (with-field i j k
+          (lambda (section index)
+            (when section
+              (add-section section)
+              (let ((light (blocklight-ref section index)))
+                (define (look-around i j k light)
+                  (with-field i j k
+                    (lambda (section index)
+                      (when section
+                        (add-section section)
+                        (let ((new-light (blocklight-ref section index)))
+                          (unless (= new-light 0)
+                            (if (< new-light light)
+                                (inverse-propagate i j k)
+                              (enqueue queue (list i j k)))))))))
+                
+                (unless (= light 0)
+                  (blocklight-set! section index 0)
+                  (look-around (- i 1) j k light)
+                  (look-around (+ i 1) j k light)
+                  (look-around i (- j 1) k light)
+                  (look-around i (+ j 1) k light)
+                  (look-around i j (- k 1) light)
+                  (look-around i j (+ k 1) light)))))))
+      
+      (inverse-propagate i j k)
+      (let (iter)
+        (unless (queue-empty? queue)
+          (bind (i j k) (dequeue queue)
+            (with-field i j k
+              (lambda (section index)
+                (let ((light (blocklight-ref section index)))
+                  (unless (= light 0)
+                    (blocklight-set! section index 0)
+                    (propagate-light self i j k light add-section with-field block-ref blocklight-ref blocklight-set!))))))
+          (iter)))))
+  
+  
+  (method (propagate-skylight self i j k add-section with-field block-ref skylight-ref skylight-set!)
+    (let ((queue (new-queue)))
+      (define (propagate i j k light (first #f))
+        (with-field i j k
+          (lambda (section index)
+            (when section
+              (add-section section)
+              (when (and (> light 0)
+                         (or first (> light (skylight-ref section index)))
+                         (not (get-opaque? (id->block (block-ref section index)))))
+                (skylight-set! section index light)
+                (let ((light2 (- light 1)))
+                  (define (add-queue i j k (amount light2))
+                    (enqueue queue (list i j k amount)))
+                  
+                  (add-queue (- i 1) j k)
+                  (add-queue (+ i 1) j k)
+                  (add-queue i (- j 1) k (if (= light 15) 15 light2))
+                  (unless (= light 15)
+                    (add-queue i (+ j 1) k))
+                  (add-queue i j (- k 1))
+                  (add-queue i j (+ k 1))))
+              (let (iter)
+                (unless (queue-empty? queue)
+                  (apply propagate (dequeue queue))
+                  (iter)))))))
+      
+      (with-field i j k
+        (lambda (section index)
+          (propagate i j k (skylight-ref section index) #t)))))
+  
+  
+  (method (inverse-propagate-skylight self i j k first-light add-section with-field block-ref skylight-ref skylight-set!)
+    (let ((inverse-spots (new-queue))
+          (propagate-spots (new-queue)))
+      (define (add-queue item queue)
+        (unless (member? item (queue-list queue))
+          (enqueue queue item)))
+      
+      (define (inverse-propagate i j k previous (first #f))
+        (with-field i j k
+          (lambda (section index)
+            (when section
+              (let ((current-light (if first first-light (skylight-ref section index))))
+                (define (add-around)
+                  (add-queue (list (- i 1) j k current-light) inverse-spots)
+                  (add-queue (list (+ i 1) j k current-light) inverse-spots)
+                  (add-queue (list i j (- k 1) current-light) inverse-spots)
+                  (add-queue (list i j (+ k 1) current-light) inverse-spots)
+                  (add-queue (list i (+ j 1) k current-light) inverse-spots)
+                  (add-queue (list i (- j 1) k (if (= current-light 15) 16 current-light)) inverse-spots))
+                
+                (unless (and (not first)
+                             (or (= current-light 0)
+                                 (get-opaque? (id->block (block-ref section index)))))
+                  (if (or first (< current-light previous))
+                      (begin
+                        (skylight-set! section index 0)
+                        (add-section section)
+                        (add-around))
+                    (begin
+                      (add-queue (list i j k) propagate-spots)))))))))
+      
+      (inverse-propagate i j k 0 #t)
+      (let (iter-inverse)
+        (unless (queue-empty? inverse-spots)
+          (apply inverse-propagate (dequeue inverse-spots))
+          (iter-inverse)))
+      (let (iter-propagate)
+        (unless (queue-empty? propagate-spots)
+          (bind (i j k) (dequeue propagate-spots)
+            (propagate-skylight self i j k add-section with-field block-ref skylight-ref skylight-set!)
+            (iter-propagate))))))
+  
+  
+  ;;;
+  ;;;; Rail
+  ;;;
+
+
+  (definition (rail-configuration i j k add-section with-field section-block-ref section-data-ref section-data-set!)
+    (define (block-ref i j k)
+      (with-field i j k
+        (lambda (section index)
+          (section-block-ref section index))))
+    
+    (define (data-ref i j k)
+      (with-field i j k
+        (lambda (section index)
+          (section-data-ref section index))))
+    
+    (define (data-set! i j k value)
+      (with-field i j k
+        (lambda (section index)
+          (add-section section)
+          (section-data-set! section index value))))
+    
+    (define (check-rail a c) ;; when indirect check
+      (and (id? (block-ref (+ i a) j (+ k c)) PoweredRail DetectorRail Rail) (not (other-rail-double-connected? a c))))
+    
+    (define (check-rail2 a c direction)
+      (and (id? (block-ref (+ i a) j (+ k c)) PoweredRail DetectorRail Rail) (memq? (data-ref (+ i a) j (+ k c)) (direction->datas direction))))
+    
+    (define (direction->datas direction)
+      (case direction
+        ((south) '(0 4 5 6 7))
+        ((north) '(0 4 5 8 9))
+        ((east)  '(1 2 3 6 9))
+        ((west)  '(1 2 3 7 8))))
+    
+    (define (other-rail-double-connected? a c)
+      (let ((data (data-ref (+ i a) j (+ k c)))
+            (connections 0))      
+        (when (and (/= a -1) (memq? data (direction->datas 'east)) (check-rail2 (+ a 1) c 'west))
+          (increase! connections))
+        (when (and (/= a 1) (memq? data (direction->datas 'west)) (check-rail2 (- a 1) c 'east))
+          (increase! connections))
+        (when (and (/= c -1) (memq? data (direction->datas 'south)) (check-rail2 a (+ c 1) 'north))
+          (increase! connections))
+        (when (and (/= c 1) (memq? data (direction->datas 'north)) (check-rail2 a (- c 1) 'south))
+          (increase! connections))
+        (= connections 2)))
+    
+    (define (update-rail a c)
+      (set! i (+ i a))
+      (set! k (+ k c))
+      (data-set! i j k (let ((south? (= c -1))
+                             (east?  (= a -1))
+                             (north? (= c  1))
+                             (west?  (= a  1))
+                             (data (data-ref i j k)))
+                         (cond ((and (not south?) (memq? data (direction->datas 'south)) (check-rail2 0 1 'north))
+                                (if east? 6 (if west? 7 0)))
+                               ((and (not east?) (memq? data (direction->datas 'east)) (check-rail2 1 0 'west))
+                                (if south? 6 (if north? 9 1)))
+                               ((and (not north?) (memq? data (direction->datas 'north)) (check-rail2 0 -1 'south))
+                                (if east? 9 (if west? 8 0)))
+                               ((and (not west?) (memq? data (direction->datas 'west)) (check-rail2 -1 0 'east))
+                                (if south? 7 (if north? 8 1)))
+                               (else
+                                (if (or south? north?) 0 1)))))
+      (set! i (- i a))
+      (set! k (- k c)))
+    
+    (define (update-rails south east north west)
+      (when south
+        (update-rail 0 1))
+      (when east
+        (update-rail 1 0))
+      (when north
+        (update-rail 0 -1))
+      (when west
+        (update-rail -1 0)))
+    
+    (let ((count 0)
+          (south? #f)
+          (east?  #f)
+          (north? #f)
+          (west?  #f))
+      (when (check-rail 0 1)
+        (increase! count)
+        (set! south? #t))
+      (when (check-rail 1 0)
+        (increase! count)
+        (set! east? #t))
+      (when (and (< count 2) (if south? (check-rail -1 0) (check-rail 0 -1)))
+        (if south?
+            (begin
+              (increase! count)
+              (set! west? #t))
+          (increase! count)
+          (set! north? #t)))
+      (when (and (< count 2) (if south? (check-rail 0 -1) (check-rail -1 0)))
+        (if south?
+            (begin
+              (increase! count)
+              (set! north? #t))
+          (increase! count) 
+          (set! west? #t)))
+      (case count
+        ((0) 0)
+        ((1)
+         (update-rails south? east? north? west?)
+         (if (or north? south?) 0 1))
+        ((2)
+         (update-rails south? east? north? west?)
+         (if south?
+             (if east?
+                 6
+               (if west?
+                   7
+                 0))
+           (if east?
+               (if north?
+                   9
+                 1)
+             8))))))
+  
+  
+  ;;;
+  ;;;; Plates
+  ;;;
+  
+  
+  (method package (plates-update self add-to remove-from actor) ;; bug: getting off and on quickly
+    (define (table-remove table key)
+      (list->table (map (lambda (x) (cons x (table-ref table x))) (remove key (table-keys table) test: equal?))))
+    
+    (define (pp-test pp1 pp2)
+      (and (is? pp1 Plate) (is? pp2 Plate)
+        (equal? (location pp1) (location pp2))))
+    
+    (let ((zone (current-zone)))
+      (for-each (lambda (pos)
+                  (let ((pp (table-ref plates pos #f)))
+                    (if pp
+                        (begin
+                          (set-colliders pp (cons actor (get-colliders pp)))
+                          (table-set! plates pos pp))
+                      (call-with-position zone pos ;; add new pressure plate
+                        (lambda (section block-id data-id i j k x y z with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!)
+                          (table-set! plates pos (new-plate section i j k 10 actor with-field))
+                          (set-repeaters self (remove pp repeaters test: pp-test))
+                          ;; play sound
+                          (updating-sections zone
+                            (lambda (add-section)
+                              (redstone-update section (list i j k block-id) add-section with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! #t))))))))
+                add-to)
+      (for-each (lambda (pos) ;; remove actor from plates
+                  (let ((pp (table-ref plates pos #f)))
+                    (let ((colliders (get-colliders pp)))
+                      (set! colliders (remove actor colliders))
+                      (if (null? colliders)
+                          (begin
+                            (set! plates (table-remove plates pos))
+                            (set! repeaters (cons pp repeaters))) ;; unpower
+                        (begin
+                          (set-colliders pp colliders)
+                          (table-set! plates pos pp))))))
+                remove-from)))
+  
+  
+  ;;;
+  ;;;; Fall
+  ;;;
+  
+  
+  (method package (add-fall-block self section i j k)
+    (let ((item (cons section (indexed i j k))))
+      (unless (member? item (queue-list fall-blocks))
+        (enqueue fall-blocks item))))
+  
+  
+  ;;;
+  ;;;; Liquid
+  ;;;
+  
+  
+  (definition public (liquid-filter poly)
+    (not (get-liquid-cube? (id->block (decode-id (get-data1 poly))))))
+  
+  
+  ;;;
+  ;;;; Mouse
+  ;;;
+  
+  
+  (slot hit-block initialize #f getter generate)
+  (slot hit-count initialize #f getter generate)
+  (slot hit-time  initialize #f getter generate)
+  
+  
+  (definition hit-needed
+    (world-setting 'world.hit-needed 3))
+  
+  
+  (method package (mouse-up self h v)
+    #f
+    @SPACE-fix-me
+    (and (not (user?))
+         (let ((world (current-world))
+               (zone (current-zone)))
+           (with-interaction self h v
+             (lambda (obj)
+               (and (polygon? obj)
+                    (with-polygon-interaction self obj
+                      (lambda (poly block fore)
+                        (and (allow-interaction-distance? self block)
+                             (zone-editable? zone)
+                             (let ((time (current-seconds)))
+                               (when (or (not hit-block)
+                                         (not (vertex=? block hit-block))
+                                         (and hit-time (> (- time hit-time) 1.)))
+                                 (set! hit-block block)
+                                 (set! hit-count 0)
+                                 (set! hit-time time))
+                               (set! hit-count (modulo (+ (or hit-count 0) 1) hit-needed))
+                               (if (/= hit-count 0)
+                                   (begin
+                                     (play-3d-sound "sound/dig/wood3" block volume: .1)
+                                     (set! hit-time time)
+                                     #f)
+                                 (delete-block-at self block)
+                                 (play-3d-sound "sound/dig/grass3" block volume: .5)
+                                 (reset-selection world)
+                                 (set! hit-block #f)
+                                 (set! hit-count #f)
+                                 (set! hit-time #f)
+                                 #t)))))))
+             filter: liquid-filter))))
+  
+  
+  (method package (right-mouse-up self h v)
+    (let ((interface (current-interface))
+          (world (current-world))
+          (zone (current-zone)))
+      (with-interaction self h v
+        (lambda (obj)
+          (if (element? obj)
+              (when (is? obj Actor)
+                (let ((script (get-script obj)))
+                  (when script
+                    (let ((interact (get-interact script)))
+                      (when interact
+                        (enqueue-event script 'interact)))))
+                (let ((history (current-history)))
+                  (unless (or (and (get-paused? history) (not (stepping-history?))) (admin?))
+                    (bidirectional-change 'interact (current-seconds)
+                      (lambda (store push)
+                        (store push obj))
+                      (lambda (store push)
+                        (store push obj))
+                      (lambda (store push)
+                        (store push))))))
+            (with-polygon-interaction self obj
+              (lambda (poly clicked fore)
+                (when (allow-interaction-distance? self clicked)
+                  (call-with-position zone clicked
+                    (lambda (section block-id <fx> data-id <fx> i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!)
+                      (let ((block (id/data-id->block block-id data-id)))
+                        (let ((right-mouse (get-right-mouse block)))
+                          (if right-mouse
+                              (begin
+                                (right-mouse section block-id data-id i j k x y z with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!)
+                                (let ((history (current-history)))
+                                  (unless (or (and (get-paused? history) (not (stepping-history?)))
+                                              (admin?)
+                                              (id? block-id BedBlock Chest WorkbenchBlock SignPost WallSign))
+                                    (let ((position (vertex& x y z)))
+                                      (bidirectional-change 'action (current-seconds)
+                                        (lambda (store push)
+                                          (store push position))
+                                        (lambda (store push)
+                                          (store push position))
+                                        (lambda (store push)
+                                          (store push)))))))
+                            (let ((slot (selected-slot (child interface 'belt))))
+                              (let ((id (get-id slot)))
+                                (when id
+                                  (place-slot self slot poly clicked fore))))))))))))))
+        filter: liquid-filter
+        ignore-non-physical?: #t)))
+  
+  
+  (method package (double-click self h v)
+    (let ((zone (current-zone)))
+      (with-interaction self h v
+        (lambda (obj)
+          (if (element? obj)
+              (when (is? obj Actor)
+                (let ((script (get-script obj)))
+                  (when script
+                    (let ((double-click (get-double-click script)))
+                      (when double-click
+                        (enqueue-event script 'double-click)))))
+                (let ((history (current-history)))
+                  (unless (or (and (get-paused? history) (not (stepping-history?))) (admin?))
+                    (bidirectional-change 'double-click (current-seconds)
+                      (lambda (store push)
+                        (store push obj))
+                      (lambda (store push)
+                        (store push obj))
+                      (lambda (store push)
+                        (store push))))))
+            (when (polygon? obj)
+              (with-polygon-interaction self obj
+                (lambda (poly block fore)
+                  (when (allow-interaction-distance? self block)
+                    (call-with-position zone block
+                      (lambda (section block-id <fx> data-id <fx> i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!)
+                        (let ((block (id/data-id->block block-id data-id)))
+                          (let ((double-click (get-double-click block)))
+                            (if double-click
+                                (double-click section block-id data-id i j k x y z with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!)
+                              (deposit-inventory block)))))))))))))))
+  
+  
+  ;;;
+  ;;;; Change
+  ;;;
+  
+  
+  (method package (apply-action self pos)
+    ;; quicky to call interact-at
+    (interact-at self pos))
+  
+  
+  (method package (apply-interact self entity)
+    ;; open test quicky test
+    (when (is? entity Actor)
+      (let ((script (get-script entity)))
+        (when script
+          (let ((handler (get-interact script)))
+            (when handler
+              (enqueue-event script 'interact)))))))
+  
+  
+  (method package (apply-double-click self entity)
+    ;; open test quicky test
+    (when (is? entity Actor)
+      (let ((script (get-script entity)))
+        (when script
+          (let ((handler (get-double-click script)))
+            (when handler
+              (enqueue-event script 'double-click)))))))
+  
+  
+  ;;;
+  ;;;; Interaction
+  ;;;
+  
+  
+  (definition interaction-distance <fl>
+    (world-setting 'world.interaction-distance 8.))
+  
+  
+  ;; need a section that gets called from scripts and tests that distance, ... are all valid
+  (method package (interact-at self pos)
+    (let ((zone (current-zone)))
+      (call-with-position zone pos
+        (lambda (section block-id <fx> data-id <fx> i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!)
+          (let ((block (id/data-id->block block-id data-id)))
+            (let ((right-mouse (get-right-mouse block)))
+              (when right-mouse
+                (right-mouse section block-id data-id i j k x y z with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!))))))))
+  
+  
+  (method package (interaction-element self h v)
+    (let ((zone (current-zone)))
+      (with-interaction self h v
+        (lambda (obj)
+          (if (element? obj)
+              obj
+            (with-polygon-interaction self obj
+              (lambda (poly clicked fore)
+                (when (allow-interaction-distance? self clicked) 
+                  (call-with-position zone clicked
+                    (lambda (section block-id <fx> data-id <fx> i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!)
+                      (let ((block (id/data-id->block block-id data-id)))
+                        (create-block-entity zone (get-name block) (polygon-position poly))))))))))
+        filter: liquid-filter
+        ignore-non-physical?: #t)))
+  
+  
+  (method (allow-interaction-distance? self pos)
+    (let ((me (current-me+)))
+      ;; kinda quicky
+      (or (not me)
+          (let ((distance (vertex-distance pos (get-position me)))
+                (max-distance (max-interaction-distance self)))
+            (<= distance max-distance)))))
+  
+  
+  (method (max-interaction-distance self)
+    (let ((world (current-world)))
+      (if (user?)
+          interaction-distance
+        (get-view-radius world))))
+  
+  
+  (method protected virtual (place-slot self slot poly clicked fore)
+    (let ((id (get-id slot)))
+      (if (>= id 256)
+          (bell)
+        (add-block-at self poly fore (id/durability->block id (get-durability slot)))
+        (decrease-count slot)
+        (inventory-changed))))))
