@@ -16,6 +16,7 @@
 
 (import (jazz.action)
         (jazz.application)
+        (jazz.event)
         (jazz.graphic)
         (jazz.handler)
         (jazz.markup)
@@ -24,31 +25,37 @@
         (jazz.ui)
         (world.client.actions)
         (world.interface)
-        (world.interface.frame))
+        (world.interface.frame)
+        (world.settings))
 
 
 (class World-Bindings-Viewer extends World-Frame
   
   
-  (property show-uninstalled? initialize #f accessors generate)
+  (property show-inactive?  initialize #f accessors generate)
+  (property show-shortcuts? initialize #f accessors generate)
   
   
   (form
-    (<install>                                              size: {Dimension 420 639} layout-type: border background: {Color red: .000 green: .000 blue: .000 alpha: .500}
-      (<caption~>                                           title: "Key Bindings"
-        (<Push-Button>                 name: toggle-show    title: "Show All" style: text background: #f position: {Point 4 0} size: {Dimension 100 22} action-handler: {Event-Handler :form on-toggle-show-uninstalled?}))
-      (<content~>                                           layout-type: fill
-        (<Scroller-View>                                    style: document hscroll?: #t vscroll?: #t
-          (<content~>                                       layout-type: fill
-            (<Tree-Header>                                  style: document shown?: #f
+    (<install>                                                size: {Dimension 420 639} layout-type: border background: {Color red: .000 green: .000 blue: .000 alpha: .500}
+      (<caption~>                                             title: "Keyboard Shortcuts"
+        (<Push-Button>                 name: toggle-inactive  title: "Show All" style: text background: #f position: {Point 4 0} size: {Dimension 100 22} action-handler: {Event-Handler :form on-toggle-show-inactive?})
+        (<Push-Button>                 name: toggle-shortcuts title: "Actions" style: text background: #f position: {Point 45 0} size: {Dimension 100 22} action-handler: {Event-Handler :form on-toggle-show-shortcuts?} visible?: #f))
+      (<content~>                                             layout-type: fill
+        (<Scroller-View>                                      style: document hscroll?: #t vscroll?: #t
+          (<content~>                                         layout-type: fill
+            (<Tree-Header>                                    style: document shown?: #f
               (<content~>
-                (<Tree-View>           name: actions        portfolio: :images filled-column: action background: #f
-                  (<Tree-Node-Column>  name: action         title: "Action" width: 235 toplevel-controls?: #f display-images?: #f display-levels?: #f)
-                  (<Tree-Label-Column> name: shortcut       title: "Shortcut" width: 185)))))))))
+                (<Tree-View>           name: actions          portfolio: :images filled-column: action background: #f double-click-handler: {Event-Handler :form on-double-click} return-press-handler: {Event-Handler :form on-return-press}
+                  (<Tree-Node-Column>  name: action           title: "Action" width: 235 toplevel-controls?: #f display-images?: #f display-levels?: #f)
+                  (<Tree-Label-Column> name: shortcut         title: "Shortcut" width: 185)))))))))
   
   
   (method override (conclude self initargs)
     (nextmethod self initargs)
+    (when (developer?)
+      (set-title (child (locate self 'caption) 'toggle-inactive) "Active")
+      (set-visible? (child (locate self 'caption) 'toggle-shortcuts) #t))
     (view-bindings self))
   
   
@@ -56,10 +63,37 @@
     (acquire-focus (get-tree self)))
   
   
-  (method (on-toggle-show-uninstalled? self evt)
-    (set! show-uninstalled? (not show-uninstalled?))
-    (set-title (child (locate self 'caption) 'toggle-show) (if show-uninstalled? "Show Active" "Show All"))
+  (method (on-toggle-show-inactive? self evt)
+    (set! show-inactive? (not show-inactive?))
+    (set-title (get-sender evt) (if (developer?)
+                                    (if show-inactive? "All" "Active")
+                                  (if show-inactive? "Show Active" "Show All")))
     (view-bindings self))
+  
+  
+  (method (on-toggle-show-shortcuts? self evt)
+    (set! show-shortcuts? (not show-shortcuts?))
+    (set-title (get-sender evt) (if show-shortcuts? "Shortcuts" "Actions"))
+    (view-bindings self))
+  
+  
+  (method (on-double-click self evt)
+    (when (developer?)
+      (invoke-action-item self)))
+  
+  
+  (method override (on-return-press self key)
+    (when (developer?)
+      (invoke-action-item self)))
+  
+  
+  (method (invoke-action-item self)
+    (let ((tree (locate self 'actions)))
+      (let ((action-item (get-single-selected-data tree)))
+        (if (is-not? action-item Action-Item)
+            (bell)
+          (let ((handler (get-action-handler action-item)))
+            (notify-handler self handler self '()))))))
   
   
   ;;;
@@ -81,42 +115,112 @@
       (let ((designer (get-bindings-designer appl))
             (bindings (current-bindings))
             (tree (get-tree self)))
-        (define (view-actions-flat)
-          (for-each (lambda (actions)
-                      (let ((children (get-visible-children actions)))
-                        (unless (null? children)
-                          (let ((installed-actions
-                                  (collect (lambda (action)
-                                             (and (get-visible? action)
-                                                  (get-title action)
-                                                  (let ((shortcut (get-shortcut action)))
-                                                    (and (or show-uninstalled?
-                                                             (and shortcut (not-null? (get-allowed-actions appl shortcut))))
-                                                         action))))
-                                           children)))
-                            (when (not-null? installed-actions)
-                              (let ((father (add-row tree
-                                                     state: 'expanded
-                                                     children: (list (new Tree-Node title: (get-title actions) font: {Font Label-User} color: {Color red: 220 green: 0 blue: 0})
-                                                                     (new Tree-Label title: "" font: {Font Label-User} color: {Color White}))
-                                                     user-data: actions)))
-                                (for-each (lambda (action)
-                                            (let ((title (get-title action))
-                                                  (shortcut (get-shortcut action))
-                                                  (alternate-shortcut (first-alternate-shortcut action)))
+        (define (collect-actions)
+          (let ((shortcuts (make-table test: shortcut=? hash: shortcut-hash)))
+            (let ((toplevels
+                    (collect (lambda (actions)
+                               (let ((children (get-children actions)))
+                                 (and (not-null? children)
+                                      (let ((active-actions
+                                              (if show-inactive?
+                                                  children
+                                                (collect (lambda (action)
+                                                           (and (get-visible? action)
+                                                                (let ((shortcut (get-shortcut action)))
+                                                                  (and shortcut
+                                                                       (not-null? (get-allowed-actions appl shortcut))
+                                                                       action))))
+                                                         children))))
+                                        (for-each (lambda (action)
+                                                    (let ((shortcut (get-shortcut action)))
+                                                      (when shortcut
+                                                        (table-add shortcuts shortcut action))))
+                                                  active-actions)
+                                        (and (not-null? active-actions)
+                                             (cons actions active-actions))))))
+                             (collect-type World-Actions (if show-inactive?
+                                                             (get-children bindings)
+                                                           (get-visible-children bindings))))))
+              (cons shortcuts toplevels))))
+        
+        (define (view-actions)
+          (bind (shortcuts . toplevels) (collect-actions)
+            (for-each (lambda (toplevel)
+                        (bind (actions . active-actions) toplevel
+                          (let ((father (add-row tree
+                                                 state: 'expanded
+                                                 children: (list (new Tree-Node title: (get-title actions) font: {Font Label-User} color: {Color red: 220 green: 0 blue: 0})
+                                                                 (new Tree-Label title: "" font: {Font Label-User} color: {Color White}))
+                                                 user-data: actions)))
+                            (for-each (lambda (action)
+                                        (let ((title (get-title action))
+                                              (shortcut (get-shortcut action))
+                                              (alternate-shortcut (first-alternate-shortcut action)))
+                                          (let ((font {Font Label-User})
+                                                (color (if (and shortcut (not-null? (get-allowed-actions appl shortcut)))
+                                                           {Color World-Blue}
+                                                         {Color Medium-Gray}))
+                                                (conflict? (and shortcut (> (length (table-ref shortcuts shortcut)) 1))))
+                                            (let ((shortcuts-title (shortcuts-present shortcut alternate-shortcut))
+                                                  (shortcuts-color (if conflict? {Color Pastel-Orange} color)))
+                                              (add-row tree
+                                                       father: father
+                                                       children: (list (new Tree-Node title: title font: font color: color)
+                                                                       (new Tree-Label title: shortcuts-title font: font color: shortcuts-color))
+                                                       user-data: action)))))
+                                      active-actions))))
+                      toplevels)))
+        
+        (define sorted-fkeys
+          (let ((fkeys '(F1 F2 F3 F4 F5 F6 F7 F8 F9 F10 F11 F12)))
+            (list->table
+              (map cons
+                   fkeys
+                   (naturals 0 (length fkeys))))))
+        
+        (define (view-shortcuts)
+          (bind (shortcuts . toplevels) (collect-actions)
+            (let ((bindings (table->list shortcuts)))
+              (for-each (lambda (partition)
+                          (bind (modifiers . bindings) partition
+                            (let ((father (add-row tree
+                                                   state: 'expanded
+                                                   children: (list (new Tree-Node title: (if (null? modifiers) "none" (present-modifiers modifiers)) font: {Font Label-User} color: {Color red: 220 green: 0 blue: 0})
+                                                                   (new Tree-Label title: "" font: {Font Label-User} color: {Color White})))))
+                              (for-each (lambda (binding)
+                                          (bind (shortcut . actions) binding
+                                            (let ((title (present-key (get-key shortcut))))
                                               (let ((font {Font Label-User})
-                                                    (color (if (and shortcut (not-null? (get-allowed-actions appl shortcut)))
+                                                    (color (if (not-null? (get-allowed-actions appl shortcut))
                                                                {Color World-Blue}
-                                                             {Color Medium-Gray})))
-                                                (add-row tree
-                                                         father: father
-                                                         children: (list (new Tree-Node title: title font: font color: color)
-                                                                         (new Tree-Label title: (shortcuts-present shortcut alternate-shortcut) font: font color: color))
-                                                         user-data: action))))
-                                          installed-actions)))))))
-                    (collect-type World-Actions (get-visible-children (current-bindings)))))
+                                                             {Color Medium-Gray}))
+                                                    (conflict? (> (length actions) 1)))
+                                                (let ((actions-title (join (map get-title actions) ", "))
+                                                      (actions-color (if conflict? {Color Pastel-Orange} color)))
+                                                  (add-row tree
+                                                           father: father
+                                                           children: (list (new Tree-Node title: title font: font color: color)
+                                                                           (new Tree-Label title: actions-title font: font color: actions-color))
+                                                           user-data: shortcut))))))
+                                        (sort nu<? bindings key: (lambda (binding)
+                                                                   (let ((key (get-key (car binding))))
+                                                                     (let ((fkey-rank (table-ref sorted-fkeys key #f)))
+                                                                       (cons (cond ((char? key) 0)
+                                                                                   ((not fkey-rank) 1)
+                                                                                   (else (+ fkey-rank 2)))
+                                                                             (present-key key))))))))))
+                        (partition-bindings bindings)))))
+        
+        (define (partition-bindings bindings)
+          (sort nu<? (partition bindings key: (lambda (binding)
+                                                (get-modifiers (car binding)))
+                       test: equal?)
+            key: (lambda (partition)
+                   (format "{l}" (car partition)))))
         
         (remove-every-row tree)
         (with-update-locked self
           (lambda ()
-            (view-actions-flat))))))))
+            (if show-shortcuts?
+                (view-shortcuts)
+              (view-actions)))))))))
