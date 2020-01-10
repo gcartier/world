@@ -220,7 +220,6 @@
   (slot editable-warned?            <bool>       initialize #f                        accessors generate)
   (slot generate-thread             <object>     initialize #f                        accessors generate)
   (slot lighting                    <Lighting>   initialize (new Lighting)            accessors generate)
-  (slot block-lighting              <Lighting>   initialize (new Lighting)            accessors generate)
   (slot daytime                     <fl>         initialize 0.                        getter generate)
   (slot daylight                    <fl>         initialize 0.                        accessors generate)
   (slot sun                         <Sun+>       initialize #f                        accessors generate)
@@ -1030,6 +1029,7 @@
                       (for-each (lambda (info)
                                   (add-info section (car info) (cdr info)))
                                 info)))))
+              @wait
               (let ((info (center-info "Fore" fore)))
                 (if (not info)
                     (unregister-info 'fore)
@@ -1041,9 +1041,91 @@
                                   info)))))))))
         (unregister-info 'feet)))
     
+    (define (update-vertex)
+      (define (determine-mesh)
+        (if (and target
+                 (= (length target) 1)
+                 (is? (car target) Entity)
+                 (is-not? (car target) Block-Entity)
+                 (get-model (car target)))
+            (let ((meshes (get-meshes (cache-model (car target)))))
+              (and meshes
+                   (> (vector-length meshes) 0)
+                   (let ((position (get-position (car target))))
+                     (values (vertex- vert position) (vector-ref meshes 0)))))
+          (let ((universe (current-universe)))
+            (with-polygon-interaction universe poly
+              (lambda (poly block fore)
+                (let ((section (position-section self block)))
+                  (let ((sector (find-eye-sector (current-zone) (get-index section))))
+                    (and sector
+                         (let ((position (get-position& sector)))
+                           (values (vertex- vert position) (get-mesh sector)))))))))))
+      
+      (define (vertex-info)
+        (and vert
+             (let ((info (determine-mesh)))
+               (and info
+                    (receive (vert mesh) info
+                      (with-render-mutex
+                        (lambda ()
+                          (let ((world (current-world)))
+                            (parameterize ((transform-feedback? #t))
+                              (glEnable GL_RASTERIZER_DISCARD)
+                              (render-world world)
+                              (glDisable GL_RASTERIZER_DISCARD)))))
+                      (let ((feedback (get-feedback-buffer mesh)))
+                        (and (get-buffer feedback)
+                             (let ((floats (get-floats feedback)))
+                               (let ((data (make-f32vector floats)))
+                                 (define (find-vertex-offset)
+                                   (continuation-capture
+                                     (lambda (return)
+                                       (loop (for n from 0 below (get-indices feedback))
+                                             (let ((offset (* n feedback-floats)))
+                                               (when (and (= (f32vector-ref data offset) (vertex-x vert))
+                                                          (= (f32vector-ref data (+ offset 1)) (vertex-y vert))
+                                                          (= (f32vector-ref data (+ offset 2)) (vertex-z vert)))
+                                                 (continuation-return return offset))))
+                                       #f)))
+                                 
+                                 (bind-feedback-buffer feedback)
+                                 (glGetTransformFeedbackFloat* 0 floats data)
+                                 (let ((offset (find-vertex-offset)))
+                                   (if (not offset)
+                                       (list (cons "feedback" "<not found>")
+                                             (cons "out1" (present-vec4 (subf32vector data 0 4)))
+                                             (cons "out2" (present-vec4 (subf32vector data 4 8)))
+                                             (cons "out3" (present-vec4 (subf32vector data 8 12)))
+                                             (cons "out4" (present-vec4 (subf32vector data 12 16))))
+                                     (list (cons "out1" (present-vec4 (subf32vector data (+ offset 0) (+ offset 4))))
+                                           (cons "out2" (present-vec4 (subf32vector data (+ offset 4) (+ offset 8))))
+                                           (cons "out3" (present-vec4 (subf32vector data (+ offset 8) (+ offset 12))))
+                                           (cons "out4" (present-vec4 (subf32vector data (+ offset 12) (+ offset 16))))))))))))))))
+      
+      (define (present-vec4 vec)
+        (format "{r precision: 3} {r precision: 3} {r precision: 3} {r precision: 3}"
+                (f32vector-ref vec 0)
+                (f32vector-ref vec 1)
+                (f32vector-ref vec 2)
+                (f32vector-ref vec 3)))
+      
+      (let ((info (and (developer?) (vertex-info))))
+        (if (not info)
+            (unregister-info 'vertex)
+          (register-info 'vertex
+            (lambda (add-section add-info)
+              (let ((section (add-section "Vertex")))
+                (for-each (lambda (info)
+                            (add-info section (car info) (cdr info)))
+                          info)))))))
+             
+    
+    @wait
     (update-feet)
     (unless only-feet?
-      (update-info)))
+      (update-info)
+      (update-vertex)))
   
   
   (proclaim (warn optimizations))
@@ -2961,85 +3043,22 @@
   ;;;
   
   
-  (definition default-lights-cache
-    #f)
-  
-  
-  (method (effective-lights self) <list>
-    (define (default-lights)
-      (or default-lights-cache
-          (let ((lights (list (new Ambient-Light position: (vertex 10000. 10. 10000.)))))
-            (set! default-lights-cache lights)
-            lights)))
-    
-    (let ((world (current-world)))
-      (if (get-lighting? world)
-          (let ((lights (collect-lights self)))
-            (if (null? lights)
-                (default-lights)
-              lights))
-        '())))
-  
-  
-  (method package (effective-player-glow self)
-    player-glow)
-  
-  
   (method package (setup-lighting self)
-    (lighting-setup self)
-    (block-lighting-setup self))
-  
-  
-  (method (lighting-setup self)
     (let ((world (current-world)))
-      (let ((lights (effective-lights self)))
-        (let ((light (max .1 (/ daylight 5.))))
-          (set-ambient-color lighting (dye (+ (dye-red ambient-color) light)
-                                           (+ (dye-green ambient-color) light)
-                                           (+ (dye-blue ambient-color) light)
-                                           1.0)))
-        (set-lights lighting lights)
-        (set-lights-count lighting (min (get-dynamic-lights world) (length lights)))
-        @wait-sun-on-player/material 
-        (cond (sun-cycle?
-               (set-sun-effective lighting sun-color)
-               (set-sun-coordinates lighting (vertex 10000.0 10000.0 10000.0)))
-              (else
-               (set-sun-effective lighting (dye 0. 0. 0. 0.))
-               (set-sun-coordinates lighting (vertex 0. 0. 0.))))
-        (set-current-lighting lighting))))
-  
-  
-  (method (block-lighting-setup self)
-    (let ((world (current-world)))
-      (let ((lights '()))
-        (set-ambient-color block-lighting ambient-color)
-        (set-lights block-lighting lights)
-        (set-lights-count block-lighting 0)
-        (set-current-block-lighting block-lighting))))
-  
-  
-  (method (iterate-lights self proc)
-    (iterate-gadgets self
-      (lambda (gadget)
-        (when (is? gadget Light)
-          (proc gadget)))))
-  
-  
-  (method (collect-lights self)
-    (let ((queue (new-queue)))
-      (iterate-lights self
-        (lambda (light)
-          (enqueue queue light)))
-      (queue-list queue)))
-  
-  
-  (method (count-lights self)
-    (let ((count 0))
-      (iterate-lights self
-        (lambda (light)
-          (increase! count)))
-      count))
+      (let ((light (max .1 (/ daylight 5.))))
+        (set-ambient-color lighting (dye (+ (dye-red ambient-color) light)
+                                         (+ (dye-green ambient-color) light)
+                                         (+ (dye-blue ambient-color) light)
+                                         1.0)))
+      (set-ambient-color lighting (dye 0.1 0.1 0.1 1.))
+      @wait-sun-on-player/material 
+      (cond (sun-cycle?
+             (set-sun-effective lighting sun-color)
+             (set-sun-coordinates lighting (vertex 10000.0 10000.0 10000.0)))
+            (else
+             (set-sun-effective lighting (dye 0. 0. 0. 0.))
+             (set-sun-coordinates lighting (vertex 0. 0. 0.))))
+      (set-current-lighting lighting)))
   
   
   ;;;
