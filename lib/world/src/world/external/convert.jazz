@@ -1,0 +1,178 @@
+;;;===============
+;;;  WorldScheme
+;;;===============
+;;;
+;;;; Convert 3D Formats
+;;;
+;;;  The Initial Developer of the Original Code is Guillaume Cartier.
+;;;  Portions created by the Initial Developer are Copyright (C) 2012-2018
+;;;  the Initial Developer. All Rights Reserved.
+;;;
+;;;  Contributor(s):
+
+
+(module world.external.convert jazz
+
+
+(import (jazz.geometry)
+        (jazz.io)
+        (jazz.python)
+        (world)
+        (world.external.blender)
+        (world.external.milkshape)
+        (world.geometry)
+        (world.settings))
+
+
+(definition public (convert-milkshape->blender ms3d-file b3d-file)
+  (let ((ms3d (read-ms3d ms3d-file))
+        (vertices-index (make-table test: vertex=? hash: vertex-hash))
+        (vertices-axis (new Axis 0)))
+    (define (unify-vertices)
+      (let ((vertices (get-vertices ms3d))
+            (rank 0))
+        (loop (for vertex in-vector vertices)
+              (let ((vert (get-vertex vertex))
+                    (bone-id (get-bone-id vertex)))
+                (when (not (table-ref vertices-index vert #f))
+                  (table-set! vertices-index vert rank)
+                  (axis-add vertices-axis vertex)
+                  (increase! rank))))))
+    
+    (define (unique-rank rank)
+      (let ((vertex (vector-ref (get-vertices ms3d) rank)))
+        (table-ref vertices-index (get-vertex vertex))))
+    
+    (unify-vertices)
+    (call-with-output-file (path-settings b3d-file)
+      (lambda (port)
+        (define (vertex->blender vert)
+          (vertex (vertex-z vert)
+                  (vertex-x vert)
+                  (vertex-y vert)))
+        
+        (define (bone->blender vert)
+          (vertex (- (vertex-x vert))
+                  (vertex-z vert)
+                  (vertex-y vert)))
+        
+        (define (framerot->blender vert)
+          (vertex (- (vertex-x vert))
+                  (vertex-y vert)
+                  (vertex-z vert)))
+        
+        (define (->vertex vert)
+          (format port
+                  "{r precision: 6}, {r precision: 6}, {r precision: 6}"
+                  (vertex-x vert)
+                  (vertex-y vert)
+                  (vertex-z vert)))
+        
+        ;; name
+        (format port "OBJECT{%}")
+        (format port
+                "{s}, {r precision: 3}, {r precision: 3}, {r precision: 3}, {r precision: 3}{%}"
+                (get-base ms3d-file)
+                (get-animation-fps ms3d)
+                1.
+                (get-total-frames ms3d)
+                (get-current-frame ms3d))
+        
+        ;; vertices
+        (format port "{%}VERTICES{%}")
+        (let ((vertices-count (if unify-vertices? (get-size vertices-axis) (vector-length (get-vertices ms3d))))
+              (vertices-content (if unify-vertices? (get-content vertices-axis) (get-vertices ms3d))))
+          (format port "{s}{%}" vertices-count)
+          (loop (for n from 0 below vertices-count)
+                (let ((vertex (vector-ref vertices-content n)))
+                  (let ((vert (get-vertex vertex))
+                        (bone-id (get-bone-id vertex)))
+                    (->vertex (vertex->blender vert))
+                    (format port ", {s}" bone-id)
+                    (format port "{%}")))))
+        ;; triangles
+        (format port "{%}TRIANGLES{%}")
+        (let ((triangles (get-triangles ms3d)))
+          (format port "{s}{%}" (vector-length triangles))
+          (loop (for triangle in-vector triangles)
+                (let ((indices (get-vertex-indices triangle))
+                      (normal (vertex 0. 0. 1.))
+                      (s (get-s triangle))
+                      (t (get-t triangle))
+                      (group-index (get-group-index triangle)))
+                  (format port
+                          "{s}, {s}, {s}, {r precision: 6}, {r precision: 6}, {r precision: 6}, {s}, {r precision: 6}, {r precision: 6}, {r precision: 6}, {r precision: 6}, {r precision: 6}, {r precision: 6}"
+                          (unique-rank (vector-ref indices 0))
+                          (unique-rank (vector-ref indices 1))
+                          (unique-rank (vector-ref indices 2))
+                          (vertex-x normal)
+                          (vertex-y normal)
+                          (vertex-z normal)
+                          (let ((groups (get-groups ms3d)))
+                            (let ((group (vector-ref groups group-index)))
+                              (get-material-index group)))
+                          (vertex-x s) (vertex-x t)
+                          (vertex-y s) (vertex-y t)
+                          (vertex-z s) (vertex-z t))
+                  (format port "{%}"))))
+        ;; materials
+        (format port "{%}MATERIALS{%}")
+        (let ((materials (get-materials ms3d)))
+          (format port "{s}{%}" (vector-length materials))
+          (loop (for material in-vector materials)
+                (let ((name (get-name material))
+                      (texture-name (get-texture-name material)))
+                  (format port "{s}, {s}{%}" name texture-name))))
+        ;; bones
+        (format port "{%}BONES{%}")
+        (let ((bones (get-bones ms3d)))
+          (format port "{s}{%}" (vector-length bones))
+          (loop (for bone in-vector bones)
+                (let ((name (get-name bone))
+                      (parent-name (get-parent-name bone))
+                      (position (bone->blender (get-position bone)))
+                      (rotation (vertex->blender (quaternion->euler (get-rotation bone))))
+                      (length .1))
+                  (format port
+                          "{s}, {s}, {r precision: 6}, {r precision: 6}, {r precision: 6}, {r precision: 6}, {r precision: 6}, {r precision: 6}, {r precision: 3}{%}"
+                          name
+                          parent-name
+                          (vertex-x position)
+                          (vertex-y position)
+                          (vertex-z position)
+                          (vertex-x rotation)
+                          (vertex-z rotation)
+                          (vertex-y rotation)
+                          length))))
+        ;; animations
+        (format port "{%}ANIMATIONS{%}")
+        (format port "1{%}")
+        (format port "{s}{%}" "Idle")
+        (let ((bones (get-bones ms3d)))
+          (loop (for bone in-vector bones)
+                (let ((name (get-name bone))
+                      (position-keys (get-position-keys bone))
+                      (rotation-keys (get-rotation-keys bone)))
+                  (format port "{s}{%}" name)
+                  ;; locations
+                  (format port "{s}{%}" (vector-length position-keys))
+                  (loop (for keyframe in-vector position-keys)
+                        (let ((time (get-frame keyframe))
+                              (pos (bone->blender (get-key keyframe))))
+                          (format port
+                                  "{r precision: 3}, {r precision: 6}, {r precision: 6}, {r precision: 6}{%}"
+                                  time
+                                  (vertex-x pos)
+                                  (vertex-y pos)
+                                  (vertex-z pos))))
+                  ;; rotations
+                  (format port "{s}{%}" (vector-length rotation-keys))
+                  (loop (for keyframe in-vector rotation-keys)
+                        (let ((time (get-frame keyframe))
+                              (rot (framerot->blender (quaternion->euler (get-key keyframe)))))
+                          (format port
+                                  "{r precision: 3}, {r precision: 6}, {r precision: 6}, {r precision: 6}{%}"
+                                  time
+                                  (vertex-x rot)
+                                  (vertex-z rot)
+                                  (vertex-y rot))))))))))))
