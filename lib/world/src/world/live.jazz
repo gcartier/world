@@ -3145,12 +3145,12 @@
   
   
   (method public (find-model self path (error?: error? #t))
-    (define (search-assets existing-time)
+    (define (search-assets)
       (continuation-capture
         (lambda (return)
           (iterate-assets self
             (lambda (assets)
-              (let ((info (search-in (new-directory (get-directory assets) "model") existing-time)))
+              (let ((info (search-in (new-directory (get-directory assets) "model"))))
                 (when info
                   (continuation-return return info)))))
           (if #f @wait (client?)
@@ -3169,16 +3169,27 @@
                     (values #f #f))))
             (values #f #f)))))
     
-    (define (search-in models-dir existing-time)
+    (define (search-in models-dir)
       (and (exists? models-dir)
            (let ((dir (new-directory models-dir path)))
              (and (exists? dir)
                   (let ((name (get-name dir))
                         (idle "_Idle"))
                     (let ((metadata (load-model-metadata name (new-file dir ".model"))))
+                      (define (maybe-b3d)
+                        (let ((b3d (new-file dir (add-extension idle "b3d"))))
+                          (and (exists? b3d)
+                               (values b3d (import-b3d b3d metadata: metadata)))))
+                      
+                      (define (maybe-ms3d)
+                        (let ((ms3d (new-file dir (add-extension idle "ms3d"))))
+                          (and (exists? ms3d)
+                               (values ms3d (import-ms3d ms3d metadata: metadata)))))
+                      
+                      @needs-work
                       (define (maybe-fbx)
                         (let ((fbx (new-file dir (add-extension idle "fbx"))))
-                          (and (changed? fbx existing-time)
+                          (and (exists? fbx)
                                (let ((w3ds (new-file dir (add-extension idle "w3ds"))))
                                  (when (or (not (exists? w3ds))
                                            (> (time->seconds (get-last-modification-time fbx))
@@ -3188,70 +3199,71 @@
                                      (call-process (list path: path arguments: arguments show-console: #f))))
                                  (values fbx (import-w3ds w3ds metadata: metadata))))))
                       
-                      (define (maybe-b3d)
-                        (let ((b3d (new-file dir (add-extension idle "b3d"))))
-                          (and (exists? b3d)
-                               ;; quick hack as the code doesn't work if the same model
-                               ;; has more than 1 extension available like b3d and md3d
-                               ;; (changed? b3d existing-time)
-                               (values b3d (import-b3d b3d metadata: metadata)))))
-                      
+                      @needs-work
                       (define (maybe-w3ds)
                         (let ((w3ds (new-file dir (add-extension idle "w3ds"))))
-                          (and (changed? w3ds existing-time)
+                          (and (exists? w3ds)
                                (values w3ds (import-w3ds w3ds metadata: metadata)))))
                       
-                      (define (maybe-ms3d)
-                        (let ((ms3d (new-file dir (add-extension idle "ms3d"))))
-                          (and (changed? ms3d existing-time)
-                               (values ms3d (import-ms3d ms3d metadata: metadata)))))
-                      
+                      @needs-fixing
                       (define (maybe-obj)
                         (let ((obj (new-file dir (add-extension idle "obj"))))
-                          (and (changed? obj existing-time)
+                          (and (exists? obj)
                                (let ((png (new-brother obj (add-extension (get-base obj) "png"))))
                                  (assert (exists? png)
                                    (values obj (import-obj obj (make-file-texture png))))))))
                       
-                      (define (changed? file existing-time)
-                        (and (exists? file)
-                             (or (not existing-time)
-                                 (/= (time->seconds (get-last-modification-time file)) existing-time))))
-                      
-                      (or (maybe-fbx)
-                          (maybe-b3d)
-                          (maybe-w3ds)
+                      (or (maybe-b3d)
                           (maybe-ms3d)
-                          @obj-format-needs-fixing
+                          @needs-work
+                          (maybe-fbx)
+                          @needs-work
+                          (maybe-w3ds)
+                          @needs-fixing
                           (maybe-obj))))))))
+    
+    (define (setup-model model path file)
+      (set-file model file)
+      (set-path model path)
+      (set-path-time model (time->seconds (get-last-modification-time file)))
+      (table-set! models path model))
     
     (if (symbol? path)
         (registered-model path)
       (let ((existing-model (table-ref models path #f)))
-        (let ((existing-time (and existing-model (get-path-time existing-model))))
-          (bind-values (file model) (search-assets existing-time)
+        (if existing-model
+            (let ((existing-file (get-file existing-model))
+                  (existing-time (get-path-time existing-model))
+                  (existing-metadata (get-metadata existing-model)))
+              (if (and (exists? existing-file)
+                       (/= (time->seconds (get-last-modification-time existing-file)) existing-time))
+                  (let ((ext (get-extension existing-file)))
+                    (let ((model (cond ((extension=? ext "b3d")
+                                        (import-b3d existing-file metadata: existing-metadata))
+                                       ((extension=? ext "ms3d")
+                                        (import-ms3d existing-file metadata: existing-metadata)))))
+                      (setup-model model path existing-file)
+                      model))
+                existing-model))
+          (bind-values (file model) (search-assets)
             (if (not model)
-                (or existing-model
-                    (if error?
-                        ;; a try
-                        @wait
-                        ;; and this is wrong wrong wrong oh so wrong to push dirt
-                        ;; under the rug like this. it lead to a very nasty bug to
-                        ;; debug: the dwarfmale was not being found on the processor
-                        ;; and so it was being replaced by Orb and because the client
-                        ;; had the correct model there was no way to know that something
-                        ;; was wrong but buggy collision detection behaviors that
-                        ;; turned out to be very difficult to debug
-                        (find-model self 'Orb)
-                        ;; test for a robust approach
-                        (if #t @wait (not (equal? path "base/talktomequestiongrey"))
-                            (find-model self "base/talktomequestiongrey" error?: #t)
-                          (error "Unable to find model: {a}" path))
-                      #f))
-              (set-file model file)
-              (set-path model path)
-              (set-path-time model (time->seconds (get-last-modification-time file)))
-              (table-set! models path model)
+                (if error?
+                    ;; a try
+                    @wait
+                    ;; and this is wrong wrong wrong oh so wrong to push dirt
+                    ;; under the rug like this. it lead to a very nasty bug to
+                    ;; debug: the dwarfmale was not being found on the processor
+                    ;; and so it was being replaced by Orb and because the client
+                    ;; had the correct model there was no way to know that something
+                    ;; was wrong but buggy collision detection behaviors that
+                    ;; turned out to be very difficult to debug
+                    (find-model self 'Orb)
+                    ;; test for a robust approach
+                    (if #t @wait (not (equal? path "base/talktomequestiongrey"))
+                        (find-model self "base/talktomequestiongrey" error?: #t)
+                      (error "Unable to find model: {a}" path))
+                  #f)
+              (setup-model model path file)
               model))))))
   
   
