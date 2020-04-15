@@ -118,6 +118,142 @@
 
 
 ;;;
+;;;; Dimension
+;;;
+
+
+(class World-Dimension extends Object
+  
+  
+  (slot directory             <Directory>                                   getter generate)
+  (slot generator             <object>                                      getter generate)
+  (slot truncate-y            <fx+>                                         getter generate)
+  (slot zone                  <object>                                      getter generate)
+  (slot regions-mutex         <object>     initialize (make-mutex 'regions) getter generate)
+  (slot region-access-mutexes <table>      initialize #f                    getter generate)
+  (slot regions               <table>      initialize #f                    getter generate)
+  
+  
+  (method override (initialize self directory generator truncate-y (zone #f))
+    (set! self.directory directory)
+    (set! self.generator generator)
+    (set! self.truncate-y truncate-y)
+    (set! self.zone zone)
+    (with-regions-mutex self
+      (lambda ()
+        (set! region-access-mutexes (make-table test: equal?))
+        ;; temporary simplification by having processor retain everything
+        (set! regions (make-table test: equal? weak-values: #f @wait-client-caching-chunks (not (processing?)))))))
+  
+  
+  (method (with-regions-mutex self thunk)
+    (mutex-lock! regions-mutex)
+    (prog1 (thunk)
+      (mutex-unlock! regions-mutex)))
+  
+  
+  (method (with-region-access-mutex self index thunk)
+    (define (region-access-mutex index)
+      (with-regions-mutex self
+        (lambda ()
+          (or (table-ref region-access-mutexes index #f)
+              (let ((mutex (make-mutex 'region-access)))
+                (table-set! region-access-mutexes index mutex)
+                mutex)))))
+    
+    (let ((mutex (region-access-mutex index)))
+      (mutex-lock! mutex)
+      (prog1 (thunk)
+        (mutex-unlock! mutex))))
+  
+  
+  (method package (iterate-regions self proc)
+    (with-regions-mutex self
+      (lambda ()
+        (iterate-table regions
+          (lambda (index region)
+            (proc region))))))
+  
+  
+  (method package (find-region self index <index>) <World-Region+>
+    (with-regions-mutex self
+      (lambda ()
+        (table-ref regions index #f))))
+  
+  
+  (method package (load-region self index <index>) <World-Region>
+    (or (find-region self index)
+        (with-region-access-mutex self index
+          (lambda ()
+            (let ((index (copy-index index)))
+              (let ((region (create-region self index)))
+                (with-regions-mutex self
+                  (lambda ()
+                    (table-set! regions index region)))
+                region))))))
+  
+  
+  (method package (load-region-if self index <index>) <World-Region+>
+    (and (or (not truncate-y)
+             (>= (index-y index) (fxfloor/ truncate-y region-size)))
+         (load-region self index)))
+  
+  
+  (method (create-region self index <index>) <World-Region>
+    (let ((region-x (index-x index))
+          (region-y (index-y index))
+          (region-z (index-z index)))
+      (define (region-name)
+        (if (= region-y 0)
+            (format "r.{a}.{a}.mca" region-x region-z)
+          (format "r.{a}.{a}.{a}.mca" region-x region-z region-y)))
+      
+      (define (create-file file)
+        (create-directories file)
+        (call-with-output-file (path-settings file)
+          (lambda (port)
+            (let ((locations/timestamps (make-u8vector 4096 0)))
+              (write-subu8vector locations/timestamps 0 4096 port)
+              (write-subu8vector locations/timestamps 0 4096 port)))))
+      
+      (let ((name (region-name)))
+        (let ((file (new-file directory name)))
+          (if (exists? file)
+              (new World-Region self index file generator truncate-y)
+            (create-file file)
+            (new World-Region self index file generator truncate-y))))))
+  
+  
+  (method package (iterate-regions-dir self proc)
+    (iterate-directory directory
+      (lambda (file <File>)
+        (when (extension=? (get-extension file) "mca")
+          (let ((base <string> (get-base file)))
+            (bind (x z y . rest) (split (substring base 2 (string-length base)) ".")
+              (let ((x (string->number x))
+                    (z (string->number z))
+                    (y (if (null? rest) 0 (string->number y))))
+                (proc file (indexed x y z)))))))))
+  
+  
+  (method package (unlink-region self region)
+    (with-regions-mutex self
+      (lambda ()
+        (let ((index (get-index region)))
+          (table-clear region-access-mutexes index)
+          (table-clear regions index)))))
+  
+  
+  (method package (free-regions self)
+    (iterate-regions self
+      (lambda (region)
+        (with-mutex region
+          (lambda ()
+            (close region)))))
+    (set! zone #f)))
+
+
+;;;
 ;;;; Region
 ;;;
 
@@ -125,35 +261,39 @@
 (class World-Region extends Object
   
   
+  (slot dimension            <World-Dimension>                               getter generate)
   (slot index                <index>                                         getter generate)
   (slot mutex                <object>                                        getter generate)
   (slot file                 <File>                                          getter generate)
   (slot port                 <port>                                          getter generate)
   (slot header               <u8vector>                                      getter generate)
+  (slot generator            <object>                                        getter generate)
+  (slot truncate-y           <fx+>                                           getter generate)
   (slot chunks-mutex         <object>   initialize (make-mutex 'chunks)      getter generate)
   (slot chunk-access-mutexes <object>   initialize (make-table test: equal?) getter generate)
   (slot chunks               <table>    initialize #f                        getter generate)
   (slot modified?            <bool>     initialize #f                        accessors generate)
   (slot compact?             <bool>     initialize #f                        accessors generate)
-  (slot zone                 <bool>     initialize #f                        accessors generate)
   
   
-  (method override (initialize self index file zone)
+  (method override (initialize self dimension index file generator truncate-y)
+    (set! self.dimension dimension)
     (set! self.index index)
     (set! self.mutex (make-mutex 'region))
     (set! self.file file)
     (set! self.port (open-file (path-settings file)))
-    (set! header (read-header self))
+    (set! self.header (read-header self))
+    (set! self.generator generator)
+    (set! self.truncate-y truncate-y)
     ;; temporary simplification by having processor retain everything
-    (set! chunks (make-table test: equal? weak-values: #f @wait-client-caching-chunks (not (processing?))))
-    (set! self.zone zone)
+    (set! self.chunks (make-table test: equal? weak-values: #f @wait-client-caching-chunks (not (processing?))))
     (make-will self
       (lambda (obj)
         ;; because of the will, the object will only be recycled on
         ;; the next garbage collection, so we have to remove it from
         ;; table ourself to make sure it cannot be referenced anymore
-        (when zone ;; test zone in case we got gced after zone destruction
-          (unlink-region zone obj)
+        (when dimension ;; test dimension in case we got gced after dimension destruction
+          (unlink-region dimension obj)
           (close-port port)))))
   
   
@@ -280,39 +420,37 @@
                        (list
                          biomes heightmap entities block-entities sections))))))
         (let ((chunk (new World-Chunk index Shaped #f #f self tag (tag-value biomes) (tag-value heightmap) (tag-value entities) (tag-value block-entities) (tag-value sections) #f)))
-          (let ((generator (get-generator zone)))
-            (with-shapings-mutex
-              (lambda ()
-                (setup-shapings self shape-shapings chunk)
-                (shape generator chunk shape-shapings)
-                (extract-shapings self shape-shapings chunk))))
+          (with-shapings-mutex
+            (lambda ()
+              (setup-shapings self shape-shapings chunk)
+              (shape generator chunk shape-shapings)
+              (extract-shapings self shape-shapings chunk)))
           (generated chunk)
           (modified chunk)
           chunk))))
   
   
   (method package (shape-chunk self index <planar-index>) <World-Chunk>
-    (let ((zone (current-zone)))
-      (let ((chunk (with-chunks-mutex self
-                     (lambda ()
-                       (table-ref chunks index #f)))))
-        (if chunk
-            (let ((generator (get-generator zone)))
-              (when (< (get-generator-revision chunk) (get-revision generator))
-                (error "GAZOUM")
-                @cant-find
-                (regenerate chunk))
-              chunk)
-          (let ((read-chunk (if (not load-corrupted-chunks?)
-                                (read-chunk self index)
-                              (continuation-capture
-                                (lambda (corrupted)
-                                  (read-chunk self index corrupted))))))
-            (let ((chunk (or read-chunk (make-chunk self index))))
-              (with-chunks-mutex self
-                (lambda ()
-                  (table-set! chunks (copy-planar-index index) chunk)))
-              chunk))))))
+    (let ((chunk (with-chunks-mutex self
+                   (lambda ()
+                     (table-ref chunks index #f)))))
+      (if chunk
+          (begin
+            (when (< (get-generator-revision chunk) (get-revision generator))
+              (error "GAZOUM")
+              @cant-find
+              (regenerate chunk))
+            chunk)
+        (let ((read-chunk (if (not load-corrupted-chunks?)
+                              (read-chunk self index)
+                            (continuation-capture
+                              (lambda (corrupted)
+                                (read-chunk self index corrupted))))))
+          (let ((chunk (or read-chunk (make-chunk self index))))
+            (with-chunks-mutex self
+              (lambda ()
+                (table-set! chunks (copy-planar-index index) chunk)))
+            chunk)))))
   
   
   (definition chunk-shapings <vector>
@@ -329,8 +467,7 @@
   
   
   (method package (populate-chunk self index <planar-index> i <fx> k <fx> shaped-chunks <vector>) <World-Chunk>
-    (let ((zone (current-zone))
-          (access-index (neighbor-index i k)))
+    (let ((access-index (neighbor-index i k)))
       (let ((chunk (vector-ref shaped-chunks access-index)))
         (if (>= (get-state chunk) Populated)
             chunk
@@ -351,8 +488,7 @@
                   (setup-shapings self front-shapings front)
                   (setup-shapings self corner-shapings corner)
                   (setup-shapings self right-shapings right)
-                  (let ((generator (get-generator zone)))
-                    (populate generator chunk-shapings front-shapings corner-shapings right-shapings))
+                  (populate generator chunk-shapings front-shapings corner-shapings right-shapings)
                   (extract-shapings self chunk-shapings chunk)
                   (extract-shapings self front-shapings front)
                   (extract-shapings self corner-shapings corner)
@@ -381,57 +517,57 @@
     (make-vector 33 #f))
   
   
-  (method (generate-chunk self index <planar-index>) <World-Chunk>
-    (let ((zone (current-zone)))
+  (method package (generate-chunk self index <planar-index>) <World-Chunk>
+    (if (empty? generator)
+        (shape-chunk self index)
       (let ((chunk (with-chunks-mutex self
                      (lambda ()
                        (table-ref chunks index #f)))))
         (if (and chunk (>= (get-state chunk) Generated))
             chunk
           (site (generate)
-            (let ((generator (get-generator zone)))
-              (let ((region-x (get-x self))
-                    (region-y (get-y self))
-                    (region-z (get-z self))
-                    (chunk-x (planar-index-x index))
-                    (chunk-z (planar-index-z index))
-                    (access-mutexes (make-vector 9 #f))
-                    (shaped-chunks (make-vector 9 #f)))
+            (let ((region-x (get-x self))
+                  (region-y (get-y self))
+                  (region-z (get-z self))
+                  (chunk-x (planar-index-x index))
+                  (chunk-z (planar-index-z index))
+                  (access-mutexes (make-vector 9 #f))
+                  (shaped-chunks (make-vector 9 #f)))
+              (loop (for i from -1 to 1)
+                    (loop (for k from -1 to 1)
+                          (let ((x (+ chunk-x i))
+                                (z (+ chunk-z k)))
+                            (let ((region (load-region dimension (indexed (+ region-x (fxfloor/ x 32)) region-y (+ region-z (fxfloor/ z 32)))))
+                                  (index (planar-index (modulo x 32) (modulo z 32))))
+                              (let ((mutex (chunk-access-mutex region index))
+                                    (chunk (shape-chunk region index))
+                                    (access-index (neighbor-index i k)))
+                                (vector-set! access-mutexes access-index mutex)
+                                (vector-set! shaped-chunks access-index chunk))))))
+              (let ((chunk (populate-chunk self index 0 0 shaped-chunks)))
+                (define (populate i <fx> k <fx>) <World-Chunk>
+                  (let ((x (+ chunk-x i))
+                        (z (+ chunk-z k)))
+                    (let ((region (load-region dimension (indexed (+ region-x (fxfloor/ x 32)) region-y (+ region-z (fxfloor/ z 32))))))
+                      (populate-chunk region (planar-index (modulo x 32) (modulo z 32)) i k shaped-chunks))))
+                
+                (populate -1 0)
+                (populate 0 -1)
+                (populate -1 -1)
+                (with-shapings-mutex
+                  (lambda ()
+                    (setup-shapings self generate-shapings chunk)
+                    ;; should move out of generator
+                    (generate-skylight generator chunk generate-shapings)
+                    (extract-shapings self generate-shapings chunk)))
+                (change-state chunk Generated)
+                (modified chunk)
                 (loop (for i from -1 to 1)
                       (loop (for k from -1 to 1)
-                            (let ((x (+ chunk-x i))
-                                  (z (+ chunk-z k)))
-                              (let ((region (load-region zone (indexed (+ region-x (fxfloor/ x 32)) region-y (+ region-z (fxfloor/ z 32)))))
-                                    (index (planar-index (modulo x 32) (modulo z 32))))
-                                (let ((mutex (chunk-access-mutex region index))
-                                      (chunk (shape-chunk region index))
-                                      (access-index (neighbor-index i k)))
-                                  (vector-set! access-mutexes access-index mutex)
-                                  (vector-set! shaped-chunks access-index chunk))))))
-                (let ((chunk (populate-chunk self index 0 0 shaped-chunks)))
-                  (define (populate i <fx> k <fx>) <World-Chunk>
-                    (let ((x (+ chunk-x i))
-                          (z (+ chunk-z k)))
-                      (let ((region (load-region zone (indexed (+ region-x (fxfloor/ x 32)) region-y (+ region-z (fxfloor/ z 32))))))
-                        (populate-chunk region (planar-index (modulo x 32) (modulo z 32)) i k shaped-chunks))))
-                  
-                  (populate -1 0)
-                  (populate 0 -1)
-                  (populate -1 -1)
-                  (with-shapings-mutex
-                    (lambda ()
-                      (setup-shapings self generate-shapings chunk)
-                      ;; should move out of generator
-                      (generate-skylight generator chunk generate-shapings)
-                      (extract-shapings self generate-shapings chunk)))
-                  (change-state chunk Generated)
-                  (modified chunk)
-                  (loop (for i from -1 to 1)
-                        (loop (for k from -1 to 1)
-                              (mutex-unlock! (vector-ref access-mutexes (neighbor-index i k)))))
-                  (site (save on?: #f parent: generate)
-                    (save-region self))
-                  chunk))))))))
+                            (mutex-unlock! (vector-ref access-mutexes (neighbor-index i k)))))
+                (site (save on?: #f parent: generate)
+                  (save-region self))
+                chunk)))))))
   
   
   (method package (load-chunk self index <planar-index>) <World-Chunk>
@@ -450,9 +586,8 @@
         chunk)))
   
   @reintegrate
-  (let ((generator (get-generator (current-zone))))
-    (when (< (get-generator-revision chunk) (get-revision generator))
-      (regenerate chunk)))
+  (when (< (get-generator-revision chunk) (get-revision generator))
+    (regenerate chunk))
 
   
   (method package (load-section-chunk self section-index <planar-index>) <World-Chunk>
@@ -510,7 +645,7 @@
       (u8vector-set! header (+ header-offset 3) count)))
   
   
-  (method (read-chunk self chunk-index <planar-index> (corrupted #f)) <World-Chunk+>
+  (method package (read-chunk self chunk-index <planar-index> (corrupted #f)) <World-Chunk+>
     (let ((chunk-x (planar-index-x chunk-index))
           (chunk-z (planar-index-z chunk-index)))
       (let ((header-offset (chunk-header-offset self chunk-x chunk-z)))
@@ -571,33 +706,31 @@
                     (set! chunk-buffer (make-u8vector (fxround (* (u8vector-length chunk-buffer) GOLDEN_GROWTH))))
                     (iter))))))))
     
-    (let ((zone <Zone> (current-zone)))
-      (let ((chunk-data <u8vector> (inflate-chunk raw)))
-        (with ((reader <NBT-Reader> (new NBT-Reader chunk-data)))
-          (let ((tag (read-tag reader)))
-            (let ((compound (tag-assoc "Level" (tag-value tag))))
-              (let ((state (or (tag-assoc "State" compound) Generated))
-                    (biomes (tag-assoc "Biomes" compound))
-                    (heightmap (tag-assoc "HeightMap" compound))
-                    (entities (tag-assoc "Entities" compound))
-                    (block-entities (tag-assoc "TileEntities" compound))
-                    (sections (tag-assoc "Sections" compound))
-                    (elements (tag-assoc "Elements" compound)))
-                (let ((chunk (new World-Chunk (planar-index chunk-x chunk-z) state digest (and (processing?) raw) self tag biomes heightmap entities block-entities sections elements)))
-                  (when sections
-                    (let ((truncate-y (get-truncate-y zone)))
-                      (for-each (lambda (section)
-                                  (let ((yPos (cast <fx> (tag-assoc "Y" section)))
-                                        (blocks (tag-assoc "Blocks" section))
-                                        (data (tag-assoc "Data" section))
-                                        (blocklight (tag-assoc "BlockLight" section))
-                                        (skylight (tag-assoc "SkyLight" section)))
-                                    (when (or (not truncate-y)
-                                              (>= yPos (cast <fx> truncate-y)))
-                                      (register-section chunk yPos (new World-Section chunk yPos blocks data blocklight skylight)))))
-                                (list-payload-content sections))))
-                  (generated chunk)
-                  chunk))))))))
+    (let ((chunk-data <u8vector> (inflate-chunk raw)))
+      (with ((reader <NBT-Reader> (new NBT-Reader chunk-data)))
+        (let ((tag (read-tag reader)))
+          (let ((compound (tag-assoc "Level" (tag-value tag))))
+            (let ((state (or (tag-assoc "State" compound) Generated))
+                  (biomes (tag-assoc "Biomes" compound))
+                  (heightmap (tag-assoc "HeightMap" compound))
+                  (entities (tag-assoc "Entities" compound))
+                  (block-entities (tag-assoc "TileEntities" compound))
+                  (sections (tag-assoc "Sections" compound))
+                  (elements (tag-assoc "Elements" compound)))
+              (let ((chunk (new World-Chunk (planar-index chunk-x chunk-z) state digest (and (processing?) raw) self tag biomes heightmap entities block-entities sections elements)))
+                (when sections
+                  (for-each (lambda (section)
+                              (let ((yPos (cast <fx> (tag-assoc "Y" section)))
+                                    (blocks (tag-assoc "Blocks" section))
+                                    (data (tag-assoc "Data" section))
+                                    (blocklight (tag-assoc "BlockLight" section))
+                                    (skylight (tag-assoc "SkyLight" section)))
+                                (when (or (not truncate-y)
+                                          (>= yPos (cast <fx> truncate-y)))
+                                  (register-section chunk yPos (new World-Section chunk yPos blocks data blocklight skylight)))))
+                            (list-payload-content sections)))
+                (generated chunk)
+                chunk)))))))
   
   
   (method package (load-section self section-x <fx> section-y <fx> section-z <fx> (create?: create? #f)) <World-Section+>
