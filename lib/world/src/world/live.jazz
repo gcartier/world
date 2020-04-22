@@ -3124,7 +3124,7 @@
     (let ((models (make-table test: equal?)))
       (let ((idle "_Idle"))
         (let ((b3d (add-extension idle "b3d"))
-              (ms3d (add-extension idle "ms3d"))))
+              (ms3d (add-extension idle "ms3d")))
           (iterate-assets self
             (lambda (assets)
               (iterate-entries assets
@@ -3133,30 +3133,15 @@
                     (let ((name (filename-name path)))
                       (when (or (filename=? name b3d)
                                 (filename=? name ms3d))
-                        (let ((dirname (filename-dir path)))
-                          (let ((path (remove-trailing #\/ (substring dirname (string-length "model/") (string-length dirname)))))
-                            (unless (table-ref models path #f)
-                              (table-set! models path (new Asset assets path))))))))))))))
+                        (let ((path (path->model self path)))
+                          (unless (table-ref models path #f)
+                            (table-set! models path (new Asset assets path)))))))))))))
       (table-values models)))
   
   
-  (method package (collect-client-models self)
-    (let ((models (make-table test: equal?))
-          (assets (get-assets (current-client))))
-      (let ((idle "_Idle"))
-        (let ((b3d (add-extension idle "b3d"))
-              (ms3d (add-extension idle "ms3d")))
-          (iterate-entries assets
-            (lambda (path)
-              (when (starts-with? path "model/")
-                (let ((name (filename-name path)))
-                  (when (or (filename=? name b3d)
-                            (filename=? name ms3d))
-                    (let ((dirname (filename-dir path)))
-                      (let ((path (remove-trailing #\/ (substring dirname (string-length "model/") (string-length dirname)))))
-                        (unless (table-ref models path #f)
-                          (table-set! models path path)))))))))))
-      (sort di<? (table-values models))))
+  (method package (path->model self path)
+    (let ((dirname (filename-dir path)))
+      (remove-trailing #\/ (substring dirname (string-length "model/") (string-length dirname)))))
   
   
   (method package (add-model self path)
@@ -3213,29 +3198,9 @@
         (or (try "b3d" import-b3d)
             (try "ms3d" import-ms3d))))
     
-    (define (setup-model model path file)
-      (set-file model file)
-      (set-path model path)
-      (set-path-time model (time->seconds (get-last-modification-time file)))
-      (table-set! models path model))
-    
     (if (symbol? path)
         (registered-model path)
-      (let ((existing-model (table-ref models path #f)))
-        (if existing-model
-            (let ((existing-file (get-file existing-model))
-                  (existing-time (get-path-time existing-model))
-                  (existing-metadata (get-metadata existing-model)))
-              (if (and (exists? existing-file)
-                       (/= (time->seconds (get-last-modification-time existing-file)) existing-time))
-                  (let ((ext (get-extension existing-file)))
-                    (let ((model (cond ((extension=? ext "b3d")
-                                        (import-b3d existing-file metadata: existing-metadata))
-                                       ((extension=? ext "ms3d")
-                                        (import-ms3d existing-file metadata: existing-metadata)))))
-                      (setup-model model path existing-file)
-                      model))
-                existing-model))
+      (or (table-ref models path #f)
           (bind-values (file model) (search-assets)
             (if (not model)
                 (case not-found
@@ -3254,33 +3219,9 @@
                    (find-model self "warcraft/base/talktomequestionblue" not-found: 'error))
                   ((error)
                    (error "Unable to find model: {a}" path)))
-              (setup-model model path file)
-              model))))))
-  
-  
-  (method (verify-reload-models self)
-    (let ((zone (current-zone)))
-      (let ((entities (get-entities zone))
-            (reloaded '()))
-        (define (verify entity)
-          (let ((model (get-model-cache entity)))
-            (when model
-              (let ((file (get-file model))
-                    (time (get-path-time model)))
-                (when (and file time (exists? file) (/= (time->seconds (get-last-modification-time file)) time))
-                  (reload-model entity)
-                  (set! reloaded (cons (get-model entity) reloaded)))))))
-        
-        (for-each verify entities)
-        (let ((showcase (ref-showcase self 'models)))
-          (when showcase
-            (loop (for entity in-vector (cache-elements showcase))
-                  (verify entity))))
-        (let ((count (length reloaded)))
-          (when (> count 0)
-            (display-status self (if (= count 1)
-                                     (format "Model {a} reloaded" (car reloaded))
-                                   (format "{a} models reloaded" count))))))))
+              (set-file model file)
+              (table-set! models path model)
+              model)))))
   
   
   (method (collect-events self)
@@ -4246,6 +4187,57 @@
     (set! draw-entities? (not draw-entities?))
     ;(update-parameter 'models)
     (display-on/off self "Draw models" draw-entities?))
+  
+  
+  ;;;
+  ;;;; Changes
+  ;;;
+  
+  
+  (method package (update-changes self changes)
+    (update-models self changes))
+  
+  
+  (method (update-models self changes)
+    (let ((zone (current-zone)))
+      (let ((models-reload (make-table test: equal?))
+            (models-showcase? #f))
+        (define (update-model what path rest)
+          (let ((name (filename-name path))
+                (path (path->model self path)))
+            (when (or (filename=? name "_Idle.b3d")
+                      (filename=? name "_Idle.ms3d"))
+              (table-set! models-reload path #t)
+              (when (or (eq? what 'added)
+                        (eq? what 'removed))
+                (set! models-showcase? #t)))
+            (when (table-ref models path #f)
+              (table-set! models-reload path #t))))
+        
+        (define (maybe-reload-model entity path)
+          (when (equal? (get-model entity) path)
+            (reload-model entity)))
+        
+        (for-each (lambda (change)
+                    (bind (what path . rest) change
+                      (when (starts-with? path "model/")
+                        (update-model what path rest))))
+                  changes)
+        (when (> (table-length models-reload) 0)
+          (let ((showcase (ref-showcase self 'models)))
+            (let ((entities (get-entities zone))
+                  (showcase-entities (and showcase (cache-elements showcase))))
+              (iterate-table models-reload
+                (lambda (path ignore)
+                  (table-clear models path)
+                  (for-each (lambda (entity)
+                              (maybe-reload-model entity path))
+                            entities)
+                  (when showcase-entities
+                    (loop (for entity in-vector showcase-entities)
+                          (maybe-reload-model entity path))))))
+            (when (and models-showcase? showcase)
+              (reset-showcase self 'models)))))))
   
   
   ;;;
