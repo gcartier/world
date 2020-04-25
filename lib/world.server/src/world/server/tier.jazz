@@ -301,21 +301,25 @@
   ;;;
   
   
-  (method (find-group self name)
-    (find-if (lambda (group)
-               (equal? (get-name group) name))
-             groups))
+  (method (find-group self name/no)
+    (if (integer? name/no)
+        (find-if (lambda (group)
+                   (= (get-no group) name/no))
+                 groups)
+      (find-if (lambda (group)
+                 (equal? (get-name group) name/no))
+               groups)))
   
   
   (method (create-group self delegate name persistent? audio-only?)
-    (logger/activity self "Create group {a} ({a})" name (get-name delegate))
+    (logger/activity self "Create group{? {a}~} ({a})" name (get-name delegate))
     (let ((group (new Server-Group name persistent? audio-only? (get-zone delegate))))
       (set! groups (cons group groups))
       group))
   
   
   (method (delete-group self delegate group)
-    (logger/activity self "Delete group {a} ({a})" (get-name group) (if delegate (get-name delegate) "Server"))
+    (logger/activity self "Delete group{? {a}~} ({a})" (get-name group) (if delegate (get-name delegate) "Server"))
     (set! groups (remove! group groups)))
   
   
@@ -344,7 +348,7 @@
   
   
   (method (join-group self delegate group)
-    (logger/activity self "Join group {a} ({a})" (get-name group) (get-name delegate))
+    (logger/activity self "Join group{? {a}~} ({a})" (get-name group) (get-name delegate))
     (set-group delegate group)
     (set-members group (cons delegate (get-members group)))
     (wait-keyframes udp-server delegate (delegate->connection self delegate))
@@ -352,7 +356,7 @@
   
   
   (method (leave-group self delegate group)
-    (logger/activity self "Leave group {a} ({a})" (get-name group) (get-name delegate))
+    (logger/activity self "Leave group{? {a}~} ({a})" (get-name group) (get-name delegate))
     (done-keyframes udp-server delegate (delegate->connection self delegate))
     (set-group delegate #f)
     (set-members group (remove! delegate (get-members group)))
@@ -614,6 +618,71 @@
         (set-alive delegate (current-seconds)))))
   
   
+  (method package (client-invite self client recipient)
+    (let ((delegate (find-delegate self client)))
+      ;; aec robust
+      (when delegate
+        (let ((recipient-delegate (find-delegate-by-name self recipient)))
+          (if (not recipient-delegate)
+              (format "Unable to find {a}" recipient)
+            (let ((client (get-client recipient-delegate))
+                  (sender (get-name delegate)))
+              (calling-client self recipient-delegate
+                (lambda ()
+                  (server-invite client sender))))
+            #f)))))
+  
+  
+  (method package (client-accept self client sender)
+    (let ((delegate (find-delegate self client)))
+      ;; aec robust
+      (when delegate
+        (let ((sender-delegate (find-delegate-by-name self sender)))
+          (if (not sender-delegate)
+              (format "Unable to find {a}" sender)
+            (let ((sender-group (get-group sender-delegate)))
+              (let ((group (if sender-group
+                               (begin
+                                 (join-group self delegate sender-group)
+                                 sender-group)
+                             (let ((group (create-group self sender-delegate #f #f #t)))
+                               (join-group self sender-delegate group)
+                               (join-group self delegate group)
+                               group))))
+                (let ((sender-client (get-client sender-delegate))
+                      (recipient (get-name delegate)))
+                  (calling-client self sender-delegate
+                    (lambda ()
+                      (server-accept sender-client recipient))))
+                (cons (get-no group) (cons (get-audio-only? group) (group-streams self group))))))))))
+  
+  
+  (method package (client-decline self client sender)
+    (let ((delegate (find-delegate self client)))
+      ;; aec robust
+      (when delegate
+        (let ((sender-delegate (find-delegate-by-name self sender)))
+          (if (not sender-delegate)
+              (format "Unable to find {a}" sender)
+            (let ((sender-client (get-client sender-delegate))
+                  (recipient (get-name delegate)))
+              (calling-client self sender-delegate
+                (lambda ()
+                  (server-decline sender-client recipient))))
+            #f)))))
+  
+  
+  (method package (client-leave self client)
+    ;; aec robust
+    (let ((delegate (find-delegate self client)))
+      (when delegate
+        (let ((group (get-group delegate)))
+          (if (not group)
+              (format "Not in a group")
+            (leave-group self delegate group)
+            #f)))))
+  
+  
   (method package (client-message self client kind recipient message)
     ;; aec robust
     (let ((delegate (find-delegate self client)))
@@ -699,64 +768,74 @@
       ;; together robust
       (if (not delegate)
           (format "Delegate not found")
-        (if (find-group self name)
-            (format "{a} {a} already exists" (group-domain-name self) name)
-          (let ((group (create-group self delegate name persistent? audio-only?)))
-            (when broadcast-hierarchy?
-              (broadcast-hierarchy self))
-            (get-no group))))))
+        (let ((existing-group (and name (find-group self name))))
+          (if existing-group
+              (format "{a}{? {a}~} already exists" (group-domain-name self name) name)
+            (let ((group (create-group self delegate name persistent? audio-only?)))
+              (when broadcast-hierarchy?
+                (broadcast-hierarchy self))
+              (get-no group)))))))
   
   
-  (method package (client-delete-group self client name)
+  (method package (client-delete-group self client name/no)
     (let ((delegate (find-delegate self client)))
       ;; together robust
       (if (not delegate)
           (format "Delegate not found")
-        (let ((group (find-group self name)))
+        (let ((group (find-group self name/no))
+              (group-name (and (string? name/no) name/no)))
           (if (not group)
-              (format "{a} {a} doesn't exist anymore" (group-domain-name self) name)
+              (format "{a}{? {a}~} doesn't exist anymore" (group-domain-name self name/no) group-name)
             (if (has-members? self group)
-                (format "{a} {a} still has members" (group-domain-name self) name)
+                (format "{a}{? {a}~} still has members" (group-domain-name self name/no) group-name)
               (if (has-streams? self group)
-                  (format "{a} {a} still has streams" (group-domain-name self) name)
-                (when (maybe-delete-group self delegate name)
+                  (format "{a}{? {a}~} still has streams" (group-domain-name self name/no) group-name)
+                (when (maybe-delete-group self delegate name/no)
                   (broadcast-hierarchy self))
                 #f)))))))
   
   
-  (method package (client-disband-group self client name)
+  (method package (client-disband-group self client name/no)
     (let ((delegate (find-delegate self client)))
       ;; together robust
       (if (not delegate)
           (format "Delegate not found")
-        (disband-group self name)
-        (broadcast-hierarchy self)
-        #f)))
-  
-  
-  (method package (client-join-group self client name mode)
-    (let ((delegate (find-delegate self client)))
-      ;; together robust
-      (if (not delegate)
-          (format "Delegate not found")
-        (let ((group (find-group self name)))
+        (let ((group (find-group self name/no))
+              (group-name (and (string? name/no) name/no)))
           (if (not group)
-              (format "{a} {a} doesn't exist anymore" (group-domain-name self) name)
-            (when mode
-              (set-mode delegate mode))
-            (join-group self delegate group)
+              (format "{a}{? {a}~} doesn't exist anymore" (group-domain-name self name/no) group-name)
+            (disband-group self group)
             (broadcast-hierarchy self)
-            (cons (get-no group) (cons (get-audio-only? group) (group-streams self group))))))))
+            #f)))))
   
   
-  (method package (client-leave-group self client name mode)
+  (method package (client-join-group self client name/no mode)
     (let ((delegate (find-delegate self client)))
       ;; together robust
       (if (not delegate)
           (format "Delegate not found")
-        (let ((group (find-group self name)))
+        (if (get-group delegate)
+            (format "Already in a group")
+          (let ((group (find-group self name/no))
+                (group-name (and (string? name/no) name/no)))
+            (if (not group)
+                (format "{a}{? {a}~} doesn't exist anymore" (group-domain-name self name/no) group-name)
+              (when mode
+                (set-mode delegate mode))
+              (join-group self delegate group)
+              (broadcast-hierarchy self)
+              (cons (get-no group) (cons (get-audio-only? group) (group-streams self group)))))))))
+  
+  
+  (method package (client-leave-group self client name/no mode)
+    (let ((delegate (find-delegate self client)))
+      ;; together robust
+      (if (not delegate)
+          (format "Delegate not found")
+        (let ((group (find-group self name/no))
+              (group-name (and (string? name/no) name/no)))
           (if (not group)
-              (format "{a} {a} doesn't exist anymore" (group-domain-name self) name)
+              (format "{a}{? {a}~} doesn't exist anymore" (group-domain-name self name/no) group-name)
             (when mode
               (set-mode delegate mode))
             (leave-group self delegate group)
@@ -805,7 +884,7 @@
           
           (if (and (not recipient)
                    (not group))
-              (format "You are not in a group")
+              (format "Not in a group")
             (let ((origin (get-no client-delegate))
                   (recipient (normalize-recipient))
                   (exclude-register client-delegate)
@@ -945,10 +1024,11 @@
       (queue-list streams)))
   
   
-  (method package (client-list-group-members self name)
-    (let ((group (find-group self name)))
+  (method package (client-list-group-members self name/no)
+    (let ((group (find-group self name/no))
+          (group-name (and (string? name/no) name/no)))
       (if (not group)
-          (format "{a} {a} doesn't exist anymore" (group-domain-name self) name)
+          (format "{a}{? {a}~} doesn't exist anymore" (group-domain-name self name/no) group-name)
         (map get-name (get-members group)))))
   
   
@@ -973,15 +1053,19 @@
                                                                 (not (get-group delegate))))
                                                          delegates)))))
           (map (lambda (group)
-                 (cons (get-name group)
+                 (cons (or (get-name group)
+                           (get-no group))
                        (cons (get-audio-only? group)
                              (cons (get-zone group)
                                    (map member-info (get-members group))))))
                groups)))
   
   
-  (method (group-domain-name self)
-    (registered-domain-name 'group "Group"))
+  (method (group-domain-name self name)
+    (if (or (not name)
+            (integer? name))
+        (registered-domain-name 'group "Group")
+      (registered-domain-name 'circle "Circle")))
   
   
   (method override (connected-players self)
@@ -1781,7 +1865,7 @@
           "Delegate not found"
         (let ((group (get-group client-delegate)))
           (if (not group)
-              "You are not in a group"
+              "Not in a group"
             (if (not (string? location))
                 "Invalid location"
               (let ((audio? (exists? (new-file {Directory Documents} (add-extension location (audio-profile-extension))))))
