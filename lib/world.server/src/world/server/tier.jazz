@@ -66,11 +66,20 @@
         (world.video))
 
 
+(definition world-assets-mutex
+  (make-mutex 'world-assets))
+
+
+(definition (with-world-assets-mutex thunk)
+  (mutex-lock! world-assets-mutex)
+  (prog1 (thunk)
+    (mutex-unlock! world-assets-mutex)))
+
+
 (class Server-Tier extends Serving-Tier implements Server-Interface
   
   
   (slot configuration                                       getter generate)
-  (slot assets-mutex                                        getter generate)
   (slot delegates      initialize '()                       getter generate)
   (slot disconnected   initialize '()                       getter generate)
   (slot instances      initialize (make-table test: equal?) getter generate)
@@ -84,7 +93,6 @@
   (method override (initialize self dir)
     (nextmethod self dir)
     (set! configuration (get-server-configuration))
-    (set! assets-mutex (make-mutex 'assets))
     (prepare-assets self)
     (let ((id (make-unique-id)))
       ;; not sure about this, for now lets use the hardcoded server-no = 0
@@ -102,17 +110,11 @@
             (delay-disconnected-client self delegate))))))
   
   
-  (method (with-assets-mutex self thunk)
-    (mutex-lock! assets-mutex)
-    (prog1 (thunk)
-      (mutex-unlock! assets-mutex)))
-  
-  
   (method override (prepare-assets self)
-    (with-assets-mutex self
-      (lambda ()
-        (let ((assets-dir (new-directory directory "assets")))
-          (set! assets (new Remote-Assets 'tier assets-dir))))))
+    (let ((assets-dir {Directory Universe "assets"}))
+      (set! universe-assets (new Remote-Assets 'universe assets-dir)))
+    (let ((assets-dir (new-directory directory "assets")))
+      (set! world-assets (new Remote-Assets 'world assets-dir))))
   
   
   (method override (startup self)
@@ -423,21 +425,23 @@
                 ;; retrieve character
                 (let ((client-id (get-id delegate))
                       (client-no (get-no delegate))
+                      (universe-asset-entries (collect-universe-asset-entries self))
+                      (world-asset-entries (collect-world-asset-entries self))
                       (character (character-retrieve self character-name character-avatar))
                       (character-delegate delegate))
                   (set-character character-delegate character)
                   ;; join character zone
                   (let ((character-zone (or character-zone (get-zone character))))
-                    (let ((processor (get-remote (spawn-processor (get-host configuration) (get-service configuration) (collect-asset-entries self) character-zone))))
+                    (let ((processor (get-remote (spawn-processor (get-host configuration) (get-service configuration) world-asset-entries character-zone))))
                       (let ((join-info (client-enter processor client client-uuid client-id client-no character-name character-avatar character-script character-role)))
                         (if (string? join-info)
                             join-info
                           (set-zone character-delegate character-zone)
                           (set-processor character-delegate processor)
                           (bind (form zone-asset-entries spawnpoint player-spawnpoint player-id player-no player-position player-lookat camera-position camera-lookat other-players) join-info
-                            (let ((asset-entries (collect-asset-entries self))
+                            (let (
                                   (welcome (format "Welcome to {a}!" tier-title)))
-                              (list client-id client-no asset-entries zone-asset-entries (proxy-connection-info client processor) welcome form spawnpoint player-spawnpoint player-id player-no player-position player-lookat camera-position camera-lookat other-players)))))))))))))))
+                              (list client-id client-no universe-asset-entries world-asset-entries zone-asset-entries (proxy-connection-info client processor) welcome form spawnpoint player-spawnpoint player-id player-no player-position player-lookat camera-position camera-lookat other-players)))))))))))))))
   
   
   (method package (client-start self client)
@@ -762,7 +766,7 @@
   
   (method package (client-load-zone self client zone)
     (let ((delegate (find-delegate self client)))
-      (spawn-processor (get-host configuration) (get-service configuration) (collect-asset-entries self) zone)
+      (spawn-processor (get-host configuration) (get-service configuration) (collect-world-asset-entries self) zone)
       (delay-event
         (lambda ()
           (with-task-mutex
@@ -1146,7 +1150,7 @@
         ;; leave
         (client-exit (get-processor delegate) client character-name)
         ;; join
-        (let ((processor (get-remote (spawn-processor (get-host configuration) (get-service configuration) (collect-asset-entries self) zone))))
+        (let ((processor (get-remote (spawn-processor (get-host configuration) (get-service configuration) (collect-world-asset-entries self) zone))))
           (let ((join-info (client-enter processor client client-uuid client-id client-no character-name character-avatar character-script character-role)))
             (set-zone delegate zone)
             (set-processor delegate processor)
@@ -1167,38 +1171,50 @@
            (format "{a}{? <{a}>~}" (get-name (get-template instance)) (+ (get-rank instance) 1))))
         (else
          (last zone)))))
+    
   
+  (method (collect-universe-asset-entries self)
+    (get-entries (get-index (get-repository universe-assets))))
+
   
-  (method (collect-asset-entries self)
-    (with-assets-mutex self
+  (method (collect-world-asset-entries self)
+    (with-world-assets-mutex
       (lambda ()
-        (get-entries (get-index (get-repository assets))))))
+        (get-entries (get-index (get-repository world-assets))))))
   
   
-  (method package (upload-tier-asset self content digest)
-    (with-assets-mutex self
+  (method package (retrieve-universe-asset self path)
+    (let ((repository (get-repository universe-assets)))
+      (let ((entry (find-entry repository path)))
+        (and entry
+             (bind (path digest seconds) entry
+               (list (retrieve-object repository digest) digest))))))
+  
+  
+  (method package (retrieve-world-asset self path)
+    (with-world-assets-mutex
       (lambda ()
-        (let ((repository (get-repository assets)))
-          (store-object repository content digest)))))
-  
-  
-  (method package (update-tier-assets self client changes)
-    (with-assets-mutex self
-      (lambda ()
-        (let ((repository (get-repository assets)))
-          (let ((delegate (find-delegate self client)))
-            (apply-changes repository changes)
-            (broadcast-assets self delegate changes))))))
-  
-  
-  (method package (retrieve-tier-asset self path)
-    (with-assets-mutex self
-      (lambda ()
-        (let ((repository (get-repository assets)))
+        (let ((repository (get-repository world-assets)))
           (let ((entry (find-entry repository path)))
             (and entry
                  (bind (path digest seconds) entry
                    (list (retrieve-object repository digest) digest))))))))
+  
+  
+  (method package (upload-world-asset self content digest)
+    (with-world-assets-mutex
+      (lambda ()
+        (let ((repository (get-repository world-assets)))
+          (store-object repository content digest)))))
+  
+  
+  (method package (update-world-assets self client changes)
+    (with-world-assets-mutex
+      (lambda ()
+        (let ((repository (get-repository world-assets)))
+          (let ((delegate (find-delegate self client)))
+            (apply-changes repository changes)
+            (broadcast-assets self delegate changes))))))
   
   
   (method (broadcast-assets self client-delegate changes)
