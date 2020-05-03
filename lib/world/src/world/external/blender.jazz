@@ -19,8 +19,11 @@
         (jazz.python)
         (world)
         (world.animation)
+        (world.asset)
+        (world.assets)
         (world.atlas)
         (world.binary)
+        (world.context)
         (world.dye)
         (world.generate)
         (world.geometry)
@@ -123,7 +126,7 @@
   (slot bones         <object> accessors generate)
   
   
-  (method package (extract-atlas self file <File>)
+  (method package (extract-atlas self asset <Asset>)
     (define (triangle-ref index <fx>) <B3D-Triangle>
       (vector-ref triangles index))
     
@@ -137,8 +140,8 @@
           (for-each (lambda (texture)
                       ;; quick hack
                       (if (starts-with? texture "C:")
-                          (add-file atlas (new-brother file (add-extension (filename-base texture) "png")))
-                        (add-file atlas (new-brother file texture))))
+                          (add-file atlas (retrieve-file (brother-asset asset (add-extension (filename-base texture) "png"))))
+                        (add-file atlas (retrieve-file (brother-asset asset texture)))))
                     textures)
           (let ((texture (extract-texture atlas mipmap?: #f)))
             (complete atlas)
@@ -247,12 +250,12 @@
       bounds))
   
   
-  (method package (extract-animation self name frames (valid-bones #f))
+  (method package (extract-animation self name frames include-animations? (valid-bones #f))
     ;; necessary as animations come from distinct files
     (if (and valid-bones (/= (vector-length bones) valid-bones))
         (error "Inconsistant bones in model: {a}" name)
       (let ((animation (new Animation name animation-fps (or frames total-frames) bones)))
-        (when (or (window?) (world-setting 'world.debug-models? #f))
+        (when include-animations?
           (setup-bones animation))
         animation))))
 
@@ -262,38 +265,40 @@
 ;;;
 
 
-(definition public (import-b3d file <File> (metadata: metadata #f)) <Model>
-  (let ((name (get-base file))
+(definition public (import-b3d asset <Asset> (metadata: metadata #f) (include-animations?: include-animations? (window?))) <Model>
+  (let ((name (get-base asset))
         (render (model-metadata-render metadata))
         (mask (model-metadata-mask metadata))
         (frames (model-metadata-frames metadata)))
     (define (add-animations model <Model> valid-bones)
-      (let ((dir <Directory> (get-parent file)))
-        (iterate-directory dir
-          (lambda (file <File>)
-            (when (extension=? (get-extension file) "b3d")
-              (let ((name (get-base file)))
-                (unless (filename=? name "_Idle")
-                  (add-animation model name
-                    (lambda ()
-                      (let ((b3d (read-b3d file)))
-                        (extract-animation b3d name frames valid-bones))))))))
-          files?: #t
-          directories?: #f)))
+      (let ((dirpath (string-append (join (get-parent asset) "/") "/")))
+        (iterate-assets (current-world)
+          (lambda (assets)
+            (iterate-entries assets
+              (lambda (path)
+                (when (starts-with? path dirpath)
+                  (when (extension=? (filename-extension path) "b3d")
+                    (let ((name (filename-base path)))
+                      (unless (filename=? name "_Idle")
+                        (let ((animation-asset (new Asset assets path)))
+                          (add-animation model name
+                            (lambda ()
+                              (let ((b3d (retrieve-file animation-asset)))
+                                (extract-animation b3d name frames include-animations? valid-bones)))))))))))))))
     
     (let ((model (new Model name: name rotation: (vertex 0. PI/2 0.))))
       (install-metadata model metadata)
-      (let ((b3d (read-b3d file)))
+      (let ((b3d (read-b3d (retrieve-file asset) include-animations?: include-animations?)))
         (when debug-b3d?
           (set-native model b3d))
-        (if (not (window?))
+        (if (not include-animations?)
             (begin
               (set-anchor model 'origin)
               (set-bounds model (extract-bounds b3d))
-              (set-animation model (extract-animation b3d "Idle" frames))
+              (set-animation model (extract-animation b3d "Idle" frames include-animations?))
               (add-animations model (vector-length (get-bones b3d))))
           ;; order is important as extract-atlas adjusts texture coordinates
-          (bind-values (atlas texture) (extract-atlas b3d file)
+          (bind-values (atlas texture) (extract-atlas b3d asset)
             (let ((effective-render (or render (if texture '(transparent) '(white)))))
               (define (extract-mesh groups renderer)
                 (let ((material (new Material atlas: atlas texture: texture renderer: renderer)))
@@ -316,7 +321,7 @@
               
               (when debug-meshes?
                 (set-atlas model atlas))
-              (if (not (window?))
+              (if (not include-animations?)
                   (set-meshes model #f)
                 (if debug-meshes?
                     (let ((queue (new-queue)))
@@ -336,12 +341,12 @@
                       (set-meshes model (list->vector (queue-list queue))))))))
             (set-anchor model 'origin)
             (set-bounds model (extract-bounds b3d))
-            (set-animation model (extract-animation b3d "Idle" frames))
+            (set-animation model (extract-animation b3d "Idle" frames include-animations?))
             (add-animations model (vector-length (get-bones b3d))))))
       model)))
 
 
-(definition package (read-b3d file <File>) <B3D-Model>
+(definition package (read-b3d file <File> (include-animations?: include-animations? (window?))) <B3D-Model>
   (call-with-input-file (path-settings file readtable: python-readtable)
     (lambda (port)
       (define (vertex->world vert)
@@ -472,7 +477,7 @@
       ;; bones
       (define (<-bones animation-fps frame-start) <vector>
         ;; quick optimization as server doesn't need animations
-        (if (or (window?) (world-setting 'world.debug-models? #f))
+        (if include-animations?
             (let* ((bones-header (read port))
                    (num-bones (read port))
                    (bones (make-vector num-bones)))
