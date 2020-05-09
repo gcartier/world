@@ -1,0 +1,130 @@
+;;;===============
+;;;  WorldScheme
+;;;===============
+;;;
+;;;; World Processor
+;;;
+;;;  The Initial Developer of the Original Code is Guillaume Cartier.
+;;;  Portions created by the Initial Developer are Copyright (C) 2012-2018
+;;;  the Initial Developer. All Rights Reserved.
+;;;
+;;;  Contributor(s):
+
+
+(module world.processor jazz
+
+
+(import (jazz.io)
+        (jazz.network)
+        (jazz.presence)
+        (world)
+        (world.context)
+        (world.history)
+        (world.master)
+        (world.settings))
+
+
+;;;
+;;;; Processor
+;;;
+
+
+(class Processor extends Object
+  
+  
+  (slot process-port getter generate)
+  (slot remote-proxy getter generate)
+  
+  
+  (method override (initialize self process-port remote-proxy)
+    (nextmethod self)
+    (set! self.process-port process-port)
+    (set! self.remote-proxy remote-proxy)))
+
+
+(definition protected processors
+  (make-table test: equal?))
+
+(definition protected processors-mutex
+  (make-mutex 'processors))
+
+(definition protected (with-processors-mutex thunk)
+  (unwind-protect
+      (begin
+        (mutex-lock! processors-mutex)
+        (thunk))
+    (mutex-unlock! processors-mutex)))
+
+
+(definition protected processor-rank
+  0)
+
+(definition protected (next-processor-rank!)
+  (prog1 processor-rank
+    (increase! processor-rank)))
+
+
+(definition protected (spawn-processor server-host server-service world-asset-entries zone)
+  (define (spawn)
+    (let ((server (current-server))
+          (debug? (world-setting 'world.processor-debug? #t))
+          (host (if slave? "localhost" server-host))
+          (service (if slave? 0 (+ server-service (next-processor-rank!) 1))))
+      (spawn-slave "processor" (get-processor-filename)
+        (lambda (master slave cookie)
+          (let ((server (load-object (get-local-register) 'world.server.remote 'world-remote-server))
+                (server-path (subpath {Directory Documents "servers"} (get-directory server)))
+                (processor-id (make-unique-id)))
+            (let ((processor-no (literal->id processor-id)))
+              (processor-setup slave server server-path processor-id processor-no world-asset-entries zone))))
+        (lambda (master slave cookie)
+          slave)
+        arguments: `("-host" ,(host->string host) "-port" ,(port->string service))
+        debug?: debug?
+        wait?: #t)))
+  
+  (with-processors-mutex
+    (lambda ()
+      (or (table-ref processors zone #f)
+          (receive (process-port remote-proxy) (spawn)
+            (let ((processor (new Processor process-port remote-proxy)))
+              (table-set! processors zone processor)
+              processor))))))
+
+
+(definition protected (quit-processors)
+  (define (quit-processor zone)
+    (let ((processor (table-ref processors zone)))
+      (let ((process-port (get-process-port processor))
+            (remote-proxy (get-remote-proxy processor)))
+        (closing-remote-proxy remote-proxy)
+        (processor-quit remote-proxy)
+        (process-status process-port)
+        (table-clear processors zone))))
+  
+  (with-processors-mutex
+    (lambda ()
+      (iterate-table-safe processors
+        (lambda (zone processor)
+          (quit-processor zone))))))
+
+
+(definition protected (iterate-processors proc)
+  (with-processors-mutex
+    (lambda ()
+      (iterate-table processors
+        proc))))
+
+
+(definition protected (list-processors)
+  (with-processors-mutex
+    (lambda ()
+      (table->list processors))))
+
+
+;;;
+;;;; Exit
+;;;
+
+
+(add-exit-job! quit-processors))
