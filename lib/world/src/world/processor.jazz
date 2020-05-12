@@ -24,6 +24,17 @@
         (world.settings))
 
 
+(definition protected max-processors
+  (world-setting 'world.server-max-processors 7))
+
+(definition protected max-played
+  (world-setting 'world.server-max-played 2))
+
+
+(definition debug-processors?
+  (world-setting 'world.server-debug-processors? #f))
+
+
 ;;;
 ;;;; Processor
 ;;;
@@ -32,14 +43,16 @@
 (class Processor extends Object
   
   
+  (slot service      getter generate)
   (slot zone         getter generate)
   (slot process-port getter generate)
   (slot remote-proxy getter generate)
   (slot delegates    getter generate)
   
   
-  (method override (initialize self zone process-port remote-proxy)
+  (method override (initialize self service zone process-port remote-proxy)
     (nextmethod self)
+    (set! self.service service)
     (set! self.zone zone)
     (set! self.process-port process-port)
     (set! self.remote-proxy remote-proxy)
@@ -57,7 +70,19 @@
   
   
   (method package (remove-delegate self delegate)
-    (set! delegates (remove! delegate delegates))))
+    (set! delegates (remove! delegate delegates)))
+  
+  
+  (method package (quitable? self)
+    (and (null? delegates)
+         (neq? zone 'start)))
+  
+  
+  (method package (played? self)
+    (and (neq? zone 'start)
+         (some? (lambda (delegate)
+                  (eq? (get-mode delegate) 'participant))
+                delegates))))
 
 
 ;;;
@@ -82,20 +107,46 @@
     (mutex-unlock! processors-mutex)))
 
 
-(definition protected processor-rank
-  0)
-
-(definition protected (next-processor-rank!)
-  (prog1 processor-rank
-    (increase! processor-rank)))
+(definition protected (max-processors-reached?)
+  (>= (length ordered-processors) max-processors))
 
 
-(definition protected (spawn-processor server-host server-service world-asset-entries zone)
-  (define (spawn)
+(definition protected (max-processors-excess)
+  (max 0 (- (length ordered-processors) max-processors)))
+
+
+(definition protected (max-played-reached? delegate)
+  (with-processors-mutex
+    (lambda ()
+      (let ((played (played-processors))
+            (processor (get-processor delegate)))
+        (let ((count (if (memq? processor played)
+                         (length played)
+                       (+ 1 (length played)))))
+          (> count max-played))))))
+
+
+(definition protected (played-processors)
+  (collect-if played? ordered-processors))
+
+
+(definition protected (quitable-processors)
+  (collect-if quitable? ordered-processors))
+
+
+(definition protected (find-free-service server-service)
+  (let ((in-use (map get-service ordered-processors)))
+    (loop (for service from (+ server-service 1) to (+ server-service 50))
+          (when (not (memv? service in-use))
+            (return service))
+          (finally
+            (error "Unable to find free service")))))
+
+
+(definition protected (spawn-processor server-host server-service world-asset-entries zone (delegate #f))
+  (define (spawn host service)
     (let ((server (current-server))
-          (debug? (world-setting 'world.processor-debug? #t))
-          (host (if slave? "localhost" server-host))
-          (service (if slave? 0 (+ server-service (next-processor-rank!) 1))))
+          (debug? (world-setting 'world.processor-debug? #t)))
       (spawn-slave "processor" (get-processor-filename)
         (lambda (master slave cookie)
           (let ((server (load-object (get-local-register) 'world.server.remote 'world-remote-server))
@@ -109,14 +160,59 @@
         debug?: debug?
         wait?: #t)))
   
+  (define (spawn/setup)
+    (let ((host (if slave? "localhost" server-host))
+          (service (if slave? 0 (find-free-service server-service))))
+      (when debug-processors?
+        (format :terminal "spawn {a} " (present-zone zone)))
+      (receive (process-port remote-proxy) (spawn host service)
+        (let ((processor (new Processor service zone process-port remote-proxy)))
+          (set! ordered-processors (append! ordered-processors (list processor)))
+          (table-set! processors zone processor)
+          (when debug-processors?
+            (format :terminal "({a}) -> {l detail: :human separator: \", \"}{%}" (substring (get-uuid (get-ior remote-proxy)) 0 8) (map present-processor ordered-processors)))
+          processor))))
+  
+  (define (last-delegate?)
+    (and delegate
+         (let ((processor (get-processor delegate)))
+           (and (neq? (get-zone delegate) 'start)
+                (let ((delegates (get-delegates processor)))
+                  (and (= (length delegates) 1)
+                       (eq? (car delegates) delegate)))))))
+  
   (with-processors-mutex
     (lambda ()
       (or (table-ref processors zone #f)
-          (receive (process-port remote-proxy) (spawn)
-            (let ((processor (new Processor zone process-port remote-proxy)))
-              (set! ordered-processors (append! ordered-processors (list processor)))
-              (table-set! processors zone processor)
-              processor))))))
+          (if (or (eq? zone 'start)
+                  (not (max-processors-reached?))
+                  (last-delegate?))
+              (spawn/setup)
+            (let ((quitable (quitable-processors)))
+              (if (null? quitable)
+                  (format "Server max {a} zone{a} reached" max-processors (format-plural max-processors))
+                (when debug-processors?
+                  (format :terminal "quit {a} ({a}) -> " (present-processor (car quitable)) (substring (get-uuid (get-ior (get-remote-proxy (car quitable)))) 0 8)))
+                (%%quit-processor (car quitable))
+                (when debug-processors?
+                  (format :terminal "{l detail: :human separator: \", \"}{%}" (map present-processor ordered-processors)))
+                (spawn/setup))))))))
+
+
+(definition protected (cleanup-processors)
+  (with-processors-mutex
+    (lambda ()
+      (let ((excess (max-processors-excess)))
+        (when (> excess 0)
+          (let ((quitable (quitable-processors)))
+            (let ((quit (subseq quitable 0 (min excess (length quitable)))))
+              (for-each (lambda (processor)
+                          (when debug-processors?
+                            (format :terminal "cleanup {a} ({a}) -> " (present-processor processor) (substring (get-uuid (get-ior (get-remote-proxy processor))) 0 8)))
+                          (%%quit-processor processor)
+                          (when debug-processors?
+                            (format :terminal "{l detail: :human separator: \", \"}{%}" (map present-processor ordered-processors))))
+                        quit))))))))
 
 
 (definition protected (quit-processor processor)
@@ -155,6 +251,16 @@
   (with-processors-mutex
     (lambda ()
       ordered-processors)))
+
+
+(definition (present-zone zone)
+  (if (eq? zone 'start)
+      zone
+    (last zone)))
+
+
+(definition (present-processor processor)
+  (present-zone (get-zone processor)))
 
 
 ;;;

@@ -66,6 +66,10 @@
         (world.video))
 
 
+(definition max-connections
+  (world-setting 'world.server-max-connections #f))
+
+
 (definition world-assets-mutex
   (make-mutex 'world-assets))
 
@@ -392,8 +396,7 @@
     (let ((identity (retrieve-identity directory personal-key)))
       (if (not identity)
           "Invalid personal key"
-        (let ((character-name (get-name identity))
-              (max-connections (world-setting 'world.server-max-connections #f)))
+        (let ((character-name (get-name identity)))
           (if (and max-connections (>= (count-alive self) max-connections))
               (begin
                 (logger/activity self "Max connections reached ({a})" character-name)
@@ -441,16 +444,18 @@
                       ;; join character zone
                       (let ((character-zone (or character-zone (get-zone character))))
                         (let ((processor (spawn-processor (get-host configuration) (get-service configuration) world-asset-entries character-zone)))
-                          (let ((remote-processor (get-remote-proxy processor)))
-                            (let ((join-info (client-enter remote-processor client client-uuid client-id client-no character-name character-avatar character-script character-role)))
-                              (if (string? join-info)
-                                  join-info
-                                (set-zone character-delegate character-zone)
-                                (set-processor character-delegate processor)
-                                (add-delegate processor character-delegate)
-                                (bind (form zone-asset-entries spawnpoint player-spawnpoint player-id player-no player-position player-lookat camera-position camera-lookat other-players) join-info
-                                  (let ((welcome (format "Welcome to {a}!" tier-title)))
-                                    (list client-id client-no character-name universe-asset-entries world-asset-entries zone-asset-entries (proxy-connection-info client remote-processor) welcome form spawnpoint player-spawnpoint player-id player-no player-position player-lookat camera-position camera-lookat other-players))))))))))))))))))
+                          (if (string? processor)
+                              processor
+                            (let ((remote-processor (get-remote-proxy processor)))
+                              (let ((join-info (client-enter remote-processor client client-uuid client-id client-no character-name character-avatar character-script character-role)))
+                                (if (string? join-info)
+                                    join-info
+                                  (set-zone character-delegate character-zone)
+                                  (set-processor character-delegate processor)
+                                  (add-delegate processor character-delegate)
+                                  (bind (form zone-asset-entries spawnpoint player-spawnpoint player-id player-no player-position player-lookat camera-position camera-lookat other-players) join-info
+                                    (let ((welcome (format "Welcome to {a}!" tier-title)))
+                                      (list client-id client-no character-name universe-asset-entries world-asset-entries zone-asset-entries (proxy-connection-info client remote-processor) welcome form spawnpoint player-spawnpoint player-id player-no player-position player-lookat camera-position camera-lookat other-players)))))))))))))))))))
   
   
   (method package (client-start self client)
@@ -514,9 +519,19 @@
   (method package (client-mode self client mode)
     (let ((delegate (find-delegate self client)))
       ;; together robust
-      (when delegate
-        (set-mode delegate mode)
-        (broadcast-hierarchy self))))
+      (if (not delegate)
+          "Delegate not found"
+        (case mode
+          ((observer)
+           (set-mode delegate mode)
+           (broadcast-hierarchy self)
+           #f)
+          ((participant)
+           (if (max-played-reached? delegate)
+               (format "Server max {a} played zones{a} reached" max-played (format-plural max-played))
+             (set-mode delegate mode)
+             (broadcast-hierarchy self)
+             #f))))))
   
   
   (method package (client-sleep self client)
@@ -777,21 +792,27 @@
   (method package (client-load-zone self client zone)
     (let ((delegate (with-task-mutex
                       (lambda ()
-                        (find-delegate self client)))))
+                        (find-delegate self client))))
+          (spawn-result #f))
       (let ((spawn-thread (current-thread)))
         (delay-event
           (lambda ()
             (thread-join! spawn-thread)
-            (with-task-mutex
-              (lambda ()
-                (calling-client self delegate
-                  (lambda ()
-                    (zone-loaded client zone))))))))
-      (spawn-processor (get-host configuration) (get-service configuration) (collect-world-asset-entries self) zone)))
+            (let ((error-string (if (string? spawn-result) spawn-result #f)))
+              (with-task-mutex
+                (lambda ()
+                  (calling-client self delegate
+                    (lambda ()
+                      (zone-loaded client zone error-string)))))))))
+      (set! spawn-result (spawn-processor (get-host configuration) (get-service configuration) (collect-world-asset-entries self) zone delegate))))
   
   
   (method package (client-change-zone self client zone)
     (change-client-zone self client zone))
+  
+  
+  (method package (client-changed-zone self client)
+    (changed-client-zone self client))
   
   
   (method package (client-create-group self client name persistent? audio-only? broadcast-hierarchy?)
@@ -1157,17 +1178,25 @@
             (character-avatar (get-avatar delegate))
             (character-script (get-script delegate))
             (character-role (get-role delegate)))
-        ;; leave
-        (client-exit (get-remote-proxy (get-processor delegate)) client character-name)
-        (remove-delegate (get-processor delegate) delegate)
-        ;; join
-        (let ((processor (spawn-processor (get-host configuration) (get-service configuration) (collect-world-asset-entries self) zone)))
-          (let ((remote-processor (get-remote-proxy processor)))
-            (let ((join-info (client-enter remote-processor client client-uuid client-id client-no character-name character-avatar character-script character-role)))
-              (set-zone delegate zone)
-              (set-processor delegate processor)
-              (add-delegate processor delegate)
-              (cons (proxy-connection-info client remote-processor) join-info)))))))
+        ;; spawn
+        (let ((processor (spawn-processor (get-host configuration) (get-service configuration) (collect-world-asset-entries self) zone delegate)))
+          (if (string? processor)
+              processor
+            ;; leave
+            (client-exit (get-remote-proxy (get-processor delegate)) client character-name)
+            (remove-delegate (get-processor delegate) delegate)
+            ;; join
+            (let ((remote-processor (get-remote-proxy processor)))
+              (let ((join-info (client-enter remote-processor client client-uuid client-id client-no character-name character-avatar character-script character-role)))
+                (set-zone delegate zone)
+                (set-processor delegate processor)
+                (add-delegate processor delegate)
+                (broadcast-hierarchy self)
+                (cons (proxy-connection-info client remote-processor) join-info))))))))
+  
+  
+  (method (changed-client-zone self client)
+    (cleanup-processors))
   
   
   (method (present-zone self zone)
@@ -1557,7 +1586,7 @@
                     (server-service server)
                     (map get-name (collect-alive (current-server)))
                     (map get-name (collect-disconnected (current-server)))
-                    (map car (list-processors))
+                    (map get-zone (list-processors))
                     (map get-purpose (table-values presences))
                     (collect-hierarchy (current-server))
                     garbage-collect
