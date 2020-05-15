@@ -15,21 +15,55 @@
 
 
 (import (jazz.application)
+        (jazz.component)
+        (jazz.event)
         (jazz.graphic)
         (jazz.markup)
         (jazz.outline)
+        (jazz.screen)
         (jazz.text)
         (jazz.tree)
         (jazz.ui)
         (jazz.view)
         (world)
+        (world.configure)
         (world.context)
         (world.creature)
         (world.interface.dialogs)
         (world.interface.frame)
+        (world.interface.panel)
         (world.settings)
         (world.sound)
-        (world.support))
+        (world.support)
+        (world.task))
+
+
+;;;
+;;;; Restart
+;;;
+
+
+(definition restart-needed?
+  #f)
+
+(definition (restart-not-needed)
+  (set! restart-needed? #f))
+
+(definition (restart-needed)
+  (set! restart-needed? #t))
+
+(definition (warn-if-restart-needed)
+  (when restart-needed?
+    (delay-event
+      (lambda ()
+        (with-task-mutex
+          (lambda ()
+            (open-message (format "{a} needs to be restarted for some options to take effect" tier-title)
+                          caption: "Restart"
+                          type: 'message
+                          execute: (lambda (evt)
+                                     (let ((dialog (find-ascendant (get-sender evt) World-Dialog)))
+                                       (close dialog))))))))))
 
 
 ;;;
@@ -147,6 +181,7 @@
     (nextmethod self initargs)
     (set-checked? self (case option
                     ((world.post-processing?) (get-post-processing? (current-world)))
+                    ((world.retina?) (world-setting 'world.retina? #t))
                     @wait
                     ((world.creature-models?) creature-models?)
                     ((world.music?) (get-music? (current-music)))
@@ -170,7 +205,9 @@
       ((world.independent-camera?) (set-independent-camera? checked?))
       ((world.camera-smoothing?) (change-camera-smoothing (current-world) checked?)))
     (set-setting options-settings option checked?)
-    (save-content options-settings)))
+    (save-content options-settings)
+    (when (memq? option '(world.retina?))
+      (restart-needed))))
 
 
 (class Combo-Option extends Border-View
@@ -189,25 +226,43 @@
     (let ((combo (child self 'combo)))
       (case option
         ((world.view-distance)
-         (set-choices combo '((ultra "Ultra")
-                              (high "High")
-                              (medium "Medium")
-                              (low "Low")))
-         (set-value combo (let ((view-distance (get-view-distance (current-world))))
-                             (caar (sort < '((ultra . 15)
-                                             (high . 11)
-                                             (medium . 7)
-                                             (low . 5))
-                                     key: (lambda (pair)
-                                            (distance (cdr pair) view-distance)))))))
+         (set-choices combo '((ultra "Ultra (15)")
+                              (high "High(11)")
+                              (medium "Medium (7)")
+                              (low "Low (5)")))
+         (let ((value (case (world-setting 'world.view-distance 7)
+                        ((15) 'ultra)
+                        ((11) 'high)
+                        ((7) 'medium)
+                        ((5) 'low)
+                        (else #f))))
+           (if (not value)
+               (set-entry combo "<invalid>")
+             (set-value combo value))))
         ((world.tile-resolution)
-         (set-choices combo '((high "High")
-                              (medium "Medium")
-                              (low "Low")))
-         (set-value combo (case (world-setting 'world.tile-resolution 128)
-                             ((128) 'high)
-                             ((32) 'medium)
-                             ((16) 'low)))))))
+         (set-choices combo '((high "High (128)")
+                              (medium "Medium (32)")
+                              (low "Low (16)")))
+         (let ((value (case (world-setting 'world.tile-resolution 128)
+                        ((128) 'high)
+                        ((32) 'medium)
+                        ((16) 'low)
+                        (else #f))))
+           (if (not value)
+               (set-entry combo "<invalid>")
+             (set-value combo value))))
+        ((world.render-rate)
+         (set-choices combo '((high "High (60)")
+                              (medium "Medium (30)")
+                              (low "Low (20)")))
+         (let ((value (case (world-setting 'world.render-rate 60.)
+                        ((60.) 'high)
+                        ((30.) 'medium)
+                        ((20.) 'low)
+                        (else #f))))
+           (if (not value)
+               (set-entry combo "<invalid>")
+             (set-value combo value)))))))
   
   
   (method package (option-change self value)
@@ -229,16 +284,24 @@
                          ((high) 128)
                          ((medium) 32)
                          ((low) 16))))
-                 resolution)))))
-      (set-setting options-settings option option-value)
+                 resolution))
+              ((world.render-rate)
+               (let ((rate
+                       (case value
+                         ((high) 60.)
+                         ((medium) 30.)
+                         ((low) 20.))))
+                 rate)))))
+      (if (eq? option 'world.render-rate)
+          (let ((active option-value)
+                (inactive (/ option-value 2.)))
+            (setup-render-rate active inactive)
+            (set-setting options-settings 'world.render-rate active)
+            (set-setting options-settings 'world.render-rate-inactive inactive))
+        (set-setting options-settings option option-value))
       (save-content options-settings)
       (when (memq? option '(world.view-distance world.tile-resolution))
-        (open-message (format "{a} needs to be restarted for this option to take effect" tier-title)
-                      caption: "Restart"
-                      type: 'message
-                      execute: (lambda (evt)
-                                 (let ((dialog (find-ascendant (get-sender evt) World-Dialog)))
-                                   (close dialog))))))))
+        (restart-needed)))))
 
 
 ;;;
@@ -253,17 +316,31 @@
     (<install>
       (<caption~>           title: "Video Options")
       (<content~>                                    layout-type: center
-        (<View>                                      size: {Dimension 190 134}
+        (<View>                                      size: {Dimension 190 164}
           (<Option-Label>   title: "View Distance"   position: {Point  0   1})
           (<Combo-Option>                            position: {Point 90   0} option: world.view-distance)
-          (<Option-Label>   title: "Tile Resolution" position: {Point  0  41})
-          (<Combo-Option>                            position: {Point 90  40} option: world.tile-resolution)
-          (<Option-Label>   title: "Post Processing" position: {Point 20  80})
-          (<Boolean-Option>                          position: {Point  0  80}  option: world.post-processing?)
+          (<Option-Label>   title: "Tile Resolution" position: {Point  0  36})
+          (<Combo-Option>                            position: {Point 90  35} option: world.tile-resolution)
+          (<Option-Label>   title: "Render Rate"     position: {Point  0  71})
+          (<Combo-Option>                            position: {Point 90  70} option: world.render-rate)
+          (<Option-Label>   title: "Post Processing" position: {Point 20 120})
+          (<Boolean-Option>                          position: {Point  0 120} option: world.post-processing?)
+          (<Option-Label>   title: "Use Retina"      position: {Point 20 150})
+          (<Boolean-Option>                          position: {Point  0 150} option: world.retina?)
           @wait
           (<Option-Label>   title: "Enemy Models (experimental)" position: {Point 20 120} size: {Dimension 180 16})
           @wait
-          (<Boolean-Option>                          position: {Point  0 120}  option: world.creature-models?))))))
+          (<Boolean-Option>                          position: {Point  0 120}  option: world.creature-models?)))))
+  
+  
+  (method override (prepare self rest)
+    (nextmethod self rest)
+    (restart-not-needed))
+  
+  
+  (method override (destroy self)
+    (warn-if-restart-needed)
+    (nextmethod self)))
 
 
 ;;;
