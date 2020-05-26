@@ -31,12 +31,8 @@
 
 
 (definition public (setup-profiling)
-  (iterate-table (registered-sites)
-    (lambda (identifier site)
-      (setup-site site)))
   (set-site-callback
     (lambda (site)
-      (setup-site site)
       (when current-advise
         (current-advise site)))))
 
@@ -46,82 +42,65 @@
 ;;;
 
 
-(definition public (advise-profile what)
-  (let ((identifier (enumerator->symbol what)))
-    (advise what
-            (lambda (field locator original set)
-              (let ((original (original)))
-                (when (procedure? original)
-                  (set (lambda rest
-                         (with-profile identifier
-                           (lambda ()
-                             (apply original rest)))))))))))
+(class Profile-Site extends Object
+  
+  
+  (slot parent         initialize #f                     getter generate)
+  (slot children       initialize (make-table test: eq?) getter generate)
+  (slot start          initialize #f                     accessors generate)
+  (slot running   <fl> initialize 0.                     accessors generate)
+  (slot allocated <fl> initialize 0.                     accessors generate)
+  (slot called    <fx> initialize 0                      accessors generate)
+  
+  
+  (method override (initialize self parent)
+    (nextmethod self)
+    (set! self.parent parent)))
 
 
-(definition protected (update-sites! chronology)
+(definition protected (profile-sites chronology)
   (with-mutex chronology
     (lambda ()
       (let ((first (first-position chronology))
-            (last (last-position chronology)))
-        (iterate-table (registered-sites)
-          (lambda (identifier site)
-            (site-profile-reset (get-profile site))))
-        (let ((starts (make-vector (site-id-count) #f)))
-          (loop (for n from first to last)
-                (let ((id (flonum->fixnum (chronological-id chronology n)))
-                      (marker (chronological-marker chronology n)))
-                  (let ((start? (even? (flonum->fixnum marker))))
-                    (cond (start?
-                           (vector-set! starts id n))
-                          (else
-                           (let ((start (vector-ref starts id)))
+            (last (last-position chronology))
+            (threads (make-table test: eqv?)))
+        (loop (for n from first to last)
+              (let ((id (flonum->fixnum (chronological-id chronology n)))
+                    (marker (chronological-marker chronology n))
+                    (thread (chronological-thread chronology n)))
+                (let ((current (or (table-ref threads thread #f)
+                                   (let ((p (new Profile-Site #f)))
+                                     (table-set! threads thread p)
+                                     p)))
+                      (start? (even? (flonum->fixnum marker))))
+                  (cond (start?
+                         (let ((profile (or (table-ref (get-children current) id #f)
+                                            (let ((p (new Profile-Site current)))
+                                              (table-set! (get-children current) id p)
+                                              p))))
+                           (set-start profile n)
+                           (table-set! threads thread profile)))
+                        (else
+                         (let ((profile current))
+                           (let ((start (get-start profile)))
+                             ;; TRUNC
                              (when start
-                               (let ((start-time (chronological-time chronology start))
-                                     (start-memory (chronological-memory chronology start)))
-                                 (let ((running (- (chronological-time chronology n) start-time))
-                                       (allocated (- (chronological-memory chronology n) start-memory))
-                                       (profile (get-profile (id->site id))))
-                                   (site-profile-running-set! profile (+ (site-profile-running profile) running))
-                                   (site-profile-allocated-set! profile (+ (site-profile-allocated profile) allocated))
-                                   (site-profile-called-set! profile (+ (site-profile-called profile) 1.))
-                                   (vector-set! starts id #f)))))))))))
-        (- (chronological-time chronology last)
-           (chronological-time chronology first))))))
+                             (let ((start-time (chronological-time chronology start))
+                                   (start-memory (chronological-memory chronology start)))
+                               (let ((running (- (chronological-time chronology n) start-time))
+                                     (allocated (- (chronological-memory chronology n) start-memory)))
+                                 (set-running profile (+ (get-running profile) running))
+                                 (set-allocated profile (+ (get-allocated profile) allocated))
+                                 (set-called profile (+ (get-called profile) 1))
+                                 (set-start profile #f)))
+                           (table-set! threads thread (get-parent profile))))))))))
+        (values threads (- (chronological-time chronology last)
+                           (chronological-time chronology first)))))))
 
 
 ;;;
 ;;;; Site
 ;;;
-
-
-(definition inline (make-site-profile) <f64vector>
-  (f64vector 0. 0. 0.))
-
-
-(definition protected inline (site-profile-running profile <f64vector>) <fl>
-  (f64vector-ref profile 0))
-
-(definition protected inline (site-profile-allocated profile <f64vector>) <fl>
-  (f64vector-ref profile 1))
-
-(definition protected inline (site-profile-called profile <f64vector>) <fl>
-  (f64vector-ref profile 2))
-
-
-(definition protected inline (site-profile-running-set! profile <f64vector> running <fl>) <void>
-  (f64vector-set! profile 0 running))
-
-(definition protected inline (site-profile-allocated-set! profile <f64vector> allocated <fl>) <void>
-  (f64vector-set! profile 1 allocated))
-
-(definition protected inline (site-profile-called-set! profile <f64vector> called <fl>) <void>
-  (f64vector-set! profile 2 called))
-
-
-(definition protected (site-profile-reset profile <f64vector>) <void>
-  (site-profile-running-set! profile 0.)
-  (site-profile-allocated-set! profile 0.)
-  (site-profile-called-set! profile 0.))
 
 
 (definition public (iterate-sites proc)
@@ -142,10 +121,6 @@
   (set! current-advise #f))
 
 
-(definition (setup-site site <Call-Site>)
-  (set-profile site (make-site-profile)))
-
-
 (definition public (advise-site what)
   (let ((identifier (enumerator->symbol what)))
     (advise what
@@ -164,10 +139,10 @@
   (declare (inline))
   (declare (inlining-limit 1000))
   (let ((chronology (current-chronology)))
-    (let ((profile (get-profile site))
-          (content (get-content chronology))
+    (let ((content (get-content chronology))
           (mutex (get-mutex chronology))
-          (id <fx> (get-id site)))
+          (id <fx> (get-id site))
+          (thread (fixnum->flonum (object->serial (current-thread)))))
       (mutex-lock! mutex)
       (let ((marker (next-marker! chronology)))
         (let ((index (index-now chronology)))
@@ -175,7 +150,7 @@
           (f64vector-set! content (+ index 1) (cast <fl> marker))
           (current-seconds! content (+ index 2))
           (bytes-allocated! content (+ index 3))
-          (f64vector-set! content (+ index 4) (fixnum->flonum (object->serial (current-thread))))
+          (f64vector-set! content (+ index 4) thread)
           (advance! chronology))
         (mutex-unlock! mutex)
         (prog1 (case (get-monitor site)
@@ -191,11 +166,9 @@
             (f64vector-set! content (+ index 1) (cast <fl> (+ marker 1)))
             (current-seconds! content (+ index 2))
             (bytes-allocated! content (+ index 3))
+            (f64vector-set! content (+ index 4) thread)
             (advance! chronology))
           (mutex-unlock! mutex))))))
-
-
-(proclaim (not warn optimizations))
 
 
 (definition public (sites-metadata)
@@ -203,102 +176,4 @@
     (iterate-table (registered-sites)
       (lambda (name site)
         (enqueue queue (cons (get-id site) name))))
-    (queue-list queue)))
-
-
-(definition debug-bug?
-  #f)
-
-
-(definition public (root-sites)
-  (let ((queue (new-queue)))
-    (iterate-table (registered-sites)
-      (lambda (name site)
-        (when (not (get-parent site))
-          (enqueue queue site))))
-    (queue-list queue)))
-
-
-(definition public (sites-tree)
-  (let ((root (list #f))
-        (nodes (make-table test: eq?)))
-    (define (site-node site)
-      (or (table-ref nodes site #f)
-          (let ((node (list site)))
-            (table-set! nodes site node)
-            (let ((parent (get-parent site)))
-              (let ((parent-node (if (not parent)
-                                     root
-                                   (site-node (registered-site parent)))))
-                (set-cdr! parent-node (insert-ordered! node (cdr parent-node)
-                                        key: (lambda (node) (get-identifier (car node)))
-                                        test: (lambda (x y)
-                                                ;; quicky to put memory at the top
-                                                (cond ((eq? x 'memory) #t)
-                                                      ((eq? y 'memory) #f)
-                                                      (else (nu<? x y))))))))
-            node)))
-    
-    (iterate-table-safe (registered-sites)
-      (lambda (identifier site)
-        (site-node site)))
-    root))
-
-
-@wait
-(definition public (sites-tree)
-  (when debug-bug?
-  (terminal '********))
-  (let ((root (list #f))
-        (nodes (make-table test: eq?)))
-    (define (site-node site)
-      (or (table-ref nodes site #f)
-          (let ((node (list site)))
-            (table-set! nodes site node)
-            (let ((parent (get-parent site)))
-              (let ((parent-node (if (not parent)
-                                     root
-                                   (site-node (registered-site parent)))))
-                (set-cdr! parent-node (insert-ordered! node (cdr parent-node)
-                                        key: (lambda (node) (get-identifier (car node)))
-                                        test: (lambda (x y)
-                                                ;; quicky to put memory at the top
-                                                (cond ((eq? x 'memory) #t)
-                                                      ((eq? y 'memory) #f)
-                                                      (else (nu<? x y))))))))
-            node)))
-    
-    (iterate-table-safe (registered-sites)
-      (lambda (identifier site)
-        (when debug-bug?
-        (when (eq? identifier 'read-chunk)
-          (terminal 'GAZ)))
-        (site-node site)))
-    (when debug-bug?
-    (let ()
-      (continuation-capture
-        (lambda (return)
-          (define (p node)
-            (if (and (car node) (eq? (get-identifier (car node)) 'read-chunk))
-                (continuation-return return #f)
-              (for-each p (cdr node))))
-          
-          (p root)
-          (bell)(bell)(bell)
-          (terminal 'NOT-FOUND (registered-site 'read-chunk))))))
-    root))
-
-
-(definition public (describe-sites)
-  (let ((root (sites-tree)))
-    (define (describe nodes level)
-      (for-each (lambda (node)
-                  (let ((site (car node))
-                        (children (cdr node)))
-                    (let ((profile (get-profile site)))
-                      (let ((called (site-profile-called profile)))
-                        (format :console "{_ :v}{a} {a}{%}" (* level 2) (get-name site) called)))
-                    (describe children (+ level 1))))
-                nodes))
-    
-    (describe (cdr root) 0))))
+    (queue-list queue))))
