@@ -90,7 +90,6 @@
   
   
   (slot configuration                                       getter generate)
-  (slot disconnected   initialize '()                       getter generate)
   (slot instances      initialize (make-table test: equal?) getter generate)
   (slot zones          initialize '()                       getter generate)
   (slot groups         initialize '()                       getter generate)
@@ -218,20 +217,20 @@
   
   
   ;;;
-  ;;;; Alive
+  ;;;; Delegates
   ;;;
   
   
-  (method (count-alive self)
+  (method (count-delegates self)
     (length delegates))
   
   
-  (method package (collect-alive self)
+  (method package (collect-delegates self)
     (sort ci<? delegates key: get-name))
   
   
   (method package (collect-disconnected self)
-    disconnected)
+    (collect-if get-disconnected? delegates))
   
   
   ;;;
@@ -408,30 +407,26 @@
         (let ((character-name (get-name identity))
               (character-role (or (get-role identity) default-role))
               (character-admin? (get-admin? identity)))
-          (if (and max-connections (>= (count-alive self) max-connections))
+          (if (and max-connections (>= (count-delegates self) max-connections))
               (begin
                 (logger/activity self "Max connections reached ({a})" character-name)
                 (format "Max {a} connections reached" max-connections))
-            (cleanup-disconnected self)
             (let ((existing-delegate (find-delegate-by-name self character-name)))
-              (let ((disconnected-delegate
-                      (find-if (lambda (delegate)
-                                 (equal? (get-name delegate) character-name))
-                               disconnected)))
-                (if existing-delegate
+              (let ((disconnected-delegate? (and existing-delegate (get-disconnected? existing-delegate))))
+                (if (and existing-delegate (not disconnected-delegate?))
                     (begin
                       (logger/activity self "{a} is already connected" character-name)
                       (format "{a} is already connected" character-name))
                   ;; register client
-                  (let ((delegate (cond (disconnected-delegate
-                                         (set! disconnected (remove! disconnected-delegate disconnected))
-                                         (client-reconnected self client disconnected-delegate client-uuid)
-                                         disconnected-delegate)
+                  (let ((delegate (cond (disconnected-delegate?
+                                         (reconnect-client self client existing-delegate client-uuid)
+                                         existing-delegate)
                                         (else
                                          (let ((id (make-unique-id)))
                                            (new Client-Delegate client 'connected client-uuid id (literal->id id self) character-name character-avatar character-script character-role character-admin?))))))
-                    (logger/activity self "{a} {a}" (if disconnected-delegate "Reconnect" "Connect") character-name)
-                    (set! delegates (cons delegate delegates))
+                    (logger/activity self "{a} {a}" (if disconnected-delegate? "Reconnect" "Connect") character-name)
+                    (unless disconnected-delegate?
+                      (set! delegates (cons delegate delegates)))
                     ;; retrieve character
                     (let ((client-id (get-id delegate))
                           (client-no (get-no delegate))
@@ -476,16 +471,6 @@
           (when group
             (leave-group self delegate group)))
         (set-state delegate 'stopped))))
-  
-  
-  (method package (client-reconnected self client reconnected-delegate uuid)
-    (set-client reconnected-delegate client)
-    (set-alive reconnected-delegate (current-seconds))
-    (set-exception reconnected-delegate #f)
-    (set-exception-stack reconnected-delegate #f)
-    (set-exception-time reconnected-delegate #f)
-    (set-uuid reconnected-delegate uuid)
-    (broadcast-reconnected self reconnected-delegate))
   
   
   (method package (client-deconnect self client character-name)
@@ -1108,6 +1093,7 @@
       (list (get-name delegate)
             (get-id delegate)
             (get-no delegate)
+            (get-disconnected? delegate)
             (get-asleep? delegate)
             (get-zone delegate)
             (get-mode delegate)))
@@ -1415,7 +1401,7 @@
               (list (get-name delegate)
                     (exception-reason (get-exception delegate))
                     (get-exception-stack delegate)))
-            disconnected))
+            (collect-disconnected self)))
       ((metadata)
        (admin-metadata self))
       ((latency)
@@ -1575,8 +1561,7 @@
                   (list
                     (server-host server)
                     (server-service server)
-                    (map get-name (collect-alive (current-server)))
-                    (map get-name (collect-disconnected (current-server)))
+                    (map get-name (collect-delegates (current-server)))
                     (map get-zone (list-processors))
                     (map get-purpose (table-values presences))
                     (collect-hierarchy (current-server))
@@ -1739,20 +1724,16 @@
   
   
   (method (start-aliveness-task self)
-    @YOWNU
-    (begin
     (set! aliveness-task (new Task 'aliveness (lambda (task)
                                                 (aliveness-loop self task))
                               priority: aliveness-priority))
-    (start-task aliveness-task)))
+    (start-task aliveness-task))
   
   
   (method (stop-aliveness-task self)
-    @YOWNU
-    (begin
     (exit-thread (get-thread aliveness-task))
     (thread-join! (get-thread aliveness-task))
-    (set! aliveness-task #f)))
+    (set! aliveness-task #f))
   
   
   (method (aliveness-loop self task)
@@ -1773,53 +1754,42 @@
   
   
   (method (check-aliveness self)
-    (let ((newly-disconnected '()))
+    ;; disconnect
+    (let ((disconnect (collect-if (lambda (delegate)
+                                    (and (not (get-disconnected? delegate))
+                                         (not (still-alive? delegate))))
+                                  delegates)))
       (for-each (lambda (delegate)
-                  (when (not (still-alive? delegate))
-                    (set-exception delegate "Disconnected")
-                    (set-exception-stack delegate '())
-                    (set-exception-time delegate (current-seconds))
-                    (disconnect-client self delegate)
-                    (set! newly-disconnected (cons delegate newly-disconnected))))
-                delegates)
-      (cleanup-disconnected self)
-      (when (not-null? newly-disconnected)
-        (broadcast-disconnected self newly-disconnected))))
+                  (set-exception delegate "Disconnected")
+                  (set-exception-stack delegate '())
+                  (set-exception-time delegate (current-seconds))
+                  (disconnect-client self delegate))
+                disconnect)
+      ;; remove
+      (let ((remove (collect-if disconnected-remove? delegates)))
+        (for-each (lambda (delegate)
+                    (set! delegates (remove! delegate delegates))
+                    (client-remove (get-remote-proxy (get-processor delegate)) (get-client delegate)))
+                  remove)
+        ;; broadcast
+        (when (or (not-null? disconnect)
+                  (not-null? remove))
+          (broadcast-hierarchy self)))))
   
   
-  (method (cleanup-disconnected self)
-    (set! disconnected (collect-if keep-disconnected? disconnected)))
+  (method override (delayed-disconnect-client self delegate)
+    (disconnect-client self delegate)
+    (broadcast-hierarchy self))
   
   
   (method override (disconnect-client self delegate)
     (logger/activity self "Disconnect {a}" (get-name delegate))
-    (set! delegates (remove! delegate delegates))
-    (set! disconnected (cons delegate disconnected))
-    ;; unregister existing streams
-    (let ((reconnected-no (get-no delegate)))
-      (iterate-table (get-server-streams udp-server)
-        (lambda (no stream)
-          (when (= (get-origin stream) reconnected-no)
-            (server-unregister-stream self no)))))
-    ;; leave group
-    (let ((group (get-group delegate)))
-      (when group
-        (leave-group self delegate group)
-        ;; restore group after leave
-        (set-group delegate group)))
-    ;; detach client
-    (if (is? delegate Mobile-Delegate)
-        (send-detach self delegate)
-      (calling-client self delegate
-        (lambda ()
-          (catch (connection-exception? exc)
-            (detach-client (get-client delegate))))))
-    ;; broadcast disconnected
+    (set-disconnected? delegate #t)
+    (client-disconnect (get-remote-proxy (get-processor delegate)) (get-client delegate))
     (broadcast-disconnected self (list delegate)))
   
   
   (method (broadcast-disconnected self newly-disconnected)
-    (broadcast-hierarchy self)
     (for-each (lambda (client-delegate)
                 (let ((client-group (get-group client-delegate)))
                   (when client-group
@@ -1834,6 +1804,18 @@
                                             (server-disconnected client client-name)))))))
                                 (get-members client-group))))))
               newly-disconnected))
+  
+  
+  (method (reconnect-client self client delegate uuid)
+    (set-disconnected? delegate #f)
+    (set-client delegate client)
+    (set-alive delegate (current-seconds))
+    (set-exception delegate #f)
+    (set-exception-stack delegate #f)
+    (set-exception-time delegate #f)
+    (set-uuid delegate uuid)
+    (client-reconnect (get-remote-proxy (get-processor delegate)) client)
+    (broadcast-reconnected self delegate))
   
   
   (method (broadcast-reconnected self client-delegate)
@@ -1907,8 +1889,7 @@
   
   (method package (mobile-disconnect self delegate)
     (logger/activity self "Disconnect {a}" (get-name delegate))
-    (set! delegates (remove! delegate delegates))
-    (send-detach self delegate))
+    (set-disconnected? delegate #t))
   
   
   (method (serve-mobile self delegate)
