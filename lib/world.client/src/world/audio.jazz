@@ -181,15 +181,20 @@
   
   
   (method (new-output self (codec: codec #f) (caps: caps #f) (volume: volume #f))
-    (new Audio-Sink
-      codec: (or codec audio-codec)
-      caps: caps
-      volume: volume))
+    (let ((sink (new Audio-Sink
+                  codec: (or codec audio-codec)
+                  caps: caps
+                  volume: volume))
+          (audio (cache-audio)))
+      (add-sink audio sink)
+      (play sink)
+      sink))
   
   
   (method package (close-output self id output)
     (table-clear outputs id)
     (set! ordered-outputs (remove! output ordered-outputs))
+    (remove-sink (cache-audio) output)
     (release output)
     (close output))
   
@@ -226,6 +231,122 @@
     (if (is? id/output Audio-Sink)
         (receive-visualizer-audio self id/output buffer dts pts duration)
       (receive-server-audio self id/output buffer dts pts duration))))
+
+
+;;;
+;;;; Audio
+;;;
+
+
+(definition protected echoprobe-latency
+  260)
+
+(definition protected echoprobe-delay
+  0)
+
+
+(definition protected audio
+  #f)
+
+(definition public (cache-audio)
+  (or audio
+      (let ((aud (new Audio)))
+        (setup aud)
+        (play aud)
+        (set! audio aud)
+        aud)))
+
+
+(class Audio extends Object
+  
+  
+  (slot provider initialize #f accessors generate)
+  (slot pipeline initialize #f accessors generate)
+  
+  
+  (method override (initialize self (provider: provider #f))
+    (nextmethod self)
+    (set! self.provider (or provider audio-provider)))
+  
+  
+  (method protected (add-sink self sink)
+    (setup sink)
+    (let ((bin (get-bin sink)))
+      (set-pipeline sink pipeline)
+      (with-unref ((mix (gst_bin_get_by_name pipeline "mix")))
+        (gst_bin_add pipeline bin)
+        (with-unref ((pan (gst_bin_get_by_name bin "panorama")))
+          (gst_element_link pan mix)))))
+  
+  
+  (method protected (remove-sink self sink)
+    (let ((bin (get-bin sink)))
+      (let ((pads (gst_element_src_pads bin)))
+        (let ((ghost-pad (car pads)))
+          (with-unref ((pan (gst_bin_get_by_name bin "panorama"))
+                       (mix (gst_bin_get_by_name pipeline "mix")))
+            (gst_element_unlink pan mix)
+            (gst_element_release_request_pad mix (gst_pad_get_peer ghost-pad)))))
+      (gst_element_set_state bin GST_STATE_NULL)
+      (gst_bin_remove pipeline bin)))
+  
+  
+  (method (force-audioclock self)
+    ;; it seems that appsrc will not generate events
+    ;; and so we need to generate them ourselves as it
+    ;; is critical that the audio sink receives the caps
+    ;; event before going to play else when the pipeline
+    ;; asks the audio sink for a provided clock the sink
+    ;; will return null because its ring buffer won't have
+    ;; been created in response to the caps event yet
+    (with-unref ((mix (gst_bin_get_by_name pipeline "mix")))
+      (with-unref ((pad (gst_element_get_static_pad mix "src")))
+        (let ((caps (gst-new-caps "audio/x-raw"
+                                  "format" 'string "S16LE"
+                                  "layout" 'string "interleaved"
+                                  "rate" 'int 48000
+                                  "channels" 'int 2)))
+          (gst_pad_push_event pad (gst_event_new_stream_start "stream"))
+          (gst_pad_push_event pad (gst_event_new_caps caps))
+          (gst_caps_unref caps)))))
+  
+  
+  (method public (setup self)
+    (let ((pipeline (gst-pipeline "audiomixer name=mix"
+                                  "queue"
+                                  (tie "webrtcechoprobe latency={echoprobe-latency} delay={echoprobe-delay}")
+                                  "audio/x-raw, format=S16LE, layout=interleaved, rate=48000, channels=2"
+                                  (gst-element (cond-expand (windows (if (eq? provider 'directsound)
+                                                                         "directsoundsink"
+                                                                       "wasapisink"))
+                                                            (mac "osxaudiosink")
+                                                            (else "pulsesink"))
+                                               buffer-time: 200000
+                                               ; discont-wait: 0
+                                               name: "sink")
+                                  (list "audiotestsrc samplesperbuffer=480 wave=silence is-live=true"
+                                        "mix."))))
+      (gst_object_set_name pipeline "audio")
+      (set! self.pipeline pipeline)
+      (force-audioclock self)
+      (gst_element_set_state pipeline GST_STATE_PAUSED)))
+  
+  
+  (method public (play self)
+    (gst_element_set_state pipeline GST_STATE_PLAYING))
+  
+  
+  (method public (pause self)
+    (gst_element_set_state pipeline GST_STATE_PAUSED))
+  
+  
+  (method public (stop self)
+    (gst_element_set_state pipeline GST_STATE_READY))
+  
+  
+  (method public (release self)
+    (gst_element_release pipeline)
+    (set! pipeline #f)))
 
 
 ;;;
@@ -303,10 +424,10 @@
 (class Mic-Audio-Src extends Audio-Src
   
   
-  (slot mic-pipeline initialize #f accessors generate)
-  (slot mic-sink     initialize #f accessors generate)
-  (slot denoiser     initialize #f getter generate)
-  (slot cached-caps  initialize #f getter generate)
+  (slot mic-bin     initialize #f accessors generate)
+  (slot mic-sink    initialize #f accessors generate)
+  (slot denoiser    initialize #f getter generate)
+  (slot cached-caps initialize #f getter generate)
   
   
   ;; we need to go in playing before the caps are available
@@ -315,45 +436,53 @@
         (begin
           (setup self)
           (gst_element_set_state pipeline GST_STATE_PLAYING)
-          (gst_element_set_state mic-pipeline GST_STATE_PLAYING)
-          (let ((listener (get-listener consumer))
-                (element (get-element consumer))
-                (data (get-data consumer))
-                (info (get-info consumer)))
-            (gst_app_sink_read listener element data info)
-            (gst_app_sink_read listener element data info)
-            (gst_app_sink_read listener element data info))
-          (prog1 (with-unref ((sink (gst_bin_get_by_name pipeline "sink")))
-                   (with-unref ((pad (gst_element_get_static_pad sink "sink")))
-                     (let ((caps (gst_pad_get_current_caps pad)))
-                       (let ((caps-string (gst_caps_to_string caps)))
-                         (gst_caps_unref caps)
-                         (set! cached-caps caps-string)
-                         caps-string))))
-            (gst_element_set_state pipeline GST_STATE_READY)
-            (gst_element_set_state mic-pipeline GST_STATE_READY)))))
+          (gst_element_set_state mic-bin GST_STATE_PLAYING)
+          (with-unref ((sink (gst_bin_get_by_name pipeline "sink")))
+            (with-unref ((pad (gst_element_get_static_pad sink "sink")))
+              ;; wait for data to flow
+              (let (loop (n 0))
+                (if (> n 100)
+                    (begin
+                      (terminal 'COULD 'NOT 'GET 'MICROPHONE 'CAPS)
+                      (exit))
+                  (if (not (gst_pad_has_current_caps pad))
+                      (begin
+                        (sleep .01)
+                        (loop (+ n 1)))
+                    (let ((caps (gst_pad_get_current_caps pad)))
+                      (let ((caps-string (gst_caps_to_string caps)))
+                        (gst_caps_unref caps)
+                        caps-string))))))))))
   
   
   (method override (setup-element self)
     (nextmethod self)
     ;; mic
-    (let ((pipeline (gst-pipeline
-                      ;; provide-clock=false to use the system clock
-                      ;; this makes sure audio and video stay synced
-                      ;; latency-time=30000 is the minimum to get good
-                      ;; audio on windows and also improves the mac audio
-                      (cond-expand
-                        (windows "directsoundsrc latency-time=30000 provide-clock=false name=src")
-                        (mac "osxaudiosrc latency-time=30000 provide-clock=false name=src")
-                        (else "pulsesrc latency-time=30000 provide-clock=false name=src"))
-                      "audioresample"
-                      denoiser-caps
-                      denoiser-filter
-                      "appsink sync=false name=sink")))
-      (gst_object_set_name pipeline "mic")
-      (with-unref ((appsink (gst_bin_get_by_name pipeline "sink")))
-        (gst_element_set_state pipeline GST_STATE_READY)
-        (set! self.mic-pipeline pipeline)
+    (let ((pipeline (get-pipeline (cache-audio)))
+          (bin (gst-bin
+                 ;; provide-clock=false to use the audio sink clock
+                 ;; this makes sure audio and video stay synced
+                 ;; latency-time=30000 is the minimum to get good
+                 ;; audio on windows and also improves the mac audio
+                 (cond-expand
+                   (windows "directsoundsrc latency-time=30000 provide-clock=false")
+                   (mac "osxaudiosrc latency-time=30000 provide-clock=false")
+                   (else "pulsesrc latency-time=30000 provide-clock=false"))
+                 ;; needed on some computers
+                 "audioresample"
+                 (gst-element "webrtcdsp"
+                              echo-cancel: "true"
+                              echo-suppression-level: "high"
+                              gain-control: "false"
+                              noise-suppression: "true")
+                 "audioresample"
+                 denoiser-caps
+                 denoiser-filter
+                 "appsink sync=false name=micsink")))
+      (gst_bin_add pipeline bin)
+      (with-unref ((appsink (gst_bin_get_by_name bin "micsink")))
+        (gst_element_set_state bin GST_STATE_READY)
+        (set! self.mic-bin bin)
         (set! self.mic-sink appsink)))
     ;; audio
     (let ((listener (open-stream-listener "mic"))
@@ -387,27 +516,27 @@
   (method override (start-element self)
     (nextmethod self)
     (gst_element_set_state pipeline GST_STATE_PAUSED)
-    (gst_element_set_state mic-pipeline GST_STATE_PAUSED)
+    (gst_element_set_state mic-bin GST_STATE_PAUSED)
     (task-start self 'mic))
   
   
   (method override (play-element self)
     (nextmethod self)
     (gst_element_set_state pipeline GST_STATE_PLAYING)
-    (gst_element_set_state mic-pipeline GST_STATE_PLAYING))
+    (gst_element_set_state mic-bin GST_STATE_PLAYING))
   
   
   (method override (pause-element self)
     (nextmethod self)
     (gst_element_set_state pipeline GST_STATE_PAUSED)
-    (gst_element_set_state mic-pipeline GST_STATE_PAUSED))
+    (gst_element_set_state mic-bin GST_STATE_PAUSED))
   
   
   (method override (stop-element self)
     (nextmethod self)
     (task-stop self)
     (gst_element_set_state pipeline GST_STATE_READY)
-    (gst_element_set_state mic-pipeline GST_STATE_READY))
+    (gst_element_set_state mic-bin GST_STATE_READY))
   
   
   (method override (release-element self)
@@ -417,8 +546,8 @@
     (set! pipeline #f)
     (set! appsrc #f)
     (release-consumer consumer)
-    (gst_element_release mic-pipeline)
-    (set! mic-pipeline #f)
+    (gst_element_release mic-bin)
+    (set! mic-bin #f)
     (set! mic-sink #f)
     (free-denoiser denoiser)
     (set! denoiser #f)))
@@ -712,6 +841,7 @@
   (slot volume                 initialize #f accessors explicit)
   (slot sound?                 initialize #f accessors explicit) ;; gambit30 revisit
   (slot pipeline               initialize #f accessors generate)
+  (slot bin                    initialize #f accessors generate)
   (slot appsrc                 initialize #f accessors generate)
   (slot volelem                initialize #f accessors generate)
   (slot panelem                initialize #f accessors generate)
@@ -753,32 +883,23 @@
     (invalidate-audio-state (current-client) self))
   
   
-  (method package virtual (setup-pipeline self)
-    (let ((pipeline (gst-pipeline (format "appsrc{? caps=\"{a}\"~} name=src" caps)
-                                  (and (not sound?) "queue")
-                                  (and (eq? codec 'aac) "avdec_aac name=dec")
-                                  (and (eq? codec 'opus) "opusdec name=dec")
-                                  (and (eq? codec 'vorbis) "vorbisdec name=dec")
-                                  "audioconvert"
-                                  "audioresample"
-                                  (let ((volume (or volume 1)))
-                                    (tie "volume name=volume volume={volume}"))
-                                  "audiopanorama method=1 name=panorama"
-                                  ;; hardcoded caps for now that must match
-                                  ;; the event caps pushed on the decoder pad
-                                  "audio/x-raw, format=S16LE, layout=interleaved, rate=48000, channels=2"
-                                  (gst-element (cond-expand (windows (if (eq? provider 'directsound)
-                                                                         "directsoundsink"
-                                                                       "wasapisink"))
-                                                            (mac "osxaudiosink")
-                                                            (else "pulsesink"))
-                                               buffer-time: 200000
-                                               discont-wait: (and (not sound?) 0)
-                                               name: "sink"))))
-      (gst_object_set_name pipeline "output")
-      (with-unref ((appsrc (gst_bin_get_by_name pipeline "src"))
-                   (volelem (gst_bin_get_by_name pipeline "volume"))
-                   (panelem (gst_bin_get_by_name pipeline "panorama")))
+  (method package (setup-bin self)
+    (let ((bin (gst-bin (format "appsrc{? caps=\"{a}\"~} name=src" caps)
+                        (and (not sound?) "queue")
+                        (and (eq? codec 'aac) "avdec_aac name=dec")
+                        (and (eq? codec 'opus) "opusdec name=dec")
+                        (and (eq? codec 'vorbis) "vorbisdec name=dec")
+                        "audioconvert"
+                        "audioresample"
+                        ;; hardcoded caps for now that must match
+                        ;; the event caps pushed on the decoder pad
+                        "audio/x-raw, format=S16LE, layout=interleaved, rate=48000, channels=2"
+                        (let ((volume (or volume 1)))
+                          (tie "volume name=volume volume={volume}"))
+                        "audiopanorama method=1 name=panorama")))
+      (with-unref ((appsrc (gst_bin_get_by_name bin "src"))
+                   (volelem (gst_bin_get_by_name bin "volume"))
+                   (panelem (gst_bin_get_by_name bin "panorama")))
         (when (not caps)
           (case codec
             ((opus)
@@ -790,8 +911,8 @@
           "is-live"     'boolean #t
           "stream-type" 'int     GST_APP_STREAM_TYPE_STREAM
           "format"      'int     GST_FORMAT_TIME)
-        (gst_element_set_state pipeline GST_STATE_READY)
-        (set! self.pipeline pipeline)
+        (gst_element_set_state bin GST_STATE_READY)
+        (set! self.bin bin)
         (set! self.appsrc appsrc)
         (set! self.volelem volelem)
         (set! self.panelem panelem))))
@@ -799,50 +920,33 @@
   
   (method override (setup-element self)
     (nextmethod self)
-    (setup-pipeline self))
+    (setup-bin self))
   
   
   (method override (start-element self)
     (nextmethod self)
-    (gst_element_set_state pipeline GST_STATE_PAUSED)
-    ;; it seems that appsrc will not generate events
-    ;; and so we need to generate them ourselves as it
-    ;; is critical that the audio sink receives the caps
-    ;; event before going to play else when the pipeline
-    ;; asks the audio sink for a provided clock the sink
-    ;; will return null because its ring buffer won't have
-    ;; been created in response to the caps event yet
-    (with-unref ((dec (gst_bin_get_by_name pipeline "dec")))
-      (with-unref ((pad (gst_element_get_static_pad dec "src")))
-        (let ((caps (gst-new-caps "audio/x-raw"
-                                  "format" 'string "S16LE"
-                                  "layout" 'string "interleaved"
-                                  "rate" 'int 48000
-                                  "channels" 'int 2)))
-          (gst_pad_push_event pad (gst_event_new_stream_start "stream"))
-          (gst_pad_push_event pad (gst_event_new_caps caps))
-          (gst_caps_unref caps)))))
+    (gst_element_set_state bin GST_STATE_PAUSED))
   
   
   (method override (play-element self)
     (nextmethod self)
-    (gst_element_set_state pipeline GST_STATE_PLAYING))
+    (gst_element_set_state bin GST_STATE_PLAYING))
   
   
   (method override (pause-element self)
     (nextmethod self)
-    (gst_element_set_state pipeline GST_STATE_PAUSED))
+    (gst_element_set_state bin GST_STATE_PAUSED))
   
   
   (method override (stop-element self)
     (nextmethod self)
-    (gst_element_set_state pipeline GST_STATE_READY))
+    (gst_element_set_state bin GST_STATE_READY))
   
   
   (method override (release-element self)
     (nextmethod self)
-    (gst_element_release pipeline)
-    (set! pipeline #f)
+    (gst_element_release bin)
+    (set! bin #f)
     (set! appsrc #f)
     (set-stream-state self 'off))
   
