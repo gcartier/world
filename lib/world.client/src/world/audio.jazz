@@ -334,29 +334,41 @@
       (gst_bin_remove pipeline bin)))
   
   
-  (method (force-audioclock self)
-    ;; it seems that appsrc will not generate events
-    ;; and so we need to generate them ourselves as it
-    ;; is critical that the audio sink receives the caps
-    ;; event before going to play else when the pipeline
-    ;; asks the audio sink for a provided clock the sink
-    ;; will return null because its ring buffer won't have
-    ;; been created in response to the caps event yet
-    (with-unref ((mix (gst_bin_get_by_name pipeline "mix")))
-      (with-unref ((pad (gst_element_get_static_pad mix "src")))
-        (let ((caps (gst-new-caps "audio/x-raw"
-                                  "format" 'string "S16LE"
-                                  "layout" 'string "interleaved"
-                                  "rate" 'int 48000
-                                  "channels" 'int 2)))
-          (gst_pad_push_event pad (gst_event_new_stream_start "stream"))
-          (gst_pad_push_event pad (gst_event_new_caps caps))
-          (gst_caps_unref caps)))))
+  (method (wait-audioclock self pipeline)
+    (with-unref ((sink (gst_bin_get_by_name pipeline "sink")))
+      (let (loop (n 0))
+        (let ((clock (gst_element_get_clock sink)))
+          (let ((clock-name (and clock (gst_object_get_name clock))))
+            (cond ((equal? clock-name (cond-expand
+                                        (linux "GstPulseSinkClock")
+                                        (else "GstAudioSinkClock")))
+                   (gst_object_unref clock))
+                  ((>= n 1000)
+                   (delay-event
+                     (lambda ()
+                       (with-task-mutex
+                         (lambda ()
+                           (chat-problem (current-world) (format "Failed to install an audio clock: {a}" clock-name)))))))
+                  (else
+                   (sleep .001)
+                   (loop (+ n 1)))))))))
+  
+  
+  (method (add-mixer self pipeline)
+    (with-unref ((silence (gst_bin_get_by_name pipeline "silence"))
+                 (queue (gst_bin_get_by_name pipeline "queue")))
+      (let ((mix (gst_element_factory_make "audiomixer" "mix")))
+        (g_object_set_uint64 mix "output-buffer-duration" 50000000)
+        (gst_bin_add pipeline mix)
+        (gst_element_unlink silence queue)
+        (gst_element_link silence mix)
+        (gst_element_link mix queue)
+        (gst_element_set_state mix GST_STATE_PLAYING))))
   
   
   (method public (setup self)
-    (let ((pipeline (gst-pipeline "audiomixer output-buffer-duration=50000000 name=mix"
-                                  "queue"
+    (let ((pipeline (gst-pipeline "audiotestsrc samplesperbuffer=480 wave=silence is-live=true name=silence"
+                                  "queue name=queue"
                                   (tie "webrtcaudioprobe latency={audioprobe-latency} delay={audioprobe-delay}")
                                   "audio/x-raw, format=S16LE, layout=interleaved, rate=48000, channels=2"
                                   (gst-element (cond-expand (windows (if (eq? provider 'directsound)
@@ -366,13 +378,14 @@
                                                             (else "pulsesink"))
                                                buffer-time: 200000
                                                ; discont-wait: 0
-                                               name: "sink")
-                                  (list "audiotestsrc samplesperbuffer=480 wave=silence is-live=true"
-                                        "mix."))))
+                                               name: "sink"))))
       (gst_object_set_name pipeline "audio")
       (set! self.pipeline pipeline)
-      (force-audioclock self)
-      (gst_element_set_state pipeline GST_STATE_PAUSED)))
+      (gst_element_set_state pipeline GST_STATE_PAUSED)
+      (sleep .01)
+      (gst_element_set_state pipeline GST_STATE_PLAYING)
+      (wait-audioclock self pipeline)
+      (add-mixer self pipeline)))
   
   
   (method public (play self)
@@ -985,18 +998,8 @@
     (when (not stream-playing?)
       (if (not stream-prerolled?)
           (set! stream-prerolled? #t)
-        (with-unref ((clock (gst_element_get_clock pipeline)))
-          (let ((clock-name (and clock (gst_object_get_name clock))))
-            @w (when (and (developer?) clock-name (not (equal? clock-name (cond-expand
-                                                                         (linux "GstPulseSinkClock")
-                                                                         (else "GstAudioSinkClock")))))
-              (delay-event
-                (lambda ()
-                  (with-task-mutex
-                    (lambda ()
-                      (chat-problem (current-world) (format "Failed to install an audio clock: {a}" clock-name)))))))
-            (play self)
-            (set! stream-playing? #t)))))
+        (play self)
+        (set! stream-playing? #t)))
     ;; this experimental number seems to give the best results
     (let ((extra-offset 30000000)
           (timestamp-offset (rebase-time time-adapter appsrc dts)))
