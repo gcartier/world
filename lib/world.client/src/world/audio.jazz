@@ -317,7 +317,8 @@
       (with-unref ((mix (gst_bin_get_by_name pipeline "mix")))
         (gst_bin_add pipeline bin)
         (with-unref ((pan (gst_bin_get_by_name bin "panorama")))
-          (gst_element_link pan mix)))))
+          (gst_element_link pan mix))))
+    (redistribute-latency self))
   
   
   (method protected (remove-sink self sink)
@@ -329,43 +330,43 @@
             (gst_element_unlink pan mix)
             (gst_element_release_request_pad mix (gst_pad_get_peer ghost-pad)))))
       (gst_element_set_state bin GST_STATE_NULL)
-      (gst_bin_remove pipeline bin)))
+      (gst_bin_remove pipeline bin)
+      (redistribute-latency self)))
   
   
-  (method (wait-audioclock self pipeline)
-    (with-unref ((sink (gst_bin_get_by_name pipeline "sink")))
-      (let (loop (n 0))
-        (when (< n 100)
-          (when (not (gst_audio_ring_buffer_acquired sink))
-            (sleep .01)
-            (loop (+ n 1)))))
-      (with-unref ((clock (gst_pipeline_get_clock pipeline)))
-        (let ((clock-name (gst_object_get_name clock)))
-          (unless (equal? clock-name (cond-expand
-                                       (linux "GstPulseSinkClock")
-                                       (else "GstAudioSinkClock")))
-            (delay-event
-              (lambda ()
-                (with-task-mutex
-                  (lambda ()
-                    (chat-problem (current-world) (format "Failed to install an audio clock: {a}" clock-name)))))))))))
+  (method (redistribute-latency self)
+    (let ((info (make-u64vector 3)))
+      (gst_element_query_latency pipeline info)
+      (let ((live (u64vector-ref info 0))
+            (min (u64vector-ref info 1))
+            (max (u64vector-ref info 2)))
+        (gst_element_send_event pipeline (gst_event_new_latency min)))))
   
   
-  (method (add-mixer self pipeline)
-    (with-unref ((silence (gst_bin_get_by_name pipeline "silence"))
-                 (queue (gst_bin_get_by_name pipeline "queue")))
-      (let ((mix (gst_element_factory_make "audiomixer" "mix")))
-        (g_object_set_uint64 mix "latency" 10000000)
-        (g_object_set_uint64 mix "output-buffer-duration" 10000000)
-        (gst_bin_add pipeline mix)
-        (gst_element_unlink silence queue)
-        (gst_element_link silence mix)
-        (gst_element_link mix queue)
-        (gst_element_set_state mix GST_STATE_PLAYING))))
+  (method (wait-playing self pipeline)
+    (let (loop (n 0))
+      (when (< n 100)
+        (when (/= (gst_element_get_state pipeline) 4)
+          (sleep .01)
+          (loop (+ n 1))))))
+  
+  
+  (method (check-audioclock self pipeline)
+    (with-unref ((clock (gst_pipeline_get_clock pipeline)))
+      (let ((clock-name (gst_object_get_name clock)))
+        (unless (equal? clock-name (cond-expand
+                                     (linux "GstPulseSinkClock")
+                                     (else "GstAudioSinkClock")))
+          (delay-event
+            (lambda ()
+              (with-task-mutex
+                (lambda ()
+                  (chat-problem (current-world) (format "Failed to install an audio clock: {a}" clock-name))))))))))
   
   
   (method public (setup self)
-    (let ((pipeline (gst-pipeline "audiotestsrc samplesperbuffer=4800 wave=silence is-live=true name=silence"
+    (let ((pipeline (gst-pipeline "audiotestsrc samplesperbuffer=4800 wave=silence name=silence"
+                                  "audiomixer name=mix"
                                   "queue name=queue"
                                   (tie "webrtcaudioprobe delay={audioprobe-delay}")
                                   "audio/x-raw, format=S16LE, layout=interleaved, rate=48000, channels=2"
@@ -379,10 +380,9 @@
                                                name: "sink"))))
       (gst_object_set_name pipeline "audio")
       (set! self.pipeline pipeline)
-      (gst_element_set_state pipeline GST_STATE_PAUSED)
-      (wait-audioclock self pipeline)
       (gst_element_set_state pipeline GST_STATE_PLAYING)
-      (add-mixer self pipeline)))
+      (wait-playing self pipeline)
+      (check-audioclock self pipeline)))
   
   
   (method public (play self)
