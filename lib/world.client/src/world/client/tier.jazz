@@ -1457,60 +1457,78 @@
           (when (exists? file)
             (send-file name file)))))
     
+    (define (send-settings)
+      (let ((file support-settings-file))
+        (when (exists? file)
+          (send-file 0 file))))
+    
     (define (send-file name file)
       (send-threaded name
         (lambda ()
           (load-binary file))))
     
     (define (generate-snapshot)
-      (send-reply
+      (background
         (lambda ()
-          (snapshot-process reason: (format "Snapshot requested by {a}" requester-name)))))
+          (snapshot-process reason: (format "Snapshot requested by {a}" requester-name))
+          (send-reply "done" #t))))
     
-    (define (send-reply thunk)
-      (let ((thread
-              (new-thread
-                (lambda ()
-                  (thunk)
-                  (let ((sender character-name))
-                    (admin-request-chunk self requester cookie sender 0 #f #f))))))
-        (thread-base-priority-set! thread background-priority)
-        (thread-start! thread)))
+    (define (attach-to-debugger)
+      (let ((debugger action))
+        (delay-event
+          (lambda ()
+            (let ((exc (setup-debuggee debugger: debugger connection-exception-exit?: #f)))
+              (if exc
+                  (send-reply "Unable to connect to debugger" #f)
+                (start-repl-thread (current-thread) #f (current-console-port))
+                (select-debugger-console)
+                (current-input-port (console-input-port))
+                (current-output-port (console-output-port))
+                (ready-to-controller)
+                (send-reply "attached" #t)))))))
+    
+    (define (detach-from-debugger)
+      (background
+        (lambda ()
+          (current-input-port (standard-input-port))
+          (current-output-port (standard-output-port))
+          (detach-from-controller)
+          (send-reply "detached" #t))))
+    
+    (define (send-reply name done?)
+      (let ((sender "_server"))
+        (admin-chunk requester cookie sender name #f done?)))
     
     (define (send-threaded name extract (missing #f))
-      (let ((thread
-              (new-thread
-                (lambda ()
-                  (let ((sender character-name))
-                    (admin-request-chunk self requester cookie sender name #f #f)
-                    (let ((content (zlib-deflate (extract)))
-                          (give-time .01))
-                      (when missing
-                        (let ((missing (missing)))
-                          (for-each (lambda (missing)
-                                      (sleep give-time)
-                                      (admin-request-chunk self requester cookie sender 'missing missing #f))
-                                    missing)))
-                      (let ((content-size (u8vector-length content))
-                            (max-size 8192))
-                        (let (loop-chunk (part 0) (pos 0))
-                          (let ((remain (- content-size pos)))
-                            (when (> remain 0)
+      (background
+        (lambda ()
+          (let ((sender character-name))
+            (admin-request-chunk self requester cookie sender name #f #f)
+            (let ((content (zlib-deflate (extract)))
+                  (give-time .01))
+              (when missing
+                (let ((missing (missing)))
+                  (for-each (lambda (missing)
                               (sleep give-time)
-                              (let ((chunk-size (min remain max-size)))
-                                (let ((chunk (make-u8vector chunk-size))
-                                      (done? (>= chunk-size remain)))
-                                  (subu8vector-move! content pos (+ pos chunk-size) chunk 0)
-                                  (admin-request-chunk self requester cookie sender name chunk done?))
-                                (loop-chunk (+ part 1) (+ pos chunk-size))))))))))
-                'request)))
+                              (admin-request-chunk self requester cookie sender 'missing missing #f))
+                            missing)))
+              (let ((content-size (u8vector-length content))
+                    (max-size 8192))
+                (let (loop-chunk (part 0) (pos 0))
+                  (let ((remain (- content-size pos)))
+                    (when (> remain 0)
+                      (sleep give-time)
+                      (let ((chunk-size (min remain max-size)))
+                        (let ((chunk (make-u8vector chunk-size))
+                              (done? (>= chunk-size remain)))
+                          (subu8vector-move! content pos (+ pos chunk-size) chunk 0)
+                          (admin-request-chunk self requester cookie sender name chunk done?))
+                        (loop-chunk (+ part 1) (+ pos chunk-size))))))))))))
+    
+    (define (background thunk)
+      (let ((thread (new-thread thunk 'request)))
         (thread-base-priority-set! thread background-priority)
         (thread-start! thread)))
-    
-    (define (send-settings)
-      (let ((file support-settings-file))
-        (when (exists? file)
-          (send-file 0 file))))
     
     (if (string? what)
         (send-shared-file what)
@@ -1526,7 +1544,11 @@
         ((settings)
          (send-settings))
         ((snapshot)
-         (generate-snapshot)))))
+         (generate-snapshot))
+        ((attach)
+         (attach-to-debugger))
+        ((detach)
+         (detach-from-debugger)))))
   
   
   (method package (admin-chunk self cookie sender name chunk done?)
