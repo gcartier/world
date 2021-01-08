@@ -1,0 +1,119 @@
+;;;===============
+;;;  WorldScheme
+;;;===============
+;;;
+;;;; World Garbage Collect
+;;;
+;;;  The Initial Developer of the Original Code is Guillaume Cartier.
+;;;  Portions created by the Initial Developer are Copyright (C) 2012-2018
+;;;  the Initial Developer. All Rights Reserved.
+;;;
+;;;  Contributor(s):
+
+
+(module world.gc jazz
+
+
+(import (jazz.media)
+        (world.chronology)
+        (world.configure)
+        (world.event))
+
+
+(definition protected gc-sound? <bool>
+  #f)
+
+(definition protected gc-trace? <bool>
+  #f)
+
+
+(definition protected (set-gc-sound? flag)
+  (set! gc-sound? flag))
+
+(definition protected (set-gc-trace? flag)
+  (set! gc-trace? flag))
+
+
+(definition protected memory-site
+  (register-site '(memory) '() '(kind: memory)))
+
+
+;; the gc interrupt job can be called from any
+;; thread and anywhere in the code and so needs
+;; to be totally safe and minimal
+(definition protected (setup-gc self)
+  (let ((port (open-vector)))
+    ;; interrupt
+    (add-gc-interrupt-job!
+      (lambda ()
+        (write (current-seconds) port)
+        (force-output port)))
+    ;; process
+    (let ((thread
+            (new-thread
+              (lambda ()
+                (declare (proper-tail-calls))
+                (let (loop)
+                  (process-gc (read port))
+                  (loop)))
+              'gc)))
+      ;; use a fairly high priority as thread is low work
+      ;; and also to get events showing in a responsive way
+      (thread-base-priority-set! thread event-priority)
+      (thread-start! thread))))
+
+
+(definition (process-gc seconds)
+  (proclaim (not check bounds))
+  (when gc-sound?
+    (gc-sound))
+  (when gc-trace?
+    (terminal 'garbage-collect (last-gc-real-time)))
+  ;; simulate call
+  (let ((chronology (current-chronology)))
+    (let ((mutex (get-mutex chronology)))
+      (mutex-lock! mutex)
+      (let ((running (last-gc-real-time))
+            (content (get-content chronology))
+            (id <fx> (get-id memory-site))
+            ;; dummy thread so all gc calls end up together in the profiler
+            (thread -1.)
+            (marker (next-marker! chronology)))
+        ;; start
+        (let ((index (index-now chronology)))
+          (f64vector-set! content index (cast <fl> id))
+          (f64vector-set! content (+ index 1) (cast <fl> marker))
+          (f64vector-set! content (+ index 2) (- seconds running))
+          (f64vector-set! content (+ index 3) 0.)
+          (f64vector-set! content (+ index 4) thread)
+          (advance! chronology))
+        ;; end
+        (let ((index (index-now chronology)))
+          (f64vector-set! content index (cast <fl> id))
+          (f64vector-set! content (+ index 1) (cast <fl> (+ marker 1)))
+          (f64vector-set! content (+ index 2) seconds)
+          (f64vector-set! content (+ index 3) 0.)
+          (f64vector-set! content (+ index 4) thread)
+          (advance! chronology)))
+      (mutex-unlock! mutex)))
+  ;; record event
+  (record-event udp-id-garbage-collect
+                -1.
+                -1.
+                -1.
+                -1.
+                -1.
+                -1.
+                -1.))
+
+
+(cond-expand
+  (windows
+   (definition (gc-sound)
+     (MessageBeep MB_ICONINFORMATION)))
+  (cocoa
+   (definition (gc-sound)
+     (play-sound "Submarine" volume: .25)))
+  (else
+   (definition (gc-sound)
+     (bell)))))
