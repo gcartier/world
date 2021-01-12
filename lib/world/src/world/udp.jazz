@@ -83,6 +83,13 @@
   (vector-ref udp-names kind))
 
 
+(definition protected udp-purge-gap
+  1.)
+
+(definition protected udp-purge-seek
+  2.)
+
+
 ;; MTU - IP HEADER - UDP HEADER
 ;; 1500 - 20 (60) - 8 = 1472 (1432)
 (definition protected udp-datagram-max <fx>
@@ -1505,15 +1512,40 @@
                                 dts
                                 effective-latency))))))
         
-        (define (insert/reset-empty)
+        (define (insert/purge reason)
           (let ((packet (new UDP-Packet dts pts duration sequence frame part total keyframe? data)))
+            (empty self)
+            (when reason
+              (record-purge reason))
             (record-insert)
-            (insert-before self head packet)
+            (insert-before self tail packet)
             (set! last-sequence sequence)
             (set! lowest sequence)
             (set! highest sequence)
             (check self)
+            (state-waiting self)
             (condition-variable-signal! wait-condvar)))
+        
+        (define (insert-first-time)
+          (insert/purge #f))
+        
+        (define (insert-highest packet)
+          (record-insert)
+          (insert-before self tail packet)
+          (set! last-sequence sequence)
+          (set! highest sequence)
+          (check self)
+          (condition-variable-signal! wait-condvar))
+        
+        (define (record-purge reason)
+          (record-event udp-id-purge-ring
+                        (fixnum->flonum no)
+                        (fixnum->flonum origin)
+                        (fixnum->flonum media-kind)
+                        (fixnum->flonum sequence)
+                        (fixnum->flonum frame)
+                        reason
+                        -1.))
         
         (define (record-insert)
           (let ((base (get-base time-base))
@@ -1555,7 +1587,7 @@
         (cond ;; first time
               ((not last-sequence)
                (time-update)
-               (insert/reset-empty))
+               (insert-first-time))
               ;; in-order insert
               ((> sequence last-sequence)
                (let ((expected (+ (allege last-sequence) 1)))
@@ -1563,19 +1595,12 @@
                    (when (> gap 0)
                      (record-gap gap))
                    (if (>= gap udp-max-gap)
-                       (begin
-                         (set! last-sequence sequence)
-                         (flush self count #f)
-                         (state-waiting self)
-                         (condition-variable-signal! wait-condvar))
+                       (insert/purge udp-purge-gap)
                      (let ((previous-latency (get-last-latency time-base)))
                        (time-update)
-                       (let ((change (abs (- (get-last-latency time-base) previous-latency))))
-                         ;; empty ring after a seek
-                         (if #f @wait-do-this-correctly-as-if-this-happens-not-from-a-seek-we-just-empty-without-any-flush-events (> change 1.)
-                             (begin
-                               (empty self)
-                               (insert/reset-empty))
+                       (let ((seek-change-heuristic (abs (- (get-last-latency time-base) previous-latency))))
+                         (if (> seek-change-heuristic 1.)
+                             (insert/purge udp-purge-seek)
                            (let ((packet (new UDP-Packet dts pts duration sequence frame part total keyframe? data)))
                              (if (= count 0)
                                  (loop (for seq from (+ highest 1) below sequence)
@@ -1587,12 +1612,7 @@
                                          (let ((dts (interpolate seq highest sequence highest-dts dts)))
                                            (record-missing seq)
                                            (insert-before self tail (new UDP-Packet dts pts #f seq #f #f #f #f #f)))))))
-                             (record-insert)
-                             (insert-before self tail packet)
-                             (set! last-sequence sequence)
-                             (set! highest sequence)
-                             (check self)
-                             (condition-variable-signal! wait-condvar)))))))))
+                             (insert-highest packet)))))))))
               ;; out-of-order replace
               (else
                (if (between? sequence lowest highest)
