@@ -111,19 +111,19 @@
     (let (@peer2peer (local-host (determine-local-host))
           @peer2peer (local-port (socket-info-port-number (udp-local-socket-info udp-port))))
       (define (send-connect)
-        (mutex-lock! write-mutex)
-        (let ((data (make-u8vector (+ (udp-connect-size) udp-code-size))))
-          (write-udp-sent data (current-seconds))
-          (write-udp-kind data udp-connect)
-          (write-udp-sender data client-no)
-          @peer2peer
-          (write-udp-connect-local-host data local-host)
-          @peer2peer
-          (write-udp-connect-local-port data local-port)
-          (write-udp-connect-video-level data (or (video-profile-level) -1))
-          (write-udp-code data)
-          (write-data data udp-port))
-        (mutex-unlock! write-mutex))
+        (with-write-mutex self
+          (lambda ()
+            (let ((data (make-u8vector (+ (udp-connect-size) udp-code-size))))
+              (write-udp-sent data (current-seconds))
+              (write-udp-kind data udp-connect)
+              (write-udp-sender data client-no)
+              @peer2peer
+              (write-udp-connect-local-host data local-host)
+              @peer2peer
+              (write-udp-connect-local-port data local-port)
+              (write-udp-connect-video-level data (or (video-profile-level) -1))
+              (write-udp-code data)
+              (write-data data udp-port)))))
       
       @peer2peer (set! self.local-host local-host)
       @peer2peer (set! self.local-port local-port)
@@ -204,6 +204,14 @@
       (stop-task state-task)
       (set! state-task #f)
       (set! started? #f)))
+  
+  
+  (method (with-write-mutex self thunk)
+    (unwind-protect
+        (begin
+          (mutex-lock! write-mutex)
+          (thunk))
+      (mutex-unlock! write-mutex)))
   
   
   (method (snapshot-receive-streams self)
@@ -413,57 +421,57 @@
   
   
   (method package (send-media self channel-no buffer dts pts duration keyframe?)
-    (mutex-lock! write-mutex)
-    (let ((channel (find-send-channel self channel-no)))
-      (when channel
-        (let ((kind (get-media-kind channel)))
-          (define (send)
-            (send-media channel buffer dts pts duration keyframe?
-              (lambda (data)
-                (send-data self data))))
-          
-          (define (advance-frame!)
-            (let ((frame (next-frame-sequence! channel)))
-              (record-event udp-id-throttle-frame
-                            (fixnum->flonum channel-no)
-                            (fixnum->flonum client-no)
-                            (fixnum->flonum kind)
-                            -1.
-                            (fixnum->flonum frame)
-                            -1.
-                            -1.)))
-          
-          (if (simulation?)
-              (send)
-            (if throttle-media?
-                (advance-frame!)
-              (if (waiting-keyframe? channel)
-                  (if (not keyframe?)
-                      (begin
-                        (advance-frame!)
-                        (when udp-show-skipping?
-                          (format :terminal "{s} {s} {s}{%}" presence-name 'SKIPPING (get-frame-sequence channel))))
-                    (got-keyframe channel)
-                    (send))
-                (let ((now (current-seconds)))
-                  (if (and udp-throttle (> (- now last-received-ack) udp-throttle))
-                      (begin
-                        (set! throttle-media? #t)
-                        (iterate-table send-channels
-                          (lambda (no channel)
-                            (wait-keyframe channel)))
-                        (record-event udp-id-throttle-on
-                                      -1.
-                                      (fixnum->flonum server-no)
-                                      -1.
-                                      -1.
-                                      -1.
-                                      -1.
-                                      -1.)
-                        (when udp-show-throttle?
-                          (format :terminal "{s} {s} {s}{%}" presence-name 'THROTTLE 'ON)))
-                    (send)))))))))
-    (mutex-unlock! write-mutex))
+    (with-write-mutex self
+      (lambda ()
+        (let ((channel (find-send-channel self channel-no)))
+          (when channel
+            (let ((kind (get-media-kind channel)))
+              (define (send)
+                (send-media channel buffer dts pts duration keyframe?
+                  (lambda (data)
+                    (send-data self data))))
+              
+              (define (advance-frame!)
+                (let ((frame (next-frame-sequence! channel)))
+                  (record-event udp-id-throttle-frame
+                                (fixnum->flonum channel-no)
+                                (fixnum->flonum client-no)
+                                (fixnum->flonum kind)
+                                -1.
+                                (fixnum->flonum frame)
+                                -1.
+                                -1.)))
+              
+              (if (simulation?)
+                  (send)
+                (if throttle-media?
+                    (advance-frame!)
+                  (if (waiting-keyframe? channel)
+                      (if (not keyframe?)
+                          (begin
+                            (advance-frame!)
+                            (when udp-show-skipping?
+                              (format :terminal "{s} {s} {s}{%}" presence-name 'SKIPPING (get-frame-sequence channel))))
+                        (got-keyframe channel)
+                        (send))
+                    (let ((now (current-seconds)))
+                      (if (and udp-throttle (> (- now last-received-ack) udp-throttle))
+                          (begin
+                            (set! throttle-media? #t)
+                            (iterate-table send-channels
+                              (lambda (no channel)
+                                (wait-keyframe channel)))
+                            (record-event udp-id-throttle-on
+                                          -1.
+                                          (fixnum->flonum server-no)
+                                          -1.
+                                          -1.
+                                          -1.
+                                          -1.
+                                          -1.)
+                            (when udp-show-throttle?
+                              (format :terminal "{s} {s} {s}{%}" presence-name 'THROTTLE 'ON)))
+                        (send))))))))))))
   
   
   (method protected (next-profile-pulse-sequence! self)
@@ -482,50 +490,50 @@
   
   
   (method package (send-profile-pulse self)
-    (mutex-lock! write-mutex)
-    (let ((size (udp-profile-pulse-size)))
-      (let ((data (make-u8vector (+ size udp-code-size))))
-        (write-udp-sent data (current-seconds))
-        (write-udp-kind data udp-profile-pulse)
-        (write-udp-sender data client-no)
-        (write-udp-profile-pulse-sequence data (next-profile-pulse-sequence! self))
-        (write-udp-profile-pulse-packets-sent data 0)
-        (write-udp-profile-pulse-bytes-sent data 0)
-        (write-udp-profile-pulse-packets-received data 0)
-        (write-udp-profile-pulse-bytes-received data 0)
-        (write-udp-code data)
-        (send-data self data)))
-    (mutex-unlock! write-mutex))
+    (with-write-mutex self
+      (lambda ()
+        (let ((size (udp-profile-pulse-size)))
+          (let ((data (make-u8vector (+ size udp-code-size))))
+            (write-udp-sent data (current-seconds))
+            (write-udp-kind data udp-profile-pulse)
+            (write-udp-sender data client-no)
+            (write-udp-profile-pulse-sequence data (next-profile-pulse-sequence! self))
+            (write-udp-profile-pulse-packets-sent data 0)
+            (write-udp-profile-pulse-bytes-sent data 0)
+            (write-udp-profile-pulse-packets-received data 0)
+            (write-udp-profile-pulse-bytes-received data 0)
+            (write-udp-code data)
+            (send-data self data))))))
   
   
   (method package (send-profile-media self payload)
-    (mutex-lock! write-mutex)
-    (let ((size (udp-profile-media-size payload)))
-      (let ((data (make-u8vector (+ size udp-code-size))))
-        (write-udp-sent data (current-seconds))
-        (write-udp-kind data udp-profile-media)
-        (write-udp-sender data client-no)
-        (write-udp-profile-media-sequence data (next-profile-media-sequence! self))
-        (write-udp-profile-media-payload data payload)
-        (write-udp-code data)
-        (send-data self data)
-        (increase-sent profile-monitor data)))
-    (mutex-unlock! write-mutex))
+    (with-write-mutex self
+      (lambda ()
+        (let ((size (udp-profile-media-size payload)))
+          (let ((data (make-u8vector (+ size udp-code-size))))
+            (write-udp-sent data (current-seconds))
+            (write-udp-kind data udp-profile-media)
+            (write-udp-sender data client-no)
+            (write-udp-profile-media-sequence data (next-profile-media-sequence! self))
+            (write-udp-profile-media-payload data payload)
+            (write-udp-code data)
+            (send-data self data)
+            (increase-sent profile-monitor data))))))
   
   
   (method package (send-upload-ping self payload)
-    (mutex-lock! write-mutex)
-    (let ((size (udp-upload-ping-size payload)))
-      (let ((data (make-u8vector (+ size udp-code-size))))
-        (write-udp-sent data (current-seconds))
-        (write-udp-kind data udp-upload-ping)
-        (write-udp-sender data client-no)
-        (write-udp-upload-ping-sequence data (next-upload-ping-sequence! self))
-        (write-udp-upload-ping-payload data payload)
-        (write-udp-code data)
-        (send-data self data)
-        (increase-sent profile-monitor data)))
-    (mutex-unlock! write-mutex))
+    (with-write-mutex self
+      (lambda ()
+        (let ((size (udp-upload-ping-size payload)))
+          (let ((data (make-u8vector (+ size udp-code-size))))
+            (write-udp-sent data (current-seconds))
+            (write-udp-kind data udp-upload-ping)
+            (write-udp-sender data client-no)
+            (write-udp-upload-ping-sequence data (next-upload-ping-sequence! self))
+            (write-udp-upload-ping-payload data payload)
+            (write-udp-code data)
+            (send-data self data)
+            (increase-sent profile-monitor data))))))
   
   
   (method (send-data self data)
@@ -844,56 +852,56 @@
     
     (let ((state-sequence (next-state-sequence! self))
           (states (collect-states)))
-      (mutex-lock! write-mutex)
-      (let ((states (object->u8vector states)))
-        (let ((size (udp-state-size states)))
-          (let ((data (make-u8vector (+ size udp-code-size))))
-            (write-udp-sent data (current-seconds))
-            (write-udp-kind data udp-state)
-            (write-udp-sender data client-no)
-            (write-udp-state-sequence data state-sequence)
-            (write-udp-state-channels data states)
-            (write-udp-code data)
-            (send-data self data))))
-      (record-event udp-id-send-state
-                    -1.
-                    (fixnum->flonum client-no)
-                    -1.
-                    (fixnum->flonum state-sequence)
-                    -1.
-                    -1.
-                    -1.)
-      (mutex-unlock! write-mutex)))
+      (with-write-mutex self
+        (lambda ()
+          (let ((states (object->u8vector states)))
+            (let ((size (udp-state-size states)))
+              (let ((data (make-u8vector (+ size udp-code-size))))
+                (write-udp-sent data (current-seconds))
+                (write-udp-kind data udp-state)
+                (write-udp-sender data client-no)
+                (write-udp-state-sequence data state-sequence)
+                (write-udp-state-channels data states)
+                (write-udp-code data)
+                (send-data self data))))
+          (record-event udp-id-send-state
+                        -1.
+                        (fixnum->flonum client-no)
+                        -1.
+                        (fixnum->flonum state-sequence)
+                        -1.
+                        -1.
+                        -1.)))))
   
   
   (method (send-nack self channel-no media-kind missing)
     (when udp-show-nacks?
       (terminal presence-name (present-media-kind media-kind) '***send-nack*** missing))
-    (mutex-lock! write-mutex)
-    (let ((missing-vector (object->u8vector missing)))
-      (let ((size (udp-nack-size missing-vector)))
-        (let ((data (make-u8vector (+ size udp-code-size))))
-          (write-udp-sent data (current-seconds))
-          (write-udp-kind data udp-nack)
-          (write-udp-sender data client-no)
-          (write-udp-channel data channel-no)
-          (write-udp-nack-media-kind data media-kind)
-          (write-udp-nack-missing data missing-vector)
-          (write-udp-code data)
-          (send-data self data))))
-    (mutex-unlock! write-mutex))
+    (with-write-mutex self
+      (lambda ()
+        (let ((missing-vector (object->u8vector missing)))
+          (let ((size (udp-nack-size missing-vector)))
+            (let ((data (make-u8vector (+ size udp-code-size))))
+              (write-udp-sent data (current-seconds))
+              (write-udp-kind data udp-nack)
+              (write-udp-sender data client-no)
+              (write-udp-channel data channel-no)
+              (write-udp-nack-media-kind data media-kind)
+              (write-udp-nack-missing data missing-vector)
+              (write-udp-code data)
+              (send-data self data)))))))
   
   
   (method (send-alive self)
-    (mutex-lock! write-mutex)
-    (let ((size (udp-sender-header-size)))
-      (let ((data (make-u8vector (+ size udp-code-size))))
-        (write-udp-sent data (current-seconds))
-        (write-udp-kind data udp-alive)
-        (write-udp-sender data client-no)
-        (write-udp-code data)
-        (send-data self data)))
-    (mutex-unlock! write-mutex)))
+    (with-write-mutex self
+      (lambda ()
+        (let ((size (udp-sender-header-size)))
+          (let ((data (make-u8vector (+ size udp-code-size))))
+            (write-udp-sent data (current-seconds))
+            (write-udp-kind data udp-alive)
+            (write-udp-sender data client-no)
+            (write-udp-code data)
+            (send-data self data)))))))
 
 
 ;;;
