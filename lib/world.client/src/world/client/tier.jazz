@@ -161,7 +161,7 @@
         (handle-exception-filter
           connection-exception?
           (lambda (exc)
-            (bailout-client self exc (execution-stack)))
+            (bailout self exc (execution-stack)))
           (lambda ()
             (proc connection)))))
     (set! configuration (instantiate-client))
@@ -232,6 +232,7 @@
   
   
   (method override (shutdown self)
+    (reset-presence-process-handler)
     (save-to-processor self)
     (stop-to-server self)
     (close-live-stream self)
@@ -516,17 +517,31 @@
       (quit)))
   
   
-  (method (bailout-client self exc (stack #f))
-    (with-reentrant-task-mutex
+  (method (bailout self exc stack)
+    (with-bailout-mutex
+      (lambda ()
+        (let ((exit/restart/pristine (or (current-exit) (boot-restart) (event-restart) pristine-thread-continuation)))
+          (if bailout?
+              (continuation-return exit/restart/pristine #f)
+            (set-bailout? #t)
+            (delay-event
+              (lambda ()
+                (bailout-client self exc stack)
+                (with-bailout-mutex
+                  (lambda ()
+                    (reset-bailout-target)
+                    (set-bailout? #f)))))
+            (continuation-return exit/restart/pristine #f))))))
+  
+  
+  (method (bailout-client self exc stack)
+    (with-task-mutex
       (lambda ()
         (if (window?)
-            ;; this test is a simple solution
-            ;; to having multiple threads bailout
-            (let ((zone (current-zone+)))
-              (unless (or (eq? (current-thread) task-stopping) (and zone (login? zone)))
-                (detach-from-server self)
-                (let ((world (current-world)))
-                  (open-welcome world exception-title: "Disconnected from server" exception: exc exception-stack: stack))))
+            (begin
+              (detach-from-server self)
+              (let ((world (current-world)))
+                (open-welcome world exception-title: "Disconnected from server" exception: exc exception-stack: stack)))
           ;; too much for bots
           (unless bot?
             (snapshot-process exception: exc))
@@ -955,35 +970,15 @@
   
   
   (method (calling-serving self thunk)
-    (let ((exit (current-exit)))
-      (define (bailout exc stack)
-        ;; else if the current thread is the mutex owner
-        ;; and terminates the mutex will become abandoned
-        (mutex-unlock! mutex)
-        (if (not exit)
-            (let ((restart (or (boot-restart) (event-restart))))
-              (if restart
-                  (continuation-graft restart
-                    (lambda ()
-                      (bailout-client self exc stack)))
-                (snapshot-process exception: (new Error message: "No exit"))
-                (quit)))
-          (continuation-graft exit
-            (lambda ()
-              (bailout-client self exc stack)))))
-      
-      (define (call)
+    (handle-exception-filter
+      connection-exception?
+      (lambda (exc)
+        (bailout self exc (execution-stack)))
+      (lambda ()
         (let ((result (thunk)))
           (if (eq? result disconnect-marker)
-              (bailout (new Error message: "Received disconnect marker") (execution-stack))
-            result)))
-      
-      (handle-exception-filter
-        connection-exception?
-        (lambda (exc)
-          (bailout exc (execution-stack)))
-        (lambda ()
-          (call)))))
+              (bailout self (new Error message: "Received disconnect marker") (execution-stack))
+            result)))))
   
   
   ;;;
