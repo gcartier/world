@@ -73,6 +73,26 @@
   (world-setting 'world.server-max-connections #f))
 
 
+;; quick solution for sending the reconnected message
+;; while we are not keeping the disconnected delegate
+(definition protected disconnected-groups
+  (make-table test: equal?))
+
+(definition (registered-disconnected-group character-name)
+  (table-ref disconnected-groups character-name #f))
+
+(definition (register-disconnected-group character-name group)
+  (table-set! disconnected-groups character-name group))
+
+(definition (unregister-disconnected-group character-name)
+  (table-clear disconnected-groups character-name))
+
+(definition (cleanup-disconnected-group group)
+  (let ((character-name (table-find disconnected-groups group)))
+    (when character-name
+      (table-clear disconnected-groups character-name))))
+
+
 (definition world-assets-mutex
   (make-mutex 'world-assets))
 
@@ -341,7 +361,8 @@
   
   (method (delete-group self delegate group)
     (logger/activity self "Delete group{? {a}~} ({a})" (get-name group) (if delegate (get-name delegate) "Server"))
-    (set! groups (remove! group groups)))
+    (set! groups (remove! group groups))
+    (cleanup-disconnected-group group))
   
   
   (method (maybe-delete-group self delegate group)
@@ -371,7 +392,8 @@
                       (lambda ()
                         (server-disband client))))))
               (get-members group))
-    (set! groups (remove! group groups)))
+    (set! groups (remove! group groups))
+    (cleanup-disconnected-group group))
   
   
   (method (has-members? self group)
@@ -467,7 +489,11 @@
                                            (new Client-Delegate client 'connected client-uuid id (literal->id id self) character-name character-avatar character-dye character-script character-role character-admin?))))))
                     (logger/activity self "{a} {a}" (if existing-delegate "Reconnect" "Connect") character-name)
                     (unless existing-delegate
-                      (set! delegates (cons delegate delegates)))
+                      (set! delegates (cons delegate delegates))
+                      (let ((group (registered-disconnected-group character-name)))
+                        (when group
+                          (unregister-disconnected-group character-name)
+                          (broadcast-reconnected-to-group self delegate group))))
                     ;; retrieve character
                     (let ((client-id (get-id delegate))
                           (client-no (get-no delegate))
@@ -549,7 +575,7 @@
           (delegate-deconnect self delegate)))))
   
   
-  (method (delegate-deconnect self delegate)
+  (method (delegate-deconnect self delegate (broadcast-exited?: broadcast-exited? #t))
     (let ((client (get-client delegate))
           (name (get-name delegate)))
       ;; deconnect udp
@@ -567,7 +593,8 @@
       ;; closing remote
       (closing-remote-proxy-safe client)
       ;; broadcast
-      (broadcast-exited self delegate)
+      (when broadcast-exited?
+        (broadcast-exited self delegate))
       @peer2peer
       (broadcast-peers self)
       (broadcast-hierarchy self)))
@@ -2052,17 +2079,21 @@
     (for-each (lambda (client-delegate)
                 (let ((client-group (get-group client-delegate)))
                   (when client-group
-                    (let ((client-name (get-name client-delegate)))
-                      (for-each (lambda (delegate)
-                                  (unless (eq? delegate client-delegate)
-                                    (if (is? delegate Mobile-Delegate)
-                                        (send-disconnected self delegate client-name)
-                                      (let ((client (get-client delegate)))
-                                        (calling-client self delegate
-                                          (lambda ()
-                                            (server-disconnected client client-name)))))))
-                                (get-members client-group))))))
+                    (broadcast-disconnected-to-group self client-delegate client-group))))
               newly-disconnected))
+  
+  
+  (method (broadcast-disconnected-to-group self client-delegate client-group)
+    (let ((client-name (get-name client-delegate)))
+      (for-each (lambda (delegate)
+                  (unless (eq? delegate client-delegate)
+                    (if (is? delegate Mobile-Delegate)
+                        (send-disconnected self delegate client-name)
+                      (let ((client (get-client delegate)))
+                        (calling-client self delegate
+                          (lambda ()
+                            (server-disconnected client client-name)))))))
+                (get-members client-group))))
   
   
   (method (reconnect-client self client delegate uuid)
@@ -2080,17 +2111,22 @@
   
   (method (broadcast-reconnected self client-delegate)
     (let ((client-group (get-group client-delegate)))
-      (when (and client-group (memq? client-group groups))
-        (let ((client-name (get-name client-delegate)))
-          (for-each (lambda (delegate)
-                      (unless (eq? delegate client-delegate)
-                        (if (is? delegate Mobile-Delegate)
-                            (send-reconnected self delegate client-name)
-                          (let ((client (get-client delegate)))
-                            (calling-client self delegate
-                              (lambda ()
-                                (server-reconnected client client-name)))))))
-                    (get-members client-group))))))
+      (when client-group
+        (broadcast-reconnected-to-group self client-delegate client-group))))
+  
+  
+  (method (broadcast-reconnected-to-group self client-delegate client-group)
+    (when (memq? client-group groups)
+      (let ((client-name (get-name client-delegate)))
+        (for-each (lambda (delegate)
+                    (unless (eq? delegate client-delegate)
+                      (if (is? delegate Mobile-Delegate)
+                          (send-reconnected self delegate client-name)
+                        (let ((client (get-client delegate)))
+                          (calling-client self delegate
+                            (lambda ()
+                              (server-reconnected client client-name)))))))
+                  (get-members client-group)))))
   
   
   (method (giveup-client self delegate)
@@ -2101,13 +2137,17 @@
   
   
   (method (kick-client self delegate)
-    (let ((client (get-client delegate)))
+    (let ((client (get-client delegate))
+          (group (get-group delegate)))
       (logger/activity self "Kick {a}" (get-name delegate))
       (server-unregister-streams self (get-no delegate))
-      (client-stop self client)
-      (client-deconnect self client)
+      (delegate-stop self delegate)
+      (delegate-deconnect self delegate broadcast-exited?: #f)
       (disconnect-remote-proxy client)
-      (client-kick (get-remote-proxy (get-processor delegate)) client)))
+      (client-kick (get-remote-proxy (get-processor delegate)) client)
+      (when group
+        (register-disconnected-group (get-name delegate) group)
+        (broadcast-disconnected-to-group self delegate group))))
   
   
   ;;;
