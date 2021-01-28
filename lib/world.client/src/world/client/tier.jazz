@@ -732,6 +732,20 @@
           (client-unregister-stream remote-server remote-client stream-no)))))
   
   
+  (method package (channel-on self channel-no caps)
+    (when remote-server
+      (calling-server self
+        (lambda ()
+          (client-channel-on remote-server remote-client channel-no caps)))))
+  
+  
+  (method package (channel-off self channel-no)
+    (when remote-server
+      (calling-server self
+        (lambda ()
+          (client-channel-off remote-server remote-client channel-no)))))
+  
+  
   (method package (stream-action self stream-no action arguments)
     (calling-server self
       (lambda ()
@@ -1241,7 +1255,8 @@
               (let ((media-kind (get-media-kind channel)))
                 (ecase media-kind
                   ((udp-audio)
-                   (channel-output (current-audio) channel volume: (and (eq? source-kind 'stream) .5))
+                   (when (get-caps channel)
+                     (channel-output (current-audio) channel volume: (and (eq? source-kind 'stream) .5)))
                    (let ((video-channel (locate-stream-video-channel (get-stream channel))))
                      (when video-channel
                        (let ((output (find-output (current-video) (get-no video-channel))))
@@ -1289,6 +1304,30 @@
                (let ((output (find-output (current-video) (get-no channel))))
                  (when output
                    (set-stream-disconnected output))))))))))
+  
+  
+  (method package (stream-channel-on self channel-no caps)
+    (let ((channel (find-receive-channel udp-client channel-no)))
+      ;; lets be robust
+      (when channel
+        (set-caps channel caps)
+        (when (= (get-media-kind channel) udp-audio)
+          (let ((id (get-no channel)))
+            (let ((output (find-output (current-audio) id)))
+              (unless output
+                (channel-output (current-audio) channel volume: (and (eq? (get-source-kind channel) 'stream) .5)))))))))
+  
+  
+  (method package (stream-channel-off self channel-no)
+    (let ((channel (find-receive-channel udp-client channel-no)))
+      ;; lets be robust
+      (when channel
+        (set-caps channel #f)
+        (when (= (get-media-kind channel) udp-audio)
+          (let ((id (get-no channel)))
+            (let ((output (find-output (current-audio) id)))
+              (when output
+                (close-output (current-audio) id output))))))))
   
   
   (method package (streamer-update self origin video-level)
@@ -1716,7 +1755,7 @@
                                   stream-video-channels)))))))
             ;; camera
             (when camera-channel
-              (let ((playing? (camera-playing? self))
+              (let ((on? (camera-on? self))
                     (camera-pipeline (get-pipeline camera-channel)))
                 (let ((pipeline (get-pipeline (get-src camera-pipeline))))
                   (let ((elements (get-elements camera-pipeline)))
@@ -1750,7 +1789,7 @@
                                   (set-probe consumer new-probe)))))))
                       
                       (when (neq? new-consumer actual-consumer)
-                        (when playing?
+                        (when on?
                           (update-probe new-consumer #t))
                         (let ((self-output (get-self-output video))
                               (self-consumer (get-self-consumer video)))
@@ -1758,11 +1797,11 @@
                             (let ((new-output (if self-split? #f (create-self-output new-consumer))))
                               (unless self-split?
                                 (set-output new-consumer new-output))
-                              (when playing?
+                              (when on?
                                 (gst_app_sink_process_one new-consumer)
                                 (update-probe actual-consumer #f))
                               (set-processing? actual-consumer #f)
-                              (when playing?
+                              (when on?
                                 (stop-processing actual-consumer))
                               (set-stream-state (get-output actual-consumer) 'off)
                               (unless self-split?
@@ -1770,7 +1809,7 @@
                                   (close-self-output self-consumer))
                                 (install-self-output new-consumer rank: rank)))))
                         (set-processing? new-consumer #t)
-                        (when playing?
+                        (when on?
                           (start-processing new-consumer video-priority))))
                     ;; media
                     (for-each (lambda (element)
@@ -1781,7 +1820,7 @@
                                           (framerate (get-framerate profile)))
                                       (let ((processing? (<= level new-video-level)))
                                         (when (neq? processing? (get-processing? element))
-                                          (when playing?
+                                          (when on?
                                             (with-unref ((queue (gst_bin_get_by_name pipeline (tie "queue{name}"))))
                                               (with-unref ((pad (gst_element_get_static_pad queue "sink")))
                                                 (let ((new-probe (if processing?
@@ -1792,7 +1831,7 @@
                                                       (gst_pad_remove_probe pad probe)))
                                                   (set-probe element new-probe)))))
                                           (set-processing? element processing?)
-                                          (when playing?
+                                          (when on?
                                             (if processing?
                                                 (start-processing element video-priority)
                                               (stop-processing element)))))))))
@@ -1843,27 +1882,36 @@
   
   
   (method package (toggle-mic self)
-    (if (mic-playing? self)
+    (if (mic-on? self)
         (release-mic self feedback?: #t)
       (play-mic self feedback?: #t)))
   
   
   (method package (play-mic self (feedback?: feedback? #f))
     (let ((world (current-world)))
-      (play mic-channel)
-      (invalidate-self-output self)
-      (update-parameter world 'mic)
-      (when feedback?
-        (display-on/off world "Microphone" (mic-playing? self)))))
+      (unless (on? mic-channel)
+        (play mic-channel)
+        (let ((caps (require-caps mic-channel)))
+          (channel-on self (get-no mic-channel) caps)
+          (set-state mic-channel 'on)
+          (set-caps mic-channel caps))
+        (invalidate-self-output self)
+        (update-parameter world 'mic)
+        (when feedback?
+          (display-on/off world "Microphone" (mic-on? self))))))
   
   
   (method package (release-mic self (feedback?: feedback? #f))
     (let ((world (current-world)))
-      (release mic-channel)
-      (invalidate-self-output self)
-      (update-parameter world 'mic)
-      (when feedback?
-        (display-on/off world "Microphone" (mic-playing? self)))))
+      (when (on? mic-channel)
+        (release mic-channel)
+        (channel-off self (get-no mic-channel))
+        (set-state mic-channel 'off)
+        (set-caps mic-channel #f)
+        (invalidate-self-output self)
+        (update-parameter world 'mic)
+        (when feedback?
+          (display-on/off world "Microphone" (mic-on? self))))))
   
   
   (method (invalidate-self-output self)
@@ -1873,9 +1921,9 @@
           (invalidate-state self-output)))))
 
   
-  (method package (mic-playing? self)
+  (method package (mic-on? self)
     (and mic-channel
-         (playing? mic-channel)))
+         (on? mic-channel)))
   
   
   ;;;
@@ -1884,45 +1932,49 @@
   
   
   (method package (toggle-camera self)
-    (if (camera-playing? self)
+    (if (camera-on? self)
         (release-camera self feedback?: #t)
       (play-camera self feedback?: #t)))
   
   
   (method package (stop-camera self)
-    (when (camera-playing? self)
+    (when (camera-on? self)
       (release-camera self)))
   
   
   (method package (play-camera self (feedback?: feedback? #f))
     (let ((world (current-world)))
-      (play camera-channel)
-      (update-parameter world 'camera)
-      (when feedback?
-        (display-on/off world "Camera" (camera-playing? self)))))
+      (unless (on? camera-channel)
+        (play camera-channel)
+        (let ((caps (require-caps camera-channel)))
+          (channel-on self (get-no camera-channel) caps)
+          (set-state camera-channel 'on)
+          (set-caps camera-channel caps))
+        (update-parameter world 'camera)
+        (when feedback?
+          (display-on/off world "Camera" (camera-on? self))))))
   
   
   (method package (release-camera self (feedback?: feedback? #f))
     (let ((world (current-world)))
-      (release camera-channel)
-      (update-parameter world 'camera)
-      (when feedback?
-        (display-on/off world "Camera" (camera-playing? self)))))
+      (when (on? camera-channel)
+        (release camera-channel)
+        (channel-off self (get-no camera-channel))
+        (set-state camera-channel 'off)
+        (set-caps camera-channel #f)
+        (update-parameter world 'camera)
+        (when feedback?
+          (display-on/off world "Camera" (camera-on? self))))))
   
   
-  (method package (camera-playing? self)
+  (method package (camera-on? self)
     (and camera-channel
-         (playing? camera-channel)))
+         (on? camera-channel)))
   
   
   (method package (camera-caps self)
-    (and (camera-playing? self)
-         (let ((pipeline (get-pipeline (get-src (get-pipeline camera-channel)))))
-           (with-unref ((src (gst_bin_get_by_name pipeline "src")))
-             (with-unref ((pad (gst_element_get_static_pad src "src")))
-               (let ((caps (gst_pad_get_current_caps pad)))
-                 (prog1 (gst_caps_to_string caps)
-                   (gst_caps_unref caps))))))))
+    (and (camera-on? self)
+         (camera-caps (get-src (get-pipeline camera-channel)))))
   
   
   ;;;
