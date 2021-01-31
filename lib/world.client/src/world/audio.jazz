@@ -449,35 +449,47 @@
 ;;;
 
 
+(definition protected mic-pipeline
+  #f)
+
+(definition protected mic-listener
+  #f)
+
+(definition protected mic-caps
+  #f)
+
+
+(definition (require-mic-pipeline)
+  (assert mic-pipeline
+    mic-pipeline))
+
+(definition (require-mic-listener)
+  (assert mic-listener
+    mic-listener))
+
+(definition (require-mic-caps)
+  (assert mic-caps
+    mic-caps))
+
+
 (definition public (acquire-microphone)
-  #t)
-
-
-(class Mic-Audio-Src extends Audio-Src
-  
-  
-  (slot sink initialize #f accessors generate)
-  
-  
-  (method override (require-caps self)
+  (define (wait-caps appsink)
     (declare (proper-tail-calls))
-    (with-unref ((sink (gst_bin_get_by_name pipeline "sink")))
-      (with-unref ((pad (gst_element_get_static_pad sink "sink")))
-        (let (loop (n 0))
-          (if (> n 1000)
-              #f
-            (if (not (gst_pad_has_current_caps pad))
-                (begin
-                  (sleep .01)
-                  (loop (+ n 1)))
-              (let ((caps (gst_pad_get_current_caps pad)))
-                (let ((caps-string (gst_caps_to_string caps)))
-                  (gst_caps_unref caps)
-                  caps-string))))))))
+    (with-unref ((pad (gst_element_get_static_pad appsink "sink")))
+      (let (loop (n 0))
+        (if (> n 1000)
+            #f
+          (if (not (gst_pad_has_current_caps pad))
+              (begin
+                (sleep .01)
+                (loop (+ n 1)))
+            (let ((caps (gst_pad_get_current_caps pad)))
+              (let ((caps-string (gst_caps_to_string caps)))
+                (gst_caps_unref caps)
+                caps-string)))))))
   
-  
-  (method override (setup-element self)
-    (nextmethod self)
+  (if mic-pipeline
+      #t
     (let ((pipeline (gst-pipeline
                       ;; provide-clock=false to use the audio sink clock
                       ;; this makes sure audio and video stay synced
@@ -498,17 +510,51 @@
                       (and (eq? audio-codec 'vorbis) (tie "audio/x-raw, format=F32LE, layout=interleaved, rate={audio-rate}, channels=1"))
                       (and (eq? audio-codec 'vorbis) "vorbisenc name=enc")
                       "appsink name=sink")))
-      (gst_object_set_name pipeline "audio.mic")
       (let ((listener (open-stream-listener "mic")))
         (with-unref ((appsink (gst_bin_get_by_name pipeline "sink")))
           (gst_app_sink_connect_signals appsink listener)
+          (gst_element_set_state pipeline GST_STATE_PLAYING)
+          (let ((caps (wait-caps appsink)))
+            (if (not caps)
+                #f
+              (set! mic-pipeline pipeline)
+              (set! mic-listener listener)
+              (set! mic-caps caps)
+              #t)))))))
+
+
+(definition public (release-microphone)
+  (gst_bin_release mic-pipeline)
+  (set! mic-pipeline #f)
+  (set! mic-listener #f)
+  (set! mic-caps #f))
+
+
+(class Mic-Audio-Src extends Audio-Src
+  
+  
+  (slot sink initialize #f accessors generate)
+  
+  
+  (method override (require-caps self)
+    (require-mic-caps))
+  
+  
+  (method override (setup-element self)
+    (nextmethod self)
+    (let ((pipeline (require-mic-pipeline)))
+      (gst_object_set_name pipeline "audio.mic")
+      (let ((listener (require-mic-listener)))
+        (with-unref ((appsink (gst_bin_get_by_name pipeline "sink")))
           (setup-consumer consumer listener appsink 4096)
+          @already-done-in-acquire-microphone
           (gst_element_set_state pipeline GST_STATE_READY)
           (set! self.pipeline pipeline)))))
   
   
   (method override (start-element self)
     (nextmethod self)
+    @already-done-in-acquire-microphone
     (gst_element_set_state pipeline GST_STATE_PAUSED)
     (task-start self 'mic))
   
@@ -534,7 +580,7 @@
     (unless bailout?
       (consume consumer #f #f #f #f #f))
     (release-consumer consumer)
-    (gst_bin_release pipeline)
+    (release-microphone)
     (set! pipeline #f)))
 
 
