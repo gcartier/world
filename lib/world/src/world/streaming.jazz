@@ -16,9 +16,11 @@
 
 (import (jazz.event)
         (jazz.io)
+        (jazz.listener)
         (jazz.stream)
         (world)
         (world.audio)
+        (world.configure)
         (world.context)
         (world.event)
         (world.media)
@@ -629,4 +631,144 @@
         (let ((temp-file (new-brother file (add-extension base temp-extension))))
           (convert-to temp-file)
           (delete file)
-          (rename temp-file file)))))))
+          (rename temp-file file))))))
+
+
+;;;
+;;;; Record
+;;;
+
+
+(definition pad-recording?
+  #f)
+
+(definition pad-monitors
+  #f)
+
+
+(definition protected (record-start pads)
+  (let ((dir {Directory Settings "work" "records"})
+        (pipeline (get-pipeline (cache-audio))))
+    (define (parse-info info proc)
+      (cond ((string? info)
+             (proc info 'file))
+            ((pair? info)
+             (proc (first info) (second info)))))
+    
+    (define (parse-bin info)
+      (let ((parts (split info "%")))
+        (if (> (length parts) 1)
+            parts
+          (list #f info))))
+    
+    (define (find-bin bin-name)
+      (if (not bin-name)
+          pipeline
+        (if (equal? bin-name "mic")
+            (get-pipeline (get-src (get-pipeline (get-mic-channel (current-client)))))
+          (let ((sink (let ((sinks (get-ordered-outputs (current-audio))))
+                        (if (empty-string? bin-name)
+                            (car sinks)
+                          (find-if (lambda (sink)
+                                     (search (gst_object_get_name (get-bin sink)) bin-name ignore-case?: #t))
+                                   sinks)))))
+            (get-bin sink)))))
+    
+    (define (monitor info)
+      (parse-info info
+        (lambda (info what)
+          (bind (bin-name pad-info) (parse-bin info)
+            (let ((bin (find-bin bin-name)))
+              (define (monitor-file)
+                (let ((file (new-file dir (format "{a}.raw" info))))
+                  (let ((filename (path-normalize (parse file))))
+                    (let ((monitored (gst_monitor bin pad-info 'file filename)))
+                      (cons 'file (list monitored file))))))
+              
+              (define (monitor-analyse)
+                (let ((listener (open-stream-listener)))
+                  (let ((monitored (gst_monitor bin pad-info 'analyse (get-write-file listener)))
+                        (thread (new-thread
+                                  (lambda ()
+                                    (declare (proper-tail-calls))
+                                    (let ((discont 0)
+                                          (gap 0)
+                                          (expected 0)
+                                          (silence 0))
+                                      (let (loop)
+                                        (case (wait listener)
+                                          ((#\d)
+                                           (increase! discont)
+                                           (format :terminal "{a} : discont -> {a}{%}" pad-info discont)
+                                           (loop))
+                                          ((#\g)
+                                           (increase! gap)
+                                           (format :terminal "{a} : gap -> {a}{%}" pad-info gap)
+                                           (loop))
+                                          ((#\e)
+                                           (increase! expected)
+                                           (format :terminal "{a} : expected -> {a}{%}" pad-info expected)
+                                           (loop))
+                                          ((#\s)
+                                           (increase! silence)
+                                           (format :terminal "{a} : silence -> {a}{%}" pad-info silence)
+                                           (loop))))))
+                                  'monitor)))
+                    (thread-base-priority-set! thread background-priority)
+                    (thread-start! thread)
+                    (cons 'analyse (list monitored listener thread)))))
+              
+              (define (monitor-other)
+                (let ((monitored (gst_monitor bin pad-info what pipeline)))
+                  (cons what monitored)))
+              
+              (case what
+                ((file)
+                 (monitor-file))
+                ((analyse)
+                 (monitor-analyse))
+                (else
+                 (monitor-other))))))))
+      
+    (when (not pad-recording?)
+      (create-directories dir)
+      (set! pad-monitors (map monitor pads))
+      (set! pad-recording? #t))))
+
+
+(definition protected (record-done)
+  (define (unmonitor info)
+    (define (unmonitor-file rest)
+      (bind (monitored file) rest
+        (gst_unmonitor monitored)))
+    
+    (define (unmonitor-analyse rest)
+      (bind (monitored listener thread) rest
+        (exit-thread thread)
+        (close-stream-listener listener)
+        (gst_unmonitor monitored)))
+    
+    (define (unmonitor-other monitored)
+      (gst_unmonitor monitored))
+    
+    (bind (what . rest) info
+      (case what
+        ((file)
+         (unmonitor-file rest))
+        ((analyse)
+         (unmonitor-analyse rest))
+        (else
+         (unmonitor-other rest)))))
+  
+  (when pad-recording?
+    (for-each unmonitor pad-monitors)
+    (set! pad-recording? #f)))
+
+
+(definition protected (recorded-files)
+  (and pad-monitors (collect (lambda (info)
+                               (bind (what . rest) info
+                                 (and (eq? what 'file)
+                                      (bind (monitored file) rest
+                                        file))))
+                             pad-monitors))))
