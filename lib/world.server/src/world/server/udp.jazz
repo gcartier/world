@@ -29,6 +29,7 @@
         (world.event)
         (world.evolution)
         (world.profiling)
+        (world.record (phase syntax))
         (world.ring)
         (world.server.client)
         (world.server.group)
@@ -230,7 +231,8 @@
               (problem "Receiving data: Invalid code: {a}" code)
               (increase! invalid-packets))
           (mutex-lock! server-mutex)
-          (let ((sender (read-udp-sender data)))
+          (let ((sender (with-record header
+                          (read-header-sender data))))
             (let ((connection (no->connection self sender)))
               (when connection
                 ;; experiment for a udp timeout hypothesis
@@ -251,7 +253,8 @@
                         (format :terminal "{s} {s} {s} {s} {s}{%}" presence-name '***reconnect*** sender (get-port connection) source-port))
                       (update-host/port connection source-host source-port))))
                 (increase-received connection data))))
-          (let ((kind (read-udp-kind data)))
+          (let ((kind (with-record header
+                        (read-header-kind data))))
             (ecase kind
               ((udp-connect)
                (connect-source self data))
@@ -275,61 +278,62 @@
   
   
   (method (connect-source self data)
-    (let ((sent (read-udp-sent data))
-          (sender (read-udp-sender data))
-          @peer2peer
-          (local-host (read-udp-connect-local-host data))
-          @peer2peer
-          (local-port (read-udp-connect-local-port data))
-          (video-level (read-udp-connect-video-level data))
-          (source-info (udp-source-socket-info udp-port)))
-      (define (udp-simulator)
-        (cond-expand
-          (devel (let ((latency udp-latency)
-                       (drop udp-drop))
-                   (if (or latency drop)
-                       (new-simulator self latency drop)
-                     #f)))
-          (else #f)))
-      
-      (let ((source-host (socket-info-address source-info))
-            (source-port (socket-info-port-number source-info)))
-        (define (send-connected connection)
-          (udp-destination-set! source-host source-port udp-port)
-          (let ((size (udp-sender-header-size)))
-            (let ((data (make-u8vector (+ size udp-code-size))))
-              (write-udp-sent data sent)
-              (write-udp-kind data udp-connected)
-              (write-udp-sender data server-no)
-              (write-udp-code data)
-              (write-data data udp-port)
-              (increase-sent connection data))))
+    (with-record connect
+      (let ((sent (read-header-sent data))
+            (sender (read-header-sender data))
+            @peer2peer
+            (local-host (read-connect-local-host data))
+            @peer2peer
+            (local-port (read-connect-local-port data))
+            (video-level (read-connect-video-level data))
+            (source-info (udp-source-socket-info udp-port)))
+        (define (udp-simulator)
+          (cond-expand
+            (devel (let ((latency udp-latency)
+                         (drop udp-drop))
+                     (if (or latency drop)
+                         (new-simulator self latency drop)
+                       #f)))
+            (else #f)))
         
-        (let ((existing-connection (no->connection self sender)))
-          (if existing-connection
-              (begin
-                (send-connected existing-connection)
-                (let ((video-level (get-video-level existing-connection)))
+        (let ((source-host (socket-info-address source-info))
+              (source-port (socket-info-port-number source-info)))
+          (define (send-connected connection)
+            (udp-destination-set! source-host source-port udp-port)
+            (let ((size (udp-sender-header-size)))
+              (let ((data (make-u8vector (+ size udp-code-size))))
+                (write-header-sent data sent)
+                (write-header-kind data udp-connected)
+                (write-header-sender data server-no)
+                (write-udp-code data)
+                (write-data data udp-port)
+                (increase-sent connection data))))
+          
+          (let ((existing-connection (no->connection self sender)))
+            (if existing-connection
+                (begin
+                  (send-connected existing-connection)
+                  (let ((video-level (get-video-level existing-connection)))
+                    (record-event udp-id-connect
+                                  -1.
+                                  (fixnum->flonum sender)
+                                  -1.
+                                  reconnect-marker
+                                  (if video-level (fixnum->flonum video-level) -1.)
+                                  -1.
+                                  -1.)))
+              (let ((video-level (and (/= video-level -1) video-level)))
+                (let ((connection (new UDP-Connection source-host source-port @peer2peer local-host @peer2peer local-port (udp-simulator) video-level)))
+                  (register-connection self sender connection)
+                  (send-connected connection)
                   (record-event udp-id-connect
                                 -1.
                                 (fixnum->flonum sender)
                                 -1.
-                                reconnect-marker
+                                -1.
                                 (if video-level (fixnum->flonum video-level) -1.)
                                 -1.
-                                -1.)))
-            (let ((video-level (and (/= video-level -1) video-level)))
-              (let ((connection (new UDP-Connection source-host source-port @peer2peer local-host @peer2peer local-port (udp-simulator) video-level)))
-                (register-connection self sender connection)
-                (send-connected connection)
-                (record-event udp-id-connect
-                              -1.
-                              (fixnum->flonum sender)
-                              -1.
-                              -1.
-                              (if video-level (fixnum->flonum video-level) -1.)
-                              -1.
-                              -1.))))))))
+                                -1.)))))))))
   
   
   (method package (deconnect-source self no)
@@ -405,66 +409,69 @@
   
   
   (method (receive-state self data)
-    (let ((sender (read-udp-sender data)))
-      ;; ack
-      (send-ack self sender data)
-      ;; throttling
-      (let ((connection (no->connection self sender)))
-        (when connection
-          (set-last-received-state connection (current-seconds))
-          (when (get-throttle-media? connection)
-            (set-throttle-media? connection #f)
-            (record-event udp-id-throttle-off
-                          -1.
-                          (fixnum->flonum sender)
-                          -1.
-                          (fixnum->flonum (read-udp-state-sequence data))
-                          -1.
-                          -1.
-                          -1.)
-            (when udp-show-throttle?
-              (let ((delegate (find-delegate-by-no (current-server) sender)))
-                (format :terminal "{s} {s} {a} {s}{%}" presence-name 'THROTTLE (if delegate (get-name delegate) sender) 'OFF))))))
-      ;; reset
-      (let ((states (u8vector->object (read-udp-state-channels data)))
-            (really-needs-reset '()))
-        (for-each (lambda (info)
-                    (bind (channel-no client-state) info
-                      (let ((channel (find-send-channel self channel-no)))
-                        (when (and channel (eq? client-state 'waiting))
-                          ;; quicky around video still sending waiting
-                          (when (= (get-media-kind channel) udp-audio)
-                            (set! really-needs-reset (cons channel really-needs-reset)))))))
-                  states)
-        (when (not-null? really-needs-reset)
-          (delay-event
-            (lambda ()
-              (for-each reset-media really-needs-reset)))))
-      ;; broadcast
-      (broadcast-state self sender data)))
+    (with-record state
+      (let ((sender (read-header-sender data)))
+        ;; ack
+        (send-ack self sender data)
+        ;; throttling
+        (let ((connection (no->connection self sender)))
+          (when connection
+            (set-last-received-state connection (current-seconds))
+            (when (get-throttle-media? connection)
+              (set-throttle-media? connection #f)
+              (record-event udp-id-throttle-off
+                            -1.
+                            (fixnum->flonum sender)
+                            -1.
+                            (fixnum->flonum (read-state-sequence data))
+                            -1.
+                            -1.
+                            -1.)
+              (when udp-show-throttle?
+                (let ((delegate (find-delegate-by-no (current-server) sender)))
+                  (format :terminal "{s} {s} {a} {s}{%}" presence-name 'THROTTLE (if delegate (get-name delegate) sender) 'OFF))))))
+        ;; reset
+        (let ((states (u8vector->object (read-state-channels data)))
+              (really-needs-reset '()))
+          (for-each (lambda (info)
+                      (bind (channel-no client-state) info
+                        (let ((channel (find-send-channel self channel-no)))
+                          (when (and channel (eq? client-state 'waiting))
+                            ;; quicky around video still sending waiting
+                            (when (= (get-media-kind channel) udp-audio)
+                              (set! really-needs-reset (cons channel really-needs-reset)))))))
+                    states)
+          (when (not-null? really-needs-reset)
+            (delay-event
+              (lambda ()
+                (for-each reset-media really-needs-reset)))))
+        ;; broadcast
+        (broadcast-state self sender data))))
   
   
   (method (receive-nack self data)
-    (let ((channel-no (read-udp-channel data))
-          (sender (read-udp-sender data))
-          (media-kind (read-udp-nack-media-kind data))
-          (missing (u8vector->object (read-udp-nack-missing data))))
-      (send-missing self sender channel-no media-kind missing)))
+    (with-record nack
+      (let ((sender (read-header-sender data))
+            (channel-no (read-nack-channel data))
+            (media-kind (read-nack-media-kind data))
+            (missing (u8vector->object (read-nack-missing data))))
+        (send-missing self sender channel-no media-kind missing))))
   
   
   (method (receive-media self kind data)
-    (let ((channel-no (read-udp-channel data))
-          (sender (read-udp-sender data)))
-      (let ((channel (find-server-channel self channel-no)))
-        (when channel
-          (retain-media channel data)
-          (broadcast-media self channel kind data)
-          (let ((frame (read-udp-frame data))
-                (last-nacked-frame (get-last-nacked-frame channel)))
-            (when (or (not last-nacked-frame)
-                      (> frame last-nacked-frame))
-              (send-nacks self sender channel-no kind channel)
-              (set-last-nacked-frame channel frame)))))))
+    (with-record media
+      (let ((channel-no (read-media-channel data))
+            (sender (read-header-sender data)))
+        (let ((channel (find-server-channel self channel-no)))
+          (when channel
+            (retain-media channel data)
+            (broadcast-media self channel kind data)
+            (let ((frame (read-media-frame data))
+                  (last-nacked-frame (get-last-nacked-frame channel)))
+              (when (or (not last-nacked-frame)
+                        (> frame last-nacked-frame))
+                (send-nacks self sender channel-no kind channel)
+                (set-last-nacked-frame channel frame))))))))
   
   
   (method (send-nacks self sender channel-no kind channel)
@@ -482,20 +489,21 @@
         (for-each (lambda (sequence)
                     (let ((data (locate-data ring sequence)))
                       (if data
-                          (let ((connection (no->connection self sender)))
-                            (when udp-show-nacks?
-                              (terminal presence-name (present-media-kind media-kind) '***nack-found-on-server*** sequence))
-                            (increase-udp-resent data)
-                            (send-data self connection data)
-                            (let ((frame (read-udp-frame data)))
-                              (record-event udp-id-resend-packet
-                                            (fixnum->flonum channel-no)
-                                            (fixnum->flonum sender)
-                                            (fixnum->flonum media-kind)
-                                            (fixnum->flonum sequence)
-                                            (fixnum->flonum frame)
-                                            -1.
-                                            -1.)))
+                          (with-record media
+                            (let ((connection (no->connection self sender)))
+                              (increase-media-resent data)
+                              (send-data self connection data)
+                              (let ((frame (read-media-frame data)))
+                                (record-event udp-id-resend-packet
+                                              (fixnum->flonum channel-no)
+                                              (fixnum->flonum sender)
+                                              (fixnum->flonum media-kind)
+                                              (fixnum->flonum sequence)
+                                              (fixnum->flonum frame)
+                                              -1.
+                                              -1.))
+                              (when udp-show-nacks?
+                                (terminal presence-name (present-media-kind media-kind) '***nack-resent-from-server*** sequence))))
                         (record-event udp-id-absent-packet
                                       (fixnum->flonum channel-no)
                                       (fixnum->flonum sender)
@@ -504,6 +512,8 @@
                                       -1.
                                       -1.
                                       -1.)
+                        (when udp-show-nacks?
+                          (terminal presence-name (present-media-kind media-kind) '***nack-absent-on-server*** sequence))
                         ;; we already nacked the source early and will broadcast
                         ;; when we receive the resent so we can ignore this nack
                         )))
@@ -513,17 +523,18 @@
   (method (send-nack self connection channel-no media-kind missing)
     (when udp-show-nacks?
       (terminal presence-name (present-media-kind media-kind) '***send-nack*** missing))
-    (let ((missing-vector (object->u8vector missing)))
-      (let ((size (udp-nack-size missing-vector)))
-        (let ((data (make-u8vector (+ size udp-code-size))))
-          (write-udp-sent data (current-seconds))
-          (write-udp-kind data udp-nack)
-          (write-udp-sender data server-no)
-          (write-udp-channel data channel-no)
-          (write-udp-nack-media-kind data media-kind)
-          (write-udp-nack-missing data missing-vector)
-          (write-udp-code data)
-          (send-data self connection data)))))
+    (with-record nack
+      (let ((missing-vector (object->u8vector missing)))
+        (let ((size (udp-nack-size missing-vector)))
+          (let ((data (make-u8vector (+ size udp-code-size))))
+            (write-header-sent data (current-seconds))
+            (write-header-kind data udp-nack)
+            (write-header-sender data server-no)
+            (write-nack-channel data channel-no)
+            (write-nack-media-kind data media-kind)
+            (write-nack-missing data missing-vector)
+            (write-udp-code data)
+            (send-data self connection data))))))
   
   
   (method (send-ack self sender data)
@@ -534,29 +545,33 @@
                 (bytes-sent (get-bytes-sent monitor))
                 (packets-received (get-packets-received monitor))
                 (bytes-received (get-bytes-received monitor)))
-            (let ((size (udp-ack-size))
-                  (sent (read-udp-sent data))
-                  (state-sequence (read-udp-state-sequence data)))
-              (let ((data (make-u8vector (+ size udp-code-size))))
-                (write-udp-sent data (current-seconds))
-                (write-udp-kind data udp-ack)
-                (write-udp-sender data sender)
-                (write-udp-ack-state-sent data sent)
-                (write-udp-ack-state-sequence data state-sequence)
-                (write-udp-ack-packets-sent data packets-sent)
-                (write-udp-ack-bytes-sent data bytes-sent)
-                (write-udp-ack-packets-received data packets-received)
-                (write-udp-ack-bytes-received data bytes-received)
-                (write-udp-code data)
-                (send-data self connection data))
-              (record-event udp-id-send-ack
-                            -1.
-                            (fixnum->flonum sender)
-                            -1.
-                            (fixnum->flonum state-sequence)
-                            -1.
-                            -1.
-                            -1.)))))))
+            (define (extract)
+              (with-record state
+                (values (read-header-sent data) (read-state-sequence data))))
+            
+            (receive (sent state-sequence) (extract)
+              (with-record ack
+                (let ((size (udp-ack-size)))
+                  (let ((data (make-u8vector (+ size udp-code-size))))
+                    (write-header-sent data (current-seconds))
+                    (write-header-kind data udp-ack)
+                    (write-header-sender data sender)
+                    (write-ack-state-sent data sent)
+                    (write-ack-state-sequence data state-sequence)
+                    (write-ack-packets-sent data packets-sent)
+                    (write-ack-bytes-sent data bytes-sent)
+                    (write-ack-packets-received data packets-received)
+                    (write-ack-bytes-received data bytes-received)
+                    (write-udp-code data)
+                    (send-data self connection data))
+                  (record-event udp-id-send-ack
+                                -1.
+                                (fixnum->flonum sender)
+                                -1.
+                                (fixnum->flonum state-sequence)
+                                -1.
+                                -1.
+                                -1.)))))))))
   
   
   (method (broadcast-state self sender data)
@@ -592,11 +607,12 @@
                                       (when last-received-state
                                         (unless (get-throttle-media? connection)
                                           (if (waiting-keyframe? connection channel)
-                                              (if (not (read-udp-media-keyframe? data))
-                                                  (when udp-show-skipping?
-                                                    (format :terminal "{s} {s} {s}{%}" presence-name 'SKIPPING (read-udp-frame data)))
-                                                (got-keyframe connection channel)
-                                                (send-data self connection data))
+                                              (with-record media
+                                                (if (not (read-media-keyframe? data))
+                                                    (when udp-show-skipping?
+                                                      (format :terminal "{s} {s} {s}{%}" presence-name 'SKIPPING (read-media-frame data)))
+                                                  (got-keyframe connection channel)
+                                                  (send-data self connection data)))
                                             (let ((now (current-seconds)))
                                               (if (and udp-throttle (> (- now last-received-state) udp-throttle))
                                                   (begin
@@ -633,53 +649,58 @@
     
   
   (method (receive-alive self data)
-    (let ((sender (read-udp-sender data)))
-      (send-alive-ack self sender data)))
+    (with-record header
+      (let ((sender (read-header-sender data)))
+        (send-alive-ack self sender data))))
   
   
   (method (send-alive-ack self sender data)
     (let ((connection (no->connection self sender)))
       (when connection
-        (let ((size (udp-sender-header-size)))
-          (let ((data (make-u8vector (+ size udp-code-size))))
-            (write-udp-sent data (current-seconds))
-            (write-udp-kind data udp-alive-ack)
-            (write-udp-sender data sender)
-            (write-udp-code data)
-            (send-data self connection data))))))
+        (with-record header
+          (let ((size (udp-sender-header-size)))
+            (let ((data (make-u8vector (+ size udp-code-size))))
+              (write-header-sent data (current-seconds))
+              (write-header-kind data udp-alive-ack)
+              (write-header-sender data sender)
+              (write-udp-code data)
+              (send-data self connection data)))))))
 
   
   (method package (send-profile-media self connection sequence payload)
     (mutex-lock! server-mutex)
-    (let ((size (udp-profile-media-size payload)))
-      (let ((data (make-u8vector (+ size udp-code-size))))
-        (write-udp-sent data (current-seconds))
-        (write-udp-kind data udp-profile-media)
-        (write-udp-sender data server-no)
-        (write-udp-profile-media-sequence data sequence)
-        (write-udp-profile-media-payload data payload)
-        (write-udp-code data)
-        (send-data self connection data)))
+    (with-record profile-media
+      (let ((size (udp-profile-media-size payload)))
+        (let ((data (make-u8vector (+ size udp-code-size))))
+          (write-header-sent data (current-seconds))
+          (write-header-kind data udp-profile-media)
+          (write-header-sender data server-no)
+          (write-profile-media-sequence data sequence)
+          (write-profile-media-payload data payload)
+          (write-udp-code data)
+          (send-data self connection data))))
     (mutex-unlock! server-mutex))
   
   
   (method (receive-profile-pulse self data)
-    (let ((sender (read-udp-sender data)))
-      (let ((connection (no->connection self sender)))
-        (when connection
-          (receive-profile-pulse connection data)
-          (send-data self connection data))))
-    (when udp-show-profile?
-      (format :terminal "{s} {s} {s}{%}" presence-name 'PROFILE 'PULSE)))
+    (with-record profile-pulse
+      (let ((sender (read-header-sender data)))
+        (let ((connection (no->connection self sender)))
+          (when connection
+            (receive-profile-pulse connection data)
+            (send-data self connection data))))
+      (when udp-show-profile?
+        (format :terminal "{s} {s} {s}{%}" presence-name 'PROFILE 'PULSE))))
   
   
   (method (receive-profile-media self data)
-    (let ((sender (read-udp-sender data)))
-      (let ((connection (no->connection self sender)))
-        (when connection
-          (receive-profile-media connection data))))
-    (when udp-show-profile?
-      (format :terminal "{s} {s} {s}{%}" presence-name 'PROFILE 'MEDIA)))
+    (with-record profile-media
+      (let ((sender (read-header-sender data)))
+        (let ((connection (no->connection self sender)))
+          (when connection
+            (receive-profile-media connection data))))
+      (when udp-show-profile?
+        (format :terminal "{s} {s} {s}{%}" presence-name 'PROFILE 'MEDIA))))
   
   
   (method (receive-upload-ping self data)
@@ -832,33 +853,35 @@
   
   
   (method (receive-profile-pulse self data)
-    (increase-received profile-monitor data)
-    (write-udp-profile-pulse-sent data (current-seconds))
-    (write-udp-profile-pulse-packets-sent data (get-packets-sent profile-monitor))
-    (write-udp-profile-pulse-bytes-sent data (get-bytes-sent profile-monitor))
-    (write-udp-profile-pulse-packets-received data (get-packets-received profile-monitor))
-    (write-udp-profile-pulse-bytes-received data (get-bytes-received profile-monitor))
-    (increase-sent profile-monitor data))
+    (with-record profile-pulse
+      (increase-received profile-monitor data)
+      (write-profile-pulse-sent data (current-seconds))
+      (write-profile-pulse-packets-sent data (get-packets-sent profile-monitor))
+      (write-profile-pulse-bytes-sent data (get-bytes-sent profile-monitor))
+      (write-profile-pulse-packets-received data (get-packets-received profile-monitor))
+      (write-profile-pulse-bytes-received data (get-bytes-received profile-monitor))
+      (increase-sent profile-monitor data)))
   
   
   (method package (receive-profile-media self data)
-    (let ((sender (read-udp-sender data))
-          (sequence (read-udp-profile-media-sequence data)))
-      (when profile-last-sequence
-        (let ((expected-sequence (+ profile-last-sequence 1)))
-          (when (/= sequence expected-sequence)
-            (parameterize ((simulation-evolution profile-evolution))
-              (loop (for seq from expected-sequence below sequence)
-                    (record-event udp-id-lost-packet
-                                  -1.
-                                  (fixnum->flonum sender)
-                                  (fixnum->flonum udp-audio)
-                                  (fixnum->flonum seq)
-                                  -1.
-                                  -1.
-                                  -1.))))))
-      (set! profile-last-sequence sequence)
-      (increase-received profile-monitor data))))
+    (with-record profile-media
+      (let ((sender (read-header-sender data))
+            (sequence (read-profile-media-sequence data)))
+        (when profile-last-sequence
+          (let ((expected-sequence (+ profile-last-sequence 1)))
+            (when (/= sequence expected-sequence)
+              (parameterize ((simulation-evolution profile-evolution))
+                (loop (for seq from expected-sequence below sequence)
+                      (record-event udp-id-lost-packet
+                                    -1.
+                                    (fixnum->flonum sender)
+                                    (fixnum->flonum udp-audio)
+                                    (fixnum->flonum seq)
+                                    -1.
+                                    -1.
+                                    -1.))))))
+        (set! profile-last-sequence sequence)
+        (increase-received profile-monitor data)))))
 
 
 ;;;
@@ -955,15 +978,16 @@
                           -1.
                           -1.
                           -1.))
-        (let ((sequence (read-udp-sequence data))
-              (frame (read-udp-frame data))
-              (dts (read-udp-media-dts data))
-              (pts (read-udp-media-pts data)))
-          (record-event udp-id-release-packet
-                        (fixnum->flonum no)
-                        (fixnum->flonum origin)
-                        (fixnum->flonum media-kind)
-                        (fixnum->flonum sequence)
-                        (fixnum->flonum frame)
-                        -1.
-                        (timestamp->flonum dts))))))))
+        (with-record media
+          (let ((sequence (read-media-sequence data))
+                (frame (read-media-frame data))
+                (dts (read-media-dts data))
+                (pts (read-media-pts data)))
+            (record-event udp-id-release-packet
+                          (fixnum->flonum no)
+                          (fixnum->flonum origin)
+                          (fixnum->flonum media-kind)
+                          (fixnum->flonum sequence)
+                          (fixnum->flonum frame)
+                          -1.
+                          (timestamp->flonum dts)))))))))

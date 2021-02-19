@@ -39,67 +39,146 @@
   (method override (initialize self offset next)
     (nextmethod self)
     (set! self.offset offset)
-    (set! self.next next)))
+    (set! self.next next))
+  
+  
+  (method override (print self output readably)
+    (print-unreadable self output
+      (lambda (output)
+        (format output "{a} {a}" offset next)))))
 
 
-(definition record-fields
+(definition (field-next record name)
+  (get-next (registered-field record name)))
+
+(definition (field-offset record name)
+  (get-offset (registered-field record name)))
+
+
+(macro public (fieldoffset record-name name)
+  (field-offset (require-record record-name) name))
+
+
+(macro public (define-field record-name name previous replace kind (type #f))
+  (let ((record (require-record record-name)))
+    (define (determine-offset)
+      (cond ((pair? previous)
+             (record-size (car previous)))
+            (replace
+             (bind (record-name field-name) replace
+               (field-offset (require-record record-name) field-name)))
+            (else
+             (field-next record previous))))
+    
+    (let ((offset (determine-offset))
+          (size (table-ref kind-sizes kind))
+          (type (if type (list type) '()))
+          (read (string->symbol (format "read-{a}-{a}^" record-name name)))
+          (write (string->symbol (format "write-{a}-{a}^" record-name name)))
+          (scan (string->symbol (string-append "scan-" (symbol->string kind))))
+          (put (string->symbol (string-append "put-" (symbol->string kind)))))
+      (register-field record name (new Record-Field offset (+ offset size)))
+      `(begin
+         (definition public (,read data) ,@type
+                     (,scan data ,offset))
+         
+         (definition public (,write data value)
+           (,put data ,offset value))))))
+
+
+(class Record extends Object
+  
+  
+  (slot ascendant   getter generate)
+  (slot offset      getter generate)
+  (slot fields      getter generate)
+  (slot field-names getter generate)
+  (slot last-name   getter generate)
+  
+  
+  (method override (initialize self ascendant offset field-names last-name)
+    (nextmethod self)
+    (set! self.ascendant ascendant)
+    (set! self.offset offset)
+    (set! self.fields (make-table test: eq?))
+    (set! self.field-names field-names)
+    (set! self.last-name last-name))
+  
+  
+  (method override (print self output readably)
+    (print-unreadable self output
+      (lambda (output)
+        (format output "{a} {a}" ascendant offset))))
+  
+  
+  (method protected (register-field self name field)
+    (table-set! fields name field))
+  
+  
+  (method protected (registered-field self name)
+    (table-ref fields name)))
+
+
+(definition records
   (make-table test: eq?))
 
 
-(definition (field-next name)
-  (let ((next (if (not name)
-                  0
-                (get-next (table-ref record-fields name)))))
-    (if (symbol? next)
-        (field-next next)
-      next)))
+(definition (require-record name)
+  (table-ref records name))
 
 
-(macro public (fieldoffset name)
-  (get-offset (table-ref record-fields name)))
-
-(macro public (fieldnext name)
-  (field-next name))
-
-
-(macro public (define-field name previous kind (type #f))
-  (let ((offset (field-next previous))
-        (size (table-ref kind-sizes kind))
-        (type (if type (list type) '()))
-        (read (string->symbol (string-append "read-udp-" (symbol->string name))))
-        (write (string->symbol (string-append "write-udp-" (symbol->string name))))
-        (scan (string->symbol (string-append "scan-" (symbol->string kind))))
-        (put (string->symbol (string-append "put-" (symbol->string kind)))))
-    (table-set! record-fields name (new Record-Field offset (+ offset size)))
-    `(begin
-       (definition public (,read data) ,@type
-         (,scan data ,offset))
-       
-       (definition public (,write data value)
-         (,put data ,offset value)))))
+(definition (record-size name)
+  (if (not name)
+      0
+    (let ((record (require-record name)))
+      (field-next record (get-last-name record)))))
 
 
-(macro public (define-record name . fields)
+(macro public (recordsize name)
+  (record-size name))
+
+
+(macro public (define-record name . infos)
   (define (parse)
-    (if (and (pair? fields) (symbol? (car fields)))
-        (values (car fields) (cdr fields))
-      (values #f fields)))
+    (if (and (pair? infos) (symbol? (car infos)))
+        (values (car infos) (cdr infos))
+      (values #f infos)))
   
-  (receive (ascendant fields) (parse)
-    (let ((previous ascendant))
-      (table-set! record-fields name (let ((offset (if (not ascendant)
-                                                       0
-                                                     (field-next ascendant)))
-                                           (next (if (null? fields)
-                                                     (if (not ascendant)
-                                                         0
-                                                       ascendant)
-                                                   (car (last fields)))))
-                                       (new Record-Field offset next)))
-      `(begin
-         ,@(map (lambda (field)
-                  (bind (name kind . rest) field
-                    (bind-optionals ((type #f)) rest
-                      (prog1 `(define-field ,name ,previous ,kind ,type)
-                        (set! previous name)))))
-                fields))))))
+  (assert (not-null? infos)
+    (receive (ascendant infos) (parse)
+      (let ((previous (list ascendant))
+            (offset (if (not ascendant)
+                        0
+                      (record-size ascendant)))
+            (field-names (map car infos)))
+        (table-set! records name (new Record ascendant offset field-names (last field-names)))
+        `(begin
+           ,@(map (lambda (info)
+                    (bind (field-name kind . rest) info
+                      (bind-optionals ((type/replace #f)) rest
+                        (if (pair? type/replace)
+                            `(define-field ,name ,field-name #f ,type/replace ,kind #f)
+                          (prog1 `(define-field ,name ,field-name ,previous #f ,kind ,type/replace)
+                            (set! previous field-name))))))
+                  infos))))))
+
+
+(macro public (with-record record-name . body)
+  `(let-macro (,@(let ((queue (new-queue)))
+                   (define (add name)
+                     (let ((record (require-record name)))
+                       (let ((ascendant (get-ascendant record)))
+                         (when ascendant
+                           (add ascendant)))
+                       (for-each (lambda (field-name)
+                                   (let ((reader (string->symbol (format "read-{a}-{a}" name field-name)))
+                                         (read (string->symbol (format "read-{a}-{a}^" name field-name)))
+                                         (writer (string->symbol (format "write-{a}-{a}" name field-name)))
+                                         (write (string->symbol (format "write-{a}-{a}^" name field-name))))
+                                     (enqueue queue (list reader (list 'lambda '(data) (list 'quasiquote (list read ',data)))))
+                                     (enqueue queue (list writer (list 'lambda '(data value) (list 'quasiquote (list write ',data ',value)))))))
+                                 (get-field-names record))))
+                   
+                   (add record-name)
+                   (queue-list queue)))
+     ,@body)))
