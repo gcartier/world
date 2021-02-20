@@ -18,6 +18,7 @@
         (jazz.io)
         (jazz.listener)
         (jazz.stream)
+        (jazz.stream.syntax (phase syntax))
         (world)
         (world.audio)
         (world.configure)
@@ -517,6 +518,83 @@
     (lambda ()
       (sleep (or delay streaming-delay))
       (thunk))))
+
+
+;;;
+;;;; Mux
+;;;
+
+
+(definition public (mux-streams audio video output)
+  (let ((audio-reader (new Stream-Reader audio))
+        (video-reader (new Stream-Reader video)))
+    (let ((audio-caps (get-caps audio-reader))
+          (video-caps (get-caps video-reader))
+          (location (path-normalize (parse output))))
+      (let ((pipeline (gst-pipeline (format "appsrc caps=\"{a}\" name=audio" audio-caps)
+                                    "qtmux name=mux"
+                                    (tie "filesink location={location} name=sink")
+                                    (list
+                                      (format "appsrc caps=\"{a}\" name=video" video-caps)
+                                      "h264parse"
+                                      "mux^."))))
+        (with-unref ((audiosrc (gst_bin_get_by_name pipeline "audio"))
+                     (videosrc (gst_bin_get_by_name pipeline "video")))
+          (define (process-audio)
+            (declare (proper-tail-calls))
+            (let (loop)
+              (let ((frame (read-frame audio-reader)))
+                (when frame
+                  (receive (buffer dts pts duration keyframe?) frame
+                    (gst_app_src_write audiosrc buffer (u8vector-length buffer) dts pts duration 0)
+                    (loop))))))
+          
+          (define (process-video)
+            (declare (proper-tail-calls))
+            (let (loop)
+              (let ((frame (read-frame video-reader)))
+                (when frame
+                  (receive (buffer dts pts duration keyframe?) frame
+                    (gst_app_src_write videosrc buffer (u8vector-length buffer) dts pts duration 0)
+                    (loop))))))
+          
+          (g-object-set audiosrc
+                        "stream-type" 'int GST_APP_STREAM_TYPE_STREAM
+                        "format"      'int GST_FORMAT_TIME)
+          (g-object-set videosrc
+                        "stream-type" 'int GST_APP_STREAM_TYPE_STREAM
+                        "format"      'int GST_FORMAT_TIME)
+          (gst_element_set_state pipeline GST_STATE_PLAYING)
+          (let ((audio-thread (new-thread process-audio 'mux-audio))
+                (video-thread (new-thread process-video 'mux-video)))
+            (thread-start! audio-thread)
+            (thread-start! video-thread)
+            (thread-join! audio-thread)
+            (thread-join! video-thread)
+            (close audio-reader)
+            (close video-reader)
+            ;; quick hack as somehow waiting for eos doesn't ensure
+            ;; all data has been processed and saved to the filesink
+            (sleep 1)
+            (set-pipeline-flushing? pipeline #f)
+            (gst_element_send_event pipeline (gst_event_new_eos))
+            ;; wait for eos message
+            (with-unref ((bus (gst_pipeline_get_bus pipeline)))
+              (let (loop)
+                (let ((msg (gst_bus_pop bus)))
+                  (if (not msg)
+                      (begin
+                        (sleep .001)
+                        (loop))
+                    (let ((type (GST_MESSAGE_TYPE msg)))
+                      (if (/= type GST_MESSAGE_EOS)
+                          (begin
+                            (gst_message_unref msg)
+                            (sleep .001)
+                            (loop))
+                        (gst_message_unref msg)))))))
+            (set-pipeline-flushing? pipeline #t)
+            (gst_bin_release pipeline)))))))
 
 
 ;;;
