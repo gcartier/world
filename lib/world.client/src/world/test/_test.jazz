@@ -15,6 +15,117 @@
 
 
 ;;;
+;;;; Audio
+;;;
+
+
+@audio (
+(require (trun))
+
+(import (jazz.io)
+        (jazz.listener)
+        (jazz.process)
+        (jazz.stream)
+        (jazz.stream.syntax (phase syntax))
+        (jazz.stream.test)
+        (world.audio)
+        (world.stream))
+
+
+(definition (test-audio)
+  (let ((audio (gst-pipeline "audiotestsrc samplesperbuffer=480 wave=silence name=silence"
+                             "queue name=queue"
+                             "webrtcaudioprobe delay=0"
+                             (gst-element audiosink name: "sink")))
+        (mixer? #f)
+        (channels '()))
+    (define (remove-silence)
+      (with-unref ((silence (gst_bin_get_by_name audio "silence"))
+                   (queue (gst_bin_get_by_name audio "queue")))
+        (gst_element_unlink silence queue)
+        (gst_element_set_state silence GST_STATE_NULL)
+        (gst_bin_remove audio silence)))
+    
+    (define (add-channel location (volume 1.))
+      (let ((channel (create-channel location volume)))
+        (set! channels (append channels (list channel)))
+        channel))
+    
+    (define (create-channel location volume)
+      (when (not mixer?)
+        (let ((mixer (gst_element_factory_make "audiomixer" (gst-element-bin-name audio "mixer"))))
+          (g_object_set_uint64 mixer "latency" 100000000)
+          ;; output-buffer-duration 10000000
+          (with-unref ((queue (gst_bin_get_by_name audio "queue")))
+            (gst_bin_add audio mixer)
+            (gst_element_link mixer queue)
+            (gst_element_sync_state_with_parent mixer)
+            (set! mixer? #t))))
+      (let ((file (new-file {Directory Documents} (tokenise-filename location))))
+        (let ((reader (new Stream-Reader file)))
+          (let ((codec (get-codec reader))
+                (caps (get-caps reader)))
+            (close reader)
+            (let ((bin (gst-bin (format "appsrc caps=\"{a}\" min-latency=40000000 name=src" caps)
+                                (and (eq? codec 'mp3) "avdec_mp3 name=dec")
+                                (and (eq? codec 'aac) "avdec_aac name=dec")
+                                (and (eq? codec 'opus) "opusdec name=dec")
+                                (and (eq? codec 'vorbis) "vorbisdec name=dec")
+                                "audiorate"
+                                "audioconvert"
+                                "audioresample"
+                                "audio/x-raw, format=S16LE, layout=interleaved, rate=48000, channels=2"
+                                (tie "volume volume={volume}")
+                                "audiopanorama method=1 name=end")))
+              (gst_object_set_name bin (filename-base location))
+              (gst_bin_add audio bin)
+              (with-unref ((audio-mixer (gst_bin_get_by_name audio "mixer"))
+                           (bin-src (gst_bin_get_by_name bin "src"))
+                           (bin-end (gst_bin_get_by_name bin "end")))
+                (g-object-set bin-src
+                              "is-live"     'boolean #t
+                              "stream-type" 'int     GST_APP_STREAM_TYPE_STREAM
+                              "format"      'int     GST_FORMAT_TIME)
+                (let ((src (new File-Stream-Audio-Src
+                             #f
+                             file: file
+                             sound?: #t))
+                      (sink (let ((adapter (new Time-Adapter)))
+                              (new Stream-Consumer
+                                consumer: (lambda (buffer dts pts duration keyframe?)
+                                            (let ((timestamp-offset (rebase-time adapter 'audio bin-src pts)))
+                                              (gst_app_src_write bin-src buffer (u8vector-length buffer) dts pts duration timestamp-offset)))))))
+                  (let ((input (pipeline (list src sink))))
+                    (gst_element_link bin-end audio-mixer)
+                    (gst_element_set_state bin GST_STATE_PLAYING)
+                    (play input)
+                    (gst_bin_recalculate_latency audio)
+                    (new Channel location input bin #f)))))))))
+    
+    (define huge
+      (make-vector 120000000))
+    
+    (define (mouser view pos)
+      (terminal 'gc)
+      (gc))
+    
+    (gst_object_set_name audio "audio")
+    (gst_element_set_state audio GST_STATE_PLAYING)
+    (wait-playing audio)
+    (remove-silence)
+    (add-channel "streams/music/Blood Diamond - Solomon Vandy.streamaudio")
+    (report-info audio "audio")
+    ;; application
+    (boot-environment (new Test-Application position: {Point 350 250} mouser: mouser))))
+
+
+(definition (run descriptor)
+  (test-audio))
+
+(register-product-run 'world.test run))
+
+
+;;;
 ;;;; Chronology
 ;;;
 
