@@ -601,6 +601,10 @@
     (register-snapshot-callback (~ snapshot-send-streams self)))
   
   
+  (method package virtual (send-nack self sender channel-no media-kind start end)
+    )
+  
+  
   (method (snapshot-send-streams self)
     (let ((info (map (lambda (stream)
                        (list (get-sender stream)
@@ -1481,20 +1485,6 @@
                               (when (not (get-data packet))
                                 (enqueue missing (get-sequence packet)))
                               (loop (- n 1)))))))
-      (mutex-unlock! mutex)))
-  
-  
-  (method public (count-missing self)
-    (mutex-lock! mutex)
-    (unwind-protect (let ((missing 0))
-                      (let (loop (n (- count 1)))
-                        (if (< n 0)
-                            missing
-                          (let ((pos (modulo (+ head n) size)))
-                            (let ((packet <UDP-Packet> (vector-ref packets pos)))
-                              (when (not (get-data packet))
-                                (increase! missing))
-                              (loop (- n 1)))))))
       (mutex-unlock! mutex))))
 
 
@@ -1638,7 +1628,8 @@
             (dts (timestamp->flonum (read-media-dts data)))
             (pts (timestamp->flonum (read-media-pts data))))
         (mutex-lock! mutex)
-        (let ((duration (read-media-duration data))
+        (let ((sender (read-header-sender data))
+              (duration (read-media-duration data))
               (sequence (read-media-sequence data))
               (frame (read-media-frame data))
               (part (read-media-part data))
@@ -1650,16 +1641,15 @@
               (update-time time-base now dts
                 (lambda (current-latency effective-latency)
                   (condition-variable-signal! wait-condvar)
-                  (let ((sender (read-header-sender data)))
-                    (record-event udp-id-update-time
-                                  (fixnum->flonum no)
-                                  (fixnum->flonum sender)
-                                  (fixnum->flonum media-kind)
-                                  (fixnum->flonum sequence)
-                                  now
-                                  current-latency
-                                  dts
-                                  effective-latency))))))
+                  (record-event udp-id-update-time
+                                (fixnum->flonum no)
+                                (fixnum->flonum sender)
+                                (fixnum->flonum media-kind)
+                                (fixnum->flonum sequence)
+                                now
+                                current-latency
+                                dts
+                                effective-latency)))))
           
           (define (insert/purge reason)
             (let ((packet (new UDP-Packet dts pts duration sequence frame part total keyframe? off? data)))
@@ -1745,6 +1735,8 @@
                        (record-gap gap))
                      (if (>= gap udp-max-gap)
                          (insert/purge udp-purge-gap)
+                       (when (> gap 0)
+                         (send-nack (current-udp) sender no media-kind expected (- sequence 1)))
                        (let ((previous-latency (get-last-latency time-base)))
                          (time-update)
                          (let ((seek-change-heuristic (abs (- (get-last-latency time-base) previous-latency))))
@@ -2713,10 +2705,11 @@
 (define-record nack header
   (channel    u32 <fx>)
   (media-kind u32)
-  (missing    u8vector))
+  (start      u32)
+  (end        u32))
 
-(definition public (calculate-nack-size missing)
-  (+ (recordsize nack) (u8vector-length missing)))
+(definition public (calculate-nack-size)
+  (recordsize nack))
 
 
 ;; profile pulse

@@ -455,8 +455,9 @@
       (let ((sender (read-header-sender data))
             (channel-no (read-nack-channel data))
             (media-kind (read-nack-media-kind data))
-            (missing (u8vector->object (read-nack-missing data))))
-        (send-missing self sender channel-no media-kind missing))))
+            (start (read-nack-start data))
+            (end (read-nack-end data)))
+        (send-missing self sender channel-no media-kind start end))))
   
   
   (method (receive-media self kind data)
@@ -466,76 +467,64 @@
         (let ((channel (find-server-channel self channel-no)))
           (when channel
             (retain-media channel data)
-            (broadcast-media self channel kind data)
-            (let ((frame (read-media-frame data))
-                  (last-nacked-frame (get-last-nacked-frame channel)))
-              (when (or (not last-nacked-frame)
-                        (> frame last-nacked-frame))
-                (send-nacks self sender channel-no kind channel)
-                (set-last-nacked-frame channel frame))))))))
+            (broadcast-media self channel kind data))))))
   
   
-  (method (send-nacks self sender channel-no kind channel)
-    (let ((missing (collect-missing channel)))
-      (unless (null? missing)
-        (let ((connection (no->connection self sender)))
-          (send-nack self connection channel-no kind missing)))))
-  
-  
-  (method (send-missing self sender channel-no media-kind missing)
+  (method (send-missing self sender channel-no media-kind start end)
     (let ((ring (cond ((find-send-channel self channel-no) => get-retain-ring)
                       ((find-server-channel self channel-no) => get-retain-ring)
                       (else #f))))
       (when ring
-        (for-each (lambda (sequence)
-                    (let ((data (locate-data ring sequence)))
-                      (if data
-                          (with-record media
-                            (let ((connection (no->connection self sender)))
-                              (increase-media-resent data)
-                              (send-data self connection data)
-                              (let ((frame (read-media-frame data)))
-                                (record-event udp-id-resend-packet
-                                              (fixnum->flonum channel-no)
-                                              (fixnum->flonum sender)
-                                              (fixnum->flonum media-kind)
-                                              (fixnum->flonum sequence)
-                                              (fixnum->flonum frame)
-                                              -1.
-                                              -1.))
-                              (when udp-show-nacks?
-                                (terminal presence-name (present-media-kind media-kind) '***nack-resent-from-server*** sequence))))
-                        (record-event udp-id-absent-packet
-                                      (fixnum->flonum channel-no)
-                                      (fixnum->flonum sender)
-                                      (fixnum->flonum media-kind)
-                                      (fixnum->flonum sequence)
-                                      -1.
-                                      -1.
-                                      -1.)
+        (loop (for sequence from start to end)
+              (let ((data (locate-data ring sequence)))
+                (if data
+                    (with-record media
+                      (let ((connection (no->connection self sender)))
+                        (increase-media-resent data)
+                        (send-data self connection data)
+                        (let ((frame (read-media-frame data)))
+                          (record-event udp-id-resend-packet
+                                        (fixnum->flonum channel-no)
+                                        (fixnum->flonum sender)
+                                        (fixnum->flonum media-kind)
+                                        (fixnum->flonum sequence)
+                                        (fixnum->flonum frame)
+                                        -1.
+                                        -1.))
                         (when udp-show-nacks?
-                          (terminal presence-name (present-media-kind media-kind) '***nack-absent-on-server*** sequence))
-                        ;; we already nacked the source early and will broadcast
-                        ;; when we receive the resent so we can ignore this nack
-                        )))
-                  missing))))
+                          (terminal presence-name (present-media-kind media-kind) '***nack-resent-from-server*** sequence))))
+                  (record-event udp-id-absent-packet
+                                (fixnum->flonum channel-no)
+                                (fixnum->flonum sender)
+                                (fixnum->flonum media-kind)
+                                (fixnum->flonum sequence)
+                                -1.
+                                -1.
+                                -1.)
+                  (when udp-show-nacks?
+                    (terminal presence-name (present-media-kind media-kind) '***nack-absent-on-server*** sequence))
+                  ;; we already nacked the source early and will broadcast
+                  ;; when we receive the resent so we can ignore this nack
+                  ))))))
   
   
-  (method (send-nack self connection channel-no media-kind missing)
-    (when udp-show-nacks?
-      (terminal presence-name (present-media-kind media-kind) '***send-nack*** missing))
-    (with-record nack
-      (let ((missing-vector (object->u8vector missing)))
-        (let ((size (calculate-nack-size missing-vector)))
-          (let ((data (make-u8vector (+ size udp-code-size))))
-            (write-header-sent data (current-seconds))
-            (write-header-kind data udp-nack)
-            (write-header-sender data server-no)
-            (write-nack-channel data channel-no)
-            (write-nack-media-kind data media-kind)
-            (write-nack-missing data missing-vector)
-            (write-udp-code data)
-            (send-data self connection data))))))
+  (method override (send-nack self sender channel-no media-kind start end)
+    (let ((connection (no->connection self sender)))
+      (when connection
+        (when udp-show-nacks?
+          (terminal presence-name (present-media-kind media-kind) '***send-nack*** start end))
+        (with-record nack
+          (let ((size (calculate-nack-size)))
+            (let ((data (make-u8vector (+ size udp-code-size))))
+              (write-header-sent data (current-seconds))
+              (write-header-kind data udp-nack)
+              (write-header-sender data server-no)
+              (write-nack-channel data channel-no)
+              (write-nack-media-kind data media-kind)
+              (write-nack-start data start)
+              (write-nack-end data end)
+              (write-udp-code data)
+              (send-data self connection data)))))))
   
   
   (method (send-ack self sender data)
@@ -944,16 +933,14 @@
 (class UDP-Server-Channel extends UDP-Channel
   
   
-  (slot server-sender?    getter generate)
-  (slot last-nacked-frame accessors generate)
-  (slot retain-ring       getter generate)
-  (slot release-task      getter generate)
+  (slot server-sender? getter generate)
+  (slot retain-ring    getter generate)
+  (slot release-task   getter generate)
   
   
   (method override (initialize self stream-no no media-kind source-kind level resolution framerate bitrate codec caps metadata server-sender?)
     (nextmethod self stream-no no media-kind source-kind level resolution framerate bitrate codec caps metadata)
     (set! self.server-sender? server-sender?)
-    (set! self.last-nacked-frame #f)
     (if server-sender?
         (begin
           (set! self.retain-ring #f)
@@ -969,15 +956,6 @@
       (terminate retain-ring)
       (thread-join! (get-thread release-task)))
     (nextmethod self))
-  
-  
-  (method protected (collect-missing self)
-    (let ((missing (new-queue)))
-      (iterate-earliest retain-ring
-        (lambda (packet)
-          (when (not (get-data packet))
-            (enqueue missing (get-sequence packet)))))
-      (queue-list missing)))
   
   
   (method protected (retain-media self data)
