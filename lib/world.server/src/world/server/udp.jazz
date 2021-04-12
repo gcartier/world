@@ -259,8 +259,8 @@
             (ecase kind
               ((udp-connect)
                (connect-source self data))
-              ((udp-state)
-               (receive-state self data))
+              ((udp-heartbeat)
+               (receive-heartbeat self data))
               ((udp-nack)
                (receive-nack self data))
               ((udp-audio udp-video)
@@ -409,45 +409,28 @@
               (get-streams group)))
   
   
-  (method (receive-state self data)
-    (with-record state
+  (method (receive-heartbeat self data)
+    (with-record heartbeat
       (let ((sender (read-header-sender data)))
         ;; ack
         (send-ack self sender data)
         ;; throttling
         (let ((connection (no->connection self sender)))
           (when connection
-            (set-last-received-state connection (current-seconds))
+            (set-last-received-heartbeat connection (current-seconds))
             (when (get-throttle-media? connection)
               (set-throttle-media? connection #f)
               (record-event udp-id-throttle-off
                             -1.
                             (fixnum->flonum sender)
                             -1.
-                            (fixnum->flonum (read-state-sequence data))
+                            (fixnum->flonum (read-heartbeat-sequence data))
                             -1.
                             -1.
                             -1.)
               (when udp-show-throttle?
                 (let ((delegate (find-delegate-by-no (current-server) sender)))
-                  (format :terminal "{s} {s} {a} {s}{%}" presence-name 'THROTTLE (if delegate (get-name delegate) sender) 'OFF))))))
-        ;; reset
-        (let ((states (u8vector->object (read-state-channels data)))
-              (really-needs-reset '()))
-          (for-each (lambda (info)
-                      (bind (channel-no client-state) info
-                        (let ((channel (find-send-channel self channel-no)))
-                          (when (and channel (eq? client-state 'waiting))
-                            ;; quicky around video still sending waiting
-                            (when (= (get-media-kind channel) udp-audio)
-                              (set! really-needs-reset (cons channel really-needs-reset)))))))
-                    states)
-          (when (not-null? really-needs-reset)
-            (delay-event
-              (lambda ()
-                (for-each reset-media really-needs-reset)))))
-        ;; broadcast
-        (broadcast-state self sender data))))
+                  (format :terminal "{s} {s} {a} {s}{%}" presence-name 'THROTTLE (if delegate (get-name delegate) sender) 'OFF)))))))))
   
   
   (method (receive-nack self data)
@@ -536,18 +519,18 @@
                 (packets-received (get-packets-received monitor))
                 (bytes-received (get-bytes-received monitor)))
             (define (extract)
-              (with-record state
-                (values (read-header-sent data) (read-state-sequence data))))
+              (with-record heartbeat
+                (values (read-header-sent data) (read-heartbeat-sequence data))))
             
-            (receive (state-sent state-sequence) (extract)
+            (receive (heartbeat-sent heartbeat-sequence) (extract)
               (with-record ack
                 (let ((size (calculate-ack-size)))
                   (let ((data (make-u8vector (+ size udp-code-size))))
                     (write-header-sent data (current-seconds))
                     (write-header-kind data udp-ack)
                     (write-header-sender data sender)
-                    (write-ack-state-sent data state-sent)
-                    (write-ack-state-sequence data state-sequence)
+                    (write-ack-heartbeat-sent data heartbeat-sent)
+                    (write-ack-heartbeat-sequence data heartbeat-sequence)
                     (write-ack-packets-sent data packets-sent)
                     (write-ack-bytes-sent data bytes-sent)
                     (write-ack-packets-received data packets-received)
@@ -558,24 +541,10 @@
                                 -1.
                                 (fixnum->flonum sender)
                                 -1.
-                                (fixnum->flonum state-sequence)
+                                (fixnum->flonum heartbeat-sequence)
                                 -1.
                                 -1.
                                 -1.)))))))))
-  
-  
-  (method (broadcast-state self sender data)
-    (let ((delegate (find-delegate-by-no (current-server) sender)))
-      (when delegate
-        (let ((group (get-group delegate)))
-          (when group
-            (for-each (lambda (member)
-                        (let ((no (get-no member)))
-                          (let ((connection (table-ref no-connections no #f)))
-                            (when connection
-                              (unless (eq? member delegate)
-                                (send-data self connection data))))))
-                      (get-members group)))))))
   
   
   (method (broadcast-media self channel kind data)
@@ -593,8 +562,8 @@
                                 (let ((video-level (get-video-level connection)))
                                   (unless (and (= kind udp-video)
                                                (not (stream-video-channel? self stream channel-level video-level)))
-                                    (let ((last-received-state (get-last-received-state connection)))
-                                      (when last-received-state
+                                    (let ((last-received-heartbeat (get-last-received-heartbeat connection)))
+                                      (when last-received-heartbeat
                                         (unless (get-throttle-media? connection)
                                           (if (waiting-keyframe? connection channel)
                                               (with-record media
@@ -604,7 +573,7 @@
                                                   (got-keyframe connection channel)
                                                   (send-data self connection data)))
                                             (let ((now (current-seconds)))
-                                              (if (and udp-throttle (> (- now last-received-state) udp-throttle))
+                                              (if (and udp-throttle (> (- now last-received-heartbeat) udp-throttle))
                                                   (begin
                                                     (set-throttle-media? connection #t)
                                                     (wait-keyframes self member connection)
@@ -755,25 +724,25 @@
 (class UDP-Connection extends Object
   
   
-  (slot host                                 getter generate)
-  (slot port                                 getter generate)
+  (slot host                                  getter generate)
+  (slot port                                  getter generate)
   @peer2peer
-  (slot local-host                           getter generate)
+  (slot local-host                            getter generate)
   @peer2peer
-  (slot local-port                           getter generate)
-  (slot monitor                              getter generate)
-  (slot simulator                            accessors generate)
-  (slot video-level                          accessors generate)
-  (slot last-received-state    initialize #f accessors generate)
-  (slot throttle-media?        initialize #f accessors generate)
-  (slot waiting-for-keyframe                 accessors generate)
-  (slot profile-base-time      initialize #f getter generate)
-  (slot profile-time-base      initialize #f getter generate)
-  (slot profile-media-sequence initialize #f getter generate)
-  (slot profile-last-sequence  initialize #f getter generate)
-  (slot profile-monitor        initialize #f getter generate)
-  (slot profile-chronology     initialize #f getter generate)
-  (slot profile-evolution      initialize #f getter generate)
+  (slot local-port                            getter generate)
+  (slot monitor                               getter generate)
+  (slot simulator                             accessors generate)
+  (slot video-level                           accessors generate)
+  (slot last-received-heartbeat initialize #f accessors generate)
+  (slot throttle-media?         initialize #f accessors generate)
+  (slot waiting-for-keyframe                  accessors generate)
+  (slot profile-base-time       initialize #f getter generate)
+  (slot profile-time-base       initialize #f getter generate)
+  (slot profile-media-sequence  initialize #f getter generate)
+  (slot profile-last-sequence   initialize #f getter generate)
+  (slot profile-monitor         initialize #f getter generate)
+  (slot profile-chronology      initialize #f getter generate)
+  (slot profile-evolution       initialize #f getter generate)
   
   
   (method override (initialize self host port @peer2peer local-host @peer2peer local-port simulator video-level)

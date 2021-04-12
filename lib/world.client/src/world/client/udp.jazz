@@ -60,8 +60,8 @@
   (slot receive-channels       initialize #f getter generate)
   (slot alive-task             initialize #f getter generate)
   (slot receive-task           initialize #f getter generate)
-  (slot state-task             initialize #f getter generate)
-  (slot state-sequence         initialize 0  getter generate)
+  (slot heartbeat-task         initialize #f getter generate)
+  (slot heartbeat-sequence     initialize 0  getter generate)
   (slot started?               initialize #f getter generate)
   (slot monitor                initialize #f getter generate)
   (slot statistics             initialize #f getter generate)
@@ -204,8 +204,8 @@
   (method (start self)
     (unless started?
       (unless (simulation?)
-        (set! state-task (new Task 'udp-state (~ run-state self) priority: udp-priority))
-        (start-task state-task))
+        (set! heartbeat-task (new Task 'udp-heartbeat (~ run-heartbeat self) priority: udp-priority))
+        (start-task heartbeat-task))
       (set! last-received-ack (current-seconds))
       (set! throttle-media? #f)
       (set! started? #t)))
@@ -213,8 +213,8 @@
   
   (method (stop self)
     (when started?
-      (stop-task state-task)
-      (set! state-task #f)
+      (stop-task heartbeat-task)
+      (set! heartbeat-task #f)
       (set! started? #f)))
   
   
@@ -593,18 +593,18 @@
   
   
   ;;;
-  ;;;; State
+  ;;;; Heartbeat
   ;;;
   
   
-  (method (run-state self task)
+  (method (run-heartbeat self task)
     (declare (proper-tail-calls))
     (with-task task
       (lambda (exit)
         (let (loop)
-          (site udp-state
-            (send-state self))
-          (task-sleep task udp-state-period exit)
+          (site udp-heartbeat
+            (send-heartbeat self))
+          (task-sleep task udp-heartbeat-period exit)
           (loop)))))
   
   
@@ -641,7 +641,6 @@
         (if (not started?)
             (ecase kind
               ((udp-connected))
-              ((udp-state))
               ((udp-ack))
               ((udp-nack))
               ((udp-audio udp-video))
@@ -655,8 +654,6 @@
                (error "Unknown UDP kind: {s}" kind)))
           (ecase kind
             ((udp-connected))
-            ((udp-state)
-             (receive-state self data))
             ((udp-ack)
              (receive-ack self data))
             ((udp-nack)
@@ -671,25 +668,14 @@
              (error "Unknown UDP kind: {s}" kind)))))))
   
   
-  (method (receive-state self data)
-    (with-record state
-      (let ((states (u8vector->object (read-state-channels data))))
-        (for-each (lambda (info)
-                    (bind (channel-no client-state) info
-                      (let ((channel (find-send-channel self channel-no)))
-                        (when (and channel (eq? client-state 'waiting))
-                          (reset-media channel)))))
-                  states))))
-  
-  
   (method (receive-ack self data)
     (with-record ack
       (let ((now (current-seconds))
             (sender (read-header-sender data))
-            (state-sent (read-ack-state-sent data))
-            (state-sequence (read-ack-state-sequence data)))
+            (heartbeat-sent (read-ack-heartbeat-sent data))
+            (heartbeat-sequence (read-ack-heartbeat-sequence data)))
         ;; throttle
-        (received-ack throttle state-sent state-sequence
+        (received-ack throttle heartbeat-sent heartbeat-sequence
           (lambda (adjustment)
             (throttle-camera (current-client))
             (record-event udp-id-throttle-rate
@@ -711,7 +697,7 @@
                         -1.
                         (fixnum->flonum server-no)
                         -1.
-                        (fixnum->flonum state-sequence)
+                        (fixnum->flonum heartbeat-sequence)
                         -1.
                         -1.
                         -1.)
@@ -723,15 +709,15 @@
               (server-bytes-sent (read-ack-bytes-sent data))
               (server-packets-received (read-ack-packets-received data))
               (server-bytes-received (read-ack-bytes-received data)))
-          (let ((round-trip (- now state-sent)))
+          (let ((round-trip (- now heartbeat-sent)))
             (update statistics now monitor round-trip server-packets-sent server-bytes-sent server-packets-received server-bytes-received)
             (record-event udp-id-receive-ack
                           -1.
                           (fixnum->flonum sender)
                           -1.
-                          (fixnum->flonum state-sequence)
+                          (fixnum->flonum heartbeat-sequence)
                           round-trip
-                          state-sent
+                          heartbeat-sent
                           ack-sent
                           -1. @PROFILE (fixnum->flonum (- fresh-bytes-sent fresh-server-bytes-received))
                           -1. @PROFILE (fixnum->flonum (- fresh-server-bytes-sent fresh-bytes-received))))
@@ -742,7 +728,7 @@
                             -1.
                             (fixnum->flonum sender)
                             -1.
-                            (fixnum->flonum state-sequence)
+                            (fixnum->flonum heartbeat-sequence)
                             -1.
                             last-send-rate
                             last-receive-rate)))))))
@@ -891,45 +877,32 @@
         (format :terminal "{s} {s} {s}{%}" presence-name 'PROFILE 'MEDIA))))
   
   
-  (method protected (next-state-sequence! self)
-    (prog1 state-sequence
+  (method protected (next-heartbeat-sequence! self)
+    (prog1 heartbeat-sequence
       ;; wrap around acceptable
-      (if (= state-sequence max-state-sequence)
-          (set! state-sequence 0)
-        (increase! state-sequence))))
+      (if (= heartbeat-sequence max-heartbeat-sequence)
+          (set! heartbeat-sequence 0)
+        (increase! heartbeat-sequence))))
   
   
-  (method (send-state self)
-    (define (collect-states)
-      (let ((queue (new-queue)))
-        (iterate-table receive-channels
-          (lambda (key channel)
-            (let ((state (get-state (get-process-ring channel))))
-              (enqueue queue
-                       (list (get-no channel)
-                             state)))))
-        (queue-list queue)))
-    
-    (let ((state-sequence (next-state-sequence! self))
-          (states (collect-states)))
+  (method (send-heartbeat self)
+    (let ((heartbeat-sequence (next-heartbeat-sequence! self)))
       (with-write-mutex self
         (lambda ()
-          (with-record state
-            (let ((states (object->u8vector states)))
-              (let ((size (calculate-state-size states)))
-                (let ((data (make-u8vector (+ size udp-code-size))))
-                  (write-header-sent data (current-seconds))
-                  (write-header-kind data udp-state)
-                  (write-header-sender data client-no)
-                  (write-state-sequence data state-sequence)
-                  (write-state-channels data states)
-                  (write-udp-code data)
-                  (send-data self data)))))
-          (record-event udp-id-send-state
+          (with-record heartbeat
+            (let ((size (calculate-heartbeat-size)))
+              (let ((data (make-u8vector (+ size udp-code-size))))
+                (write-header-sent data (current-seconds))
+                (write-header-kind data udp-heartbeat)
+                (write-header-sender data client-no)
+                (write-heartbeat-sequence data heartbeat-sequence)
+                (write-udp-code data)
+                (send-data self data))))
+          (record-event udp-id-send-heartbeat
                         -1.
                         (fixnum->flonum client-no)
                         -1.
-                        (fixnum->flonum state-sequence)
+                        (fixnum->flonum heartbeat-sequence)
                         -1.
                         -1.
                         -1.)))))
