@@ -62,7 +62,7 @@
 ;;;
 
 
-(definition public (gst_app_sink_wait task exit listener elem vec info reset-action eos-action)
+(definition public (gst_app_sink_wait_frame task exit listener elem vec info reset-action eos-action)
   (declare (proper-tail-calls))
   (let (loop)
     (let ((c (wait listener)))
@@ -78,10 +78,29 @@
         ((#\@)
          (task-done task exit))
         (else
-         (validate-try-pull (gst_app_sink_try_pull elem vec info)))))))
+         (validate-try-pull-frame (gst_app_sink_try_pull_frame elem vec info)))))))
 
 
-(definition public (gst_app_sink_process task exit consumer (drain?: drain? #f))
+(definition public (gst_app_sink_wait_buffer task exit listener elem reset-action eos-action)
+  (declare (proper-tail-calls))
+  (let (loop)
+    (let ((c (wait listener)))
+      (case c
+        ((#\!)
+         (when reset-action
+           (reset-action))
+         (loop))
+        ((#\^)
+         (when eos-action
+           (eos-action))
+         (loop))
+        ((#\@)
+         (task-done task exit))
+        (else
+         (validate-try-pull-buffer (gst_app_sink_try_pull_buffer elem)))))))
+
+
+(definition public (gst_app_sink_process_frames task exit consumer (drain?: drain? #f))
   (declare (proper-tail-calls))
   (let ((listener (get-listener consumer))
         (element (get-element consumer))
@@ -109,7 +128,7 @@
             ((#\@)
              (task-done task exit))
             (else
-             (let ((size (validate-try-pull (gst_app_sink_try_pull element data info))))
+             (let ((size (validate-try-pull-frame (gst_app_sink_try_pull_frame element data info))))
                (if drain?
                    (loop)
                  (let ((buffer (subu8vector data 0 size))
@@ -117,23 +136,55 @@
                        (pts (u64vector-ref info 1))
                        (duration (u64vector-ref info 2))
                        (keyframe? (= (u64vector-ref info 3) 1)))
-                   (consume consumer buffer dts pts duration keyframe?)))))))))))
+                   (consume-frame consumer buffer dts pts duration keyframe?)))))))))))
 
 
-(definition public (gst_app_sink_process_one consumer)
+(definition public (gst_app_sink_process_buffers task exit consumer (drain?: drain? #f))
+  (declare (proper-tail-calls))
+  (let ((listener (get-listener consumer))
+        (element (get-element consumer)))
+    (let (loop)
+      (if (get-closed? listener)
+          (task-done task exit)
+        (let ((c (if drain?
+                     (let ((c (wait-timeout listener 0)))
+                       (if (eqv? c #\.)
+                           c
+                         (set! drain? #f)
+                         (if (eof-object? c)
+                             (wait listener)
+                           c)))
+                   (wait listener))))
+          (case c
+            ((#\!)
+             (reset-action consumer)
+             (loop))
+            ((#\^)
+             (eos-action consumer)
+             (loop))
+            ((#\@)
+             (task-done task exit))
+            (else
+             (let ((buffer (validate-try-pull-buffer (gst_app_sink_try_pull_buffer element))))
+               (if drain?
+                   (loop)
+                 (consume-buffer consumer buffer))))))))))
+
+
+(definition public (gst_app_sink_process_one_frame consumer)
   (let ((listener (get-listener consumer))
         (element (get-element consumer))
         (data (get-data consumer))
         (info (get-info consumer)))
     (let ((c (wait listener)))
       (assert (eqv? c #\.)
-        (let ((size (validate-try-pull (gst_app_sink_try_pull element data info))))
+        (let ((size (validate-try-pull-frame (gst_app_sink_try_pull_frame element data info))))
           (let ((buffer (subu8vector data 0 size))
                 (dts (u64vector-ref info 0))
                 (pts (u64vector-ref info 1))
                 (duration (u64vector-ref info 2))
                 (keyframe? (= (u64vector-ref info 3) 1)))
-            (consume consumer buffer dts pts duration keyframe?)))))))
+            (consume-frame consumer buffer dts pts duration keyframe?)))))))
 
 
 ;;;
@@ -147,8 +198,6 @@
   (slot caps                  initialize #f accessors generate)
   (slot listener              initialize #f accessors generate)
   (slot element               initialize #f accessors generate)
-  (slot data     <u8vector+>  initialize #f accessors generate)
-  (slot info     <u64vector+> initialize #f accessors generate)
   (slot task                  initialize #f accessors generate)
   (slot processing?           initialize #t accessors generate)
   
@@ -167,21 +216,17 @@
     'consumer)
   
   
-  (method protected (setup-consumer self listener element size)
+  (method protected virtual (setup-consumer self listener element)
     (set! self.listener listener)
-    (set! self.element element)
-    (set! self.data (make-u8vector size))
-    (set! self.info (make-u64vector app-sink-info-size)))
+    (set! self.element element))
   
   
-  (method protected (release-consumer self)
+  (method protected virtual (release-consumer self)
     (unless bailout?
-      (consume self #f #f #f #f #f))
+      (consume-eos self))
     (close-stream-listener listener)
     (set! listener #f)
-    (set! element #f)
-    (set! data #f)
-    (set! info #f))
+    (set! element #f))
   
   
   (method protected (start-listener self)
@@ -216,17 +261,65 @@
           (iter)))))
   
   
-  (method override (process self task exit)
-    (gst_app_sink_process task exit self))
-  
-  
   (method protected virtual (reset-action self)
+    )
+  
+  
+  (method protected virtual (consume-eos self)
     )
   
   
   (method protected virtual (eos-action self)
     (unless bailout?
-      (consume self #f #f #f #f #f))))
+      (consume-eos self))))
+
+
+;;;
+;;;; Frame
+;;;
+
+
+(class Stream-Frame-Consumer extends Stream-Consumer
+  
+  
+  (slot data <u8vector+>  initialize #f accessors generate)
+  (slot info <u64vector+> initialize #f accessors generate)
+  
+  
+  (method override (setup-consumer self listener element size)
+    (nextmethod self listener element)
+    (set! self.data (make-u8vector size))
+    (set! self.info (make-u64vector app-sink-info-size)))
+  
+  
+  (method override (release-consumer self)
+    (nextmethod self)
+    (set! data #f)
+    (set! info #f))
+  
+  
+  (method override (process self task exit)
+    (gst_app_sink_process_frames task exit self))
+  
+  
+  (method override (consume-eos self)
+    (consume-frame self #f #f #f #f #f)))
+
+
+;;;
+;;;; Buffer
+;;;
+
+
+(class Stream-Buffer-Consumer extends Stream-Consumer
+  
+  
+  (method override (process self task exit)
+    (gst_app_sink_process_buffers task exit self))
+  
+  
+  (method override (consume-eos self)
+    (consume-buffer self #f)))
 
 
 ;;;
@@ -785,8 +878,8 @@
               (gst_app_src_write_pointer_now alpha-src alpha-data alpha-size duration)
               (heap-free alpha-data)
               ;; retrieve frames from sink
-              (let ((color-bytes (gst_app_sink_wait task exit color-listener color-sink color-buffer color-info #f #f))
-                    (alpha-bytes (gst_app_sink_wait task exit alpha-listener alpha-sink alpha-buffer alpha-info #f #f)))
+              (let ((color-bytes (gst_app_sink_wait_frame task exit color-listener color-sink color-buffer color-info #f #f))
+                    (alpha-bytes (gst_app_sink_wait_frame task exit alpha-listener alpha-sink alpha-buffer alpha-info #f #f)))
                 (let ((dts (u64vector-ref color-info 0))
                       (pts (u64vector-ref color-info 1))
                       (duration (u64vector-ref color-info 2))

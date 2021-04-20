@@ -860,7 +860,7 @@
   (method override (process self task exit)
     (for-each (lambda (consumer)
                 (when (get-processing? consumer)
-                  (gst_app_sink_process task exit consumer)))
+                  (gst_app_sink_process_frames task exit consumer)))
               sinks)))
 
 
@@ -1128,12 +1128,10 @@
                                   (profile (get-profile consumer)))
                               (let ((resolution (get-resolution profile))
                                     (selfrate (get-selfrate profile)))
-                                (let ((width (get-width resolution))
-                                      (height (get-height resolution))
-                                      (listener (open-stream-listener (format "cameraself{a}" name))))
+                                (let ((listener (open-stream-listener (format "cameraself{a}" name))))
                                   (with-unref ((appsink (gst_bin_get_by_name pipeline (format "sinkself{a}" name))))
                                     (gst_app_sink_connect_signals appsink listener)
-                                    (setup-consumer consumer listener appsink (* width height 4))
+                                    (setup-consumer consumer listener appsink)
                                     (with-unref ((queueself (gst_bin_get_by_name pipeline (tie "queueself{name}"))))
                                       (with-unref ((pad (gst_element_get_static_pad queueself "sink")))
                                         (if (get-processing? consumer)
@@ -1201,7 +1199,7 @@
 ;;;
 
 
-(class Camera-Video-Consumer extends Stream-Consumer
+(class Camera-Video-Consumer extends Stream-Frame-Consumer
   
   
   (slot channel-no getter generate)
@@ -1237,7 +1235,7 @@
       (string->symbol (format "camera{a}" name))))
 
 
-  (method override (consume self buffer dts pts duration keyframe?)
+  (method override (consume-frame self buffer dts pts duration keyframe?)
     (site camera
       (send-client-media (current-client) channel-no buffer dts pts duration keyframe?)
       (update rate (get-framerate profile)))))
@@ -1248,7 +1246,7 @@
 ;;;
 
 
-(class Camera-Self-Consumer extends Stream-Consumer
+(class Camera-Self-Consumer extends Stream-Buffer-Consumer
   
   
   (slot profile initialize #f getter generate)
@@ -1334,15 +1332,16 @@
         (set! output #f))))
   
   
-  (method override (consume self buffer dts pts duration keyframe?)
+  (method override (consume-buffer self buffer)
     (site self
       (when output
         (if (not buffer)
             (set-stream-state output 'off)
           (set-stream-state output 'drawn)
-          (draw output buffer #f dts pts duration)
+          (draw-buffer output buffer)
           (when udp-record-src/sink?
-            (let ((size (u8vector-length buffer)))
+            (let ((size (gst_buffer_get_size buffer))
+                  (dts (gst_buffer_get_dts buffer)))
               (record-event udp-id-src-media
                             -1. ;; todo channel no
                             (fixnum->flonum client-no)
@@ -1455,7 +1454,7 @@
 ;;;
 
 
-(class Screen-Video-Consumer extends Stream-Consumer
+(class Screen-Video-Consumer extends Stream-Frame-Consumer
   
   
   (slot channel-no getter generate)
@@ -1466,7 +1465,7 @@
     (set! self.channel-no channel-no))
 
 
-  (method override (consume self buffer dts pts duration keyframe?)
+  (method override (consume-frame self buffer dts pts duration keyframe?)
     (site screen
       (send-client-media (current-client) channel-no buffer dts pts duration keyframe?))))
 
@@ -1777,7 +1776,7 @@
             (let ((frame (read-frame reader stream? #f)))
               (when frame
                 (receive (buffer dts pts duration keyframe?) frame
-                  (consume consumer buffer dts pts duration keyframe?)))))
+                  (consume-frame consumer buffer dts pts duration keyframe?)))))
           (task-sleep task +inf.0 exit)))))
   
   
@@ -1790,7 +1789,7 @@
             (let ((frame (read-frame reader stream? #f)))
               (when frame
                 (receive (buffer dts pts duration keyframe?) frame
-                  (consume consumer buffer dts pts duration keyframe?)))))
+                  (consume-frame consumer buffer dts pts duration keyframe?)))))
           (task-sleep task +inf.0 exit)))))
   
   
@@ -1803,7 +1802,7 @@
             (let ((frame (read-frame reader stream? #f)))
               (when frame
                 (receive (buffer dts pts duration keyframe?) frame
-                  (consume consumer buffer dts pts duration keyframe?)))))
+                  (consume-frame consumer buffer dts pts duration keyframe?)))))
           (task-sleep task +inf.0 exit)))))
   
   
@@ -1835,7 +1834,7 @@
                           (if flush?
                               (set! flush? #f)
                             (site video-stream
-                              (consume consumer buffer dts pts duration keyframe?)))))))))))
+                              (consume-frame consumer buffer dts pts duration keyframe?)))))))))))
           (iter))))))
 
 
@@ -1918,7 +1917,7 @@
                 (receive (color alpha dts pts duration keyframe?) (extract context task exit)
                   (site draw-stream
                     (let ((effective-dts (flonum->timestamp (- (current-seconds) start-time))))
-                      (consume consumer color effective-dts effective-dts duration keyframe?)))))
+                      (consume-frame consumer color effective-dts effective-dts duration keyframe?)))))
               (task-sleep task .1 exit)
               (iter)))))))
   
@@ -1992,7 +1991,7 @@
           (receive (color alpha dts pts duration keyframe?) (extract/cache self task exit)
             (site image-stream
               (let ((effective-dts (flonum->timestamp (- (current-seconds) start-time))))
-                (consume consumer color effective-dts effective-dts duration keyframe?))))
+                (consume-frame consumer color effective-dts effective-dts duration keyframe?))))
           (free-context self)
           (continuation-return exit #f)))))
   
@@ -2019,7 +2018,7 @@
   (method override (reset-media self channel)
     (receive (color alpha dts pts duration keyframe?) (extract/cache self task exit)
       (let ((effective-dts (flonum->timestamp (- (current-seconds) start-time))))
-        (consume consumer color effective-dts effective-dts duration keyframe?)))))
+        (consume-frame consumer color effective-dts effective-dts duration keyframe?)))))
 
 
 ;;;
@@ -2042,15 +2041,11 @@
   (slot color-pipeline                initialize #f accessors generate)
   (slot color-appsrc                  initialize #f accessors generate)
   (slot color-appsink                 initialize #f accessors generate)
-  (slot color-data       <u8vector+>  initialize #f accessors generate)
-  (slot color-info       <u64vector+> initialize #f accessors generate)
   (slot color-listener                initialize #f accessors generate)
   (slot alpha?                        initialize #f accessors generate)
   (slot alpha-pipeline                initialize #f accessors generate)
   (slot alpha-appsrc                  initialize #f accessors generate)
   (slot alpha-appsink                 initialize #f accessors generate)
-  (slot alpha-data       <u8vector+>  initialize #f accessors generate)
-  (slot alpha-info       <u64vector+> initialize #f accessors generate)
   (slot alpha-listener                initialize #f accessors generate)
   (slot image-surface                 initialize #f accessors generate)
   (slot image-inhibit?                initialize #f accessors generate)
@@ -2172,35 +2167,31 @@
           (gst_object_set_name pipeline (string-append "video." name))
           (with-unref ((appsrc (gst_bin_get_by_name pipeline "src"))
                        (appsink (gst_bin_get_by_name pipeline "sink")))
-            (let ((data (make-u8vector (* width height 4)))
-                  (info (make-u64vector app-sink-info-size)))
-              (gst_app_sink_connect_signals appsink listener)
-              (when (not caps)
-                (case codec
-                  ((h264)
-                   (gst-app-src-set-caps appsrc "video/x-h264"
-                     "width"         'int      width
-                     "height"        'int      height
-                     "framerate"     'fraction (cons framerate 1)
-                     "stream-format" 'string   "byte-stream"
-                     "alignment"     'string   "au"))
-                  (else
-                   (gst-app-src-set-caps appsrc "video/x-raw"
-                     "format"    'string   "I420"
-                     "width"     'int      width
-                     "height"    'int      height
-                     "framerate" 'fraction (cons framerate 1)))))
-              (g-object-set appsrc
-                "is-live"     'boolean #t
-                "stream-type" 'int     GST_APP_STREAM_TYPE_STREAM
-                "format"      'int     GST_FORMAT_TIME)
-              (gst_element_set_state pipeline GST_STATE_READY)
-              (set! self.color-data data)
-              (set! self.color-info info)
-              (set! self.color-pipeline pipeline)
-              (set! self.color-appsrc appsrc)
-              (set! self.color-appsink appsink)
-              (set! self.color-listener listener))))
+            (gst_app_sink_connect_signals appsink listener)
+            (when (not caps)
+              (case codec
+                ((h264)
+                 (gst-app-src-set-caps appsrc "video/x-h264"
+                   "width"         'int      width
+                   "height"        'int      height
+                   "framerate"     'fraction (cons framerate 1)
+                   "stream-format" 'string   "byte-stream"
+                   "alignment"     'string   "au"))
+                (else
+                 (gst-app-src-set-caps appsrc "video/x-raw"
+                   "format"    'string   "I420"
+                   "width"     'int      width
+                   "height"    'int      height
+                   "framerate" 'fraction (cons framerate 1)))))
+            (g-object-set appsrc
+                          "is-live"     'boolean #t
+                          "stream-type" 'int     GST_APP_STREAM_TYPE_STREAM
+                          "format"      'int     GST_FORMAT_TIME)
+            (gst_element_set_state pipeline GST_STATE_READY)
+            (set! self.color-pipeline pipeline)
+            (set! self.color-appsrc appsrc)
+            (set! self.color-appsink appsink)
+            (set! self.color-listener listener)))
         (when alpha?
           (let ((listener (open-stream-listener "videoalpha"))
                 (pipeline (gst-pipeline "appsrc min-latency=30000000 name=src"
@@ -2209,27 +2200,23 @@
             (gst_object_set_name pipeline (string-append "videoalpha." name))
             (with-unref ((appsrc (gst_bin_get_by_name pipeline "src"))
                          (appsink (gst_bin_get_by_name pipeline "sink")))
-              (let ((data (make-u8vector (/ (* width height 12) 8)))
-                    (info (make-u64vector app-sink-info-size)))
-                (gst_app_sink_connect_signals appsink listener)
-                (gst-app-src-set-caps appsrc "video/x-h264"
-                  "width"         'int      width
-                  "height"        'int      height
-                  "framerate"     'fraction (cons framerate 1)
-                  "stream-format" 'string   "byte-stream"
-                  "alignment"     'string   "au")
-                (g-object-set appsrc
-                  "is-live"     'boolean #t
-                  "stream-type" 'int     GST_APP_STREAM_TYPE_STREAM
-                  "format"      'int     GST_FORMAT_TIME)
-                (gst_element_set_state pipeline GST_STATE_READY)
-                (set! self.alpha-data data)
-                (set! self.alpha-info info)
-                (set! self.alpha-pipeline pipeline)
-                (set! self.alpha-appsrc appsrc)
-                (set! self.alpha-appsink appsink)
-                (set! self.alpha-listener listener)
-                (set! self.image-surface (new Image-Surface (new Dimension width height))))))))))
+              (gst_app_sink_connect_signals appsink listener)
+              (gst-app-src-set-caps appsrc "video/x-h264"
+                "width"         'int      width
+                "height"        'int      height
+                "framerate"     'fraction (cons framerate 1)
+                "stream-format" 'string   "byte-stream"
+                "alignment"     'string   "au")
+              (g-object-set appsrc
+                            "is-live"     'boolean #t
+                            "stream-type" 'int     GST_APP_STREAM_TYPE_STREAM
+                            "format"      'int     GST_FORMAT_TIME)
+              (gst_element_set_state pipeline GST_STATE_READY)
+              (set! self.alpha-pipeline pipeline)
+              (set! self.alpha-appsrc appsrc)
+              (set! self.alpha-appsink appsink)
+              (set! self.alpha-listener listener)
+              (set! self.image-surface (new Image-Surface (new Dimension width height)))))))))
   
   
   (method override (setup-element self)
@@ -2291,8 +2278,6 @@
     (nextmethod self)
     (when process?
       (gst_bin_release color-pipeline)
-      (set! color-info #f)
-      (set! color-data #f)
       (set! color-pipeline #f)
       (set! color-appsrc #f)
       (set! color-appsink #f)
@@ -2301,8 +2286,6 @@
       (when alpha?
         (gst_bin_release alpha-pipeline)
         (close image-surface)
-        (set! alpha-info #f)
-        (set! alpha-data #f)
         (set! alpha-pipeline #f)
         (set! alpha-appsrc #f)
         (set! alpha-appsink #f)
@@ -2345,21 +2328,23 @@
   
   
   (method override (process self task exit)
-    (let ((color-bytes (gst_app_sink_wait task exit color-listener color-appsink color-data color-info #f #f))
-          (alpha-bytes (and alpha? (gst_app_sink_wait task exit alpha-listener alpha-appsink alpha-data alpha-info #f #f))))
+    (let ((color (gst_app_sink_wait_buffer task exit color-listener color-appsink #f #f))
+          (alpha (and alpha? (gst_app_sink_wait_buffer task exit alpha-listener alpha-appsink #f #f))))
       (site video-output
-        (let ((dts (u64vector-ref color-info 0))
-              (pts (u64vector-ref color-info 1))
-              (duration (u64vector-ref color-info 2)))
-          (draw self color-data (and alpha? alpha-data) dts pts duration)
-          (when (eq? stream-state 'on)
-            (set-stream-state self 'drawn))))))
+        (draw self color alpha)
+        (when (eq? stream-state 'on)
+          (set-stream-state self 'drawn)))))
   
   
-  (method package virtual (draw self color alpha dts pts duration)
+  (method package virtual (draw self color alpha)
     )
   
   
+  (method package virtual (draw-buffer self buffer)
+    )
+  
+  
+  @ziggy
   (method package (update self color alpha texture (background: background #f))
     (let ((width (get-width resolution))
           (height (get-height resolution)))
@@ -2388,6 +2373,20 @@
       (update rate framerate))
     (unless image-inhibit?
       (map-texture texture)))
+  
+  
+  (method package (update self color alpha texture)
+    (let ((map (gst_buffer_map color)))
+      (map-data texture (gst_mapinfo_data map))
+      (gst_buffer_unmap color map)
+      (gst_buffer_unref color)))
+  
+  
+  (method package (update-buffer self buffer texture)
+    (let ((map (gst_buffer_map buffer)))
+      (map-data texture (gst_mapinfo_data map))
+      (gst_buffer_unmap buffer map)
+      (gst_buffer_unref buffer)))
   
   
   (method package virtual (render self)
@@ -2452,10 +2451,10 @@
       (set! pane #f)))
   
   
-  (method override (draw self color alpha dts pts duration)
+  (method override (draw self color alpha)
     ;; quicky
     (when pane
-      (update self color alpha (get-texture (cache-quad-texture pane)) background: background)))
+      (update self color alpha (get-texture (cache-quad-texture pane)) @ziggy-background: background)))
   
   
   (method override (render self)
@@ -2565,7 +2564,7 @@
       (set! pane #f)))
   
   
-  (method override (draw self color alpha dts pts duration)
+  (method override (draw self color alpha)
     (update self color alpha (get-texture (cache-quad-texture pane))))
   
   
@@ -2639,7 +2638,7 @@
       (set! sheet #f)))
   
   
-  (method override (draw self color alpha dts pts duration)
+  (method override (draw self color alpha)
     (let ((texture (get-texture sheet)))
       (update self color alpha texture)))
   
@@ -2833,7 +2832,7 @@
       (invalidate-audio (get-root interface-pane))))
   
   
-  (method override (draw self color alpha dts pts duration)
+  (method override (draw self color alpha)
     (update self color alpha media-texture)
     (when channel
       (record-event udp-id-draw-video
@@ -2843,7 +2842,11 @@
                     -1.
                     -1.
                     -1.
-                    (timestamp->flonum dts))))
+                    (timestamp->flonum (gst_buffer_get_dts color)))))
+  
+  
+  (method override (draw-buffer self buffer)
+    (update-buffer self buffer media-texture))
   
   
   (method override (render self)
