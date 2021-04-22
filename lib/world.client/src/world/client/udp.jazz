@@ -61,6 +61,7 @@
   (slot receive-channels       initialize #f getter generate)
   (slot alive-task             initialize #f getter generate)
   (slot receive-task           initialize #f getter generate)
+  (slot state-task             initialize #f getter generate)
   (slot heartbeat-task         initialize #f getter generate)
   (slot heartbeat-sequence     initialize 0  getter generate)
   (slot noack-ring             initialize #f getter generate)
@@ -203,6 +204,8 @@
   (method (start self)
     (unless started?
       (unless (simulation?)
+        (set! state-task (new Task 'udp-state (~ run-state self) priority: udp-priority))
+        (start-task state-task)
         (set! heartbeat-task (new Task 'udp-heartbeat (~ run-heartbeat self) priority: udp-priority))
         (start-task heartbeat-task))
       (let ((thread (new-thread
@@ -226,6 +229,8 @@
   
   (method (stop self)
     (when started?
+      (stop-task state-task)
+      (set! state-task #f)
       (stop-task heartbeat-task)
       (set! heartbeat-task #f)
       (terminate noack-ring)
@@ -494,6 +499,32 @@
                         (send))))))))))))
   
   
+  (method (send-state self)
+    (define (collect-waiting)
+      (let ((waiting '()))
+        (iterate-table receive-channels
+          (lambda (key channel)
+            (when (eq? (get-source-kind channel) 'image)
+              (let ((state (get-state (get-process-ring channel))))
+                (when (eq? state 'waiting)
+                  (set! waiting (cons (get-no channel) waiting)))))))
+        waiting))
+    
+    (let ((waiting (collect-waiting)))
+      (when (not-null? waiting)
+        (with-write-mutex self
+          (lambda ()
+            (with-record state
+              (let ((waiting (object->u8vector waiting)))
+                (let ((size (calculate-state-size waiting)))
+                  (let ((data (make-u8vector (+ size udp-code-size))))
+                    (write-header-kind data udp-state)
+                    (write-header-sender data client-no)
+                    (write-state-waiting data waiting)
+                    (write-udp-code data)
+                    (send-data self data))))))))))
+  
+  
   (method protected (next-profile-pulse-sequence! self)
     (prog1 profile-pulse-sequence
       (increase! profile-pulse-sequence)))
@@ -583,6 +614,22 @@
   
   
   ;;;
+  ;;;; State
+  ;;;
+  
+  
+  (method (run-state self task)
+    (declare (proper-tail-calls))
+    (with-task task
+      (lambda (exit)
+        (let (loop)
+          (site udp-state
+            (send-state self))
+          (task-sleep task udp-state-period exit)
+          (loop)))))
+  
+  
+  ;;;
   ;;;; Heartbeat
   ;;;
   
@@ -650,6 +697,8 @@
              (receive-nack self data))
             ((udp-audio udp-video)
              (receive-media self kind data))
+            ((udp-state)
+             (receive-state self data))
             ((udp-alive-ack)
              (receive-alive-ack self data))
             ((udp-profile-pulse))
@@ -796,6 +845,16 @@
                                   -1.
                                   -1.
                                   -1.))))))))
+  
+  
+  (method (receive-state self data)
+    (with-record state
+      (let ((waiting (u8vector->object (read-state-waiting data))))
+        (for-each (lambda (channel-no)
+                    (let ((channel (find-send-channel self channel-no)))
+                      (when channel
+                        (reset-media channel))))
+                  waiting))))
   
   
   (method (receive-alive-ack self data)
