@@ -15,9 +15,11 @@
 (module world.client.udp jazz
 
 
-(import (jazz.event)
+(import (jazz.application)
+        (jazz.event)
         (jazz.io)
         (jazz.math)
+        (jazz.platform)
         (jazz.presence)
         (jazz.snapshot)
         (jazz.stream)
@@ -60,6 +62,7 @@
   (slot receive-streams        initialize #f getter generate)
   (slot receive-channels       initialize #f getter generate)
   (slot alive-task             initialize #f getter generate)
+  (slot awake-task             initialize #f getter generate)
   (slot receive-task           initialize #f getter generate)
   (slot state-task             initialize #f getter generate)
   (slot heartbeat-task         initialize #f getter generate)
@@ -187,8 +190,10 @@
                               -1.
                               -1.)
                 (set! alive-task (new Task 'udp-alive (~ run-alive self) priority: alive-priority))
+                (set! awake-task (new Task 'udp-awake (~ run-awake self) priority: awake-priority))
                 (set! receive-task (new Task 'udp-receive (~ run-receive self) priority: udp-priority))
                 (start-task alive-task)
+                (start-task awake-task)
                 (start-task receive-task)))))))))
 
   
@@ -196,6 +201,8 @@
     (set! udp-stopping? #t)
     (stop-task alive-task)
     (set! alive-task #f)
+    (stop-task awake-task)
+    (set! awake-task #f)
     (close-port udp-port)
     (thread-join! (get-thread receive-task))
     (set! udp-port #f)
@@ -609,13 +616,56 @@
             (let ((elapse (- time previous)))
               (unless (stopping? task)
                 (site alive
-                  (let ((client (current-client)))
-                    (let ((udp-client (get-udp-client client)))
-                      (when udp-client
-                        (send-alive udp-client))))))
+                  (send-alive self)))
               (let ((duration (- (current-monotonic) time)))
                 (task-wait task alive-period duration exit))
               (iter time)))))))
+  
+  
+  ;;;
+  ;;;; Awake
+  ;;;
+  
+  
+  (method (run-awake self task <Task>)
+    (declare (proper-tail-calls))
+    (with-task task
+      (lambda (exit)
+        (let (iter (previous (current-monotonic)))
+          (let ((time (current-monotonic)))
+            (let ((elapse (- time previous)))
+              (unless (stopping? task)
+                (site awake
+                  (adjust-computer-sleep self)))
+              (let ((duration (- (current-monotonic) time)))
+                (task-wait task awake-period duration exit))
+              (iter time)))))))
+  
+  
+  (method (adjust-computer-sleep self)
+    (if (not application-active?)
+        ;; when in the background we let the os manage sleep and we
+        ;; disconnect from group or circle when actually going to sleep
+        (allow-computer-sleep)
+      (let ((keep-awake? #f))
+        ;; send
+        (iterate-table send-channels
+          (lambda (no channel)
+            (ecase (get-media-kind channel)
+              ((udp-audio udp-video)
+               (when (or (neq? (get-source-kind channel) 'live)
+                         (on? channel))
+                 (set! keep-awake? #t))))))
+        ;; receive
+        (iterate-table receive-channels
+          (lambda (no channel)
+            (ecase (get-media-kind channel)
+              ((udp-audio udp-video)
+               (set! keep-awake? #t)))))
+        ;; policy
+        (if keep-awake?
+            (prevent-computer-sleep)
+          (allow-computer-sleep)))))
   
   
   ;;;
