@@ -18,6 +18,7 @@
         (jazz.io)
         (jazz.listener)
         (jazz.presence)
+        (jazz.settings)
         (jazz.stream)
         (jazz.stream.syntax (phase syntax))
         (jazz.syntax (phase syntax))
@@ -152,11 +153,17 @@
 
 (definition protected (cache-microphone-device-names)
   (or microphone-device-names
-      (let ((devices (microphone-devices)))
-        (let ((names (map gst_device_get_display_name devices)))
-          (for-each gst_device_unref_hack devices)
-          (set! microphone-device-names names)
-          names))))
+      (with-microphone-devices
+        (lambda (devices)
+          (let ((names (map gst_device_get_display_name devices)))
+            (set! microphone-device-names names)
+            names)))))
+
+
+(definition protected (with-microphone-devices proc)
+  (let ((devices (microphone-devices)))
+    (prog1 (proc devices)
+      (gst_devices_unref devices))))
 
 
 (definition protected (microphone-devices)
@@ -181,11 +188,51 @@
             (loop (gst_device_monitor_device_list_next devices))))))))
 
 
-(definition protected (microphone-device-properties device)
+(definition protected (microphone-device-identifier device)
   (with-unref ((element (gst_device_create_element device)))
     (cond-expand
-      (mac (list "device" (g_object_get_int element "device")))
-      (else '()))))
+      (mac (g_object_get_int element "device"))
+      (else #f))))
+
+
+;;;
+;;;; Speaker
+;;;
+
+
+(definition protected (with-speaker-devices proc)
+  (let ((devices (speaker-devices)))
+    (prog1 (proc devices)
+      (gst_devices_unref devices))))
+
+
+(definition protected (speaker-devices)
+  (with-unref ((monitor (gst_device_monitor_new)))
+    ;; gstreamer filter leak workaround
+    (gst_device_monitor_add_filter monitor #f #f)
+    @using-this-filter-leaks-in-gstreamer-hence-the-workaround
+    (let ((caps (gst_caps_new_empty_simple "audio/x-raw")))
+      (gst_device_monitor_add_filter monitor "Audio/Sink" caps)
+      (gst_caps_unref caps))
+    (let ((queue (new-queue)))
+      (let (loop (devices (gst_device_monitor_get_devices monitor)))
+        (if (not devices)
+            (begin
+              (g_list_free devices)
+              (queue-list queue))
+          (let ((device (gst_device_monitor_device_list_data devices)))
+            ;; gstreamer filter leak workaround
+            (if (equal? (gst_device_get_device_class device) "Audio/Sink")
+                (enqueue queue device)
+              (gst_device_unref_hack device))
+            (loop (gst_device_monitor_device_list_next devices))))))))
+
+
+(definition protected (speaker-device-identifier device)
+  (with-unref ((element (gst_device_create_element device)))
+    (cond-expand
+      (mac (g_object_get_int element "device"))
+      (else #f))))
 
 
 ;;;
@@ -346,6 +393,30 @@
     (else "panorama.src")))
 
 
+(definition protected (effective-speaker-device)
+  (with-speaker-devices
+    (lambda (devices)
+      (speaker-identifier->device (read-speaker-identifier devices)))))
+
+
+(definition protected (speaker-identifier->device identifier)
+  (or identifier 0))
+
+
+(definition package (read-speaker-identifier devices)
+  (let ((name (world-setting 'world.speaker-name #f)))
+    (if (not name)
+        #f
+      (let ((device (find devices name key: gst_device_get_display_name test: equal? return: 'item)))
+        (and device
+             (speaker-device-identifier device))))))
+
+
+(definition package (write-speaker-name name)
+  (set-setting options-settings 'world.speaker-name name)
+  (save-content options-settings))
+
+
 (class Audio extends Object
   
   
@@ -416,25 +487,34 @@
         (gst_element_sync_state_with_parent mixer))))
   
   
+  (method package (update-identifier self identifier)
+    (gst_element_set_state pipeline GST_STATE_NULL)
+    (with-unref ((sink (gst_bin_get_by_name pipeline "sink")))
+      (g_object_set_int sink "device" (speaker-identifier->device identifier)))
+    (gst_element_set_state pipeline GST_STATE_PLAYING))
+  
+  
   (method public (setup self)
-    (let ((pipeline (gst-pipeline "audiotestsrc samplesperbuffer=480 wave=silence is-live=true name=bootstrap"
-                                  "queue max-size-time=200000000 name=queue"
-                                  (and (custom-webrtc-processing)
-                                       (tie "webrtcaudioprobe delay={audioprobe-delay} name=probe"))
-                                  (cond-expand
-                                    (windows "audioconvert")
-                                    (else #f))
-                                  (gst-element audiosink
-                                               buffer-time: 100000
-                                               name: "sink"))))
-      (gst_object_set_name pipeline "audio.speaker")
-      (set! self.pipeline pipeline)
-      (gst_element_set_state pipeline GST_STATE_PAUSED)
-      (wait-audioclock self pipeline)
-      (gst_element_set_state pipeline GST_STATE_PLAYING)
-      (wait-playing pipeline)
-      (remove-bootstrap self pipeline)
-      (add-mixer self)))
+    (let ((device (effective-speaker-device)))
+      (let ((pipeline (gst-pipeline "audiotestsrc samplesperbuffer=480 wave=silence is-live=true name=bootstrap"
+                                    "queue max-size-time=200000000 name=queue"
+                                    (and (custom-webrtc-processing)
+                                         (tie "webrtcaudioprobe delay={audioprobe-delay} name=probe"))
+                                    (cond-expand
+                                      (windows "audioconvert")
+                                      (else #f))
+                                    (gst-element audiosink
+                                                 device: device
+                                                 buffer-time: 100000
+                                                 name: "sink"))))
+        (gst_object_set_name pipeline "audio.speaker")
+        (set! self.pipeline pipeline)
+        (gst_element_set_state pipeline GST_STATE_PAUSED)
+        (wait-audioclock self pipeline)
+        (gst_element_set_state pipeline GST_STATE_PLAYING)
+        (wait-playing pipeline)
+        (remove-bootstrap self pipeline)
+        (add-mixer self))))
   
   
   (method public (play self)
@@ -551,50 +631,52 @@
 (definition public (acquire-microphone)
   (if microphone-pipeline
       #t
-    (let ((pipeline (gst-pipeline
-                      ;; provide-clock=false to use the audio sink clock
-                      ;; this makes sure audio and video stay synced
-                      (gst-element audiosrc
-                                   latency-time: (custom-microphone-latency)
-                                   provide-clock: "false"
-                                   name: "src")
-                      "volume name=volume"
-                      "queue name=queue"
-                      (cond-expand
-                        (windows "audioconvert")
-                        (else #f))
-                      ;; needed on some computers
-                      "audioresample"
-                      (and (custom-webrtc-processing)
-                           (gst-element "webrtcaudioprocessor"
-                                        echo-cancel: (gst-boolean audio-echo-cancel?)
-                                        noise-suppression: (gst-boolean audio-noise-suppress?)
-                                        gain-controller: (gst-boolean audio-gain-control?)
-                                        logging-severity: (custom-logging-severity)
-                                        name: "processor"))
-                      (gst-element "rndenoiser name=rndenoiser"
-                                   denoise: (gst-boolean audio-rndenoise?))
-                      "audioresample"
-                      (and (eq? audio-codec 'opus) "opusenc name=enc")
-                      (and (eq? audio-codec 'vorbis) "audioconvert")
-                      (and (eq? audio-codec 'vorbis) (tie "audio/x-raw, format=F32LE, layout=interleaved, rate={audio-rate}, channels=1"))
-                      (and (eq? audio-codec 'vorbis) "vorbisenc name=enc")
-                      "appsink name=sink")))
-      (let ((listener (open-stream-listener "mic")))
-        (with-unref ((appsink (gst_bin_get_by_name pipeline "sink")))
-          (gst_app_sink_connect_signals appsink listener)
-          (gst_element_set_state pipeline GST_STATE_PLAYING)
-          (let ((caps (wait-caps-string appsink)))
-            (if (not caps)
-                (begin
-                  (gst_element_set_state pipeline GST_STATE_NULL)
-                  (gst_object_unref pipeline)
-                  #f)
-              (set! microphone-pipeline pipeline)
-              (set! microphone-listener listener)
-              (set! microphone-caps caps)
-              (set! microphone-drained? #f)
-              #t)))))))
+    (let ((device (effective-mic-device)))
+      (let ((pipeline (gst-pipeline
+                        ;; provide-clock=false to use the audio sink clock
+                        ;; this makes sure audio and video stay synced
+                        (gst-element audiosrc
+                                     device: device
+                                     latency-time: (custom-microphone-latency)
+                                     provide-clock: "false"
+                                     name: "src")
+                        "volume name=volume"
+                        "queue name=queue"
+                        (cond-expand
+                          (windows "audioconvert")
+                          (else #f))
+                        ;; needed on some computers
+                        "audioresample"
+                        (and (custom-webrtc-processing)
+                             (gst-element "webrtcaudioprocessor"
+                                          echo-cancel: (gst-boolean audio-echo-cancel?)
+                                          noise-suppression: (gst-boolean audio-noise-suppress?)
+                                          gain-controller: (gst-boolean audio-gain-control?)
+                                          logging-severity: (custom-logging-severity)
+                                          name: "processor"))
+                        (gst-element "rndenoiser name=rndenoiser"
+                                     denoise: (gst-boolean audio-rndenoise?))
+                        "audioresample"
+                        (and (eq? audio-codec 'opus) "opusenc name=enc")
+                        (and (eq? audio-codec 'vorbis) "audioconvert")
+                        (and (eq? audio-codec 'vorbis) (tie "audio/x-raw, format=F32LE, layout=interleaved, rate={audio-rate}, channels=1"))
+                        (and (eq? audio-codec 'vorbis) "vorbisenc name=enc")
+                        "appsink name=sink")))
+        (let ((listener (open-stream-listener "mic")))
+          (with-unref ((appsink (gst_bin_get_by_name pipeline "sink")))
+            (gst_app_sink_connect_signals appsink listener)
+            (gst_element_set_state pipeline GST_STATE_PLAYING)
+            (let ((caps (wait-caps-string appsink)))
+              (if (not caps)
+                  (begin
+                    (gst_element_set_state pipeline GST_STATE_NULL)
+                    (gst_object_unref pipeline)
+                    #f)
+                (set! microphone-pipeline pipeline)
+                (set! microphone-listener listener)
+                (set! microphone-caps caps)
+                (set! microphone-drained? #f)
+                #t))))))))
 
 
 (definition public (release-microphone)
@@ -605,6 +687,30 @@
   (set! microphone-drained? #f))
 
 
+(definition protected (effective-mic-device)
+  (with-microphone-devices
+    (lambda (devices)
+      (mic-identifier->device (read-mic-identifier devices)))))
+
+
+(definition protected (mic-identifier->device identifier)
+  (or identifier 0))
+
+
+(definition package (read-mic-identifier devices)
+  (let ((name (world-setting 'world.microphone-name #f)))
+    (if (not name)
+        #f
+      (let ((device (find devices name key: gst_device_get_display_name test: equal? return: 'item)))
+        (and device
+             (microphone-device-identifier device))))))
+
+
+(definition package (write-mic-identifier name)
+  (set-setting options-settings 'world.microphone-name name)
+  (save-content options-settings))
+
+
 (class Mic-Audio-Src extends Audio-Src
   
   
@@ -613,6 +719,13 @@
   
   (method override (require-caps self)
     (require-microphone-caps))
+  
+  
+  (method package (update-identifier self identifier)
+    (gst_element_set_state pipeline GST_STATE_NULL)
+    (with-unref ((src (gst_bin_get_by_name pipeline "src")))
+      (g_object_set_int src "device" (mic-identifier->device identifier)))
+    (gst_element_set_state pipeline GST_STATE_PLAYING))
   
   
   (method override (setup-element self)
