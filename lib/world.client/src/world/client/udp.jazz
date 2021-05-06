@@ -1021,6 +1021,10 @@
 ;;;
 
 
+(definition protected max-audio-gap
+  5)
+
+
 (class UDP-Receive-Channel extends UDP-Channel
   
   
@@ -1032,6 +1036,11 @@
   (slot insert-rate-frame getter generate)
   (slot insert-rate       getter generate)
   (slot process-rate      getter generate)
+  (slot last-audio-frame    initialize #f getter generate)
+  (slot last-audio-buffer   initialize #f getter generate)
+  (slot last-audio-pts      initialize #f getter generate)
+  (slot last-audio-dts      initialize #f getter generate)
+  (slot last-audio-duration initialize #f getter generate)
   
   
   (method override (initialize self stream no media-kind source-kind level resolution framerate bitrate codec caps metadata)
@@ -1139,6 +1148,11 @@
                            datas)))
           (apply u8vector-append chunks)))))
   
+  
+  (method (chop-audio self buffer buffer-duration duration)
+    (let ((size (fxround (exact->inexact (* (u8vector-length buffer) (/ duration buffer-duration))))))
+      (subu8vector buffer 0 size)))
+  
 
   (method protected (present-audio self datas)
     (let ((first (car datas)))
@@ -1152,11 +1166,36 @@
               (duration (read-media-duration first))
               (keyframe? (read-media-keyframe? first))
               (off? (read-media-off? first)))
-          (increase! processed total)
           (let ((id/output (or (simulation-audio) channel-no)))
+            ;; duplicate last buffer to fill missing audio which sounds a lot better
+            ;; than doing nothing and have gstreamer use silence which sounds gritchy
+            (when (and last-audio-frame (> last-audio-duration 0))
+              (let ((audio-gap (- frame last-audio-frame)))
+                (when (and (> audio-gap 1) (< audio-gap max-audio-gap))
+                  (let ((missing-dts (+ last-audio-dts last-audio-duration))
+                        (missing-pts (+ last-audio-pts last-audio-duration)))
+                    (let (loop (missing-dts missing-dts) (missing-pts missing-pts) (missing-duration (- pts missing-pts)))
+                      (when (> missing-duration 0)
+                        (if (< missing-duration last-audio-duration)
+                            (let ((buffer (chop-audio self last-audio-buffer last-audio-duration missing-duration)))
+                              (receive-audio (current-audio) id/output buffer missing-dts missing-pts missing-duration))
+                          (receive-audio (current-audio) id/output last-audio-buffer missing-dts missing-pts last-audio-duration)
+                          (loop (+ missing-dts last-audio-duration) (+ missing-pts last-audio-duration) (- missing-duration last-audio-duration)))))))))
+            (increase! processed total)
             (let ((buffer (assemble-chunks self datas first total)))
               (if off?
-                  (receive-audio (current-audio) id/output #f #f #f #f)
+                  (begin
+                    (set! last-audio-frame #f)
+                    (set! last-audio-buffer #f)
+                    (set! last-audio-dts #f)
+                    (set! last-audio-pts #f)
+                    (set! last-audio-duration #f)
+                    (receive-audio (current-audio) id/output #f #f #f #f))
+                (set! last-audio-frame frame)
+                (set! last-audio-buffer buffer)
+                (set! last-audio-dts dts)
+                (set! last-audio-pts pts)
+                (set! last-audio-duration duration)
                 (receive-audio (current-audio) id/output buffer dts pts duration)
                 (record-play-frame self sender frame keyframe? dts pts))))))))
   
