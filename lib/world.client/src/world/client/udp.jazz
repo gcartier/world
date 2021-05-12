@@ -1029,11 +1029,154 @@
 
 
 ;;;
+;;;; Receive Base
+;;;
+
+
+(definition cutoff-latency
+  1.5)
+
+(definition cutoff-last-past-time
+  0.5)
+
+
+(class UDP-Receive-Base extends Time-Base
+  
+  
+  (slot stream                    getter generate)
+  (slot media-kind                getter generate)
+  (slot source-kind               getter generate)
+  (slot short-moving        <fl>  getter generate)
+  (slot long-moving         <fl>  getter generate)
+  (slot past-moving         <fl>  getter generate)
+  (slot last-past-time      <fl+> getter generate)
+  (slot time-of-last-change <fl+> getter generate)
+  
+  
+  (method override (initialize self stream media-kind source-kind)
+    (nextmethod self)
+    (set! self.stream stream)
+    (set! self.media-kind media-kind)
+    (set! self.source-kind source-kind))
+  
+  
+  (method override (reset-base self)
+    (nextmethod self)
+    (set! self.short-moving 0.)
+    (set! self.long-moving 0.)
+    (set! self.past-moving 0.)
+    (set! self.last-past-time #f)
+    (set! self.time-of-last-change #f))
+  
+  
+  (method protected (update-moving-averages self raw new-local)
+    (let ((old-short-moving short-moving)
+          (old-long-moving long-moving))
+      (let ((new-short-moving (/ (+ (* short-moving 15.) raw) 16.))
+            (new-long-moving (/ (+ (* long-moving 1001.) raw) 1002.)))
+        (set! short-moving new-short-moving)
+        (set! long-moving new-long-moving)
+        (cond ((and (> short-moving old-short-moving) (> short-moving long-moving))
+               (set! self.long-moving short-moving)
+               (set! time-of-last-change new-local)
+               short-moving)
+              ((and (< short-moving old-short-moving) (< short-moving long-moving))
+               (set! self.short-moving long-moving)
+               long-moving)))))
+  
+  
+  (method override (update-time self new-local new-remote update-proc)
+    (let ((new-base (- new-local new-remote)))
+      (if (not base)
+          (begin
+            (set! base new-base)
+            (set! raw-latency 0.)
+            (set! latency 0.))
+        (let ((raw (- new-base base))
+              (last-latency latency))
+          (case source-kind
+            ((live)
+             (let ((min-latency (update-moving-averages self raw new-local)))
+               (set! raw-latency raw)
+               (cond ;; latency going up because of nacks
+                     ((and last-past-time
+                           (< (- new-local last-past-time) cutoff-last-past-time)
+                           (> past-moving latency))
+                      (set! latency past-moving)
+                      (update-latency stream media-kind latency)
+                      @w
+                      (terminal '*** latency))
+                     ;; latency going up
+                     ((> min-latency last-latency)
+                      (set! time-of-last-change new-local)
+                      (set! latency min-latency)
+                      (update-latency stream media-kind latency)
+                      @w
+                      (terminal '>>> latency))
+                     ;; latency going down
+                     ((and (< min-latency last-latency)
+                           time-of-last-change
+                           (> (- new-local time-of-last-change) 10.))
+                      (set! time-of-last-change new-local)
+                      (set! latency min-latency)
+                      (update-latency stream media-kind latency)
+                      @w
+                      (terminal '<<< latency))))
+             (update-proc raw-latency latency))
+            (else
+             (set! latency (max raw latency))
+             (update-latency stream media-kind latency)
+             (update-proc raw-latency latency)))))))
+  
+  
+  (method override (update-past self new-local new-remote update-proc)
+    (let ((new-base (- new-local new-remote)))
+      (let ((raw (- new-base base)))
+        (case source-kind
+          ((live)
+           (cond ((> raw cutoff-latency)
+                  @w (terminal '$$$))
+                 (else
+                  (let ((new-past-moving (/ (+ (* past-moving 31.) raw) 32.)))
+                    (set! past-moving new-past-moving)
+                    (set! last-past-time new-local)))))
+          (else
+           (when (> raw latency)
+             (set! latency raw)
+             (update-latency stream media-kind latency)))))))
+  
+  
+  (method override (remote->local self remote) <fl>
+    (+ base (effective-latency stream) remote)))
+
+
+;;;
 ;;;; Receive Stream
 ;;;
 
 
-(class UDP-Receive-Stream extends UDP-Stream)
+(class UDP-Receive-Stream extends UDP-Stream
+  
+  
+  (slot latency-mutex      initialize (make-mutex 'latency) getter generate)
+  (slot audio-latency <fl> initialize 0. getter generate)
+  (slot video-latency <fl> initialize 0. getter generate)
+  (slot latency       <fl> initialize 0. getter generate)
+  
+  
+  (method protected (effective-latency self)
+    (mutex-lock! latency-mutex)
+    (prog1 latency
+      (mutex-unlock! latency-mutex)))
+  
+  
+  (method protected (update-latency self media-kind lat)
+    (mutex-lock! latency-mutex)
+    (ecase media-kind
+      ((udp-audio) (set! audio-latency lat))
+      (else (set! video-latency lat)))
+    (set! latency (max audio-latency video-latency))
+    (mutex-unlock! latency-mutex)))
 
 
 ;;;
@@ -1064,7 +1207,7 @@
   (method override (initialize self stream no media-kind source-kind level resolution framerate bitrate codec caps metadata)
     (nextmethod self stream no media-kind source-kind level resolution framerate bitrate codec caps metadata)
     (set! self.replay-ring (and (developer?) (remember-ring media-kind source-kind level framerate)))
-    (set! self.process-ring (new UDP-Ring self no (get-origin stream) media-kind source-kind udp-process-size max-size: udp-process-max-size overflow-proc: (udp-ring-overflow 'process udp-ring-kind-process)))
+    (set! self.process-ring (new UDP-Ring self no (get-origin stream) media-kind source-kind udp-process-size max-size: udp-process-max-size time-base: (new UDP-Receive-Base stream media-kind source-kind) overflow-proc: (udp-ring-overflow 'process udp-ring-kind-process)))
     (unless (simulation?)
       (set! self.process-task (new Task 'udp-process (~ run-process self) priority: udp-process-priority)))
     (set! self.insert-rate-frame 0)
