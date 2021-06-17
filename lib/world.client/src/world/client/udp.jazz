@@ -38,6 +38,7 @@
         (world.ring)
         (world.settings)
         (world.support)
+        (world.syntax (phase syntax))
         (world.task)
         (world.throttle)
         (world.time)
@@ -839,7 +840,20 @@
         (let ((channel (find-receive-channel self channel-no)))
           (when channel
             (remember-media channel data)
-            (insert-media channel data))))))
+            (insert-media channel data)
+            @syncxp
+            (cond ((= (read-header-kind data) udp-audio)
+                   (let ((output (find-output (current-audio) channel-no)))
+                     (when output
+                        (when (setup-audio-adapter output (read-media-dts data))
+                          (remember-media channel data)
+                          (insert-media channel data)))))
+                  (else
+                    (let ((output (find-output (current-video) channel-no)))
+                      (when output
+                        (when (setup-video-adapter output (read-media-dts data))
+                          (remember-media channel data)
+                          (insert-media channel data)))))))))))
   
   
   (method (send-missing self sender channel-no start gap)
@@ -1044,10 +1058,118 @@
   0.5)
 
 
-(class UDP-Receive-Base extends Time-Base
+(class Latency-Base extends Time-Base
   
   
-  (slot stream                    getter generate)
+  (slot stream getter generate)
+  
+  
+  (method override (initialize self stream)
+    (nextmethod self)
+    (set! self.stream stream))
+  
+  
+  (method override (effective-latency self)
+    (effective-latency stream))
+  
+  
+  (method override (remote->local self remote) <fl>
+    (+ base (epoch->flonum remote) (effective-latency stream))))
+
+
+(class Audio-Latency-Base extends Latency-Base
+  
+  
+  (slot ring             accessors generate)
+  (slot media-kind       getter generate)
+  (slot source-kind      getter generate)
+  (slot last-raw-latency getter generate)
+  (slot plateau-end-time getter generate)
+  (slot rise-start       getter generate)
+  (slot rise-latency     getter generate)
+  (slot total-rises      getter generate)
+  (slot total-falls      getter generate)
+  (slot state            getter generate)
+  
+  
+  (method override (initialize self stream media-kind source-kind)
+    (nextmethod self stream)
+    (set! self.media-kind media-kind)
+    (set! self.source-kind (if live-streaming? 'live source-kind)))
+  
+  
+  (method override (reset-base self)
+    (nextmethod self)
+    (set! self.last-raw-latency 0.)
+    (set! self.plateau-end-time 0.)
+    (set! self.total-rises 0)
+    (set! self.total-falls 0)
+    (set! self.state 'plateau))
+    
+  
+  (method override (update-time self new-local new-remote duration update-proc)
+    (let ((new-base (duration->flonum (epoch- new-local new-remote))))
+      (if (not base)
+          (begin
+            (set! base new-base)
+            (set! raw-latency 0.)
+            (set! latency 0.)
+            (update-latency stream media-kind latency)
+            (update-proc raw-latency latency udp-latency-raw))
+        ;; latency
+        (let ((raw (- new-base base)))
+          (set! raw-latency raw)
+          (case state
+            ((plateau)
+             (cond ((> raw (+ latency udp-audio-tolerance))
+                    (set! state 'rise)
+                    (set! rise-start (epoch->flonum new-local))
+                    (set! rise-latency latency)
+                    (set! latency +inf.0)
+                    (set! last-raw-latency raw))
+                   ((and (eq? source-kind 'live)
+                         (> (epoch->flonum new-local) plateau-end-time)
+                         (< raw (- latency udp-audio-tolerance)))
+                    (set! state 'fall)
+                    (set! last-raw-latency raw))))
+            ((rise)
+             (if (> raw last-raw-latency)
+                 (set! last-raw-latency raw)
+               (let ((earliest (earliest-packet ring)))
+                 (define (determine-earliest-ontime)
+                   (and earliest
+                        (let ((earliest-dts (get-dts earliest)))
+                          (let ((earliest-base (duration->flonum (epoch- new-local earliest-dts))))
+                            (let ((earliest-latency (- earliest-base base)))
+                              (- earliest-latency 0. @w .14))))))
+                 
+                 (let ((earliest-ontime (determine-earliest-ontime)))
+                   (if (and earliest-ontime (< earliest-ontime last-raw-latency))
+                       (set! last-raw-latency raw)
+                     (increase! total-rises)
+                     (set! state 'plateau)
+                     (set! latency last-raw-latency @w (if earliest-ontime (max earliest-ontime last-raw-latency) last-raw-latency))
+                     (set! plateau-end-time (+ (epoch->flonum new-local) 10.)))))))
+            ((fall)
+             (if (< raw last-raw-latency)
+                 (set! last-raw-latency raw)
+               (increase! total-falls)
+               (set! state 'plateau)
+               (set! latency last-raw-latency)
+               (set! plateau-end-time (+ (epoch->flonum new-local) 5.)))))
+          ;; update
+          (update-latency stream media-kind latency)
+          (update-proc raw-latency latency udp-latency-raw)))))
+  
+  
+  (method override (update-past self new-local new-remote update-proc)
+    ))
+
+
+(class Video-Latency-Base extends Latency-Base
+  
+  
+  (slot ring                      accessors generate)
   (slot media-kind                getter generate)
   (slot source-kind               getter generate)
   (slot short-moving        <fl>  getter generate)
@@ -1055,11 +1177,12 @@
   (slot past-moving         <fl>  getter generate)
   (slot last-past-time      <fl+> getter generate)
   (slot time-of-last-change <fl+> getter generate)
+  (slot min-latency         <fl>  getter generate)
+  (slot state                     getter generate)
   
   
   (method override (initialize self stream media-kind source-kind)
-    (nextmethod self)
-    (set! self.stream stream)
+    (nextmethod self stream)
     (set! self.media-kind media-kind)
     (set! self.source-kind (if live-streaming? 'live source-kind)))
   
@@ -1070,18 +1193,16 @@
     (set! self.long-moving 0.)
     (set! self.past-moving 0.)
     (set! self.last-past-time #f)
-    (set! self.time-of-last-change #f))
-  
-  
-  (method override (effective-latency self)
-    (effective-latency stream))
+    (set! self.time-of-last-change #f)
+    (set! self.min-latency 0.)
+    (set! self.state 'plateau))
   
   
   (method protected (update-moving-averages self raw new-local)
     (let ((old-short-moving short-moving)
           (old-long-moving long-moving))
-      (let ((new-short-moving (/ (+ (* short-moving 15.) raw) 16.))
-            (new-long-moving (/ (+ (* long-moving 1001.) raw) 1002.)))
+      (let ((new-short-moving (if (= media-kind udp-audio) (/ (+ (* short-moving 15.) raw) 16.) (/ (+ (* short-moving 7.) raw) 8.)))
+            (new-long-moving (if (= media-kind udp-audio) (/ (+ (* long-moving 1001.) raw) 1002.) (/ (+ (* long-moving 479.) raw) 480.))))
         (set! short-moving new-short-moving)
         (set! long-moving new-long-moving)
         (cond ((and (> short-moving old-short-moving) (> short-moving long-moving))
@@ -1093,8 +1214,8 @@
                long-moving)))))
   
   
-  (method override (update-time self new-local new-remote update-proc)
-    (let ((new-base (- new-local new-remote)))
+  (method override (update-time self new-local new-remote duration update-proc)
+    (let ((new-base (duration->flonum (epoch- new-local new-remote))))
       (if (not base)
           (begin
             (set! base new-base)
@@ -1105,25 +1226,25 @@
           (case source-kind
             ((live)
              (let ((last-latency latency)
-                   (min-latency (update-moving-averages self raw new-local)))
+                   (min-latency (update-moving-averages self raw (epoch->flonum new-local))))
                (cond ;; latency nack up
                      ((and last-past-time
-                           (< (- new-local last-past-time) cutoff-last-past-time)
+                           (< (- (epoch->flonum new-local) last-past-time) cutoff-last-past-time)
                            (> past-moving latency))
                       (set! latency past-moving)
                       (update-latency stream media-kind latency)
                       (update-proc raw-latency latency udp-latency-nack-up))
                      ;; latency up
                      ((> min-latency last-latency)
-                      (set! time-of-last-change new-local)
+                      (set! time-of-last-change (epoch->flonum new-local))
                       (set! latency min-latency)
                       (update-latency stream media-kind latency)
                       (update-proc raw-latency latency udp-latency-up))
                      ;; latency down
                      ((and (< min-latency last-latency)
                            time-of-last-change
-                           (> (- new-local time-of-last-change) 10.))
-                      (set! time-of-last-change new-local)
+                           (> (- (epoch->flonum new-local) time-of-last-change) 10.))
+                      (set! time-of-last-change (epoch->flonum new-local))
                       (set! latency min-latency)
                       (update-latency stream media-kind latency)
                       (update-proc raw-latency latency udp-latency-down))
@@ -1140,25 +1261,636 @@
   
   
   (method override (update-past self new-local new-remote update-proc)
-    (let ((new-base (- new-local new-remote)))
+    @w
+    (let ((new-base (duration->flonum (epoch- new-local new-remote))))
       (let ((raw (- new-base base)))
         (case source-kind
           ((live)
            (cond ((> raw cutoff-latency)
-                  @w (terminal '$$$))
+                  )
                  (else
                   (let ((new-past-moving (/ (+ (* past-moving 31.) raw) 32.)))
                     (set! past-moving new-past-moving)
-                    (set! last-past-time new-local)))))
+                    (set! last-past-time (epoch->flonum new-local))))))
           (else
            (when (> raw latency)
              (set! latency raw)
              (update-latency stream media-kind latency)
-             (update-proc raw-latency latency udp-latency-max)))))))
+             (update-proc raw-latency latency udp-latency-max))))))))
+
+
+;;;
+;;;; Gazaa Audio Base
+;;;
+
+
+(definition debug-audio?
+  #f)
+
+(definition debug-audio-state?
+  #f)
+
+
+;; gazaa
+(class Gazaa-Audio-Base extends Time-Base
+  
+  
+  (slot ring                accessors generate)
+  (slot stream              getter generate)
+  (slot source-kind         getter generate)
+  (slot last-arrival-time   getter generate)
+  (slot average-delay       getter generate)
+  (slot average-count       getter generate)
+  (slot average-divergence  getter generate)
+  (slot last-adjustment     getter generate)
+  (slot previous-latency    getter generate)
+  (slot latency-count       getter generate)
+  (slot local-min           getter generate)
+  (slot local-min-time      getter generate)
+  
+  
+  (method override (initialize self stream source-kind)
+    (nextmethod self)
+    (set! self.stream stream)
+    (set! self.source-kind (if live-streaming? 'live source-kind))
+    (set! self.last-arrival-time #f)
+    (set! self.average-delay #f)
+    (set! self.average-count #f)
+    (set! self.average-divergence #f)
+    (set! self.last-adjustment #f)
+    (set! self.previous-latency #f)
+    (set! self.latency-count 0)
+    (set! self.local-min #f)
+    (set! self.local-min-time #f))
+  
+  
+  (method override (effective-latency self)
+    (effective-latency stream))
+  
+  
+  ;; this one might be good for draining excess latency
+  ;; from the ring when nothing much is happening
+  ;; Not used right now
+  (method protected (update-min self sum-duration now)
+    (if (not local-min)
+        (begin
+          (set! local-min (max sum-duration 0))
+          (set! local-min-time now)
+          #f)
+      (let ((latest-min local-min))
+        (when (<= sum-duration latest-min)
+          (set! local-min (max sum-duration 0))
+          (set! local-min-time now))
+        (if (> (- now local-min-time) 10.)
+            (begin
+              (set! local-min #f)
+              (set! local-min-time #f)
+              latest-min)
+          #f))))
+  
+  
+  ;; this one is for noticing when the ring count is up
+  (method protected (update-count self ring-count)
+    (let ((debug? debug-audio?))
+      (let ((fresh-count (cast <fl> ring-count)))
+        (if (not average-count)
+            (set! average-count fresh-count)
+          (let ((new-average-count (/ (+ (* average-count 31.) fresh-count) 32.)))
+            (set! average-count new-average-count))
+          (when debug? (terminal 'average-count average-count)))))
+    (let ((time-factor (max (- 10. (- (simulable-time) (epoch->flonum last-adjustment))) 0.)))
+      (let ((limit time-factor)) 
+        (if (> average-count limit)
+            average-count
+          #f))))
+  
+  
+  ;; this one is for noticing when the real audio latency has diverged from
+  ;; desired latency
+  (method protected (update-divergence self desired-latency actual-latency)
+    (let ((debug? debug-audio?))
+      (let ((fresh-divergence (- desired-latency actual-latency)))
+        (if (not average-divergence)
+            (set! average-divergence fresh-divergence)
+          (let ((new-average-divergence (/ (+ (* average-divergence 15.) fresh-divergence) 16.)))
+            (set! average-divergence new-average-divergence))
+          (when debug? (terminal 'average-divergence average-divergence)))))
+    (let ((time-factor (max (- 10. (- (simulable-time) (epoch->flonum last-adjustment))) 0.)))
+      (let ((limit time-factor))
+        (if (> average-divergence limit)
+            average-divergence
+          #f))))
+  
+  
+  ;; this one is good for playing audio as soon as possible but leaves
+  ;; us vulnerable to the flood of packets coming in when the wave collapses
+  (method protected (update-delay self ring-elapse ring-count now play?)
+    (let ((debug? debug-audio?))
+      (let ((fresh-delay (duration->flonum (epoch- now last-arrival-time))))
+        (if (not average-delay)
+            (set! average-delay fresh-delay)
+          (let ((new-average-delay (/ (+ (* average-delay 5.) fresh-delay) 6.)))
+            (set! average-delay new-average-delay)))
+        (cond ((<= ring-count 1)
+               #f)
+              (play?
+               (let ((average-duration (/ ring-elapse ring-count)))
+                 (if (>= average-delay average-duration)
+                     (begin
+                       (when debug? (terminal 'average-delay 'from 'play average-delay))
+                       average-delay)
+                   #f)))
+              (else
+               (let ((total-delay (* average-delay ring-count)))
+                 (if (and (>= ring-elapse (* total-delay .8)) (<= fresh-delay average-delay))
+                     (begin
+                       (when debug? (terminal 'average-delay 'from 'accumulate average-delay))
+                       average-delay)
+                   #f)))))))
+  
+  
+  (method override (update-time self new-local new-remote duration update-proc)
+    (let ((debug? debug-audio?)
+          (debug-state? debug-audio-state?)
+          (now new-local))
+      
+      (define (drain drain-target)
+        (let ((target drain-target))
+          (when drain-target
+            (set! target (max drain-target 0)))
+          (when debug-state? (terminal 'DRAIN 'target target 'count (get-count ring)))
+          (set-audio-state ring 'drain)
+          (set-target-drain ring target)))
+      
+      (define (set-latency lat)
+        (let ((new-latency (max lat gazaa-pipeline)))
+          (set! latency new-latency)
+          (when debug? (terminal 'set-latency new-latency)))
+        (when (> (abs lat) 100.)
+          (break)))
+      
+      (when (not last-arrival-time)
+        (set! last-arrival-time now)
+        (set! last-adjustment now))
+      (let ((new-base (duration->flonum (epoch- now new-remote))))
+        (if (not base)
+            (begin
+              (set! base new-base)
+              (set! raw-latency 0.)
+              @w (set! latency 0.)
+              (set! latency gazaa-pipeline)
+              (update-latency stream udp-audio latency))
+          (let ((raw (- new-base base)))
+            (set! raw-latency raw)
+            (let ((total-duration (get-audio-duration ring))
+                  (real-latency (get-real-audio-latency ring))
+                 (count (get-count ring)))
+              ;; need to accumulate for at least minimum time
+              (cond ((eq? (get-audio-state ring) 'accumulate)
+                     (let ((accumulate-finished? (update-delay self (duration->flonum total-duration) count now #f))
+                           (accumulate-time (- (epoch->flonum now) (get-begin-clocktime ring))))
+                       (when (and accumulate-finished? (>= accumulate-time .5))
+                         (set! last-adjustment now)
+                         (let ((drain-target (- (duration->timestamp total-duration) (flonum->timestamp accumulate-time))))
+                           (when (> (flonum->timestamp 0.05) (abs drain-target))
+                             (set! drain-target 0.))
+                           (when debug? (terminal 'accumulate-time accumulate-time))
+                           (when debug? (terminal 'total-duration (duration->flonum total-duration)))
+                           (set-latency (timestamp->flonum (+ real-latency (- (duration->timestamp total-duration) drain-target))))
+                           (when debug? (terminal 'latency latency))
+                           (when debug? (terminal 'count count))
+                           (set! accumulate-time 0.)
+                           (drain drain-target))
+                         (update-latency stream udp-audio latency)
+                         (set! average-delay #f))))
+                    ((eq? (get-audio-state ring) 'init)
+                       (when (>= real-latency gazaa-pipeline)
+                         (set! last-adjustment now)
+                         (set! latency real-latency)
+                         (update-latency stream udp-audio latency)))
+                    ((eq? (get-audio-state ring) 'play)
+                     (let ((real-latency (get-real-audio-latency ring)))
+                       (let ((expected-delay? (update-delay self (duration->flonum total-duration) count now #t))
+                             (divergence-count? (update-count self count))
+                             (divergence-latency? (update-divergence self latency real-latency)))
+                         (cond ((and expected-delay? divergence-count?)
+                                (set! last-adjustment now)
+                                (set-latency real-latency)
+                                (when debug? (terminal 'ring-count-too-high 'latency latency))
+                                (when debug? (terminal 'count count))
+                                (drain #f)
+                                (update-latency stream udp-audio latency)
+                                (set! average-delay #f)
+                                (set! average-count #f))
+                               ((and divergence-latency? (= count 0))
+                                (set! last-adjustment now)
+                                (set-latency real-latency)
+                                (when debug? (terminal 'real-latency-diverged-from-desired 'latency latency))
+                                (when debug? (terminal 'count count))
+                                (update-latency stream udp-audio latency)
+                                (set! average-delay #f)
+                                (set! average-divergence #f))
+                               ((> (duration->flonum (epoch- now last-adjustment)) 3.)
+                                (let ((extra-latency (- real-latency gazaa-pipeline)))
+                                  (set! last-adjustment now)
+                                  (set-latency (+ average-divergence gazaa-pipeline))
+                                  (update-latency stream udp-audio latency)
+                                  (when debug? (terminal 'three-seconds-of-quiet 'latency latency))
+                                  (when debug? (terminal 'count count))
+                                  (set! average-delay #f)
+                                  (set! average-divergence #f))))))))))
+          (set! last-arrival-time now)))))
+  
+  
+  (method override (update-past self new-local new-remote update-proc)
+    )
   
   
   (method override (remote->local self remote) <fl>
-    (+ base (effective-latency stream) remote)))
+    (error "Should not be happening")))
+
+
+;;;
+;;;; Receive Ring
+;;;
+
+
+(class UDP-Receive-Ring extends UDP-Ring)
+
+
+;;;
+;;;; Gazaa Audio Ring
+;;;
+
+
+;; gazaa
+(class Gazaa-Audio-Ring extends UDP-Receive-Ring
+  
+  
+  (slot last-dts           getter generate)
+  (slot last-pts           getter generate)
+  (slot last-duration      getter generate)
+  (slot real-audio-latency getter generate)
+  (slot audio-state        accessors generate)
+  (slot target-drain       accessors generate)
+  (slot drained            accessors generate)
+  (slot begin-clocktime    accessors generate)
+  (slot appsrc             accessors generate)
+  
+  
+  (method override (initialize self . rest)
+    (apply nextmethod self rest)
+    (set! self.last-dts epoch0)
+    (set! self.last-pts epoch0)
+    (set! self.last-duration duration0)
+    (set! self.real-audio-latency 0.)
+    (set! self.audio-state #f)
+    (set! self.target-drain 0)
+    (set! self.drained 0)
+    (set! self.begin-clocktime 0.)
+    (set! self.appsrc #f))
+  
+  
+  ;;;
+  ;;;; Process
+  ;;;
+  
+  
+  (method protected (process-audio-gazaa self channel exit)
+    (define debug?
+      debug-audio?)
+    
+    (define debug-state?
+      debug-audio-state?)
+    
+    (declare (proper-tail-calls))
+    (mutex-lock! mutex)
+    (mutex-unlock! mutex wait-condvar)
+    (let (loop-wait)
+      
+      ;; init
+      (define (init)
+        (unless (simulation?)
+          (when (not appsrc)
+            (let ((output (world.audio:find-output (current-audio) no)))
+              ;; need to do this better
+              (if (not output)
+                  (begin
+                    (mutex-unlock! mutex wait-condvar (simulable-elapse gazaa-duration))
+                    (loop-wait))
+                (set! appsrc (slot-value output 'appsrc))))))
+        (let ((running-time (if (simulation?) (flonum->epoch (simulable-time)) (timestamp->epoch (gst_element_get_running_time appsrc)))))
+          (when debug? (terminal 'running-time (epoch->flonum running-time)))
+          (set! last-dts running-time)
+          (set! last-pts running-time)
+          (set! last-duration (assert-duration duration0))
+          @w (set! real-audio-latency 0.)
+          (set! audio-state 'init)
+          (when debug-state? (terminal 'INIT))))
+      
+      ;; check state of mixer queue
+      (define (check-for-accumulate)
+        (if (<= real-audio-latency gazaa-mixer-boundary)
+            (begin
+              (when (neq? audio-state 'accumulate)
+                (set! begin-clocktime (simulable-time))
+                (set! audio-state 'accumulate)
+                (when debug-state? (terminal 'ACCUMULATE 'count count)))
+              #t)
+          #f))
+      
+      ;; extract and present count earliest complete frames
+      (define (extract&present present-count)
+        (loop (repeat present-count)
+              (when (> count 0)
+                (receive (sender channel-no packet data) (extract-complete self)
+                  (let ((dts (epoch-max (epoch+ last-dts last-duration) epoch0))
+                        (pts (epoch-max (epoch+ last-pts last-duration) epoch0))
+                        (duration (get-duration packet)))
+                    (set! last-dts dts)
+                    (set! last-pts pts)
+                    (set! last-duration (assert-duration duration))
+                    (parameterize ((in-gazaa? #t))
+                      ;; quicky
+                      (when (get-off? packet)
+                        (simulable-off))
+                      (simulable-present packet dts duration)
+                      (present-audio channel sender channel-no packet data dts pts duration)))))))
+      
+      ;; extract and drain count earliest complete frames
+      (define (extract&drain drain-count)
+        (loop (repeat drain-count)
+              (when (> count 0)
+                ;; quicky
+                (let ((earliest <UDP-Packet> (vector-ref packets head)))
+                  (when (get-off? earliest)
+                    (simulable-off))
+                  (simulable-flush earliest))
+                (flush-earliest self))))
+      
+      (if terminate?
+          (continuation-return exit #f)
+        (mutex-lock! mutex)
+        (when (not audio-state)
+          (init))
+        (let ((running-time (if (simulation?) (flonum->epoch (simulable-time)) (timestamp->epoch (gst_element_get_running_time appsrc)))))
+          @w (set! real-audio-latency (duration->flonum (epoch- (epoch+ last-dts last-duration) running-time)))
+          (set! real-audio-latency (duration->flonum (epoch- last-dts running-time)))
+          (if (= count 0)
+              (begin
+                (when (neq? audio-state 'init)
+                  (check-for-accumulate))
+                (mutex-unlock! mutex wait-condvar (simulable-elapse .05))
+                (loop-wait))
+            (let ((earliest <UDP-Packet> (vector-ref packets head)))
+              (cond ;; off
+                    ((get-off? earliest)
+                     (simulable-off)
+                     (receive (sender channel-no packet data) (extract-complete self)
+                       (parameterize ((in-gazaa? #t))
+                         (present-audio channel sender channel-no packet data)))
+                     (mutex-unlock! mutex wait-condvar)
+                     (loop-wait))
+                    ;; frame
+                    ((complete-frame? self)
+                     (let ((duration (get-duration earliest)))
+                       (cond ;;init
+                             ((eq? audio-state 'init)
+                              (if (> real-audio-latency gazaa-mixer-boundary)
+                                  (begin
+                                    (set! audio-state 'play)
+                                    (when debug-state? (terminal 'PLAY)))
+                                (extract&present count)
+                                (when debug? (terminal-string ".")))
+                              (mutex-unlock! mutex wait-condvar (simulable-elapse (duration->flonum duration)))
+                              (loop-wait))
+                             ;;drain
+                             ((eq? audio-state 'drain)                                    
+                              (let ((total-duration (get-audio-duration self)))
+                                (set! begin-clocktime 0.)
+                                (cond ((not target-drain)
+                                       (extract&drain count)
+                                       (when debug-state? (terminal 'PLAY 'from 'drain-all))
+                                       (set! audio-state 'play)
+                                       (set! target-drain 0))
+                                      ((>= drained target-drain)
+                                       (when (< real-audio-latency gazaa-mixer-boundary)
+                                         (when debug? (terminal 'ts 'to 'running-time 'duration (duration->flonum total-duration) 'drained (timestamp->flonum drained)))
+                                         (set! last-dts running-time)
+                                         (set! last-pts running-time)
+                                         (set! last-duration duration0))
+                                       (set! audio-state 'play)
+                                       (when debug-state? (terminal 'PLAY))
+                                       (set! drained 0)
+                                       (set! target-drain 0)
+                                       (when (> count 0)
+                                         (extract&present count)))
+                                      (else
+                                       ;; quicky
+                                       (let ((earliest <UDP-Packet> (vector-ref packets head)))
+                                         (when (get-off? earliest)
+                                           (simulable-off))
+                                         (simulable-flush earliest))
+                                       (flush-earliest self)
+                                       (increase! drained (duration->timestamp duration))))
+                                (mutex-unlock! mutex wait-condvar (simulable-elapse .001))
+                                (loop-wait)))
+                             ;; accumulate
+                             ((eq? audio-state 'accumulate)
+                              (when debug? (terminal-string "*"))
+                              (mutex-unlock! mutex wait-condvar (simulable-elapse .05))
+                              (loop-wait))
+                             ;; play
+                             ((eq? audio-state 'play)
+                              (let ((desired-latency (get-latency time-base)))
+                                @w (when debug? (terminal 'rl real-audio-latency 'dl desired-latency))
+                                (cond ;; pull from ring
+                                      ((and (> real-audio-latency (- desired-latency .02))
+                                            (< real-audio-latency (+ desired-latency .02)))
+                                       (when debug? (terminal-string "."))
+                                       (extract&present 1))
+                                      ((and (<= real-audio-latency gazaa-mixer-boundary) (> count 1))
+                                       (when debug? (terminal-string "..."))
+                                       (extract&present count))
+                                      ((<= real-audio-latency gazaa-mixer-boundary)
+                                       (set! audio-state 'accumulate)
+                                       (set! begin-clocktime (simulable-time))
+                                       (when debug-state? (terminal 'ACCUMULATE 'from 'play 'count count)))
+                                      ((< real-audio-latency desired-latency)
+                                       (if (> count 1)
+                                           (begin
+                                             (when debug? (terminal-string ".."))
+                                             (extract&present 2))
+                                         (when debug? (terminal-string "."))
+                                         (extract&present 1)))))
+                              (mutex-unlock! mutex)
+                              (sleep (simulable-elapse (duration->flonum duration)))
+                              (loop-wait)))))
+                    ;; not off and incomplete frame???
+                    (else
+                     (when debug? (terminal-string "?"))
+                     (mutex-unlock! mutex wait-condvar (simulable-elapse 0.1))
+                     (loop-wait))))))))))
+
+
+;;;
+;;;; Audio Ring
+;;;
+
+
+(class UDP-Audio-Ring extends UDP-Receive-Ring
+  
+  
+  (method protected (process-audio self channel exit)
+    (declare (proper-tail-calls))
+    (let (loop-wait)
+      (if terminate?
+          (continuation-return exit #f)
+        (mutex-lock! mutex)
+        (if (= count 0)
+            (begin
+              (mutex-unlock! mutex wait-condvar)
+              (loop-wait))
+          (let ((now (simulable-time))
+                (earliest <UDP-Packet> (vector-ref packets head)))
+            (let ((presentation-time (determine-presentation-time self earliest 0.)))
+              (let ((giveup-time (+ presentation-time 5. @w udp-audio-giveup)))
+                (cond ;; off
+                      ((get-off? earliest)
+                       (simulable-off)
+                       (receive (sender channel-no packet data) (extract-complete self)
+                         (present-audio channel sender channel-no packet data))
+                       (mutex-unlock! mutex)
+                       (loop-wait))
+                      ;; giveup
+                      ((>= now giveup-time)
+                       (flush-earliest self)
+                       (mutex-unlock! mutex)
+                       (loop-wait))
+                      ;; not ready
+                      ((< now presentation-time)
+                       (mutex-unlock! mutex wait-condvar (simulable-elapse (- presentation-time now)))
+                       (loop-wait))
+                      ;; frame
+                      ((complete-frame? self)
+                       (receive (sender channel-no packet data) (extract-complete self)
+                         (simulable-present packet (get-dts packet) (get-duration packet))
+                         (present-audio channel sender channel-no packet data))
+                       (mutex-unlock! mutex)
+                       (loop-wait))
+                      ;; not ready to giveup
+                      (else
+                       (flush-earliest self)
+                       (mutex-unlock! mutex)
+                       (loop-wait)))))))))))
+
+
+;;;
+;;;; Video Ring
+;;;
+
+
+(class UDP-Video-Ring extends UDP-Receive-Ring
+  
+  
+  (method protected (process-video self channel exit)
+    (declare (proper-tail-calls))
+    (let (loop-wait)
+      (if terminate?
+          (continuation-return exit #f)
+        (mutex-lock! mutex)
+        (if (= count 0)
+            (if (not (get-framerate channel))
+                (begin
+                  (mutex-unlock! mutex wait-condvar)
+                  (loop-wait))
+              (mutex-unlock! mutex wait-condvar udp-video-giveup)
+              (if (= count 0)
+                  (begin
+                    (state-waiting self)
+                    (loop-wait))
+                (loop-wait)))
+          (let ((now (simulable-time))
+                (earliest <UDP-Packet> (vector-ref packets head)))
+            (let ((presentation-time (determine-presentation-time self earliest udp-video-present)))
+              (let ((late-time (+ presentation-time udp-video-late))
+                    (giveup-time (+ presentation-time udp-video-giveup)))
+                (define (debugging what sleep)
+                  @debug
+                  (let ((sequence (get-sequence earliest))
+                        (time (- now (determine-earliest-time self earliest)))
+                        (sleep (if (symbol? sleep) sleep (format "{r precision: 3}" sleep)))
+                        (content (loop (for n from 0 below count)
+                                       (collect (get-sequence (packet-ref self n))))))
+                    (format :terminal
+                            "{a width: 6} {a} {r precision: 3} {a width: 6} ({l}){%}"
+                            what
+                            sequence
+                            time
+                            sleep
+                            content)))
+                
+                (cond ;; off
+                      ((get-off? earliest)
+                       (receive (sender channel-no packet data) (extract-complete self)
+                         (present-video channel sender channel-no packet data))
+                       (mutex-unlock! mutex)
+                       (loop-wait))
+                      ;; giveup
+                      ((>= now giveup-time)
+                       (debugging 'giveup 'loop)
+                       (flush-earliest self)
+                       (state-waiting self)
+                       (mutex-unlock! mutex)
+                       (loop-wait))
+                      ;; waiting
+                      ((eq? state 'waiting)
+                       (let ((keyframe (complete-keyframe self)))
+                         (cond ;; keyframe
+                               (keyframe
+                                (let ((packet (packet-ref self keyframe)))
+                                  (let ((packet-present (determine-presentation-time self packet udp-video-present)))
+                                    (if (< now packet-present)
+                                        ;; not ready
+                                        (begin
+                                          (mutex-unlock! mutex wait-condvar (- packet-present now))
+                                          (loop-wait))
+                                      ;; ready
+                                      (begin
+                                        (flush-before self keyframe)
+                                        (state-ok self)
+                                        (mutex-unlock! mutex)
+                                        (loop-wait))))))
+                               ;; not ready to giveup
+                               (else
+                                (mutex-unlock! mutex wait-condvar (- giveup-time now))
+                                (loop-wait)))))
+                      ;; not ready
+                      ((< now presentation-time)
+                       (debugging 'sleep (- presentation-time now))
+                       (mutex-unlock! mutex wait-condvar (- presentation-time now))
+                       (loop-wait))
+                      ;; frame
+                      ((complete-frame? self)
+                       (if (< now late-time)
+                           (state-ok self)
+                         (state-late self))
+                       (receive (sender channel-no packet data) (extract-complete self)
+                         (present-video channel sender channel-no packet data))
+                       (debugging (if (eq? state 'ok) 'play 'freeze) 'return)
+                       (mutex-unlock! mutex)
+                       (loop-wait))
+                      ;; ok
+                      ((< now late-time)
+                       (debugging 'ok (- late-time now))
+                       (mutex-unlock! mutex wait-condvar (- late-time now))
+                       (loop-wait))
+                      ;; late
+                      (else
+                       (debugging 'late (- giveup-time now))
+                       (state-late self)
+                       (mutex-unlock! mutex wait-condvar (- giveup-time now))
+                       (loop-wait)))))))))))
 
 
 ;;;
@@ -1170,9 +1902,9 @@
   
   
   (slot latency-mutex      initialize (make-mutex 'latency) getter generate)
-  (slot audio-latency <fl> initialize 0. getter generate)
-  (slot video-latency <fl> initialize 0. getter generate)
-  (slot latency       <fl> initialize 0. getter generate)
+  (slot audio-latency <fl> initialize -inf.0 getter generate)
+  (slot video-latency <fl> initialize -inf.0 getter generate)
+  (slot latency       <fl> initialize 0.     getter generate)
   
   
   (method protected (effective-latency self)
@@ -1186,7 +1918,9 @@
     (ecase media-kind
       ((udp-audio) (set! audio-latency lat))
       (else (set! video-latency lat)))
-    (set! latency (max audio-latency video-latency))
+    (if gazaa?
+        (set! latency audio-latency)
+      (set! latency (max audio-latency video-latency)))
     (mutex-unlock! latency-mutex)))
 
 
@@ -1208,7 +1942,6 @@
   (slot insert-rate-frame getter generate)
   (slot insert-rate       getter generate)
   (slot process-rate      getter generate)
-  (slot pipeline-latency    initialize #f getter generate)
   (slot last-audio-frame    initialize #f getter generate)
   (slot last-audio-buffer   initialize #f getter generate)
   (slot last-audio-pts      initialize #f getter generate)
@@ -1219,9 +1952,24 @@
   (method override (initialize self stream no media-kind source-kind level resolution framerate bitrate codec caps metadata)
     (nextmethod self stream no media-kind source-kind level resolution framerate bitrate codec caps metadata)
     (set! self.replay-ring (and (developer?) (remember-ring media-kind source-kind level framerate)))
-    (set! self.process-ring (new UDP-Ring self no (get-origin stream) media-kind source-kind udp-process-size max-size: udp-process-max-size time-base: (new UDP-Receive-Base stream media-kind source-kind) overflow-proc: (udp-ring-overflow 'process udp-ring-kind-process)))
+    (let ((time-base (ecase media-kind
+                       ((udp-audio)
+                        (if gazaa?
+                            (new Gazaa-Audio-Base stream source-kind)
+                          (new Audio-Latency-Base stream media-kind source-kind)))
+                       (else
+                        (new Video-Latency-Base stream media-kind source-kind)))))
+      (set! self.process-ring (ecase media-kind
+                                ((udp-audio)
+                                 (if gazaa?
+                                     (new Gazaa-Audio-Ring self no (get-origin stream) media-kind source-kind udp-process-size max-size: udp-process-max-size time-base: time-base overflow-proc: (udp-ring-overflow 'process udp-ring-kind-process))
+                                   (new UDP-Audio-Ring self no (get-origin stream) media-kind source-kind udp-process-size max-size: udp-process-max-size time-base: time-base overflow-proc: (udp-ring-overflow 'process udp-ring-kind-process))))
+                                (else
+                                 (new UDP-Video-Ring self no (get-origin stream) media-kind source-kind udp-process-size max-size: udp-process-max-size time-base: time-base overflow-proc: (udp-ring-overflow 'process udp-ring-kind-process)))))
+      (when (= media-kind udp-audio)
+        (set-ring time-base self.process-ring)))
     (unless (simulation?)
-      (set! self.process-task (new Task 'udp-process (~ run-process self) priority: udp-process-priority)))
+      (set! self.process-task (new Task (if (= media-kind udp-audio) 'udp-audio 'udp-video) (~ run-process self) priority: udp-process-priority)))
     (set! self.insert-rate-frame 0)
     (set! self.insert-rate (new Rate))
     (set! self.process-rate (new Rate))
@@ -1241,13 +1989,12 @@
   
   
   (method protected (insert-media self data)
-    (when framerate
-      (with-record media
-        (let ((frame (read-media-frame data)))
-          (when (or (not insert-rate-frame)
-                    (> frame insert-rate-frame))
-            (update insert-rate framerate)
-            (set! insert-rate-frame frame)))))
+    (with-record media
+      (let ((frame (read-media-frame data)))
+        (when (or (not insert-rate-frame)
+                  (> frame insert-rate-frame))
+          (update insert-rate)
+          (set! insert-rate-frame frame))))
     (insert process-ring data))
   
   
@@ -1261,35 +2008,15 @@
   
   
   (method (run-process self task)
-    (ecase media-kind
-      ((udp-audio) (run-process-audio self task))
-      ((udp-video) (run-process-video self task))))
-  
-  
-  (method (run-process-audio self task)
-    (declare (proper-tail-calls))
     (with-task task
       (lambda (exit)
-        (let (looping)
-          (let ((info (process-audio process-ring)))
-            (if (eq? info 'terminate)
-                (continuation-return exit #f)
-              (site present-audio
-                (present-audio self info))
-              (looping)))))))
-  
-  
-  (method (run-process-video self task)
-    (declare (proper-tail-calls))
-    (with-task task
-      (lambda (exit)
-        (let (looping)
-          (let ((info (process-video process-ring)))
-            (if (eq? info 'terminate)
-                (continuation-return exit #f)
-              (site present-video
-                (present-video self info))
-              (looping)))))))
+        (ecase media-kind
+          ((udp-audio)
+           (if gazaa?
+               (process-audio-gazaa process-ring self exit)
+             (process-audio process-ring self exit)))
+          ((udp-video)
+           (process-video process-ring self exit))))))
   
   
   (method (record-play-frame self sender frame keyframe? dts pts)
@@ -1314,100 +2041,82 @@
                   (timestamp->flonum dts)))
   
   
-  (method (assemble-chunks self datas first total)
-    (with-record media
-      (if (= total 1)
-          (read-media-payload first)
-        (let ((chunks (map (lambda (data)
-                             (read-media-payload data))
-                           datas)))
-          (apply u8vector-append chunks)))))
-  
-  
   (method (chop-audio self buffer buffer-duration duration)
     (let ((size (fxround (exact->inexact (* (u8vector-length buffer) (/ duration buffer-duration))))))
       (subu8vector buffer 0 size)))
   
-  
-  (definition latency-precision <fl>
-    .075)
-  
-  (definition latency-rounding <fl>
-    (/ 1. latency-precision))
-  
 
-  (method protected (present-audio self datas)
-    (let ((first (car datas)))
-      (with-record media
-        (let ((sender (read-header-sender first))
-              (channel-no (read-media-channel first))
-              (frame (read-media-frame first))
-              (total (read-media-total first))
-              (dts (read-media-dts first))
-              (pts (read-media-pts first))
-              (duration (read-media-duration first))
-              (keyframe? (read-media-keyframe? first))
-              (off? (read-media-off? first)))
-          (let ((id/output (or (simulation-audio) channel-no)))
-            ;; duplicate last buffer to fill missing audio which sounds a lot better
-            ;; than doing nothing and have gstreamer use silence which sounds gritchy
-            (when (and last-audio-frame (> last-audio-duration 0))
-              (let ((audio-gap (- frame last-audio-frame)))
-                (when (and (> audio-gap 1) (< audio-gap max-audio-gap))
-                  (let ((missing-dts (+ last-audio-dts last-audio-duration))
-                        (missing-pts (+ last-audio-pts last-audio-duration)))
-                    (let (loop (missing-dts missing-dts) (missing-pts missing-pts) (missing-duration (- pts missing-pts)))
-                      (when (> missing-duration 0)
-                        (if (< missing-duration last-audio-duration)
-                            (let ((buffer (chop-audio self last-audio-buffer last-audio-duration missing-duration)))
-                              (receive-audio (current-audio) id/output buffer missing-dts missing-pts missing-duration))
-                          (receive-audio (current-audio) id/output last-audio-buffer missing-dts missing-pts last-audio-duration)
-                          (loop (+ missing-dts last-audio-duration) (+ missing-pts last-audio-duration) (- missing-duration last-audio-duration)))))))))
-            (let ((buffer (assemble-chunks self datas first total)))
-              (if off?
-                  (begin
-                    (set! last-audio-frame #f)
-                    (set! last-audio-buffer #f)
-                    (set! last-audio-dts #f)
-                    (set! last-audio-pts #f)
-                    (set! last-audio-duration #f)
-                    (receive-audio (current-audio) id/output #f #f #f #f))
-                (set! last-audio-frame frame)
-                (set! last-audio-buffer buffer)
-                (set! last-audio-dts dts)
-                (set! last-audio-pts pts)
-                (set! last-audio-duration duration)
-                (let ((latency (/ (round (* (effective-latency (get-time-base process-ring)) latency-rounding)) latency-rounding)))
-                  (when (or (not pipeline-latency) (/= latency pipeline-latency))
-                    (set! pipeline-latency latency)))
-                (let ((offset (flonum->timestamp pipeline-latency)))
-                  (receive-audio (current-audio) id/output buffer (+ dts offset) (+ pts offset) duration))
-                (record-play-frame self sender frame keyframe? dts pts))))))))
+  (method protected (present-audio self sender channel-no packet data (dts #f) (pts #f) (duration #f))
+    (site present-audio
+      (let ((frame (get-frame packet))
+            (total (get-total packet))
+            (dts (epoch->timestamp (or dts (get-dts packet))))
+            (pts (epoch->timestamp (or pts (get-pts packet))))
+            (duration (duration->timestamp (or duration (get-duration packet))))
+            (keyframe? (get-keyframe? packet))
+            (off? (get-off? packet)))
+        (let ((id/output (or (simulation-audio) channel-no)))
+          ;; duplicate last buffer to fill missing audio which sounds a lot better
+          ;; than doing nothing and have gstreamer use silence which sounds gritchy
+          (when (and last-audio-frame (> last-audio-duration 0))
+            (let ((audio-gap (- frame last-audio-frame)))
+              (when (and (> audio-gap 1) (< audio-gap max-audio-gap))
+                (let ((missing-dts (+ last-audio-dts last-audio-duration))
+                      (missing-pts (+ last-audio-pts last-audio-duration)))
+                  (let (loop (missing-dts missing-dts) (missing-pts missing-pts) (missing-duration (- pts missing-pts)))
+                    (when (> missing-duration 0)
+                      (if (< missing-duration last-audio-duration)
+                          (let ((buffer (chop-audio self last-audio-buffer last-audio-duration missing-duration)))
+                            (receive-audio (current-audio) id/output buffer missing-dts missing-pts missing-duration))
+                        (receive-audio (current-audio) id/output last-audio-buffer missing-dts missing-pts last-audio-duration)
+                        (loop (+ missing-dts last-audio-duration) (+ missing-pts last-audio-duration) (- missing-duration last-audio-duration)))))))))
+          (let ((buffer data))
+            (if off?
+                (begin
+                  (set! last-audio-frame #f)
+                  (set! last-audio-buffer #f)
+                  (set! last-audio-dts #f)
+                  (set! last-audio-pts #f)
+                  (set! last-audio-duration #f)
+                  (receive-audio (current-audio) id/output #f #f #f #f))
+              (set! last-audio-frame frame)
+              (set! last-audio-buffer buffer)
+              (set! last-audio-dts dts)
+              (set! last-audio-pts pts)
+              (set! last-audio-duration duration)
+              (cond ((not gazaa?)
+                     (let ((latency (effective-latency (get-time-base process-ring))))
+                       (let ((offset (flonum->timestamp latency)))
+                         (let ((dts (max 0 (+ dts offset)))
+                               (pts (max 0 (+ pts offset))))
+                           (receive-audio (current-audio) id/output buffer dts pts duration)))))
+                    (else
+                     (receive-audio (current-audio) id/output buffer dts pts duration)))
+              (record-play-frame self sender frame keyframe? dts pts)))))))
   
   
-  (method protected (present-video self datas)
-    (let ((first (car datas)))
-      (with-record media
-        (let ((sender (read-header-sender first))
-              (channel-no (read-media-channel first))
-              (frame (read-media-frame first))
-              (total (read-media-total first))
-              (dts (read-media-dts first))
-              (pts (read-media-pts first))
-              (duration (read-media-duration first))
-              (keyframe? (read-media-keyframe? first))
-              (off? (read-media-off? first)))
-          (let ((id/output (or (simulation-video) channel-no)))
-            (let ((buffer (assemble-chunks self datas first total)))
-              (if off?
-                  (receive-video (current-video) id/output #f #f #f #f #f)
-                (let ((latency (/ (round (* (effective-latency (get-time-base process-ring)) latency-rounding)) latency-rounding)))
-                  (when (or (not pipeline-latency) (/= latency pipeline-latency))
-                    (set! pipeline-latency latency)))
-                (let ((offset (flonum->timestamp pipeline-latency)))
-                  (receive-video (current-video) id/output buffer (+ dts offset) (+ pts offset) duration keyframe?))
-                (when framerate
-                  (update process-rate framerate))
-                (if (eq? (get-state process-ring) 'late)
-                    (record-freeze-frame self sender frame keyframe? dts pts)
-                  (record-play-frame self sender frame keyframe? dts pts)))))))))))
+  (method protected (present-video self sender channel-no packet data)
+    (site present-video
+      (let ((frame (get-frame packet))
+            (total (get-total packet))
+            (dts (epoch->timestamp (get-dts packet)))
+            (pts (epoch->timestamp (get-pts packet)))
+            (duration (duration->timestamp (get-duration packet)))
+            (keyframe? (get-keyframe? packet))
+            (off? (get-off? packet)))
+        (let ((id/output (or (simulation-video) channel-no)))
+          (let ((buffer data))
+            (if off?
+                (receive-video (current-video) id/output #f #f #f #f #f)
+              (cond ((not gazaa?)
+                     (let ((latency (effective-latency (get-time-base process-ring))))
+                       (let ((offset (flonum->timestamp latency)))
+                         (let ((dts (max 0 (+ dts offset)))
+                               (pts (max 0 (+ pts offset))))
+                           (receive-video (current-video) id/output buffer dts pts duration keyframe?)))))
+                    (else
+                     (receive-video (current-video) id/output buffer dts pts duration keyframe?)))
+              (update process-rate)
+              (if (eq? (get-state process-ring) 'late)
+                  (record-freeze-frame self sender frame keyframe? dts pts)
+                (record-play-frame self sender frame keyframe? dts pts))))))))))

@@ -33,9 +33,34 @@
         (world.ring)
         (world.settings)
         (world.simulate)
+        (world.syntax (phase syntax))
         (world.task)
         (world.time))
 
+
+(definition protected gazaa?
+  (world-setting 'world.gazaa? #f))
+
+(definition protected in-gazaa?
+  (make-parameter #f))
+
+(definition protected gazaa-duration
+  .02)
+
+(definition protected gazaa-nano-duration
+  (flonum->timestamp gazaa-duration))
+
+(definition protected gazaa-mixer
+  .15)
+
+(definition protected gazaa-nano-mixer
+  (flonum->timestamp gazaa-mixer))
+
+(definition protected gazaa-pipeline
+  .27)
+
+(definition protected gazaa-mixer-boundary
+  (+ (- gazaa-pipeline gazaa-mixer) .02))
 
 (definition protected udp-connect <fx>
   0)
@@ -125,9 +150,6 @@
   8192)
 
 
-(definition protected udp-audio-present <fl>
-  (world-setting 'world.udp-audio-present 0.))
-
 ;; gstreamer's audio buffer time
 (definition protected udp-audio-buffer <fl>
   (world-setting 'world.udp-audio-buffer .2))
@@ -138,8 +160,17 @@
   (world-setting 'world.udp-audio-giveup .1))
 
 
+;; audio mixer latency
+(definition protected udp-audio-mixer
+  .15)
+
+;; maximum lateness before mixer drops
+(definition protected udp-audio-tolerance
+  (- udp-audio-mixer .01))
+
+
 (definition protected udp-video-present <fl>
-  (world-setting 'world.udp-video-present (+ udp-audio-present udp-audio-buffer)))
+  (world-setting 'world.udp-video-present udp-audio-buffer))
 
 (definition protected udp-video-late <fl>
   (world-setting 'world.udp-video-late .05))
@@ -155,21 +186,12 @@
   4096)
 
 
-;; udp-audio-buffer
 (register-live-setting 'world.udp-audio-buffer
   (lambda (value)
     (let ((value (if (unspecified? value) .2 value)))
       (set! udp-audio-buffer value)
       (set! udp-audio-giveup (- udp-audio-buffer .01))
-      (set! udp-video-present (+ udp-audio-present udp-audio-buffer)))))
-
-
-;; udp-audio-present
-(register-live-setting 'world.udp-audio-present
-  (lambda (value)
-    (let ((value (if (unspecified? value) .2 value)))
-      (set! udp-audio-present value)
-      (set! udp-video-present (+ udp-audio-present udp-audio-buffer)))))
+      (set! udp-video-present udp-audio-buffer))))
 
 
 (definition protected udp-max-gap-live <fx>
@@ -1324,9 +1346,9 @@
   (method public (remember self data)
     (mutex-lock! mutex)
     (with-record media
-      (let ((dts (timestamp->flonum (read-media-dts data)))
-            (pts (timestamp->flonum (read-media-pts data)))
-            (duration (read-media-duration data))
+      (let ((dts (timestamp->epoch (read-media-dts data)))
+            (pts (timestamp->epoch (read-media-pts data)))
+            (duration (timestamp->duration (read-media-duration data)))
             (sequence (read-media-sequence data))
             (frame (read-media-frame data))
             (part (read-media-part data))
@@ -1499,6 +1521,7 @@
   (slot lowest        <fx>        getter generate)
   (slot highest       <fx>        getter generate)
   (slot state                     getter generate)
+  (slot audio-duration            getter generate)
   (slot last-sequence <fx+>       getter generate)
   (slot time-base     <Time-Base> getter generate)
   (slot terminate?                getter generate)
@@ -1526,6 +1549,7 @@
     (set! self.lowest 0)
     (set! self.highest 0)
     (set! self.state (if (eq? media-kind udp-audio) 'ok 'waiting))
+    (set! self.audio-duration (timestamp->duration 0))
     (set! self.last-sequence #f)
     (set! self.time-base (or time-base (new Time-Base)))
     (set! self.terminate? #f)
@@ -1582,181 +1606,184 @@
   
   (method public (insert self data (insert-event #f))
     (with-record media
-      (let ((now (current-seconds))
-            (dts (timestamp->flonum (read-media-dts data)))
-            (pts (timestamp->flonum (read-media-pts data))))
-        (mutex-lock! mutex)
-        (let ((sender (read-header-sender data))
-              (duration (read-media-duration data))
-              (sequence (read-media-sequence data))
-              (frame (read-media-frame data))
-              (part (read-media-part data))
-              (total (read-media-total data))
-              (keyframe? (read-media-keyframe? data))
-              (off? (read-media-off? data)))
-          (define (time-update)
-            (unless (emulation?)
-              (update-time time-base now dts
-                (lambda (raw-latency latency reason)
-                  (unless (= reason udp-latency-no-change)
-                    (condition-variable-signal! wait-condvar))
-                  (record-event udp-id-update-time
-                                (fixnum->flonum no)
-                                (fixnum->flonum sender)
-                                (fixnum->flonum media-kind)
-                                (fixnum->flonum sequence)
-                                now
-                                raw-latency
-                                dts
-                                latency
-                                reason)))))
-          
-          (define (insert/purge reason)
-            (let ((packet (new UDP-Packet dts pts duration sequence frame part total keyframe? off? data)))
-              (empty self)
-              (when reason
-                (record-purge reason))
-              (record-insert)
-              (insert-before self tail packet)
-              (set! last-sequence sequence)
-              (set! lowest sequence)
-              (set! highest sequence)
-              (check self)
-              (state-waiting self)
-              (condition-variable-signal! wait-condvar)))
-          
-          (define (insert-first-time)
-            (insert/purge #f))
-          
-          (define (insert-highest packet)
+      (mutex-lock! mutex)
+      (let ((now (simulable-time))
+            (dts (timestamp->epoch (read-media-dts data)))
+            (pts (timestamp->epoch (read-media-pts data)))
+            (duration (timestamp->duration (read-media-duration data)))
+            (sender (read-header-sender data))
+            (sequence (read-media-sequence data))
+            (frame (read-media-frame data))
+            (part (read-media-part data))
+            (total (read-media-total data))
+            (keyframe? (read-media-keyframe? data))
+            (off? (read-media-off? data)))
+        (define (time-update)
+          (unless (emulation?)
+            (update-time time-base (flonum->epoch now) dts duration
+              (lambda (raw-latency latency reason)
+                (unless (= reason udp-latency-no-change)
+                  (condition-variable-signal! wait-condvar))
+                (record-event udp-id-update-time
+                              (fixnum->flonum no)
+                              (fixnum->flonum sender)
+                              (fixnum->flonum media-kind)
+                              (fixnum->flonum sequence)
+                              now
+                              raw-latency
+                              (epoch->flonum dts)
+                              latency
+                              reason)))))
+        
+        (define (insert/purge reason)
+          (let ((packet (new UDP-Packet dts pts duration sequence frame part total keyframe? off? data)))
+            (empty self)
+            (when reason
+              (record-purge reason))
             (record-insert)
             (insert-before self tail packet)
             (set! last-sequence sequence)
+            (set! lowest sequence)
             (set! highest sequence)
             (check self)
-            (condition-variable-signal! wait-condvar))
-          
-          (define (record-purge reason)
-            (record-event udp-id-purge-ring
+            (state-waiting self)
+            (condition-variable-signal! wait-condvar)))
+        
+        (define (insert-first-time)
+          (insert/purge #f))
+        
+        (define (insert-highest packet)
+          (record-insert)
+          (insert-before self tail packet)
+          (set! last-sequence sequence)
+          (set! highest sequence)
+          (check self)
+          (condition-variable-signal! wait-condvar))
+        
+        (define (record-purge reason)
+          (record-event udp-id-purge-ring
+                        (fixnum->flonum no)
+                        (fixnum->flonum origin)
+                        (fixnum->flonum media-kind)
+                        (fixnum->flonum sequence)
+                        (fixnum->flonum frame)
+                        reason
+                        -1.))
+        
+        (define (record-insert)
+          (let ((base (get-base time-base))
+                (effective-latency (if gazaa? (get-latency time-base) (effective-latency time-base)))
+                (raw-latency (get-raw-latency time-base)))
+            (record-event (or insert-event udp-id-insert-packet)
                           (fixnum->flonum no)
                           (fixnum->flonum origin)
                           (fixnum->flonum media-kind)
                           (fixnum->flonum sequence)
                           (fixnum->flonum frame)
-                          reason
-                          -1.))
-          
-          (define (record-insert)
-            (let ((base (get-base time-base))
-                  (effective-latency (effective-latency time-base))
-                  (raw-latency (get-raw-latency time-base)))
-              (record-event (or insert-event udp-id-insert-packet)
-                            (fixnum->flonum no)
-                            (fixnum->flonum origin)
-                            (fixnum->flonum media-kind)
-                            (fixnum->flonum sequence)
-                            (fixnum->flonum frame)
-                            effective-latency
-                            dts
-                            (or base -1.)
-                            raw-latency)))
-          
-          (define (record-missing seq)
-            (record-event udp-id-missing-packet
-                          (fixnum->flonum no)
-                          (fixnum->flonum origin)
-                          (fixnum->flonum media-kind)
-                          (fixnum->flonum seq)
-                          (fixnum->flonum sequence)
-                          -1.
-                          -1.))
-          
-          (define (record-gap gap)
-            (record-event udp-id-packet-gap
-                          (fixnum->flonum no)
-                          (fixnum->flonum origin)
-                          (fixnum->flonum media-kind)
-                          (fixnum->flonum sequence)
-                          (fixnum->flonum frame)
-                          (fixnum->flonum gap)
-                          -1.))
-          
-          (cond ;; first time
-                ((not last-sequence)
-                 (time-update)
-                 (insert-first-time))
-                ;; in-order insert
-                ((> sequence last-sequence)
-                 (let ((expected (+ (allege last-sequence) 1)))
-                   (let ((gap (- sequence expected)))
+                          effective-latency
+                          (epoch->flonum dts)
+                          (or base -1.)
+                          raw-latency)))
+        
+        (define (record-missing seq)
+          (record-event udp-id-missing-packet
+                        (fixnum->flonum no)
+                        (fixnum->flonum origin)
+                        (fixnum->flonum media-kind)
+                        (fixnum->flonum seq)
+                        (fixnum->flonum sequence)
+                        -1.
+                        -1.))
+        
+        (define (record-gap gap)
+          (record-event udp-id-packet-gap
+                        (fixnum->flonum no)
+                        (fixnum->flonum origin)
+                        (fixnum->flonum media-kind)
+                        (fixnum->flonum sequence)
+                        (fixnum->flonum frame)
+                        (fixnum->flonum gap)
+                        -1.))
+        
+        (cond ;; first time
+              ((not last-sequence)
+               (time-update)
+               (insert-first-time))
+              ;; in-order insert
+              ((> sequence last-sequence)
+               (let ((expected (+ (allege last-sequence) 1)))
+                 (let ((gap (- sequence expected)))
+                   (when (> gap 0)
+                     (record-gap gap)
+                     (add-missed-media-packets (current-udp) sender gap))
+                   (if (>= gap max-gap)
+                       (insert/purge udp-purge-gap)
                      (when (> gap 0)
-                       (record-gap gap)
-                       (add-missed-media-packets (current-udp) sender gap))
-                     (if (>= gap max-gap)
-                         (insert/purge udp-purge-gap)
-                       (when (> gap 0)
-                         (send-nack (current-udp) sender no expected gap))
-                       (let ((previous-raw-latency (get-raw-latency time-base)))
-                         (time-update)
-                         (let ((seek-change-heuristic (abs (- (get-raw-latency time-base) previous-raw-latency))))
-                           (if (> seek-change-heuristic 1.)
-                               (begin
-                                 (reset time-base)
-                                 (time-update)
-                                 (reset-seek channel)
-                                 (insert/purge udp-purge-seek))
-                             (let ((packet (new UDP-Packet dts pts duration sequence frame part total keyframe? off? data)))
-                               (if (= count 0)
-                                   (loop (for seq from (+ highest 1) below sequence)
-                                         (record-missing seq)
-                                         (insert-before self tail (new UDP-Packet dts pts #f seq #f #f #f #f #f #f)))
-                                 (let ((highest-packet (highest-packet self)))
-                                   (let ((highest-dts (get-dts highest-packet)))
-                                     (loop (for seq from (+ highest 1) below sequence)
-                                           (let ((dts (interpolate seq highest sequence highest-dts dts)))
-                                             (record-missing seq)
-                                             (insert-before self tail (new UDP-Packet dts pts #f seq #f #f #f #f #f #f)))))))
-                               (insert-highest packet)))))))))
-                ;; out-of-order replace
-                (else
-                 (update-past time-base now dts
-                   (lambda (raw-latency latency reason)
-                     ))
-                 (if (between? sequence lowest highest)
-                     (let ((pos (index self sequence)))
-                       (let ((actual-packet <UDP-Packet> (vector-ref packets pos)))
-                         (if (get-data actual-packet)
-                             (let ((resent (read-media-resent data)))
-                               (record-event udp-id-duplicate-packet
-                                             (fixnum->flonum no)
-                                             (fixnum->flonum origin)
-                                             (fixnum->flonum media-kind)
-                                             (fixnum->flonum sequence)
-                                             (fixnum->flonum frame)
-                                             (fixnum->flonum resent)
-                                             -1.))
+                       (send-nack (current-udp) sender no expected gap))
+                     (let ((previous-raw-latency (get-raw-latency time-base)))
+                       (time-update)
+                       (let ((seek-change-heuristic (abs (- (get-raw-latency time-base) previous-raw-latency))))
+                         (if #f;(> seek-change-heuristic 1.)
+                             (begin
+                               (terminal 'seek '***)
+                               (reset time-base)
+                               (time-update)
+                               (reset-seek channel)
+                               (insert/purge udp-purge-seek))
                            (let ((packet (new UDP-Packet dts pts duration sequence frame part total keyframe? off? data)))
-                             (vector-set! packets pos packet)
-                             (let ((resent (read-media-resent data)))
-                               (record-event udp-id-got-packet
-                                             (fixnum->flonum no)
-                                             (fixnum->flonum origin)
-                                             (fixnum->flonum media-kind)
-                                             (fixnum->flonum sequence)
-                                             (fixnum->flonum frame)
-                                             (fixnum->flonum resent)
-                                             -1.))
-                             (condition-variable-signal! wait-condvar)))))
-                   (let ((resent (read-media-resent data)))
-                     (record-event udp-id-reject-packet
-                                   (fixnum->flonum no)
-                                   (fixnum->flonum origin)
-                                   (fixnum->flonum media-kind)
-                                   (fixnum->flonum sequence)
-                                   (fixnum->flonum frame)
-                                   (fixnum->flonum resent)
-                                   -1.))))))
-        (mutex-unlock! mutex))))
+                             (if (= count 0)
+                                 (loop (for seq from (+ highest 1) below sequence)
+                                       (record-missing seq)
+                                       (insert-before self tail (new UDP-Packet dts pts #f seq #f #f #f #f #f #f)))
+                               (let ((highest-packet (highest-packet self)))
+                                 (let ((highest-dts (get-dts highest-packet)))
+                                   (loop (for seq from (+ highest 1) below sequence)
+                                         (let ((dts (interpolate seq highest sequence highest-dts dts)))
+                                           (record-missing seq)
+                                           (insert-before self tail (new UDP-Packet dts pts #f seq #f #f #f #f #f #f)))))))
+                             (insert-highest packet)))))))))
+              ;; out-of-order replace
+              (else
+               (update-past time-base now dts
+                 (lambda (raw-latency latency reason)
+                   ))
+               (if (between? sequence lowest highest)
+                   (let ((pos (index self sequence)))
+                     (let ((actual-packet <UDP-Packet> (vector-ref packets pos)))
+                       (if (get-data actual-packet)
+                           (let ((resent (read-media-resent data)))
+                             (record-event udp-id-duplicate-packet
+                                           (fixnum->flonum no)
+                                           (fixnum->flonum origin)
+                                           (fixnum->flonum media-kind)
+                                           (fixnum->flonum sequence)
+                                           (fixnum->flonum frame)
+                                           (fixnum->flonum resent)
+                                           -1.))
+                         (let ((packet (new UDP-Packet dts pts duration sequence frame part total keyframe? off? data)))
+                           (vector-set! packets pos packet)
+                           (when (= media-kind udp-audio)
+                             (set! audio-duration (duration+ audio-duration duration)))
+                           (let ((resent (read-media-resent data)))
+                             (record-event udp-id-got-packet
+                                           (fixnum->flonum no)
+                                           (fixnum->flonum origin)
+                                           (fixnum->flonum media-kind)
+                                           (fixnum->flonum sequence)
+                                           (fixnum->flonum frame)
+                                           (fixnum->flonum resent)
+                                           -1.))
+                           (condition-variable-signal! wait-condvar)))))
+                 (let ((resent (read-media-resent data)))
+                   (record-event udp-id-reject-packet
+                                 (fixnum->flonum no)
+                                 (fixnum->flonum origin)
+                                 (fixnum->flonum media-kind)
+                                 (fixnum->flonum sequence)
+                                 (fixnum->flonum frame)
+                                 (fixnum->flonum resent)
+                                 -1.))))))
+      (mutex-unlock! mutex)))
   
   
   (method public (insert-before self pos <fx> packet <UDP-Packet>)
@@ -1800,7 +1827,10 @@
            (vector-set! packets tail packet)
            (set! tail (modulo (+ tail 1) size))
            (set! head tail)
-           (increase! lowest))))
+           (increase! lowest)))
+    ;; duration
+    (when (= media-kind udp-audio)
+      (set! audio-duration (duration+ audio-duration (get-duration packet)))))
   
   
   ;;;
@@ -1829,9 +1859,9 @@
           (assert (eqv? (get-sequence actual-packet) sequence)
             (assert (not (get-data actual-packet))
               (with-record media
-                (let ((dts (timestamp->flonum (read-media-dts data)))
-                      (pts (timestamp->flonum (read-media-pts data)))
-                      (duration (read-media-duration data))
+                (let ((dts (timestamp->epoch (read-media-dts data)))
+                      (pts (timestamp->epoch (read-media-pts data)))
+                      (duration (timestamp->duration (read-media-duration data)))
                       (sequence (read-media-sequence data))
                       (frame (read-media-frame data))
                       (part (read-media-part data))
@@ -1905,170 +1935,18 @@
   
   
   ;;;
-  ;;;; Process
-  ;;;
-  
-  
-  (method protected (process-audio self)
-    (declare (proper-tail-calls))
-    (let (loop-wait)
-      (if terminate?
-          'terminate
-        (mutex-lock! mutex)
-        (if (= count 0)
-            (begin
-              (mutex-unlock! mutex wait-condvar)
-              (loop-wait))
-          (let ((now (current-seconds))
-                (earliest <UDP-Packet> (vector-ref packets head)))
-            (let ((presentation-time (determine-presentation-time self earliest udp-audio-present)))
-              (let ((giveup-time (+ presentation-time udp-audio-giveup)))
-                (define (debugging what sleep)
-                  @debug
-                  (let ((sequence (get-sequence earliest))
-                        (time (- now (determine-earliest-time self earliest)))
-                        (sleep (if (symbol? sleep) sleep (format "{r precision: 3}" sleep)))
-                        (content (loop (for n from 0 below count)
-                                       (collect (get-sequence (packet-ref self n))))))
-                    (format :terminal
-                            "{a width: 8} {a} {r precision: 3} {a width: 6} ({l}){%}"
-                            what
-                            sequence
-                            time
-                            sleep
-                            content)))
-                
-                (cond ;; off
-                      ((get-off? earliest)
-                       (prog1 (present self now)
-                         (mutex-unlock! mutex)))
-                      ;; giveup
-                      ((>= now giveup-time)
-                       (debugging 'giveup 'loop)
-                       (flush-earliest self)
-                       (mutex-unlock! mutex)
-                       (loop-wait))
-                      ;; not ready
-                      ((< now presentation-time)
-                       (debugging 'sleep (- presentation-time now))
-                       (mutex-unlock! mutex wait-condvar (- presentation-time now))
-                       (loop-wait))
-                      ;; frame
-                      ((complete-frame? self)
-                       (prog1 (present self now)
-                         (debugging 'play 'return)
-                         (mutex-unlock! mutex)))
-                      ;; not ready to giveup
-                      (else
-                       (debugging 'nrtgu (- giveup-time now))
-                       (mutex-unlock! mutex wait-condvar (- giveup-time now))
-                       (loop-wait))))))))))
-  
-  
-  (method protected (process-video self)
-    (declare (proper-tail-calls))
-    (let (loop-wait)
-      (if terminate?
-          'terminate
-        (mutex-lock! mutex)
-        (if (= count 0)
-            (if (not (get-framerate channel))
-                (begin
-                  (mutex-unlock! mutex wait-condvar)
-                  (loop-wait))
-              (mutex-unlock! mutex wait-condvar udp-video-giveup)
-              (if (= count 0)
-                  (begin
-                    (state-waiting self)
-                    (loop-wait))
-                (loop-wait)))
-          (let ((now (current-seconds))
-                (earliest <UDP-Packet> (vector-ref packets head)))
-            (let ((presentation-time (determine-presentation-time self earliest udp-video-present)))
-              (let ((late-time (+ presentation-time udp-video-late))
-                    (giveup-time (+ presentation-time udp-video-giveup)))
-                (define (debugging what sleep)
-                  @debug
-                  (let ((sequence (get-sequence earliest))
-                        (time (- now (determine-earliest-time self earliest)))
-                        (sleep (if (symbol? sleep) sleep (format "{r precision: 3}" sleep)))
-                        (content (loop (for n from 0 below count)
-                                       (collect (get-sequence (packet-ref self n))))))
-                    (format :terminal
-                            "{a width: 6} {a} {r precision: 3} {a width: 6} ({l}){%}"
-                            what
-                            sequence
-                            time
-                            sleep
-                            content)))
-                
-                (cond ;; off
-                      ((get-off? earliest)
-                       (prog1 (present self now)
-                         (mutex-unlock! mutex)))
-                      ;; giveup
-                      ((>= now giveup-time)
-                       (debugging 'giveup 'loop)
-                       (flush-earliest self)
-                       (state-waiting self)
-                       (mutex-unlock! mutex)
-                       (loop-wait))
-                      ;; waiting
-                      ((eq? state 'waiting)
-                       (let ((keyframe (complete-keyframe self)))
-                         (cond ;; keyframe
-                               (keyframe
-                                (let ((packet (packet-ref self keyframe)))
-                                  (let ((packet-present (determine-presentation-time self packet udp-video-present)))
-                                    (if (< now packet-present)
-                                        ;; not ready
-                                        (begin
-                                          (mutex-unlock! mutex wait-condvar (- packet-present now))
-                                          (loop-wait))
-                                      ;; ready
-                                      (begin
-                                        (flush-before self keyframe)
-                                        (state-ok self)
-                                        (mutex-unlock! mutex)
-                                        (loop-wait))))))
-                               ;; not ready to giveup
-                               (else
-                                (mutex-unlock! mutex wait-condvar (- giveup-time now))
-                                (loop-wait)))))
-                      ;; not ready
-                      ((< now presentation-time)
-                       (debugging 'sleep (- presentation-time now))
-                       (mutex-unlock! mutex wait-condvar (- presentation-time now))
-                       (loop-wait))
-                      ;; frame
-                      ((complete-frame? self)
-                       (prog1 (begin
-                                (if (< now late-time)
-                                    (state-ok self)
-                                  (state-late self))
-                                (present self now))
-                         (debugging (if (eq? state 'ok) 'play 'freeze) 'return)
-                         (mutex-unlock! mutex)))
-                      ;; ok
-                      ((< now late-time)
-                       (debugging 'ok (- late-time now))
-                       (mutex-unlock! mutex wait-condvar (- late-time now))
-                       (loop-wait))
-                      ;; late
-                      (else
-                       (debugging 'late (- giveup-time now))
-                       (state-late self)
-                       (mutex-unlock! mutex wait-condvar (- giveup-time now))
-                       (loop-wait))))))))))
-  
-  
-  ;;;
   ;;;; Interface
   ;;;
   
   
   (method protected (packet-ref self n <fx>) <UDP-Packet>
     (vector-ref packets (modulo (+ head n) size)))
+  
+  
+  (method protected (earliest-packet self) <UDP-Packet+>
+    (if (= count 0)
+        #f
+      (vector-ref packets head)))
   
   
   (method (determine-earliest-time self packet <UDP-Packet>) <fl>
@@ -2112,13 +1990,28 @@
         #f)))
   
   
-  (method (present self now)
+  (method (extract-complete self)
     (let ((earliest <UDP-Packet> (vector-ref packets head)))
       (let ((frame (get-frame earliest))
             (total (get-total earliest)))
-        (prog1 (loop (for n from 0 below total)
-                     (collect (get-data (packet-ref self n))))
-          (remove-before self total)))))
+        (let ((datas (loop (for n from 0 below total)
+                           (collect (get-data (packet-ref self n))))))
+          (define (assemble-chunks)
+            (with-record media
+              (if (= total 1)
+                  (read-media-payload (car datas))
+                (let ((chunks (map (lambda (data)
+                                     (read-media-payload data))
+                                   datas)))
+                  (apply u8vector-append chunks)))))
+          
+          (prog1 (let ((first (car datas))
+                       (data (assemble-chunks)))
+                   (with-record media
+                     (let ((sender (read-header-sender first))
+                           (channel-no (read-media-channel first)))
+                       (values sender channel-no earliest data))))
+            (remove-before self total))))))
   
   
   (method (flush-before self cnt)
@@ -2140,6 +2033,14 @@
   
   (method protected (remove-before self cnt <fx>)
     (loop (repeat cnt)
+          (when (= media-kind udp-audio)
+            (let ((packet (vector-ref packets head)))
+              ;; quicky for discarded off
+              (when (get-off? packet)
+                (break))
+              (let ((duration (get-duration packet)))
+                (when duration
+                  (set! audio-duration (duration- audio-duration duration))))))
           (vector-set! packets head #f)
           (set! head (modulo (+ head 1) size))
           (decrease! count)
@@ -2203,7 +2104,7 @@
                       -1.
                     (fixnum->flonum frame))
                   (barbara-keyframe-hack keyframe?)
-                  (timestamp->flonum dts)))
+                  (epoch->flonum dts)))
   
   
   (method (record-discard-packet self sequence frame keyframe? dts)
@@ -2214,7 +2115,24 @@
                   (fixnum->flonum sequence)
                   (fixnum->flonum frame)
                   (barbara-keyframe-hack keyframe?)
-                  (timestamp->flonum dts)))
+                  (epoch->flonum dts)))
+  
+  
+  ;; gazaa keep as sanity check for now
+  (method public (sum-durations self)
+    (let (loop (n 0) (duration 0))
+      (if (>= n count)
+          duration
+        (let ((pos (modulo (+ head n) size)))
+          (let ((packet (vector-ref packets pos)))
+            (let ((dur (get-duration packet)))
+              ;; quicky
+              (let ((sum (if dur
+                  (loop (+ n 1) (+ duration dur))
+                (loop (+ n 1) duration))))
+                (when (/= sum audio-duration)
+                  (terminal '>>>>>>>>>>>>>>>>>mismatch 'sum sum 'duration audio-duration))
+                sum)))))))
   
   
   (method public (locate-packet self sequence <fx>) <UDP-Packet+>
@@ -2428,12 +2346,13 @@
   (slot thread               getter generate)
   
   
-  (method override (initialize self writer)
+  (method override (initialize self writer (wrapper #f))
     (nextmethod self)
     (set! self.latency #f)
     (set! self.latency-proc #f)
     (set! self.drop #f)
     (set! self.simulation #f)
+    (set! self.simulation-start #f)
     (set! self.congestion #f)
     (set! self.congestion-duration 5.)
     (set! self.congestion-occuring? #f)
@@ -2442,7 +2361,11 @@
     (set! self.ring (new Time-Ring udp-simulator-size max-size: udp-simulator-max-size))
     (set! self.thread (new-thread
                         (lambda ()
-                          (send-loop self))
+                          (if (not wrapper)
+                              (send-loop self)
+                            (wrapper
+                              (lambda ()
+                                (send-loop self)))))
                         'simulator))
     (thread-base-priority-set! thread simulator-priority)
     (thread-start! thread))
@@ -2450,11 +2373,17 @@
   
   (method protected (setup-simulation self sim)
     (if (not sim)
-        (set! simulation #f)
-      (set! simulation-start (current-seconds))
+        (begin
+          (set! simulation #f)
+          (set! simulation-start #f))
+      (set! simulation-start (simulable-time))
       (set! simulation-count (/ (f64vector-length sim) 2))
       (set! simulation-last (- simulation-count 1))
       (set! simulation sim)))
+  
+  
+  (method protected (setup-simulation-start self)
+    (set! simulation-start (simulable-time)))
   
   
   (method protected (setup-latency self lat)
@@ -2483,6 +2412,7 @@
             lat)))
     
     (set! simulation #f)
+    (set! simulation-start #f)
     (set! latency lat)
     (set! latency-proc (and lat (parse-latency lat))))
   
@@ -2499,7 +2429,7 @@
           (insert-monotonic ring time obj))))
     
     (cond (simulation
-           (let ((now (current-seconds)))
+           (let ((now (simulable-time)))
              (let ((time (- now simulation-start)))
                (let ((index (fxfloor (/ time udp-heartbeat-period))))
                  (let ((remain (- time (* index udp-heartbeat-period))))
@@ -2525,16 +2455,16 @@
                      (set! congestion-ends ends))
                  (send-writer self data info))
              (when (or (not congestion-ends)
-                       (>= (current-seconds) congestion-ends))
+                       (>= (simulable-time) congestion-ends))
                (set! congestion-occuring? #f)
                (set! congestion-ends #f)
                (send-writer self data info))))
           (latency-proc
            (let ((latency (let ((time (- (current-monotonic) kernel-boot-monotonic)))
                             (latency-proc time))))
-             (insert-latency (current-seconds) latency #f)))
+             (insert-latency (simulable-time) latency #f)))
           (else
-           (insert-latency (current-seconds) 0. #f))))
+           (insert-latency (simulable-time) 0. #f))))
   
   
   (method (drop? self)
