@@ -1061,51 +1061,71 @@
 (class Latency-Base extends Time-Base
   
   
-  (slot stream getter generate)
+  (slot media-kind getter generate)
+  (slot stream     getter generate)
   
   
-  (method override (initialize self stream)
+  (method override (initialize self media-kind stream)
     (nextmethod self)
+    (set! self.media-kind media-kind)
     (set! self.stream stream))
   
   
   (method override (effective-latency self)
-    (effective-latency stream))
+    (media-latency stream media-kind))
   
   
   (method override (remote->local self remote) <fl>
-    (+ base (epoch->flonum remote) (effective-latency stream))))
+    (+ base (epoch->flonum remote) (media-latency stream media-kind))))
+
+
+(definition debug-audio?
+  #f)
+
+(definition debug-audio-state?
+  #t)
+
+
+(definition plateau-duration
+  5.)
 
 
 (class Audio-Latency-Base extends Latency-Base
   
   
   (slot ring             accessors generate)
-  (slot media-kind       getter generate)
   (slot source-kind      getter generate)
   (slot last-raw-latency getter generate)
-  (slot plateau-end-time getter generate)
-  (slot rise-start       getter generate)
-  (slot rise-latency     getter generate)
+  (slot plateau-start    getter generate)
+  (slot plateau-highest  getter generate)
   (slot total-rises      getter generate)
   (slot total-falls      getter generate)
   (slot state            getter generate)
   
   
   (method override (initialize self stream media-kind source-kind)
-    (nextmethod self stream)
-    (set! self.media-kind media-kind)
+    (nextmethod self media-kind stream)
     (set! self.source-kind (if live-streaming? 'live source-kind)))
   
   
   (method override (reset-base self)
     (nextmethod self)
     (set! self.last-raw-latency 0.)
-    (set! self.plateau-end-time 0.)
+    (set! self.plateau-start 0.)
+    (set! self.plateau-highest 0.)
     (set! self.total-rises 0)
     (set! self.total-falls 0)
     (set! self.state 'plateau))
-    
+  
+  
+  (method (determine-earliest-ontime self new-local)
+    (let ((earliest (earliest-packet ring)))
+      (and earliest
+           (let ((earliest-dts (get-dts earliest)))
+             (let ((earliest-base (duration->flonum (epoch- new-local earliest-dts))))
+               (let ((earliest-latency (- earliest-base base)))
+                 (- earliest-latency @w 0. .14)))))))
+  
   
   (method override (update-time self new-local new-remote duration update-proc)
     (let ((new-base (duration->flonum (epoch- new-local new-remote))))
@@ -1114,49 +1134,45 @@
             (set! base new-base)
             (set! raw-latency 0.)
             (set! latency 0.)
+            (update-base stream media-kind base)
             (update-latency stream media-kind latency)
             (update-proc raw-latency latency udp-latency-raw))
-        ;; latency
         (let ((raw (- new-base base)))
           (set! raw-latency raw)
           (case state
             ((plateau)
-             (cond ((> raw (+ latency udp-audio-tolerance))
+             (cond ;; rise
+                   ((> raw (+ latency udp-audio-tolerance))
                     (set! state 'rise)
-                    (set! rise-start (epoch->flonum new-local))
-                    (set! rise-latency latency)
                     (set! latency +inf.0)
                     (set! last-raw-latency raw))
                    ((and (eq? source-kind 'live)
-                         (> (epoch->flonum new-local) plateau-end-time)
+                         (> (epoch->flonum new-local) (+ plateau-start plateau-duration))
                          (< raw (- latency udp-audio-tolerance)))
-                    (set! state 'fall)
-                    (set! last-raw-latency raw))))
+                    (let ((drop (- latency plateau-highest)))
+                      (cond ;; extend
+                            ((< drop .1)
+                             (set! plateau-start (epoch->flonum new-local))
+                             (set! plateau-highest -inf.0))
+                            ;; fall
+                            (else
+                             (set! latency plateau-highest)
+                             (set! plateau-start (epoch->flonum new-local))
+                             (set! plateau-highest -inf.0)))))
+                   ((>= (epoch->flonum new-local) (+ plateau-start 1.))
+                    (when (> raw plateau-highest)
+                      (set! plateau-highest raw)))))
             ((rise)
              (if (> raw last-raw-latency)
                  (set! last-raw-latency raw)
-               (let ((earliest (earliest-packet ring)))
-                 (define (determine-earliest-ontime)
-                   (and earliest
-                        (let ((earliest-dts (get-dts earliest)))
-                          (let ((earliest-base (duration->flonum (epoch- new-local earliest-dts))))
-                            (let ((earliest-latency (- earliest-base base)))
-                              (- earliest-latency 0. @w .14))))))
-                 
-                 (let ((earliest-ontime (determine-earliest-ontime)))
-                   (if (and earliest-ontime (< earliest-ontime last-raw-latency))
-                       (set! last-raw-latency raw)
-                     (increase! total-rises)
-                     (set! state 'plateau)
-                     (set! latency last-raw-latency @w (if earliest-ontime (max earliest-ontime last-raw-latency) last-raw-latency))
-                     (set! plateau-end-time (+ (epoch->flonum new-local) 10.)))))))
-            ((fall)
-             (if (< raw last-raw-latency)
-                 (set! last-raw-latency raw)
-               (increase! total-falls)
-               (set! state 'plateau)
-               (set! latency last-raw-latency)
-               (set! plateau-end-time (+ (epoch->flonum new-local) 5.)))))
+               (let ((earliest-ontime (determine-earliest-ontime self new-local)))
+                 (if (and earliest-ontime (< earliest-ontime last-raw-latency))
+                     (set! last-raw-latency raw)
+                   ;; plateau
+                   (set! state 'plateau)
+                   (set! latency (if earliest-ontime (max earliest-ontime last-raw-latency) last-raw-latency))
+                   (set! plateau-start (epoch->flonum new-local))
+                   (set! plateau-highest -inf.0))))))
           ;; update
           (update-latency stream media-kind latency)
           (update-proc raw-latency latency udp-latency-raw)))))
@@ -1166,52 +1182,20 @@
     ))
 
 
+(definition debug-video?
+  #f)
+
+
 (class Video-Latency-Base extends Latency-Base
   
   
-  (slot ring                      accessors generate)
-  (slot media-kind                getter generate)
-  (slot source-kind               getter generate)
-  (slot short-moving        <fl>  getter generate)
-  (slot long-moving         <fl>  getter generate)
-  (slot past-moving         <fl>  getter generate)
-  (slot last-past-time      <fl+> getter generate)
-  (slot time-of-last-change <fl+> getter generate)
-  (slot min-latency         <fl>  getter generate)
-  (slot state                     getter generate)
+  (slot ring        accessors generate)
+  (slot source-kind getter generate)
   
   
   (method override (initialize self stream media-kind source-kind)
-    (nextmethod self stream)
-    (set! self.media-kind media-kind)
+    (nextmethod self media-kind stream)
     (set! self.source-kind (if live-streaming? 'live source-kind)))
-  
-  
-  (method override (reset-base self)
-    (nextmethod self)
-    (set! self.short-moving 0.)
-    (set! self.long-moving 0.)
-    (set! self.past-moving 0.)
-    (set! self.last-past-time #f)
-    (set! self.time-of-last-change #f)
-    (set! self.min-latency 0.)
-    (set! self.state 'plateau))
-  
-  
-  (method protected (update-moving-averages self raw new-local)
-    (let ((old-short-moving short-moving)
-          (old-long-moving long-moving))
-      (let ((new-short-moving (if (= media-kind udp-audio) (/ (+ (* short-moving 15.) raw) 16.) (/ (+ (* short-moving 7.) raw) 8.)))
-            (new-long-moving (if (= media-kind udp-audio) (/ (+ (* long-moving 1001.) raw) 1002.) (/ (+ (* long-moving 479.) raw) 480.))))
-        (set! short-moving new-short-moving)
-        (set! long-moving new-long-moving)
-        (cond ((and (> short-moving old-short-moving) (> short-moving long-moving))
-               (set! self.long-moving short-moving)
-               (set! time-of-last-change new-local)
-               short-moving)
-              ((and (< short-moving old-short-moving) (< short-moving long-moving))
-               (set! self.short-moving long-moving)
-               long-moving)))))
   
   
   (method override (update-time self new-local new-remote duration update-proc)
@@ -1220,63 +1204,16 @@
           (begin
             (set! base new-base)
             (set! raw-latency 0.)
-            (set! latency 0.))
+            (set! latency 0.)
+            (update-base stream media-kind base)
+            (update-latency stream media-kind latency)
+            (update-proc raw-latency latency udp-latency-raw))
+        ;; latency
         (let ((raw (- new-base base)))
           (set! raw-latency raw)
-          (case source-kind
-            ((live)
-             (let ((last-latency latency)
-                   (min-latency (update-moving-averages self raw (epoch->flonum new-local))))
-               (cond ;; latency nack up
-                     ((and last-past-time
-                           (< (- (epoch->flonum new-local) last-past-time) cutoff-last-past-time)
-                           (> past-moving latency))
-                      (set! latency past-moving)
-                      (update-latency stream media-kind latency)
-                      (update-proc raw-latency latency udp-latency-nack-up))
-                     ;; latency up
-                     ((> min-latency last-latency)
-                      (set! time-of-last-change (epoch->flonum new-local))
-                      (set! latency min-latency)
-                      (update-latency stream media-kind latency)
-                      (update-proc raw-latency latency udp-latency-up))
-                     ;; latency down
-                     ((and (< min-latency last-latency)
-                           time-of-last-change
-                           (> (- (epoch->flonum new-local) time-of-last-change) 10.))
-                      (set! time-of-last-change (epoch->flonum new-local))
-                      (set! latency min-latency)
-                      (update-latency stream media-kind latency)
-                      (update-proc raw-latency latency udp-latency-down))
-                     ;; no change
-                     (else
-                      (update-proc raw-latency latency udp-latency-no-change)))))
-            (else
-             (cond ((> raw latency)
-                    (set! latency raw)
-                    (update-latency stream media-kind latency)
-                    (update-proc raw-latency latency udp-latency-max))
-                   (else
-                    (update-proc raw-latency latency udp-latency-no-change)))))))))
-  
-  
-  (method override (update-past self new-local new-remote update-proc)
-    @w
-    (let ((new-base (duration->flonum (epoch- new-local new-remote))))
-      (let ((raw (- new-base base)))
-        (case source-kind
-          ((live)
-           (cond ((> raw cutoff-latency)
-                  )
-                 (else
-                  (let ((new-past-moving (/ (+ (* past-moving 31.) raw) 32.)))
-                    (set! past-moving new-past-moving)
-                    (set! last-past-time (epoch->flonum new-local))))))
-          (else
-           (when (> raw latency)
-             (set! latency raw)
-             (update-latency stream media-kind latency)
-             (update-proc raw-latency latency udp-latency-max))))))))
+          ;; update
+          (update-latency stream media-kind latency)
+          (update-proc raw-latency latency udp-latency-raw))))))
 
 
 ;;;
@@ -1284,10 +1221,10 @@
 ;;;
 
 
-(definition debug-audio?
+(definition debug-gazaa-audio?
   #f)
 
-(definition debug-audio-state?
+(definition debug-gazaa-audio-state?
   #f)
 
 
@@ -1325,7 +1262,7 @@
   
   
   (method override (effective-latency self)
-    (effective-latency stream))
+    (media-latency stream udp-audio))
   
   
   ;; this one might be good for draining excess latency
@@ -1351,7 +1288,7 @@
   
   ;; this one is for noticing when the ring count is up
   (method protected (update-count self ring-count)
-    (let ((debug? debug-audio?))
+    (let ((debug? debug-gazaa-audio?))
       (let ((fresh-count (cast <fl> ring-count)))
         (if (not average-count)
             (set! average-count fresh-count)
@@ -1368,7 +1305,7 @@
   ;; this one is for noticing when the real audio latency has diverged from
   ;; desired latency
   (method protected (update-divergence self desired-latency actual-latency)
-    (let ((debug? debug-audio?))
+    (let ((debug? debug-gazaa-audio?))
       (let ((fresh-divergence (- desired-latency actual-latency)))
         (if (not average-divergence)
             (set! average-divergence fresh-divergence)
@@ -1385,7 +1322,7 @@
   ;; this one is good for playing audio as soon as possible but leaves
   ;; us vulnerable to the flood of packets coming in when the wave collapses
   (method protected (update-delay self ring-elapse ring-count now play?)
-    (let ((debug? debug-audio?))
+    (let ((debug? debug-gazaa-audio?))
       (let ((fresh-delay (duration->flonum (epoch- now last-arrival-time))))
         (if (not average-delay)
             (set! average-delay fresh-delay)
@@ -1410,8 +1347,8 @@
   
   
   (method override (update-time self new-local new-remote duration update-proc)
-    (let ((debug? debug-audio?)
-          (debug-state? debug-audio-state?)
+    (let ((debug? debug-gazaa-audio?)
+          (debug-state? debug-gazaa-audio-state?)
           (now new-local))
       
       (define (drain drain-target)
@@ -1558,10 +1495,10 @@
   
   (method protected (process-audio-gazaa self channel exit)
     (define debug?
-      debug-audio?)
+      debug-gazaa-audio?)
     
     (define debug-state?
-      debug-audio-state?)
+      debug-gazaa-audio-state?)
     
     (declare (proper-tail-calls))
     (mutex-lock! mutex)
@@ -1902,15 +1839,25 @@
   
   
   (slot latency-mutex      initialize (make-mutex 'latency) getter generate)
+  (slot audio-base    <fl> initialize 0.     getter generate)
+  (slot video-base    <fl> initialize 0.     getter generate)
   (slot audio-latency <fl> initialize -inf.0 getter generate)
   (slot video-latency <fl> initialize -inf.0 getter generate)
   (slot latency       <fl> initialize 0.     getter generate)
   
   
-  (method protected (effective-latency self)
+  (method protected (media-latency self media-kind)
     (mutex-lock! latency-mutex)
-    (prog1 latency
+    (prog1 latency @xp-audio/video-sync (ecase media-kind
+             ((udp-audio) audio-latency)
+             (else (+ audio-latency (- audio-base video-base))))
       (mutex-unlock! latency-mutex)))
+  
+  
+  (method protected (update-base self media-kind base)
+    (ecase media-kind
+      ((udp-audio) (set! audio-base base))
+      (else (set! video-base base))))
   
   
   (method protected (update-latency self media-kind lat)
@@ -1920,6 +1867,8 @@
       (else (set! video-latency lat)))
     (if gazaa?
         (set! latency audio-latency)
+      (set! latency audio-latency)
+      @old!?
       (set! latency (max audio-latency video-latency)))
     (mutex-unlock! latency-mutex)))
 
