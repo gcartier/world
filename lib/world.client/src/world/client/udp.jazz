@@ -1146,6 +1146,18 @@
 (definition plateau-grace <fx>
   (flonum->timestamp 1.))
 
+(definition plateau-minimum <fx>
+  (flonum->timestamp 2.))
+
+(definition drop-minimum <fx>
+  (flonum->timestamp 0.1))
+
+(definition plateau-effective <fx>
+  (- plateau-duration plateau-grace))
+
+(definition foamy-moving-variance <fl>
+  0.01)
+
 
 (class Audio-Latency-Base extends Latency-Base
   
@@ -1158,6 +1170,12 @@
   (slot total-rises      getter generate)
   (slot total-falls      getter generate)
   (slot state            getter generate)
+  ;;plateau
+  (slot latency-total    getter generate)
+  (slot latency-count    getter generate)
+  (slot moving-variance  getter generate)
+  (slot highest-variance getter generate)
+  (slot lowest-variance  getter generate)
   
   
   (method override (initialize self stream media-kind source-kind)
@@ -1168,7 +1186,7 @@
   (method override (reset-base self)
     (nextmethod self)
     (set! self.last-raw-latency 0)
-    (set! self.plateau-start 0.)
+    (set! self.plateau-start 0)
     (set! self.plateau-highest 0)
     (set! self.total-rises 0)
     (set! self.total-falls 0)
@@ -1184,10 +1202,42 @@
                  (- earliest-latency @w 0. .14)))))))
   
   
+  (method (update-mean-latency! self raw)
+    (set! latency-total (+ latency-total raw))
+    (increase! latency-count))
+  
+  
+  (method (check-foamy self raw new-local plateau-time drop)
+    (let ((mean-latency (/ (timestamp->flonum latency-total) latency-count))
+          @w (alpha (/ (timestamp->flonum (min plateau-time plateau-effective)) (timestamp->flonum plateau-effective)))
+          (alpha (min 1. (/ (timestamp->flonum (- plateau-time plateau-grace)) (timestamp->flonum plateau-duration)))))
+      (terminal 'alpha alpha)
+      (let ((fresh-variance (* (- mean-latency (timestamp->flonum raw)) (- mean-latency (timestamp->flonum raw)))))
+        (cond ((> fresh-variance highest-variance)
+               (set! highest-variance fresh-variance))
+              ((< fresh-variance lowest-variance)
+               (set! lowest-variance fresh-variance)))
+        (set! moving-variance (+ (* moving-variance (- 1 alpha)) (* fresh-variance alpha)))
+        @w (terminal 'moving moving-variance)))
+    (let ((foamy-limit (* foamy-moving-variance (timestamp->flonum drop))))
+      (if (and (> drop 0) (< moving-variance foamy-limit))
+          moving-variance
+        #f)))
+  
+  
   (method override (update-time self new-local new-remote update-proc)
     (assert-timestamp new-local)
     (assert-timestamp new-remote)
     (let ((new-base (- new-local new-remote)))
+      (define (reset-plateau)
+        (set! plateau-start new-local)
+        (set! plateau-highest -inf.ts)
+        (set! latency-total 0)
+        (set! latency-count 0)
+        (set! moving-variance 0.)
+        (set! highest-variance 0.)
+        (set! lowest-variance 100.))
+      
       (if (not base)
           (begin
             (when debug-sync?
@@ -1195,6 +1245,7 @@
             (set! base new-base)
             (set! raw-latency 0)
             (set! latency 0)
+            (reset-plateau)
             (update-base stream media-kind base)
             (update-latency stream media-kind latency)
             (update-proc raw-latency latency udp-latency-raw))
@@ -1202,27 +1253,32 @@
           (set! raw-latency raw)
           (case state
             ((plateau)
-             (cond ;; rise
+             (update-mean-latency! self raw)
+             (cond ;; up
                    ((> raw (+ latency udp-audio-tolerance))
+                    (terminal '********rise)
                     (set! state 'rise)
                     (set! latency +inf.ts)
                     (set! last-raw-latency raw))
+                   ;; down
                    ((and (eq? source-kind 'live)
-                         (> new-local (+ plateau-start plateau-duration))
-                         (< raw (- latency udp-audio-tolerance)))
-                    (let ((drop (- latency plateau-highest)))
-                      (cond ;; extend
-                            ((< drop .1)
-                             (set! plateau-start new-local)
-                             (set! plateau-highest -inf.ts))
-                            ;; fall
-                            (else
-                             (set! latency plateau-highest)
-                             (set! plateau-start new-local)
-                             (set! plateau-highest -inf.ts)))))
-                   ((>= new-local (+ plateau-start plateau-grace))
+                         (>= new-local (+ plateau-start plateau-grace)))
                     (when (> raw plateau-highest)
-                      (set! plateau-highest raw)))))
+                      (set! plateau-highest raw))
+                    (let ((plateau-time (- new-local plateau-start))
+                          (drop (- latency plateau-highest)))
+                      (let ((not-foamy? (check-foamy self raw new-local plateau-time drop)))
+                        (when (and not-foamy? (>= plateau-time plateau-minimum))
+                          (terminal 'moving-average not-foamy? 'drop (timestamp->flonum drop))
+                          (cond ;; extend
+                                ((< drop drop-minimum)
+                                 (terminal '********extend)
+                                 (reset-plateau))
+                                ;; fall
+                                (else
+                                 (set! latency plateau-highest)
+                                 (terminal '********fall (timestamp->flonum (- new-local (simulable-base))))
+                                 (reset-plateau)))))))))
             ((rise)
              (if (> raw last-raw-latency)
                  (set! last-raw-latency raw)
@@ -1232,8 +1288,7 @@
                    ;; plateau
                    (set! state 'plateau)
                    (set! latency (if earliest-ontime (max earliest-ontime last-raw-latency) last-raw-latency))
-                   (set! plateau-start new-local)
-                   (set! plateau-highest -inf.ts))))))
+                   (reset-plateau))))))
           ;; update
           ;; banzoo quick hack to fix
           (unless (or (= latency -inf.ts)
