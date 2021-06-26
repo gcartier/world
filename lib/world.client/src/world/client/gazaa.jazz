@@ -51,6 +51,17 @@
 ;; - (* total-delay .8)
 ;; - make constants for barbara
 
+(definition min-silence <fx>
+  (flonum->timestamp 0.5))
+
+(definition min-drain-target <fx>
+  (flonum->timestamp .05))
+
+(definition three-seconds <fx>
+  (flonum->timestamp 3.))
+
+(definition ring-tolerance <fx>
+  (flonum->timestamp .02))
 
 (definition gazaa-duration <fl>
   .02)
@@ -71,10 +82,10 @@
 
 
 (definition debug-gazaa-audio?
-  #f)
+  #t)
 
 (definition debug-gazaa-audio-state?
-  #f)
+  #t)
 
 
 (class Gazaa-Audio-Base extends Timestamp-Base
@@ -185,13 +196,12 @@
             (set! average-count fresh-count)
           (let ((new-average-count (/ (+ (* average-count 31.) fresh-count) 32.)))
             (set! average-count new-average-count))
-          (when debug? (terminal 'average-count average-count)))))
+          @w (when debug? (terminal 'average-count average-count)))))
     (assert-timestamp last-adjustment)
-    (let ((time-factor (max (- 10. (- (simulable-time) (timestamp->flonum last-adjustment))) 0.)))
-      (let ((limit time-factor)) 
-        (if (> average-count limit)
-            average-count
-          #f))))
+    (let ((time-factor (max (- 10. (timestamp->flonum (- (simulable-timestamp) last-adjustment))) 0.)))
+      (if (> average-count time-factor)
+          #t ;;average-count
+        #f)))
   
   
   ;; this one is for noticing when the real audio latency has diverged from
@@ -203,13 +213,12 @@
             (set! average-divergence fresh-divergence)
           (let ((new-average-divergence (/ (+ (* average-divergence 15.) fresh-divergence) 16.)))
             (set! average-divergence new-average-divergence))
-          (when debug? (terminal 'average-divergence average-divergence)))))
+          @w (when debug? (terminal 'average-divergence average-divergence)))))
     (assert-timestamp last-adjustment)
-    (let ((time-factor (max (- 10. (- (simulable-time) (timestamp->flonum last-adjustment))) 0.)))
-      (let ((limit time-factor))
-        (if (> average-divergence limit)
-            average-divergence
-          #f))))
+    (let ((time-factor (max (- 10. (timestamp->flonum (- (simulable-timestamp) last-adjustment))) 0.)))
+      (if (> average-divergence time-factor)
+          #t ;;average-divergence
+        #f)))
   
   
   ;; this one is good for playing audio as soon as possible but leaves
@@ -259,9 +268,7 @@
         (let ((new-latency (max lat gazaa-pipeline)))
           (set-latency time-base new-latency)
           (update-latency (get-stream time-base) udp-audio new-latency)
-          (when debug? (terminal 'set-latency new-latency)))
-        (when (> (abs lat) (flonum->timestamp 100.)) ;; barbara
-          (break)))
+          (when debug? (terminal 'set-latency new-latency))))
       
       (when (not last-arrival-time)
         (set! last-arrival-time now)
@@ -272,10 +279,10 @@
          (assert-timestamp audio-duration)
          (let ((accumulate-finished? (update-delay self (timestamp->flonum audio-duration) count now #f))
                (accumulate-time (- now begin-clocktime)))
-           (when (and accumulate-finished? (>= accumulate-time (flonum->timestamp .5))) ;; barbara
+           (when (and accumulate-finished? (>= accumulate-time min-silence))
              (set! last-adjustment now)
              (let ((drain-target (- audio-duration accumulate-time)))
-               (when (> (flonum->timestamp (flonum->timestamp 0.05)) (abs drain-target)) ;; barbara
+               (when (< (abs drain-target) min-drain-target)
                  (set! drain-target 0))
                (when debug? (terminal 'accumulate-time accumulate-time))
                (when debug? (terminal 'audio-duration (timestamp->flonum audio-duration)))
@@ -308,7 +315,7 @@
                   (when debug? (terminal 'count count))
                   (set! average-delay #f)
                   (set! average-divergence #f))
-                 ((> (- now last-adjustment) (flonum->timestamp 3.)) ;; barbara
+                 ((> (- now last-adjustment) three-seconds)
                   (let ((extra-latency (- real-audio-latency gazaa-pipeline)))
                     (set! last-adjustment now)
                     (set-time-base-latency (+ average-divergence gazaa-pipeline))
@@ -328,8 +335,152 @@
   ;;;; Process
   ;;;
   
-  
   (method protected (process-audio-gazaa self channel exit)
+    (define debug?
+      debug-gazaa-audio?)
+    
+    (define debug-state?
+      debug-gazaa-audio-state?)
+    
+    (declare (proper-tail-calls))
+    (mutex-lock! mutex)
+    (mutex-unlock! mutex wait-condvar)
+    (let (loop-wait)
+      
+      ;; init
+      (define (init)
+        (unless (simulation?)
+          (when (not appsrc)
+            (let ((output (world.audio:find-output (current-audio) no)))
+              ;; need to do this better
+              (if (not output)
+                  (begin
+                    (mutex-unlock! mutex wait-condvar (simulable-elapse gazaa-duration))
+                    (loop-wait))
+                (set! appsrc (slot-value output 'appsrc))))))
+        (let ((running-time (if (simulation?) (simulable-timestamp) (gst_element_get_running_time appsrc))))
+          (assert-timestamp running-time)
+          (when debug? (terminal 'running-time (timestamp->flonum running-time)))
+          (set! last-dts running-time)
+          (set! last-pts running-time)
+          (set! last-duration 0)
+          @w (set! real-audio-latency 0)
+          (set! audio-state 'init)
+          (when debug-state? (terminal 'INIT))))
+      
+      ;; check state of mixer queue
+      (define (check-for-accumulate)
+        (if (<= real-audio-latency gazaa-mixer-boundary)
+            (begin
+              (when (neq? audio-state 'accumulate)
+                (set! begin-clocktime (simulable-timestamp))
+                (set! audio-state 'accumulate)
+                (when debug-state? (terminal 'ACCUMULATE 'count count)))
+              #t)
+          #f))
+      
+      ;; extract and present count earliest complete frames
+      (define (extract&present present-count)
+        (loop (repeat present-count)
+              (when (> count 0)
+                (receive (sender channel-no packet data) (extract-complete self)
+                  (let ((dts (max (+ last-dts last-duration) 0))
+                        (pts (max (+ last-pts last-duration) 0))
+                        (duration (get-duration packet)))
+                    (set! last-dts dts)
+                    (set! last-pts pts)
+                    (set! last-duration duration)
+                    (parameterize ((in-gazaa? #t))
+                      ;; quicky
+                      (when (get-off? packet)
+                        (simulable-off))
+                      (simulable-present packet dts duration)
+                      (present-audio channel sender channel-no packet data dts pts duration)))))))
+      
+      ;; extract and drain count earliest complete frames
+      (define (extract&drain drain-count)
+        (loop (repeat drain-count)
+              (when (> count 0)
+                ;; quicky
+                (let ((earliest <UDP-Packet> (vector-ref packets head)))
+                  (when (get-off? earliest)
+                    (simulable-off))
+                  (simulable-flush earliest))
+                (flush-earliest self))))
+      
+      (if terminate?
+          (continuation-return exit #f)
+        (mutex-lock! mutex)
+        (when (not audio-state)
+          (init))
+        (let ((running-time (if (simulation?) (simulable-timestamp) (gst_element_get_running_time appsrc))))
+          (assert-timestamp running-time)
+          @w (set! real-audio-latency (- (+ last-dts last-duration) running-time))
+          (set! real-audio-latency (- last-dts running-time))
+          (if (= count 0)
+              (begin
+                (when (neq? audio-state 'init)
+                  (check-for-accumulate))
+                (mutex-unlock! mutex wait-condvar (simulable-elapse .05))
+                (loop-wait))
+            (let ((earliest <UDP-Packet> (vector-ref packets head)))
+              (cond ;; off
+                    ((get-off? earliest)
+                     (simulable-off)
+                     (receive (sender channel-no packet data) (extract-complete self)
+                       (parameterize ((in-gazaa? #t))
+                         (present-audio channel sender channel-no packet data)))
+                     (mutex-unlock! mutex wait-condvar)
+                     (loop-wait))
+                    ;; frame
+                    ((complete-frame? self)
+                     (case audio-state
+                       ((init)
+                        (extract&present count)
+                        (set! audio-state 'play)
+                        (when debug-state? (terminal 'PLAY))
+                        (mutex-unlock! mutex wait-condvar (simulable-elapse gazaa-duration))
+                        (loop-wait))
+                       ((play)
+                        (let ((desired-latency (get-latency time-base))
+                              (packet-duration (get-duration earliest)))
+                          (cond ;; pull from ring
+                                ((and (> real-audio-latency (- desired-latency ring-tolerance))
+                                      (< real-audio-latency (+ desired-latency ring-tolerance)))
+                                 (when debug? (terminal-string "."))
+                                 (extract&present 1))
+                                ((and (<= real-audio-latency gazaa-mixer-boundary) (> count 1))
+                                 (when debug? (terminal-string "..."))
+                                 (extract&present count))
+                                ((<= real-audio-latency gazaa-mixer-boundary)
+                                 (set! audio-state 'accumulate)
+                                 (set! begin-clocktime (simulable-timestamp))
+                                 (when debug-state? (terminal 'ACCUMULATE 'from 'play 'count count)))
+                                ((< real-audio-latency desired-latency)
+                                 (if (> count 1)
+                                     (begin
+                                       (when debug? (terminal-string ".."))
+                                       (extract&present 2))
+                                   (when debug? (terminal-string "."))
+                                   (extract&present 1))))
+                        (mutex-unlock! mutex)
+                        (sleep (simulable-elapse (timestamp->flonum packet-duration)))
+                        (loop-wait)))
+                       ((drain)
+                        (terminal 111111)
+                        (set! begin-clocktime 0)
+                        (extract&present count)
+                        (set! audio-state 'play)
+                        (mutex-unlock! mutex wait-condvar (simulable-elapse .001))
+                        (loop-wait))
+                       ;; not off and incomplete frame???
+                       (else
+                        (when debug? (terminal-string "?"))
+                        (mutex-unlock! mutex wait-condvar (simulable-elapse 0.1))
+                        (loop-wait)))))))))))
+  
+  
+  @w (method protected (process-audio-gazaa self channel exit)
     (define debug?
       debug-gazaa-audio?)
     
@@ -476,8 +627,8 @@
                           (let ((desired-latency (get-latency time-base)))
                             @w (when debug? (terminal 'rl real-audio-latency 'dl desired-latency))
                             (cond ;; pull from ring
-                                  ((and (> real-audio-latency (- desired-latency (flonum->timestamp .02))) ;; barbara
-                                        (< real-audio-latency (+ desired-latency (flonum->timestamp .02)))) ;; barbara
+                                  ((and (> real-audio-latency (- desired-latency ring-tolerance))
+                                        (< real-audio-latency (+ desired-latency ring-tolerance)))
                                    (when debug? (terminal-string "."))
                                    (extract&present 1))
                                   ((and (<= real-audio-latency gazaa-mixer-boundary) (> count 1))
