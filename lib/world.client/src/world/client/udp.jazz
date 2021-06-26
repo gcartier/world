@@ -1155,7 +1155,7 @@
 (definition plateau-effective <fx>
   (- plateau-duration plateau-grace))
 
-(definition foamy-moving-variance <fl>
+(definition low-moving-variance <fl>
   0.01)
 
 
@@ -1170,12 +1170,9 @@
   (slot total-rises      getter generate)
   (slot total-falls      getter generate)
   (slot state            getter generate)
-  ;;plateau
   (slot latency-total    getter generate)
   (slot latency-count    getter generate)
   (slot moving-variance  getter generate)
-  (slot highest-variance getter generate)
-  (slot lowest-variance  getter generate)
   
   
   (method override (initialize self stream media-kind source-kind)
@@ -1202,27 +1199,19 @@
                  (- earliest-latency @w 0. .14)))))))
   
   
-  (method (update-mean-latency! self raw)
+  (method (update-mean-latency self raw)
     (set! latency-total (+ latency-total raw))
     (increase! latency-count))
   
   
-  (method (check-foamy self raw new-local plateau-time drop)
-    (let ((mean-latency (/ (timestamp->flonum latency-total) latency-count))
-          @w (alpha (/ (timestamp->flonum (min plateau-time plateau-effective)) (timestamp->flonum plateau-effective)))
+  (method (check-low-variance self raw new-local plateau-time drop)
+    (let ((mean-latency (/ (timestamp->flonum latency-total) (cast <fl> latency-count)))
           (alpha (min 1. (/ (timestamp->flonum (- plateau-time plateau-grace)) (timestamp->flonum plateau-duration)))))
-      (terminal 'alpha alpha)
-      (let ((fresh-variance (* (- mean-latency (timestamp->flonum raw)) (- mean-latency (timestamp->flonum raw)))))
-        (cond ((> fresh-variance highest-variance)
-               (set! highest-variance fresh-variance))
-              ((< fresh-variance lowest-variance)
-               (set! lowest-variance fresh-variance)))
-        (set! moving-variance (+ (* moving-variance (- 1 alpha)) (* fresh-variance alpha)))
-        @w (terminal 'moving moving-variance)))
-    (let ((foamy-limit (* foamy-moving-variance (timestamp->flonum drop))))
-      (if (and (> drop 0) (< moving-variance foamy-limit))
-          moving-variance
-        #f)))
+      (let ((fresh-variance (sqr (- mean-latency (timestamp->flonum raw)))))
+        (set! moving-variance (+ (* moving-variance (- 1 alpha)) (* fresh-variance alpha)))))
+    (let ((low-variance-limit (* low-moving-variance (timestamp->flonum drop))))
+      (and (> drop 0.)
+           (< moving-variance low-variance-limit))))
   
   
   (method override (update-time self new-local new-remote update-proc)
@@ -1234,9 +1223,7 @@
         (set! plateau-highest -inf.ts)
         (set! latency-total 0)
         (set! latency-count 0)
-        (set! moving-variance 0.)
-        (set! highest-variance 0.)
-        (set! lowest-variance 100.))
+        (set! moving-variance 0.))
       
       (if (not base)
           (begin
@@ -1253,10 +1240,9 @@
           (set! raw-latency raw)
           (case state
             ((plateau)
-             (update-mean-latency! self raw)
+             (update-mean-latency self raw)
              (cond ;; up
                    ((> raw (+ latency udp-audio-tolerance))
-                    (terminal '********rise)
                     (set! state 'rise)
                     (set! latency +inf.ts)
                     (set! last-raw-latency raw))
@@ -1267,17 +1253,14 @@
                       (set! plateau-highest raw))
                     (let ((plateau-time (- new-local plateau-start))
                           (drop (- latency plateau-highest)))
-                      (let ((not-foamy? (check-foamy self raw new-local plateau-time drop)))
-                        (when (and not-foamy? (>= plateau-time plateau-minimum))
-                          (terminal 'moving-average not-foamy? 'drop (timestamp->flonum drop))
+                      (let ((low-variance (check-low-variance self raw new-local plateau-time drop)))
+                        (when (and low-variance (>= plateau-time plateau-minimum))
                           (cond ;; extend
                                 ((< drop drop-minimum)
-                                 (terminal '********extend)
                                  (reset-plateau))
                                 ;; fall
                                 (else
                                  (set! latency plateau-highest)
-                                 (terminal '********fall (timestamp->flonum (- new-local (simulable-base))))
                                  (reset-plateau)))))))))
             ((rise)
              (if (> raw last-raw-latency)
