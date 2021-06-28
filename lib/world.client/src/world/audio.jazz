@@ -641,6 +641,9 @@
 (definition protected microphone-listener
   #f)
 
+(definition protected microphone-voice-probe
+  #f)
+
 (definition protected microphone-caps
   #f)
 
@@ -689,7 +692,8 @@
                                           logging-severity: (custom-logging-severity)
                                           name: "processor"))
                         (gst-element "rndenoiser name=rndenoiser"
-                                     denoise: (gst-boolean audio-rndenoise?))
+                                     denoise: (gst-boolean audio-rndenoise?)
+                                     voice: (gst-boolean #t))
                         "audioresample"
                         (and (eq? audio-codec 'opus) "opusenc name=enc")
                         (and (eq? audio-codec 'vorbis) "audioconvert")
@@ -698,25 +702,30 @@
                         "appsink name=sink")))
         (let ((listener (open-stream-listener "microphone")))
           (with-unref ((appsink (gst_bin_get_by_name pipeline "sink")))
-            (gst_app_sink_connect_signals appsink listener)
-            (gst_element_set_state pipeline GST_STATE_PLAYING)
-            (let ((caps (wait-caps-string appsink)))
-              (if (not caps)
-                  (begin
-                    (gst_element_set_state pipeline GST_STATE_NULL)
-                    (gst_object_unref pipeline)
-                    #f)
-                (set! microphone-pipeline pipeline)
-                (set! microphone-listener listener)
-                (set! microphone-caps caps)
-                (set! microphone-drained? #f)
-                #t))))))))
+            (with-unref ((pad (gst_element_get_static_pad appsink "sink")))
+              (let ((voice-probe (gst_pad_add_voice_probe pad (get-write-file listener))))
+                (gst_app_sink_connect_signals appsink listener)
+                (gst_element_set_state pipeline GST_STATE_PLAYING)
+                (let ((caps (wait-caps-string appsink)))
+                  (if (not caps)
+                      (begin
+                        (gst_element_set_state pipeline GST_STATE_NULL)
+                        (gst_object_unref pipeline)
+                        #f)
+                    (set! microphone-pipeline pipeline)
+                    (set! microphone-listener listener)
+                    (set! microphone-voice-probe voice-probe)
+                    (set! microphone-caps caps)
+                    (set! microphone-drained? #f)
+                    #t))))))))))
 
 
 (definition public (release-microphone-pipeline)
+  (gst_pad_probe_free microphone-voice-probe)
   (gst_bin_release microphone-pipeline)
   (set! microphone-pipeline #f)
   (set! microphone-listener #f)
+  (set! microphone-voice-probe #f)
   (set! microphone-caps #f)
   (set! microphone-drained? #f))
 
@@ -755,9 +764,7 @@
 (class Microphone-Audio-Src extends Audio-Src
   
   
-  (slot sink      initialize #f accessors generate)
-  (slot vad-probe initialize #f accessors generate)
-  (slot vap-probe initialize #f accessors generate)
+  (slot sink initialize #f accessors generate)
   
   
   (method override (require-caps self)
@@ -775,12 +782,6 @@
     (nextmethod self)
     (let ((pipeline (require-microphone-pipeline)))
       (gst_object_set_name pipeline "audio.mic")
-      (with-unref ((rndenoiser (gst_bin_get_by_name pipeline "rndenoiser")))
-        (with-unref ((pad (gst_element_get_static_pad rndenoiser "src")))
-          (set! vad-probe (gst_pad_add_vad_probe pad))))
-      (with-unref ((appsink (gst_bin_get_by_name pipeline "sink")))
-        (with-unref ((pad (gst_element_get_static_pad appsink "sink")))
-          (set! vap-probe (gst_pad_add_vap_probe pad (get-write-file (require-microphone-listener))))))
       (let ((listener (require-microphone-listener)))
         (with-unref ((appsink (gst_bin_get_by_name pipeline "sink")))
           (setup-consumer consumer listener appsink 4096)
@@ -824,12 +825,6 @@
     (unless bailout?
       (consume-frame consumer #f #f #f #f 0))
     (release-consumer consumer)
-    (when vad-probe
-      (gst_pad_probe_free vad-probe)
-      (set! vad-probe #f))
-    (when vap-probe
-      (gst_pad_probe_free vap-probe)
-      (set! vap-probe #f))
     (release-microphone-pipeline)
     (set! pipeline #f))
   
