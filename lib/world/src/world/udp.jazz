@@ -116,10 +116,10 @@
 
 
 (definition protected udp-live-retain-window <fx>
-  (world-setting 'world.udp-sender-retain-window (flonum->timestamp 1.)))
+  (flonum->timestamp 1.))
 
 (definition protected udp-non-live-retain-window <fx>
-  (world-setting 'world.udp-server-retain-window (flonum->timestamp 5.)))
+  (flonum->timestamp 5.))
 
 (definition protected (effective-retain-window source-kind) <fx>
   (if (eq? source-kind 'live)
@@ -133,14 +133,18 @@
   8192)
 
 
+;; greater than any reasonably occuring latency change
+(definition protected udp-seek-tolerance <fx>
+  (flonum->timestamp 5.))
+
+
 ;; gstreamer's audio buffer time
 (definition protected udp-audio-buffer <fx>
-  (world-setting 'world.udp-audio-buffer (flonum->timestamp .2)))
+  (flonum->timestamp .2))
 
-;; this value should be lower than
-;; gstreamer's audio mixer latency
+;; this value should be lower than gstreamer's audio mixer latency
 (definition protected udp-audio-giveup <fx>
-  (world-setting 'world.udp-audio-giveup (flonum->timestamp .1)))
+  (flonum->timestamp .1))
 
 
 ;; audio mixer latency
@@ -152,14 +156,14 @@
   (- udp-audio-mixer (flonum->timestamp .01)))
 
 
-(definition protected udp-video-present <fx>
-  (world-setting 'world.udp-video-present udp-audio-buffer))
+(definition protected udp-video-process <fx>
+  udp-audio-buffer)
 
 (definition protected udp-video-late <fx>
-  (world-setting 'world.udp-video-late (flonum->timestamp .05)))
+  (flonum->timestamp .05))
 
 (definition protected udp-video-giveup <fx>
-  (world-setting 'world.udp-video-giveup (flonum->timestamp .5)))
+  (flonum->timestamp .5))
 
 
 (definition protected udp-process-size <fx>
@@ -1180,6 +1184,70 @@
 
 
 ;;;
+;;;; Base
+;;;
+
+
+(class UDP-Base extends Object
+  
+  
+  (slot base        <fx+> getter generate)
+  (slot raw-latency <fx>  getter generate)
+  (slot latency     <fx>  accessors generate)
+  
+  
+  (method override (initialize self)
+    (nextmethod self)
+    (reset self))
+  
+  
+  (method protected (reset self)
+    (reset-base self))
+  
+  
+  (method protected virtual (reset-base self)
+    (set! self.base #f)
+    (set! self.raw-latency 0)
+    (set! self.latency 0))
+
+  
+  (method override (print self output readably)
+    (print-unreadable self output
+      (lambda (output)
+        (format output "{a} {a}" base latency))))
+  
+  
+  (method protected virtual (effective-latency self)
+    latency)
+  
+  
+  (method protected (visualizer-update self base latency)
+    (set! self.base base)
+    (set! self.latency latency))
+  
+  
+  (method public virtual (update-time self local remote update-proc)
+    (let ((new-base (- local remote)))
+      (if (not base)
+          (begin
+            (set! base new-base)
+            (set! raw-latency 0)
+            (set! latency 0))
+        (let ((raw (- new-base base)))
+          (set! raw-latency raw)
+          (set! latency raw))))
+    (update-proc raw-latency latency udp-latency-raw))
+  
+  
+  (method public virtual (update-past self local remote update-proc)
+    )
+  
+  
+  (method public virtual (remote->local self remote) <fx>
+    (+ base remote latency)))
+
+
+;;;
 ;;;; Remember
 ;;;
 
@@ -1539,7 +1607,7 @@
     (set! self.highest 0)
     (set! self.state (if (eq? media-kind udp-audio) 'ok 'waiting))
     (set! self.last-sequence #f)
-    (set! self.time-base (or time-base (new Timestamp-Base)))
+    (set! self.time-base (or time-base (new UDP-Base)))
     (set! self.terminate? #f)
     (set! self.overflow-proc overflow-proc)
     (set! self.retain-window retain-window))
@@ -1592,10 +1660,14 @@
   ;;;
   
   
+  (method protected virtual (local-timestamp self)
+    (simulable-timestamp))
+  
+  
   (method public (insert self data (insert-event #f))
     (with-record media
       (mutex-lock! mutex)
-      (let ((now (simulable-timestamp))
+      (let ((local (local-timestamp self))
             (dts (read-media-dts data))
             (pts (read-media-pts data))
             (duration (read-media-duration data))
@@ -1608,7 +1680,7 @@
             (off? (read-media-off? data)))
         (define (time-update)
           (unless (emulation?)
-            (update-time time-base now dts
+            (update-time time-base local dts
               (lambda (raw-latency latency reason)
                 (unless (= reason udp-latency-no-change)
                   (condition-variable-signal! wait-condvar))
@@ -1618,7 +1690,7 @@
                                 (fixnum->flonum sender)
                                 (fixnum->flonum media-kind)
                                 (fixnum->flonum sequence)
-                                (timestamp->flonum now)
+                                (timestamp->flonum local)
                                 (timestamp->flonum raw-latency)
                                 (timestamp->flonum dts)
                                 (timestamp->flonum latency)
@@ -1736,7 +1808,7 @@
                              (insert-highest packet)))))))))
               ;; out-of-order replace
               (else
-               (update-past time-base now dts
+               (update-past time-base local dts
                  (lambda (raw-latency latency reason)
                    ))
                (if (between? sequence lowest highest)
@@ -1922,10 +1994,10 @@
             (begin
               (mutex-unlock! mutex wait-condvar)
               (loop-wait))
-          (let ((now (current-timestamp))
+          (let ((nowstamp (current-timestamp))
                 (earliest <UDP-Packet> (vector-ref packets head)))
             (let ((release-time (determine-release-time self earliest)))
-              (if (>= now release-time)
+              (if (>= nowstamp release-time)
                   (prog1 earliest
                     (vector-set! packets head #f)
                     (set! head (modulo (+ head 1) size))
@@ -1933,7 +2005,7 @@
                     (increase! lowest)
                     (check self)
                     (mutex-unlock! mutex))
-                (mutex-unlock! mutex wait-condvar (timestamp->flonum (- release-time now)))
+                (mutex-unlock! mutex wait-condvar (timestamp->flonum (- release-time nowstamp)))
                 (loop-wait))))))))
   
   
@@ -1957,12 +2029,7 @@
       (vector-ref packets head)))
   
   
-  (method (determine-earliest-time self packet <UDP-Packet>) <fx>
-    (let ((dts (get-dts packet)))
-      (remote->local time-base dts)))
-  
-  
-  (method (determine-presentation-time self packet <UDP-Packet> process-window <fx>) <fx>
+  (method protected (determine-write-time self packet <UDP-Packet> process-window <fx>) <fx>
     (let ((dts (get-dts packet)))
       (let ((time (remote->local time-base dts)))
         (if (= time +inf.ts)

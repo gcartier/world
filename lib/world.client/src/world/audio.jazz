@@ -331,7 +331,7 @@
             (set-stream-state output 'off)
           (when (eq? (get-stream-state output) 'off)
             (set-stream-state output 'on))
-          (consume-audio output buffer dts pts duration)
+          (write-audio output buffer dts pts duration)
           (when (and record-events? udp-record-src/sink?)
             (let ((origin (get-origin (get-stream (get-channel output)))))
               (record-event udp-id-sink-media
@@ -349,7 +349,7 @@
         (set-stream-state output 'off)
       (when (eq? (get-stream-state output) 'off)
         (set-stream-state output 'on))
-      (consume-audio output buffer dts pts duration)))
+      (write-audio output buffer dts pts duration)))
   
   
   (method package (receive-audio self id/output buffer dts pts duration)
@@ -1215,7 +1215,6 @@
   (slot stream-state           initialize 'off getter generate setter explicit)
   (slot stream-playing?        initialize #f getter generate)
   (slot stream-disconnected?   initialize #f getter generate)
-  (slot stream-prerolled?      initialize #f getter generate)
   (slot source-adapter         initialize #f getter generate)
   (slot last-timestamp         initialize #f getter generate)
   (slot last-duration          initialize #f getter generate)
@@ -1367,37 +1366,35 @@
     (string-append "audio." name))
   
   
-  @syncxp
-  (method protected (setup-audio-adapter self dts)
-    (if (not appsrc)
-        #f
-      (unless (get-timestamp-offset source-adapter)
-        (when (not stream-playing?)
-          (if (not stream-prerolled?)
-              (set! stream-prerolled? #t)
-            (play self)
-            (set! stream-playing? #t)))
-        (adapt-time source-adapter appsrc dts))
-      #t))
-  
-  
-  (method protected virtual (consume-audio self buffer dts pts duration)
-    (mutex-lock! audio-mutex)
-    ;@syncxp
+  (method protected (play-audio self)
     (when (not stream-playing?)
-      (if (not stream-prerolled?)
-          (set! stream-prerolled? #t)
-        (play self)
-        (set! stream-playing? #t)))
+      (play self)
+      (set! stream-playing? #t)))
+  
+  
+  (method protected virtual (write-audio self buffer dts pts duration)
+    (mutex-lock! audio-mutex)
+    (play-audio self)
     (if (in-gazaa?)
-        (gst_app_src_write appsrc buffer (u8vector-length buffer) dts pts duration 0)
-      (when (and debug-sync? (not (get-timestamp-offset source-adapter)))
-        (terminal '***AUDIO-ADAPTER*** (current-seconds) (current-thread)))
+        (gst_app_src_write appsrc buffer (u8vector-length buffer) dts pts duration)
       (let ((timestamp-offset (adapt-time source-adapter appsrc pts)))
-        (let ((timestamp (+ pts timestamp-offset)))
-          (when (or (not last-timestamp) (>= timestamp (+ last-timestamp last-duration)))
-            (gst_app_src_write appsrc buffer (u8vector-length buffer) dts pts duration timestamp-offset)
-            (set! last-timestamp timestamp)
+        (let ((dts (max 0 (+ dts timestamp-offset)))
+              (pts (max 0 (+ pts timestamp-offset))))
+          (when record-events?
+            (let ((running-time (gst_element_get_running_time appsrc))
+                  (late-time (+ pts udp-audio-mixer)))
+              (when (>= running-time late-time)
+                (record-event udp-id-media-late
+                              -1.
+                              -1.
+                              (fixnum->flonum udp-audio)
+                              -1.
+                              -1.
+                              -1.
+                              -1.))))
+          (when #t @this-seems-more-gritchy (or (not last-timestamp) (>= pts (+ last-timestamp last-duration)))
+            (gst_app_src_write appsrc buffer (u8vector-length buffer) dts pts duration)
+            (set! last-timestamp pts)
             (set! last-duration duration)))))
     (mutex-unlock! audio-mutex))
   

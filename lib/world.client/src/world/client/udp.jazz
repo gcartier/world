@@ -849,56 +849,67 @@
     (with-record media
       (let ((channel-no (read-media-channel data)))
         (let ((channel (find-receive-channel self channel-no)))
+          (define (receive)
+            (remember-media channel data)
+            (insert-media channel data))
+          
           (when channel
-            (let ()
-              (define (receive)
-                (remember-media channel data)
-                (insert-media channel data)
-                @syncxp
-                (cond ((= (read-header-kind data) udp-audio)
-                       (let ((output (find-output (current-audio) channel-no)))
-                         (when output
-                           (when (setup-audio-adapter output (read-media-dts data))
-                             (remember-media channel data)
-                             (insert-media channel data)))))
-                      (else
-                       (let ((output (find-output (current-video) channel-no)))
-                         (when output
-                           (when (setup-video-adapter output (read-media-dts data))
-                             (remember-media channel data)
-                             (insert-media channel data)))))))
-              
-              (if (not debug-sync?)
-                  (receive)
-                (ecase kind
-                  ((udp-audio)
+            (cond ((= (read-header-kind data) udp-audio)
                    (unless audio-muted?
-                     (when audio-skew
-                       (write-media-dts data (+ (read-media-dts data) audio-skew)))
+                     (when audio-offset
+                       (write-media-dts data (+ (read-media-dts data) audio-offset))
+                       (write-media-pts data (+ (read-media-pts data) audio-offset)))
                      (let ((audio-start (get-audio-start channel)))
-                       (if (eq? audio-start #t)
-                           (receive)
+                       (define (receive-audio)
+                         (let ((ring (get-process-ring channel)))
+                           (if (get-appsrc ring)
+                               (receive)
+                             (let ((output (find-output (current-audio) channel-no)))
+                               (when output
+                                 (let ((appsrc (get-appsrc output)))
+                                   (when appsrc
+                                     (play-audio output)
+                                     (set-appsrc ring appsrc)
+                                     (receive))))))))
+                       
+                       (if (or (not audio-delay)
+                               (eq? audio-start #t))
+                           (receive-audio)
                          (let ((now (current-seconds)))
                            (when (not audio-start)
                              (set! audio-start (+ now audio-delay))
                              (set-audio-start channel audio-start))
                            (when (>= now audio-start)
-                             (receive)
+                             (receive-audio)
                              (set-audio-start channel #t)))))))
                   (else
                    (unless video-muted?
-                     (when video-skew
-                       (write-media-dts data (+ (read-media-dts data) video-skew)))
+                     (when video-offset
+                       (write-media-dts data (+ (read-media-dts data) video-offset))
+                       (write-media-pts data (+ (read-media-pts data) video-offset)))
                      (let ((video-start (get-video-start channel)))
-                       (if (eq? video-start #t)
-                           (receive)
+                       (define (receive-video)
+                         (let ((ring (get-process-ring channel)))
+                           (if (get-appsrc ring)
+                               (receive)
+                             (let ((output (find-output (current-video) channel-no)))
+                               (when output
+                                 (let ((appsrc (get-color-appsrc output)))
+                                   (when appsrc
+                                     (play-video output)
+                                     (set-appsrc (get-process-ring channel) appsrc)
+                                     (receive))))))))
+                       
+                       (if (or (not video-delay)
+                               (eq? video-start #t))
+                           (receive-video)
                          (let ((now (current-seconds)))
                            (when (not video-start)
                              (set! video-start (+ now video-delay))
                              (set-video-start channel video-start))
                            (when (>= now video-start)
-                             (receive)
-                             (set-video-start channel #t)))))))))))))))
+                             (receive-video)
+                             (set-video-start channel #t)))))))))))))
   
   
   (method (send-missing self sender channel-no start gap)
@@ -1110,7 +1121,7 @@
   0.5)
 
 
-(class Latency-Base extends Timestamp-Base
+(class UDP-Receive-Base extends UDP-Base
   
   
   (slot media-kind getter generate)
@@ -1157,7 +1168,7 @@
   0.01)
 
 
-(class Audio-Latency-Base extends Latency-Base
+(class UDP-Audio-Base extends UDP-Receive-Base
   
   
   (slot ring             accessors generate)
@@ -1184,11 +1195,11 @@
     (set! self.state 'plateau))
   
   
-  (method (determine-earliest-ontime self new-local)
+  (method (determine-earliest-ontime self local)
     (let ((earliest (earliest-packet ring)))
       (and earliest
            (let ((earliest-dts (get-dts earliest)))
-             (let ((earliest-base (- new-local earliest-dts)))
+             (let ((earliest-base (- local earliest-dts)))
                (let ((earliest-latency (- earliest-base base)))
                  (- earliest-latency @w 0. udp-audio-tolerance)))))))
   
@@ -1198,7 +1209,7 @@
     (increase! drop-count))
   
   
-  (method (check-low-variance? self drop new-local plateau-time smallest-drop)
+  (method (check-low-variance? self drop local plateau-time smallest-drop)
     (let ((mean-drop (/ (timestamp->flonum drop-total) (cast <fl> drop-count)))
           (raw-drop (timestamp->flonum drop))
           (alpha (min 1. (/ (timestamp->flonum (- plateau-time plateau-grace)) (timestamp->flonum plateau-duration)))))
@@ -1209,10 +1220,10 @@
            (< drop-variance low-variance-limit))))
   
   
-  (method override (update-time self new-local new-remote update-proc)
-    (let ((new-base (- new-local new-remote)))
+  (method override (update-time self local remote update-proc)
+    (let ((new-base (- local remote)))
       (define (reset-plateau)
-        (set! plateau-start new-local)
+        (set! plateau-start local)
         (set! plateau-highest -inf.ts)
         (set! drop-total 0)
         (set! drop-count 0)
@@ -1220,14 +1231,11 @@
       
       (if (not base)
           (begin
-            (when debug-sync?
-              (terminal '***AUDIO-BASE*** (current-seconds) (current-thread)))
             (set! base new-base)
             (set! raw-latency 0)
             (set! latency 0)
             (reset-plateau)
-            (update-base stream media-kind base)
-            (update-latency stream media-kind latency)
+            (update-latency stream media-kind raw-latency latency)
             (update-proc raw-latency latency udp-latency-raw))
         (let ((raw (- new-base base)))
           (set! raw-latency raw)
@@ -1240,14 +1248,14 @@
                     (set! last-raw-latency raw))
                    ;; down
                    ((and (eq? source-kind 'live)
-                         (>= new-local (+ plateau-start plateau-grace)))
+                         (>= local (+ plateau-start plateau-grace)))
                     (when (> raw plateau-highest)
                       (set! plateau-highest raw))
-                    (let ((plateau-time (- new-local plateau-start))
+                    (let ((plateau-time (- local plateau-start))
                           (drop (- latency raw))
                           (smallest-drop (- latency plateau-highest)))
                       (update-mean-drop self drop)
-                      (let ((low-variance? (check-low-variance? self drop new-local plateau-time smallest-drop)))
+                      (let ((low-variance? (check-low-variance? self drop local plateau-time smallest-drop)))
                         (when (and low-variance? (>= plateau-time plateau-minimum))
                           (cond ;; extend
                                 ((< smallest-drop drop-minimum)
@@ -1260,7 +1268,7 @@
             ((rise)
              (if (> raw last-raw-latency)
                  (set! last-raw-latency raw)
-               (let ((earliest-ontime (determine-earliest-ontime self new-local)))
+               (let ((earliest-ontime (determine-earliest-ontime self local)))
                  (if (and earliest-ontime (< earliest-ontime last-raw-latency))
                      (set! last-raw-latency raw)
                    ;; plateau
@@ -1268,14 +1276,11 @@
                    (set! latency (if earliest-ontime (max earliest-ontime last-raw-latency) last-raw-latency))
                    (reset-plateau))))))
           ;; update
-          ;; banzoo quick hack to fix
-          (unless (or (= latency -inf.ts)
-                      (= latency +inf.ts))
-          (update-latency stream media-kind latency)
-          (update-proc raw-latency latency udp-latency-raw))))))
+          (update-latency stream media-kind raw-latency latency)
+          (update-proc raw-latency latency udp-latency-raw)))))
   
   
-  (method override (update-past self new-local new-remote update-proc)
+  (method override (update-past self local remote update-proc)
     ))
 
 
@@ -1283,10 +1288,9 @@
   #f)
 
 
-(class Video-Latency-Base extends Latency-Base
+(class UDP-Video-Base extends UDP-Receive-Base
   
   
-  (slot ring        accessors generate)
   (slot source-kind getter generate)
   
   
@@ -1295,23 +1299,21 @@
     (set! self.source-kind (if live-streaming? 'live source-kind)))
   
   
-  (method override (update-time self new-local new-remote update-proc)
-    (let ((new-base (- new-local new-remote)))
+  (method override (update-time self local remote update-proc)
+    (let ((new-base (- local remote)))
       (if (not base)
           (begin
-            (when debug-sync?
-              (terminal '***VIDEO-BASE*** (current-seconds) (current-thread)))
             (set! base new-base)
             (set! raw-latency 0)
             (set! latency 0)
-            (update-base stream media-kind base)
-            (update-latency stream media-kind latency)
+            (update-latency stream media-kind raw-latency latency)
             (update-proc raw-latency latency udp-latency-raw))
         ;; latency
         (let ((raw (- new-base base)))
           (set! raw-latency raw)
+          (set! latency raw)
           ;; update
-          (update-latency stream media-kind latency)
+          (update-latency stream media-kind raw-latency latency)
           (update-proc raw-latency latency udp-latency-raw))))))
 
 
@@ -1320,7 +1322,14 @@
 ;;;
 
 
-(class UDP-Receive-Ring extends UDP-Ring)
+(class UDP-Receive-Ring extends UDP-Ring
+  
+  
+  (slot appsrc initialize #f accessors generate)
+  
+  
+  (method override (local-timestamp self)
+    (gst_element_get_running_time appsrc)))
 
 
 ;;;
@@ -1367,38 +1376,44 @@
             (begin
               (mutex-unlock! mutex wait-condvar)
               (loop-wait))
-          (let ((now (simulable-timestamp))
-                (earliest <UDP-Packet> (vector-ref packets head)))
-            (let ((presentation-time (determine-presentation-time self earliest 0)))
-              (let ((giveup-time (+ presentation-time (flonum->timestamp 5.) @w udp-audio-giveup)))
-                (cond ;; off
-                      ((get-off? earliest)
-                       (simulable-off)
-                       (receive (sender channel-no packet data) (extract-complete self)
-                         (present-audio channel sender channel-no packet data))
-                       (mutex-unlock! mutex)
-                       (loop-wait))
-                      ;; giveup
-                      ((>= now giveup-time)
-                       (flush-earliest self)
-                       (mutex-unlock! mutex)
-                       (loop-wait))
-                      ;; not ready
-                      ((< now presentation-time)
-                       (mutex-unlock! mutex wait-condvar (simulable-elapse (timestamp->flonum (- presentation-time now))))
-                       (loop-wait))
-                      ;; frame
-                      ((complete-frame? self)
-                       (receive (sender channel-no packet data) (extract-complete self)
-                         (simulable-present packet (get-dts packet) (get-duration packet))
-                         (present-audio channel sender channel-no packet data))
-                       (mutex-unlock! mutex)
-                       (loop-wait))
-                      ;; not ready to giveup
-                      (else
-                       (flush-earliest self)
-                       (mutex-unlock! mutex)
-                       (loop-wait)))))))))))
+          (wake-audio self loop-wait)))))
+  
+  
+  ;; temporarily moved out of process-audio to enable evaluation
+  (method (wake-audio self loop-wait)
+    (declare (proper-tail-calls))
+    (let ((running-time (if (simulation?) (simulable-timestamp) (gst_element_get_running_time appsrc)))
+          (earliest <UDP-Packet> (vector-ref packets head)))
+      (let ((write-time (determine-write-time self earliest 0)))
+        (let ((giveup-time (+ write-time (flonum->timestamp 5.) @w udp-audio-giveup)))
+          (cond ;; off
+                ((get-off? earliest)
+                 (simulable-off)
+                 (receive (sender channel-no packet data) (extract-complete self)
+                   (give-audio channel sender channel-no packet data))
+                 (mutex-unlock! mutex)
+                 (loop-wait))
+                ;; giveup
+                ((>= running-time giveup-time)
+                 (flush-earliest self)
+                 (mutex-unlock! mutex)
+                 (loop-wait))
+                ;; not ready
+                ((< running-time write-time)
+                 (mutex-unlock! mutex wait-condvar (simulable-elapse (timestamp->flonum (- write-time running-time))))
+                 (loop-wait))
+                ;; frame
+                ((complete-frame? self)
+                 (receive (sender channel-no packet data) (extract-complete self)
+                   (simulable-present packet (get-dts packet) (get-duration packet))
+                   (give-audio channel sender channel-no packet data))
+                 (mutex-unlock! mutex)
+                 (loop-wait))
+                ;; not ready to giveup
+                (else
+                 (flush-earliest self)
+                 (mutex-unlock! mutex)
+                 (loop-wait))))))))
 
 
 ;;;
@@ -1420,93 +1435,80 @@
                 (begin
                   (mutex-unlock! mutex wait-condvar)
                   (loop-wait))
-              (mutex-unlock! mutex wait-condvar (timestamp->flonum udp-video-giveup))
+              (mutex-unlock! mutex wait-condvar (simulable-elapse (timestamp->flonum udp-video-giveup)))
               (if (= count 0)
                   (begin
                     (state-waiting self)
                     (loop-wait))
                 (loop-wait)))
-          (let ((now (simulable-timestamp))
-                (earliest <UDP-Packet> (vector-ref packets head)))
-            (let ((presentation-time (determine-presentation-time self earliest udp-video-present)))
-              (let ((late-time (+ presentation-time udp-video-late))
-                    (giveup-time (+ presentation-time udp-video-giveup)))
-                (define (debugging what sleep)
-                  @debug
-                  (let ((sequence (get-sequence earliest))
-                        (time (- now (determine-earliest-time self earliest)))
-                        (sleep (if (symbol? sleep) sleep (format "{r precision: 3}" sleep)))
-                        (content (loop (for n from 0 below count)
-                                       (collect (get-sequence (packet-ref self n))))))
-                    (format :terminal
-                            "{a width: 6} {a} {r precision: 3} {a width: 6} ({l}){%}"
-                            what
-                            sequence
-                            time
-                            sleep
-                            content)))
-                
-                (cond ;; off
-                      ((get-off? earliest)
-                       (receive (sender channel-no packet data) (extract-complete self)
-                         (present-video channel sender channel-no packet data))
-                       (mutex-unlock! mutex)
-                       (loop-wait))
-                      ;; giveup
-                      ((>= now giveup-time)
-                       (debugging 'giveup 'loop)
-                       (flush-earliest self)
-                       (state-waiting self)
-                       (mutex-unlock! mutex)
-                       (loop-wait))
-                      ;; waiting
-                      ((eq? state 'waiting)
-                       (let ((keyframe (complete-keyframe self)))
-                         (cond ;; keyframe
-                               (keyframe
-                                (let ((packet (packet-ref self keyframe)))
-                                  (let ((packet-present (determine-presentation-time self packet udp-video-present)))
-                                    (if (< now packet-present)
-                                        ;; not ready
-                                        (begin
-                                          (mutex-unlock! mutex wait-condvar (- packet-present now))
-                                          (loop-wait))
-                                      ;; ready
-                                      (begin
-                                        (flush-before self keyframe)
-                                        (state-ok self)
-                                        (mutex-unlock! mutex)
-                                        (loop-wait))))))
-                               ;; not ready to giveup
-                               (else
-                                (mutex-unlock! mutex wait-condvar (- giveup-time now))
-                                (loop-wait)))))
-                      ;; not ready
-                      ((< now presentation-time)
-                       (debugging 'sleep (- presentation-time now))
-                       (mutex-unlock! mutex wait-condvar (- presentation-time now))
-                       (loop-wait))
-                      ;; frame
-                      ((complete-frame? self)
-                       (if (< now late-time)
-                           (state-ok self)
-                         (state-late self))
-                       (receive (sender channel-no packet data) (extract-complete self)
-                         (present-video channel sender channel-no packet data))
-                       (debugging (if (eq? state 'ok) 'play 'freeze) 'return)
-                       (mutex-unlock! mutex)
-                       (loop-wait))
-                      ;; ok
-                      ((< now late-time)
-                       (debugging 'ok (- late-time now))
-                       (mutex-unlock! mutex wait-condvar (- late-time now))
-                       (loop-wait))
-                      ;; late
-                      (else
-                       (debugging 'late (- giveup-time now))
-                       (state-late self)
-                       (mutex-unlock! mutex wait-condvar (- giveup-time now))
-                       (loop-wait)))))))))))
+          (wake-video self loop-wait)))))
+  
+  
+  ;; temporarily moved out of process-video to enable evaluation
+  (method (wake-video self loop-wait)
+    (declare (proper-tail-calls))
+    (let ((running-time (if (simulation?) (simulable-timestamp) (gst_element_get_running_time appsrc)))
+          (earliest <UDP-Packet> (vector-ref packets head)))
+      (let ((write-time (determine-write-time self earliest udp-video-process)))
+        (let ((late-time (+ write-time udp-video-late))
+              (giveup-time (+ write-time udp-video-giveup)))
+          (cond ;; off
+                ((get-off? earliest)
+                 (simulable-off)
+                 (receive (sender channel-no packet data) (extract-complete self)
+                   (give-video channel sender channel-no packet data))
+                 (mutex-unlock! mutex)
+                 (loop-wait))
+                ;; giveup
+                ((>= running-time giveup-time)
+                 (flush-earliest self)
+                 (state-waiting self)
+                 (mutex-unlock! mutex)
+                 (loop-wait))
+                ;; waiting
+                ((eq? state 'waiting)
+                 (let ((keyframe (complete-keyframe self)))
+                   (cond ;; keyframe
+                         (keyframe
+                          (let ((packet (packet-ref self keyframe)))
+                            (let ((packet-write (determine-write-time self packet udp-video-process)))
+                              (if (< running-time packet-write)
+                                  ;; not ready
+                                  (begin
+                                    (mutex-unlock! mutex wait-condvar (simulable-elapse (timestamp->flonum (- packet-write running-time))))
+                                    (loop-wait))
+                                ;; ready
+                                (begin
+                                  (flush-before self keyframe)
+                                  (state-ok self)
+                                  (mutex-unlock! mutex)
+                                  (loop-wait))))))
+                         ;; not ready to giveup
+                         (else
+                          (mutex-unlock! mutex wait-condvar (simulable-elapse (timestamp->flonum (- giveup-time running-time))))
+                          (loop-wait)))))
+                ;; not ready
+                ((< running-time write-time)
+                 (mutex-unlock! mutex wait-condvar (simulable-elapse (timestamp->flonum (- write-time running-time))))
+                 (loop-wait))
+                ;; frame
+                ((complete-frame? self)
+                 (if (< running-time late-time)
+                     (state-ok self)
+                   (state-late self))
+                 (receive (sender channel-no packet data) (extract-complete self)
+                   (give-video channel sender channel-no packet data))
+                 (mutex-unlock! mutex)
+                 (loop-wait))
+                ;; ok
+                ((< running-time late-time)
+                 (mutex-unlock! mutex wait-condvar (simulable-elapse (timestamp->flonum (- late-time running-time))))
+                 (loop-wait))
+                ;; late
+                (else
+                 (state-late self)
+                 (mutex-unlock! mutex wait-condvar (simulable-elapse (timestamp->flonum (- giveup-time running-time))))
+                 (loop-wait))))))))
 
 
 ;;;
@@ -1517,38 +1519,55 @@
 (class UDP-Receive-Stream extends UDP-Stream
   
   
-  (slot latency-mutex      initialize (make-mutex 'latency) getter generate)
-  (slot audio-base    <fx> initialize 0       getter generate)
-  (slot video-base    <fx> initialize 0       getter generate)
-  (slot audio-latency <fx> initialize -inf.ts getter generate)
-  (slot video-latency <fx> initialize -inf.ts getter generate)
-  (slot latency       <fx> initialize 0       getter generate)
+  (slot latency-mutex        initialize (make-mutex 'latency) getter generate)
+  (slot audio-lowtime  <fl+> initialize #f getter generate)
+  (slot audio-lowest   <fx+> initialize #f getter generate)
+  (slot video-lowtime  <fl+> initialize #f getter generate)
+  (slot video-lowest   <fx+> initialize #f getter generate)
+  (slot audio-time     <fl+> initialize #f getter generate)
+  (slot audio-latency  <fx+> initialize #f getter generate)
+  (slot video-latency  <fx+> initialize #f getter generate)
   
   
   (method protected (media-latency self media-kind)
     (mutex-lock! latency-mutex)
-    (prog1 latency @xp-audio/video-sync (ecase media-kind
+    (prog1 (ecase media-kind
              ((udp-audio) audio-latency)
-             (else (+ audio-latency (- audio-base video-base))))
+             (else (if (or (not audio-latency)
+                           (> (- (current-seconds) audio-time) 1.))
+                       video-latency
+                     (if (= audio-latency +inf.ts)
+                         audio-latency
+                       (if (or (not audio-lowest)
+                               (not video-lowest))
+                           video-latency
+                         (let ((audio-absolute (- audio-latency audio-lowest)))
+                           (+ video-lowest audio-absolute)))))))
       (mutex-unlock! latency-mutex)))
   
   
-  (method protected (update-base self media-kind base)
-    (ecase media-kind
-      ((udp-audio) (set! audio-base base))
-      (else (set! video-base base))))
-  
-  
-  (method protected (update-latency self media-kind lat)
+  (method protected (update-latency self media-kind raw-latency latency)
     (mutex-lock! latency-mutex)
     (ecase media-kind
-      ((udp-audio) (set! audio-latency lat))
-      (else (set! video-latency lat)))
-    (if gazaa?
-        (set! latency audio-latency)
-      (set! latency audio-latency)
-      @old!?
-      (set! latency (max audio-latency video-latency)))
+      ((udp-audio)
+       (when (or (not audio-lowest)
+                 (< raw-latency audio-lowest))
+         (set! audio-lowtime (current-seconds))
+         (set! audio-lowest raw-latency)
+         (when (and video-lowest (> (abs (- video-lowtime audio-lowtime)) 1.))
+           (set! video-lowtime #f)
+           (set! video-lowest #f)))
+       (set! audio-time (current-seconds))
+       (set! audio-latency latency))
+      (else
+       (when (or (not video-lowest)
+                 (< raw-latency video-lowest))
+         (set! video-lowtime (current-seconds))
+         (set! video-lowest raw-latency)
+         (when (and audio-lowest (> (abs (- video-lowtime audio-lowtime)) 1.))
+           (set! audio-lowtime #f)
+           (set! audio-lowest #f)))
+       (set! video-latency latency)))
     (mutex-unlock! latency-mutex)))
 
 
@@ -1564,19 +1583,19 @@
 (class UDP-Receive-Channel extends UDP-Channel
   
   
-  (slot process-ring      getter generate)
-  (slot process-task      getter generate)
-  (slot replay-ring       getter generate)
-  (slot insert-rate-frame getter generate)
-  (slot insert-rate       getter generate)
-  (slot process-rate      getter generate)
+  (slot process-ring                      getter generate)
+  (slot process-task                      getter generate)
+  (slot replay-ring                       getter generate)
+  (slot insert-rate-frame                 getter generate)
+  (slot insert-rate                       getter generate)
+  (slot process-rate                      getter generate)
   (slot last-audio-frame    initialize #f getter generate)
   (slot last-audio-buffer   initialize #f getter generate)
   (slot last-audio-pts      initialize #f getter generate)
   (slot last-audio-dts      initialize #f getter generate)
   (slot last-audio-duration initialize #f getter generate)
-  (slot audio-start initialize #f accessors generate)
-  (slot video-start initialize #f accessors generate)
+  (slot audio-start         initialize #f accessors generate)
+  (slot video-start         initialize #f accessors generate)
   
   
   (method override (initialize self stream no media-kind source-kind level resolution framerate bitrate codec caps metadata)
@@ -1586,9 +1605,9 @@
                        ((udp-audio)
                         (if gazaa?
                             (new world.client.gazaa:Gazaa-Audio-Base stream source-kind)
-                          (new Audio-Latency-Base stream media-kind source-kind)))
+                          (new UDP-Audio-Base stream media-kind source-kind)))
                        (else
-                        (new Video-Latency-Base stream media-kind source-kind)))))
+                        (new UDP-Video-Base stream media-kind source-kind)))))
       (set! self.process-ring (ecase media-kind
                                 ((udp-audio)
                                  (if gazaa?
@@ -1629,7 +1648,15 @@
   
   
   (method override (reset-seek self)
-    (set! last-audio-frame #f))
+    (set! last-audio-frame #f)
+    ;; quick test
+    (ecase media-kind
+      ((udp-audio)
+       (let ((output (find-output (current-audio) no)))
+         (reset (get-source-adapter output))))
+      (else
+       (let ((output (find-output (current-video) no)))
+         (reset (get-source-adapter output))))))
   
   
   ;;;
@@ -1678,8 +1705,8 @@
       (subu8vector buffer 0 size)))
   
 
-  (method protected (present-audio self sender channel-no packet data (dts #f) (pts #f) (duration #f))
-    (site present-audio
+  (method protected (give-audio self sender channel-no packet data (dts #f) (pts #f) (duration #f))
+    (site give-audio
       (let ((frame (get-frame packet))
             (total (get-total packet))
             (dts (or dts (get-dts packet)))
@@ -1690,6 +1717,7 @@
         (let ((id/output (or (simulation-audio) channel-no)))
           ;; duplicate last buffer to fill missing audio which sounds a lot better
           ;; than doing nothing and have gstreamer use silence which sounds gritchy
+          @wait
           (when (and last-audio-frame (> last-audio-duration 0))
             (let ((audio-gap (- frame last-audio-frame)))
               (when (and (> audio-gap 1) (< audio-gap max-audio-gap))
@@ -1727,8 +1755,8 @@
                 (record-play-frame self sender frame keyframe? dts pts))))))))
   
   
-  (method protected (present-video self sender channel-no packet data)
-    (site present-video
+  (method protected (give-video self sender channel-no packet data)
+    (site give-video
       (let ((frame (get-frame packet))
             (total (get-total packet))
             (dts (get-dts packet))
