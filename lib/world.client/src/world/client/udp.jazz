@@ -1088,6 +1088,10 @@
   0.5)
 
 
+(definition max-latency <fx>
+  (flonum->timestamp 5.))
+
+
 (class UDP-Receive-Base extends UDP-Base
   
   
@@ -1240,11 +1244,7 @@
                    (reset-plateau))))))
           ;; update
           (update-latency stream media-kind raw-latency latency)
-          (update-proc raw-latency latency udp-latency-raw)))))
-  
-  
-  (method override (update-past self local remote update-proc)
-    ))
+          (update-proc raw-latency latency udp-latency-raw))))))
 
 
 (definition debug-video?
@@ -1252,6 +1252,14 @@
 
 
 (class UDP-Video-Base extends UDP-Receive-Base
+  
+  
+  (slot nack-window <fx> getter generate)
+  
+  
+  (method override (reset-base self)
+    (nextmethod self)
+    (set! self.nack-window 0))
   
   
   (method override (update-time self local remote update-proc)
@@ -1269,7 +1277,17 @@
           (set! latency raw)
           ;; update
           (update-latency stream media-kind raw-latency latency)
-          (update-proc raw-latency latency udp-latency-raw))))))
+          (update-proc raw-latency latency udp-latency-raw)))))
+  
+  
+  (method override (update-past self local remote update-proc)
+    (when (neq? source-kind 'live)
+      (let ((new-base (- local remote)))
+        (let ((raw-latency (min max-latency (- new-base base))))
+          (let ((window (- raw-latency latency)))
+            (when (> window nack-window)
+              (set! nack-window window)
+              (update-nack stream media-kind window))))))))
 
 
 ;;;
@@ -1485,22 +1503,27 @@
   (slot audio-time     <fl+> initialize #f getter generate)
   (slot audio-latency  <fx+> initialize #f getter generate)
   (slot video-latency  <fx+> initialize #f getter generate)
+  (slot nack-window    <fx>  initialize 0  getter generate)
   
   
   (method protected (media-latency self media-kind)
     (mutex-lock! latency-mutex)
-    (prog1 (ecase media-kind
-             ((udp-audio) audio-latency)
-             (else (if (or (not audio-latency)
-                           (> (- (current-seconds) audio-time) 1.))
-                       video-latency
-                     (if (= audio-latency +inf.ts)
-                         audio-latency
-                       (if (or (not audio-lowest)
-                               (not video-lowest))
-                           video-latency
-                         (let ((audio-absolute (- audio-latency audio-lowest)))
-                           (+ video-lowest audio-absolute)))))))
+    (prog1 (let ((latency (ecase media-kind
+                            ((udp-audio) audio-latency)
+                            (else (cond ((or (not audio-latency)
+                                             (> (- (current-seconds) audio-time) 1.))
+                                         video-latency)
+                                        ((= audio-latency +inf.ts)
+                                         audio-latency)
+                                        ((or (not audio-lowest)
+                                             (not video-lowest))
+                                         video-latency)
+                                        (else
+                                         (let ((audio-absolute (- audio-latency audio-lowest)))
+                                           (+ video-lowest audio-absolute))))))))
+             (if (= latency +inf.ts)
+                 latency
+               (+ latency nack-window)))
       (mutex-unlock! latency-mutex)))
   
   
@@ -1526,6 +1549,12 @@
            (set! audio-lowtime #f)
            (set! audio-lowest #f)))
        (set! video-latency latency)))
+    (mutex-unlock! latency-mutex))
+  
+  
+  (method protected (update-nack self media-kind window)
+    (mutex-lock! latency-mutex)
+    (set! nack-window window)
     (mutex-unlock! latency-mutex)))
 
 
