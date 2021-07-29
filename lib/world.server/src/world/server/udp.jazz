@@ -438,10 +438,12 @@
   (method protected (receive-medias self kind data)
     (declare (proper-tail-calls))
     (with-record media
-      (let ((no (read-media-channel data)))
+      (let ((no (read-media-channel data))
+            (sender (read-header-sender data)))
         ;; so a sequence of one doesn't allocate a pair
         (let (loop (ordered #f))
           (define (receive)
+            (resend-nacks self sender)
             (if (not ordered)
                 (receive-media self kind data)
               (for-each (lambda (data)
@@ -550,7 +552,7 @@
                       (get-members group)))))))
   
   
-  (method override (send-nack self sender channel-no start gap)
+  (method override (send-nack self sender channel-no start gap resend)
     (let ((connection (no->connection self sender)))
       (when connection
         (with-record nack
@@ -562,7 +564,31 @@
               (write-nack-start data start)
               (write-nack-gap data gap)
               (write-udp-code data)
-              (send-data self connection data)))))))
+              (send-data self connection data)
+              (when (> resend 0)
+                (add-resending-nacks connection (cons resend data)))))))))
+  
+  
+  (method (resend-nacks self sender)
+    (declare (proper-tail-calls))
+    (let ((connection (no->connection self sender)))
+      (when connection
+        (let ((resending-nacks (get-resending-nacks connection)))
+          (when (not-null? resending-nacks)
+            (let (loop (previous #f) (scan resending-nacks))
+              (when (not-null? scan)
+                (bind (info . next) scan
+                  (bind (resend . data) info
+                    (send-data self connection data)
+                    (let ((resend (- resend 1)))
+                      (cond ((<= resend 0)
+                             (if (not previous)
+                                 (set-resending-nacks connection next)
+                               (set-cdr! previous next))
+                             (loop previous next))
+                            (else
+                             (set-car! info resend)
+                             (loop scan next)))))))))))))
   
   
   (method (send-ack self sender data)
@@ -768,21 +794,22 @@
 (class UDP-Connection extends Object
   
   
-  (slot host                                  getter generate)
-  (slot port                                  getter generate)
-  (slot monitor                               getter generate)
-  (slot simulator               initialize #f accessors generate)
-  (slot video-level                           accessors generate)
-  (slot last-received-heartbeat initialize #f accessors generate)
-  (slot throttle-media?         initialize #f accessors generate)
-  (slot waiting-for-keyframe                  accessors generate)
-  (slot profile-base-time       initialize #f getter generate)
-  (slot profile-time-base       initialize #f getter generate)
-  (slot profile-media-sequence  initialize #f getter generate)
-  (slot profile-last-sequence   initialize #f getter generate)
-  (slot profile-monitor         initialize #f getter generate)
-  (slot profile-chronology      initialize #f getter generate)
-  (slot profile-evolution       initialize #f getter generate)
+  (slot host                                   getter generate)
+  (slot port                                   getter generate)
+  (slot monitor                                getter generate)
+  (slot simulator               initialize #f  accessors generate)
+  (slot video-level                            accessors generate)
+  (slot last-received-heartbeat initialize #f  accessors generate)
+  (slot throttle-media?         initialize #f  accessors generate)
+  (slot waiting-for-keyframe                   accessors generate)
+  (slot resending-nacks         initialize '() accessors generate)
+  (slot profile-base-time       initialize #f  getter generate)
+  (slot profile-time-base       initialize #f  getter generate)
+  (slot profile-media-sequence  initialize #f  getter generate)
+  (slot profile-last-sequence   initialize #f  getter generate)
+  (slot profile-monitor         initialize #f  getter generate)
+  (slot profile-chronology      initialize #f  getter generate)
+  (slot profile-evolution       initialize #f  getter generate)
   
   
   (method override (initialize self host port video-level)
@@ -829,6 +856,10 @@
   
   (method protected (increase-received self data)
     (increase-received monitor data))
+  
+  
+  (method protected (add-resending-nacks self info)
+    (set! resending-nacks (cons info resending-nacks)))
   
   
   (method package (next-profile-media-sequence! self)
