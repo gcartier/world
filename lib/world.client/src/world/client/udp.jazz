@@ -854,7 +854,7 @@
             (remember-media channel data)
             (insert-media channel data))
           
-          (when channel
+          (when (and channel (eq? (get-send-state channel) 'on))
             (cond ((= (read-header-kind data) udp-audio)
                    (let ((ring (get-process-ring channel)))
                      (if (get-appsrc ring)
@@ -1414,14 +1414,7 @@
                 (earliest <UDP-Packet> (vector-ref packets head)))
             (let ((write-time (determine-write-time self earliest 0)))
               (let ((giveup-time (+ write-time (flonum->timestamp 5.) @w udp-audio-giveup)))
-                (cond ;; off
-                      ((get-off? earliest)
-                       (simulable-off)
-                       (receive (sender channel-no packet data) (extract-complete self)
-                         (give-audio channel sender channel-no packet data))
-                       (mutex-unlock! mutex)
-                       (loop-wait))
-                      ;; giveup
+                (cond ;; giveup
                       ((>= running-time giveup-time)
                        (flush-earliest self)
                        (mutex-unlock! mutex)
@@ -1474,14 +1467,7 @@
             (let ((write-time (determine-write-time self earliest udp-video-process)))
               (let ((late-time (+ write-time udp-video-late))
                     (giveup-time (+ write-time (flonum->timestamp 5.) @w udp-video-giveup)))
-                (cond ;; off
-                      ((get-off? earliest)
-                       (simulable-off)
-                       (receive (sender channel-no packet data) (extract-complete self)
-                         (give-video channel sender channel-no packet data))
-                       (mutex-unlock! mutex)
-                       (loop-wait))
-                      ;; giveup
+                (cond ;; giveup
                       ((>= running-time giveup-time)
                        (flush-earliest self)
                        (state-waiting self)
@@ -1679,6 +1665,20 @@
     (insert process-ring data))
   
   
+  (method protected (channel-on self)
+    (set! send-state 'on))
+  
+  
+  (method protected (channel-off self)
+    (set! send-state 'off)
+    (when (= media-kind udp-audio)
+      (set! last-audio-frame #f)
+      (set! last-audio-buffer #f)
+      (set! last-audio-dts #f)
+      (set! last-audio-pts #f)
+      (set! last-audio-duration #f)))
+  
+  
   (method override (reset-seek self)
     (set! last-audio-frame #f)
     ;; quick test
@@ -1742,8 +1742,7 @@
             (dts (or dts (get-dts packet)))
             (pts (or pts (get-pts packet)))
             (duration (or duration (get-duration packet)))
-            (flags (get-flags packet))
-            (off? (get-off? packet)))
+            (flags (get-flags packet)))
         (let ((id/output (or (simulation-audio) channel-no)))
           ;; duplicate last buffer to fill missing audio which sounds a lot better
           ;; than doing nothing and have gstreamer use silence which sounds gritchy
@@ -1760,25 +1759,17 @@
                         (receive-audio (current-audio) id/output last-audio-buffer missing-dts missing-pts last-audio-duration)
                         (loop (+ missing-dts last-audio-duration) (+ missing-pts last-audio-duration) (- missing-duration last-audio-duration)))))))))
           (let ((buffer data))
-            (if off?
-                (begin
-                  (set! last-audio-frame #f)
-                  (set! last-audio-buffer #f)
-                  (set! last-audio-dts #f)
-                  (set! last-audio-pts #f)
-                  (set! last-audio-duration #f)
-                  (receive-audio (current-audio) id/output #f #f #f #f))
-              (set! last-audio-frame frame)
-              (set! last-audio-buffer buffer)
-              (set! last-audio-dts dts)
-              (set! last-audio-pts pts)
-              (set! last-audio-duration duration)
-              (let ((latency (effective-latency (get-time-base process-ring))))
-                (let ((dts (max 0 (+ dts latency)))
-                      (pts (max 0 (+ pts latency))))
-                  (receive-audio (current-audio) id/output buffer dts pts duration)))
-              (let ((keyframe? (frame-keyframe? flags)))
-                (record-play-frame self sender frame keyframe? dts pts))))))))
+            (set! last-audio-frame frame)
+            (set! last-audio-buffer buffer)
+            (set! last-audio-dts dts)
+            (set! last-audio-pts pts)
+            (set! last-audio-duration duration)
+            (let ((latency (effective-latency (get-time-base process-ring))))
+              (let ((dts (max 0 (+ dts latency)))
+                    (pts (max 0 (+ pts latency))))
+                (receive-audio (current-audio) id/output buffer dts pts duration)))
+            (let ((keyframe? (frame-keyframe? flags)))
+              (record-play-frame self sender frame keyframe? dts pts)))))))
   
   
   (method protected (give-video self sender channel-no packet data)
@@ -1788,18 +1779,15 @@
             (dts (get-dts packet))
             (pts (get-pts packet))
             (duration (get-duration packet))
-            (flags (get-flags packet))
-            (off? (get-off? packet)))
+            (flags (get-flags packet)))
         (let ((id/output (or (simulation-video) channel-no)))
           (let ((buffer data))
-            (if off?
-                (receive-video (current-video) id/output #f #f #f #f 0)
-              (let ((latency (effective-latency (get-time-base process-ring))))
-                (let ((dts (max 0 (+ dts latency)))
-                      (pts (max 0 (+ pts latency))))
-                  (receive-video (current-video) id/output buffer dts pts duration flags)))
-              (update process-rate)
-              (let ((keyframe? (frame-keyframe? flags)))
-                (if (eq? (get-state process-ring) 'late)
-                    (record-freeze-frame self sender frame keyframe? dts pts)
-                  (record-play-frame self sender frame keyframe? dts pts)))))))))))
+            (let ((latency (effective-latency (get-time-base process-ring))))
+              (let ((dts (max 0 (+ dts latency)))
+                    (pts (max 0 (+ pts latency))))
+                (receive-video (current-video) id/output buffer dts pts duration flags)))
+            (update process-rate)
+            (let ((keyframe? (frame-keyframe? flags)))
+              (if (eq? (get-state process-ring) 'late)
+                  (record-freeze-frame self sender frame keyframe? dts pts)
+                (record-play-frame self sender frame keyframe? dts pts))))))))))

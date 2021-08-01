@@ -232,10 +232,6 @@
   (world-setting 'world.udp-record-src/sink? #f))
 
 
-(definition protected udp-media-off
-  #u8(111 102 102))
-
-
 (definition protected (present-media-kind kind)
   (if (= kind udp-audio)
       'AUDIO
@@ -881,8 +877,6 @@
   (slot action-proc    accessors generate)
   (slot data-sequence  accessors generate)
   (slot frame-sequence accessors generate)
-  (slot last-dts       accessors generate)
-  (slot last-pts       accessors generate)
   (slot last-reset     getter generate)
   (slot wait-keyframe? getter generate)
   (slot replay-ring    getter generate)
@@ -895,8 +889,6 @@
     (set! self.action-proc #f)
     (set! self.data-sequence 0)
     (set! self.frame-sequence 0)
-    (set! self.last-dts #f)
-    (set! self.last-pts #f)
     (set! self.last-reset #f)
     (set! self.wait-keyframe? (= media-kind udp-video))
     (set! self.replay-ring (remember-ring media-kind source-kind level framerate))
@@ -994,18 +986,7 @@
   
   
   (method protected (send-media self sender buffer dts pts duration flags send)
-    (let ((off? (not buffer))
-          (frame (next-frame-sequence! self))
-          ;; give media off a sequential dts so it gets inserted correctly
-          (dts (or dts (+ (or last-dts 0) 1)))
-          ;; give media off a sequential pts so it gets inserted correctly
-          (pts (or pts (+ (or last-pts 0) 1)))
-          (duration (or duration 1))
-          ;; udp-media-off is not really used for its content anymore
-          ;; but it is still useful as an empty buffer ends the logic
-          (buffer (or buffer udp-media-off)))
-      (set! last-dts dts)
-      (set! last-pts pts)
+    (let ((frame (next-frame-sequence! self)))
       (with-record media
         (let ((header-size (+ (calculate-media-size) udp-code-size))
               (payload-size (u8vector-length buffer)))
@@ -1030,14 +1011,9 @@
                           (write-media-duration data duration)
                           (write-media-subpayload data buffer pos content-size)
                           (write-media-flags data flags)
-                          (write-media-off? data off?)
                           (write-media-resent data 0)
                           (write-udp-code data)
-                          ;; quick hack to make media off more robust
-                          (if (and off? (not (simulation?)))
-                              (loop (repeat 3)
-                                    (send data))
-                            (send data))
+                          (send data)
                           (when record-events?
                             (record-event udp-id-create-packet
                                           (fixnum->flonum no)
@@ -1141,12 +1117,11 @@
                               (serialize (get-part object))
                               (serialize (get-total object))
                               (serialize (get-flags object))
-                              (serialize (get-off? object))
                               (serialize (get-data object)))))
   
   
   (method override (unmarshall-object self content)
-    (bind-vector (dts pts duration sequence frame part total flags off? data) content
+    (bind-vector (dts pts duration sequence frame part total flags data) content
       (allocate self
                 (deserialize dts)
                 (deserialize pts)
@@ -1156,7 +1131,6 @@
                 (deserialize part)
                 (deserialize total)
                 (deserialize flags)
-                (deserialize off?)
                 (deserialize data)))))
 
 
@@ -1171,11 +1145,10 @@
   (slot part           getter generate)
   (slot total          getter generate)
   (slot flags          getter generate)
-  (slot off?           getter generate)
   (slot data           accessors generate)
   
   
-  (method override (initialize self dts pts duration sequence frame part total flags off? data)
+  (method override (initialize self dts pts duration sequence frame part total flags data)
     (nextmethod self)
     (set! self.dts dts)
     (set! self.pts pts)
@@ -1185,7 +1158,6 @@
     (set! self.part part)
     (set! self.total total)
     (set! self.flags flags)
-    (set! self.off? off?)
     (set! self.data data))
   
   
@@ -1430,14 +1402,13 @@
             (frame (read-media-frame data))
             (part (read-media-part data))
             (total (read-media-total data))
-            (flags (read-media-flags data))
-            (off? (read-media-off? data)))
+            (flags (read-media-flags data)))
         (let ((in-order? (or (not last-sequence)
                              (> sequence last-sequence))))
           (cond ;; empty
                 ((= count 0)
                  (when in-order?
-                   (let ((packet (new UDP-Packet dts pts duration sequence frame part total flags off? data)))
+                   (let ((packet (new UDP-Packet dts pts duration sequence frame part total flags data)))
                      (insert-before self head packet)
                      (set! last-sequence sequence)
                      (set! lowest sequence)
@@ -1445,7 +1416,7 @@
                      (check self))))
                 ;; insert
                 (in-order?
-                 (let ((packet (new UDP-Packet dts pts duration sequence frame part total flags off? data)))
+                 (let ((packet (new UDP-Packet dts pts duration sequence frame part total flags data)))
                    (let ((expected (+ last-sequence 1)))
                      (let ((gap (- sequence expected)))
                        (if (>= gap udp-max-gap-live)
@@ -1453,7 +1424,7 @@
                              (set! last-sequence sequence)
                              (remove-before self count))
                          (loop (for seq from (+ highest 1) below sequence)
-                               (insert-before self tail (new UDP-Packet #f #f #f seq #f #f #f 0 #f #f)))
+                               (insert-before self tail (new UDP-Packet #f #f #f seq #f #f #f 0 #f)))
                          (insert-before self tail packet)
                          (set! last-sequence sequence)
                          (set! highest sequence)
@@ -1464,7 +1435,7 @@
                    (let ((pos (index self sequence)))
                      (let ((actual-packet <UDP-Packet> (vector-ref packets pos)))
                        (when (not (get-data actual-packet))
-                         (let ((packet (new UDP-Packet dts pts duration sequence frame part total flags off? data)))
+                         (let ((packet (new UDP-Packet dts pts duration sequence frame part total flags data)))
                            (vector-set! packets pos packet)))))))))))
     (mutex-unlock! mutex))
   
@@ -1695,8 +1666,7 @@
             (frame (read-media-frame data))
             (part (read-media-part data))
             (total (read-media-total data))
-            (flags (read-media-flags data))
-            (off? (read-media-off? data)))
+            (flags (read-media-flags data)))
         (define (time-update)
           (unless (emulation?)
             (update-time time-base local dts
@@ -1716,7 +1686,7 @@
                                 reason))))))
         
         (define (insert/purge reason)
-          (let ((packet (new UDP-Packet dts pts duration sequence frame part total flags off? data)))
+          (let ((packet (new UDP-Packet dts pts duration sequence frame part total flags data)))
             (empty self)
             (when reason
               (record-purge reason))
@@ -1813,17 +1783,17 @@
                                (time-update)
                                (reset-seek channel)
                                (insert/purge udp-purge-seek))
-                           (let ((packet (new UDP-Packet dts pts duration sequence frame part total flags off? data)))
+                           (let ((packet (new UDP-Packet dts pts duration sequence frame part total flags data)))
                              (if (= count 0)
                                  (loop (for seq from (+ highest 1) below sequence)
                                        (record-missing seq)
-                                       (insert-before self tail (new UDP-Packet dts pts #f seq #f #f #f 0 #f #f)))
+                                       (insert-before self tail (new UDP-Packet dts pts #f seq #f #f #f 0 #f)))
                                (let ((highest-packet (highest-packet self)))
                                  (let ((highest-dts (get-dts highest-packet)))
                                    (loop (for seq from (+ highest 1) below sequence)
                                          (let ((dts (flonum->timestamp (interpolate seq highest sequence (timestamp->flonum highest-dts) (timestamp->flonum dts)))))
                                            (record-missing seq)
-                                           (insert-before self tail (new UDP-Packet dts pts #f seq #f #f #f 0 #f #f)))))))
+                                           (insert-before self tail (new UDP-Packet dts pts #f seq #f #f #f 0 #f)))))))
                              (insert-highest packet)))))))))
               ;; out-of-order replace
               (else
@@ -1844,7 +1814,7 @@
                                              (fixnum->flonum frame)
                                              (fixnum->flonum resent)
                                              -1.)))
-                         (let ((packet (new UDP-Packet dts pts duration sequence frame part total flags off? data)))
+                         (let ((packet (new UDP-Packet dts pts duration sequence frame part total flags data)))
                            (vector-set! packets pos packet)
                            (when (= media-kind udp-audio)
                              (audio-added self packet))
@@ -1965,9 +1935,8 @@
                       (frame (read-media-frame data))
                       (part (read-media-part data))
                       (total (read-media-total data))
-                      (flags (read-media-flags data))
-                      (off? (read-media-off? data)))
-                  (let ((packet (new UDP-Packet dts pts duration sequence frame part total flags off? data)))
+                      (flags (read-media-flags data)))
+                  (let ((packet (new UDP-Packet dts pts duration sequence frame part total flags data)))
                     (vector-set! packets pos packet))))))))))
   
   
@@ -2660,7 +2629,6 @@
 ;; media
 (define-record media header
   (flags     u8)
-  (off?      boolean)
   (resent    u8)
   (channel   u32    <fx>)
   (sequence  u64)
