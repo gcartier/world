@@ -144,9 +144,9 @@
 (definition protected udp-audio-buffer <fx>
   (flonum->timestamp .2))
 
-;; this value should be lower than gstreamer's audio mixer latency
+;; should be greater than max reasonable latency drop
 (definition protected udp-audio-giveup <fx>
-  (flonum->timestamp .1))
+  (flonum->timestamp 2.))
 
 
 ;; audio mixer latency
@@ -170,8 +170,9 @@
 (definition protected udp-video-late <fx>
   (- udp-video-present udp-late-tolerance))
 
+;; should be greater than max reasonable latency drop
 (definition protected udp-video-giveup <fx>
-  (flonum->timestamp .5))
+  (flonum->timestamp 2.))
 
 ;; maximum lateness before video drops
 (definition protected udp-video-tolerance <fx>
@@ -813,7 +814,7 @@
     #f)
   
   
-  (method protected virtual (reset-seek self)
+  (method protected virtual (reset self)
     ))
 
 
@@ -837,7 +838,8 @@
                                 (get-bitrate channel)
                                 (get-codec channel)
                                 (get-caps channel)
-                                (get-metadata channel)))
+                                (get-metadata channel)
+                                (get-send-state channel)))
                             (get-channels stream))))
              streams))
 
@@ -1191,7 +1193,10 @@
   
   (method override (initialize self)
     (nextmethod self)
-    (reset self))
+    (set! self.base #f)
+    (set! self.raw-latency 0)
+    (set! self.latency 0)
+    (set! self.visualizer-latency #f))
   
   
   (method protected virtual (reset self)
@@ -1199,12 +1204,6 @@
     (set! self.raw-latency 0)
     (set! self.latency 0)
     (set! self.visualizer-latency #f))
-
-  
-  (method override (print self output readably)
-    (print-unreadable self output
-      (lambda (output)
-        (format output "{a} {a}" base latency))))
   
   
   (method protected virtual (effective-latency self)
@@ -1234,7 +1233,7 @@
     )
   
   
-  (method public virtual (remote->local self remote) <fx>
+  (method protected (remote->local self remote) <fx>
     (+ base remote latency)))
 
 
@@ -1616,13 +1615,19 @@
     (mutex-unlock! mutex))
   
   
-  (method public (empty self)
+  (method protected virtual (empty self)
     (vector-fill! self.packets #f)
     (set! self.head 0)
     (set! self.tail 0)
     (set! self.count 0)
     (set! self.lowest 0)
-    (set! self.highest 0))
+    (set! self.highest 0)
+    (set! self.last-sequence #f))
+  
+  
+  (method protected virtual (reset self)
+    (empty self)
+    (reset time-base))
   
   
   (method protected (check self)
@@ -1643,6 +1648,12 @@
   
   (method protected (index self seq <fx>) <fx>
     (modulo (+ head (- seq lowest)) size))
+  
+  
+  (method protected (with-mutex self thunk)
+    (mutex-lock! mutex)
+    (prog1 (thunk)
+      (mutex-unlock! mutex)))
 
   
   ;;;
@@ -1655,8 +1666,13 @@
   
   
   (method public (insert self data (insert-event #f))
+    (mutex-lock! mutex)
+    (insert-unlocked self data insert-event)
+    (mutex-unlock! mutex))
+  
+  
+  (method public (insert-unlocked self data (insert-event #f))
     (with-record media
-      (mutex-lock! mutex)
       (let ((local (local-timestamp self))
             (dts (read-media-dts data))
             (pts (read-media-pts data))
@@ -1779,9 +1795,8 @@
                        (let ((seek-change-heuristic (abs (- (get-raw-latency time-base) previous-raw-latency))))
                          (if (> seek-change-heuristic udp-seek-tolerance)
                              (begin
-                               (reset time-base)
+                               (reset channel)
                                (time-update)
-                               (reset-seek channel)
                                (insert/purge udp-purge-seek))
                            (let ((packet (new UDP-Packet dts pts duration sequence frame part total flags data)))
                              (if (= count 0)
@@ -1838,8 +1853,7 @@
                                    (fixnum->flonum sequence)
                                    (fixnum->flonum frame)
                                    (fixnum->flonum resent)
-                                   -1.)))))))
-      (mutex-unlock! mutex)))
+                                   -1.)))))))))
   
   
   (method public (insert-before self pos <fx> packet <UDP-Packet>)
@@ -2015,14 +2029,6 @@
     (if (= count 0)
         #f
       (vector-ref packets head)))
-  
-  
-  (method protected (determine-write-time self packet <UDP-Packet> process-window <fx>) <fx>
-    (let ((dts (get-dts packet)))
-      (let ((time (remote->local time-base dts)))
-        (if (= time +inf.ts)
-            time
-          (+ time process-window)))))
   
   
   (method protected (complete-frame? self)
