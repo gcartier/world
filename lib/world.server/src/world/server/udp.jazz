@@ -54,6 +54,8 @@
   (slot server-streams  initialize #f getter generate)
   (slot server-channels initialize #f getter generate)
   (slot receive-task    initialize #f getter generate)
+  (slot reset-ring      initialize #f getter generate)
+  (slot reset-task      initialize #f getter generate)
   (slot invalid-packets initialize 0  getter generate)
   
   
@@ -76,7 +78,10 @@
       (set! server-channels (make-table))
       (set! send-channels (make-table))
       (set! receive-task (new Task 'udp-receive (~ run-receive self) priority: udp-priority))
-      (start-task receive-task)))
+      (start-task receive-task)
+      (set! reset-ring (new Time-Ring 256 max-size: 4096))
+      (set! reset-task (new Task 'udp-reset (~ run-reset self) priority: udp-priority))
+      (start-task reset-task)))
   
   
   (method package (stop self)
@@ -84,7 +89,11 @@
     (close-port udp-port)
     (thread-join! (get-thread receive-task))
     (set! udp-port #f)
-    (set! receive-task #f))
+    (set! receive-task #f)
+    (terminate reset-ring)
+    (thread-join! (get-thread reset-task))
+    (set! reset-ring #f)
+    (set! reset-task #f))
   
   
   (method (snapshot-server-streams self)
@@ -552,7 +561,7 @@
                       (get-members group)))))))
   
   
-  (method override (send-nack self sender channel-no start gap resend)
+  (method override (send-nack self sender channel-no start gap resend ring)
     (let ((connection (no->connection self sender)))
       (when connection
         (with-record nack
@@ -566,7 +575,29 @@
               (write-udp-code data)
               (send-data self connection data)
               (when (> resend 0)
-                (add-resending-nacks connection (cons resend data)))))))))
+                (add-resending-nacks connection (cons resend data))))))
+        (let ((time (+ (current-seconds) .15)))
+          (insert reset-ring time
+            (lambda ()
+              (let ((unfulfilled?
+                      (loop (for seq from start below (+ start gap))
+                            (some (let ((packet (locate-packet ring seq)))
+                                    (and packet (not (get-data packet))))))))
+                (when unfulfilled?
+                  (send-reset self connection channel-no)))))))))
+  
+  
+  (method (send-reset self connection channel-no)
+    (mutex-lock! server-mutex)
+    (with-record reset
+      (let ((size (calculate-reset-size)))
+        (let ((data (make-u8vector (+ size udp-code-size))))
+          (write-header-kind data udp-reset)
+          (write-header-sender data server-no)
+          (write-reset-channel data channel-no)
+          (write-udp-code data)
+          (send-data self connection data))))
+    (mutex-unlock! server-mutex))
   
   
   (method (resend-nacks self sender)
@@ -778,7 +809,24 @@
   
   (method (send-connection self connection data)
     (udp-destination-set! (get-host connection) (get-port connection) udp-port)
-    (write-data data udp-port)))
+    (write-data data udp-port))
+  
+  
+  ;;;
+  ;;;; Reset
+  ;;;
+  
+  
+  (method (run-reset self task)
+    (declare (proper-tail-calls))
+    (with-task task
+      (lambda (exit)
+        (let (loop)
+          (let ((proc (wait reset-ring)))
+            (if (not proc)
+                (continuation-return exit #f)
+              (proc)
+              (loop))))))))
 
 
 ;;;
