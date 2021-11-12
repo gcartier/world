@@ -946,14 +946,8 @@
             providers)))))
 
 
-(definition public (camera-resolutions)
-  (with-camera-devices
-    (lambda (devices)
-      (if (null? devices)
-          '()
-        ;; todo manage multiple cameras
-        (let ((device (car devices)))
-          (camera-device-resolutions device))))))
+(definition protected maximum-camera-resolution
+  (* 1280 720))
 
 
 (definition protected (filter/sort-resolutions resolutions)
@@ -1056,49 +1050,6 @@
       (gst_caps_unref caps))))
 
 
-(definition protected maximum-camera-resolution
-  (* 1280 720))
-
-(definition protected decreasing-camera-resolutions
-  #f)
-
-(definition protected current-camera-resolution
-  #f)
-
-(definition protected current-camera-framerate
-  #f)
-
-(definition protected (cache-decreasing-camera-resolutions)
-  (define (keep-resolution? resolution)
-    (<= (resolution-area resolution) maximum-camera-resolution))
-  
-  (define (resolution-area resolution)
-    (get-area (get-resolution resolution)))
-  
-  (or decreasing-camera-resolutions
-      (let ((resolutions (collect-if keep-resolution? (sort > (camera-resolutions) key: resolution-area))))
-        (set! decreasing-camera-resolutions resolutions)
-        resolutions)))
-
-(definition protected (determine-camera-resolution)
-  (or current-camera-resolution
-      (let ((resolution (get-resolution (car (cache-decreasing-camera-resolutions)))))
-        (set! current-camera-resolution resolution)
-        resolution)))
-
-(definition protected (determine-camera-framerate selfrate)
-  (cond-expand
-    ;; at the moment the problem only occurs on mac monterey so lets
-    ;; not take any chances and risk impacting the other platforms...
-    (mac (or current-camera-framerate
-             (let ((framerate-max (get-framerate-max (car (cache-decreasing-camera-resolutions)))))
-               (let ((framerate-real (min (exact->inexact framerate-max) (exact->inexact selfrate))))
-                 (let ((framerate (format ", framerate={a}/1" (fxround framerate-real))))
-                   (set! current-camera-framerate framerate)
-                   framerate)))))
-    (else "")))
-
-
 ;;;
 ;;;; Camera-Video-Src
 ;;;
@@ -1115,10 +1066,35 @@
   (world-setting 'world.profile-camera? #f))
 
 
-(definition protected (effective-camera-identifier)
-  (with-camera-devices
-    (lambda (devices)
-      (read-camera-identifier devices))))
+(definition protected (effective-camera-information selfrate)
+  (let ((providers (cache-camera-providers)))
+    (define (effective-provider)
+      (let ((name (world-setting 'world.camera-name #f)))
+        (if (not name)
+            (car providers)
+          (or (find providers name key: get-name test: equal? return: 'item)
+              (car providers)))))
+    
+    (let ((provider (effective-provider)))
+      (let ((resolution (car (get-resolutions provider))))
+        (define (effective-resolution)
+          (get-resolution resolution))
+        
+        (define (effective-framerate)
+          (cond-expand
+            ;; at the moment the problem only occurs on mac monterey so lets
+            ;; not take any chances and risk impacting the other platforms...
+            (mac (let ((framerate-max (get-framerate-max (car (get-resolutions provider)))))
+                   (let ((framerate-real (min (exact->inexact framerate-max) (exact->inexact selfrate))))
+                     (format ", framerate={a}/1" (fxround framerate-real)))))
+            (else "")))
+        
+        (with-camera-devices
+          (lambda (devices)
+            (values (camera-identifier-keyword)
+                    (read-camera-identifier devices)
+                    (effective-resolution)
+                    (effective-framerate))))))))
 
 
 (definition package (read-camera-identifier devices)
@@ -1242,131 +1218,128 @@
   (method override (setup-element self)
     (nextmethod self)
     (let ((udp (current-udp))
-          (identifier-keyword (camera-identifier-keyword))
-          (identifier (effective-camera-identifier))
-          (camera-resolution (determine-camera-resolution))
-          (camera-framerate (determine-camera-framerate selfrate))
           (max-resolution resolution)
           (max-framerate selfrate))
-      (let ((camera-width (get-width camera-resolution))
-            (camera-height (get-height camera-resolution))
-            (max-width (get-width max-resolution))
-            (max-height (get-height max-resolution))
-            (downscale? (nu/=? max-resolution camera-resolution))
-            (throttle (get-throttle udp)))
-        (let ((pipeline (apply gst-pipeline
-                               (gst-element camerasrc
-                                            identifier-keyword identifier
-                                            do-timestamp: "true"
-                                            name: "src")
-                               (tie "video/x-raw, width={camera-width}, height={camera-height}, pixel-aspect-ratio=(fraction)1/1{camera-framerate}")
-                               "queue name=queue"
-                               ;; for some reason doing the convert before the scale ends up taking less cpu
-                               ;; and as a side effect it ensures we always use the same format for the scale
-                               "videoconvert"
-                               (tie "video/x-raw, format=I420, width={camera-width}, height={camera-height}, pixel-aspect-ratio=(fraction)1/1")
-                               (and downscale?
-                                    profile-camera?
-                                    "queue name=queuescale")
-                               (and downscale?
-                                    "videoscale method=sinc sharpness=1.15")
-                               (and downscale?
-                                    (tie "video/x-raw, width={max-width}, height={max-height}, pixel-aspect-ratio=(fraction)1/1"))
-                               "tee name=tee"
-                               (append
-                                 (collect (lambda (consumer)
-                                            (and (is? consumer Camera-Self-Consumer)
-                                                 (let ((profile (get-profile consumer)))
-                                                   (let ((name (get-name profile))
-                                                         (resolution (get-resolution profile)))
-                                                     (let ((width (get-width resolution))
-                                                           (height (get-height resolution))
-                                                           (scale? (nu/=? resolution max-resolution)))
-                                                       (list
-                                                         "tee^."
-                                                         (tie "queue name=queueself{name}")
-                                                         (and scale?
-                                                              "videoscale method=sinc sharpness=1.15")
-                                                         (and scale?
-                                                              (tie "video/x-raw, width={width}, height={height}, pixel-aspect-ratio=(fraction)1/1"))
-                                                         (and profile-camera?
-                                                              (tie "queue name=queueselfconvert{name}"))
-                                                         "videoconvert"
-                                                         (tie "video/x-raw, format=BGRA, width={width}, height={height}, pixel-aspect-ratio=(fraction)1/1")
-                                                         (tie "appsink sync=false async=false name=sinkself{name}")))))))
-                                          sinks)
-                                 (collect (lambda (consumer)
-                                            (and (is? consumer Camera-Video-Consumer)
-                                                 (let ((profile (get-profile consumer)))
-                                                   (let ((name (get-name profile))
-                                                         (level (get-level profile))
-                                                         (resolution (get-resolution profile))
-                                                         (min-bitrate (get-min-bitrate profile))
-                                                         (bitrate (get-bitrate profile))
-                                                         (codec (get-codec profile)))
-                                                     (let ((width (get-width resolution))
-                                                           (height (get-height resolution))
-                                                           (scale? (nu/=? resolution max-resolution))
-                                                           (effective-bitrate (fxround (effective-rate throttle min-bitrate bitrate))))
-                                                       (list
-                                                         "tee^."
-                                                         (tie "queue name=queue{name}")
-                                                         (and scale?
-                                                              "videoscale method=sinc sharpness=1.15")
-                                                         (and scale?
-                                                              (tie "video/x-raw, width={width}, height={height}, pixel-aspect-ratio=(fraction)1/1"))
-                                                         (and profile-camera?
-                                                              (tie "queue name=queueencode{name}"))
-                                                         (and (eq? codec 'h264)
-                                                              (let ((key-int-max (and camera-keyframes (fxround (* (cast <fl> framerate) camera-keyframes))))
-                                                                    (tune "zerolatency")
-                                                                    (speed-preset "superfast")
-                                                                    (threads (expt 2 (max 0 (- level 1)))))
-                                                                (gst-element "x264enc"
-                                                                             key-int-max: key-int-max
-                                                                             bitrate: effective-bitrate
-                                                                             tune: tune
-                                                                             speed-preset: speed-preset
-                                                                             threads: threads
-                                                                             name: (tie "enc{name}"))))
-                                                         (tie "appsink sync=false async=false name=sink{name}")))))))
-                                          sinks)))))
-          (gst_object_set_name pipeline "video.camera")
-          (with-unref ((src (gst_bin_get_by_name pipeline "src")))
-            (with-unref ((pad (gst_element_get_static_pad src "src")))
-              (set! probe (gst_pad_add_rate_probe pad max-framerate #t))))
-          (for-each (lambda (consumer)
-                      (if (eq? (get-caps consumer) 'self)
+      (receive (camera-identifier-keyword camera-identifier camera-resolution camera-framerate) (effective-camera-information selfrate)
+        (let ((camera-width (get-width camera-resolution))
+              (camera-height (get-height camera-resolution))
+              (max-width (get-width max-resolution))
+              (max-height (get-height max-resolution))
+              (downscale? (nu/=? max-resolution camera-resolution))
+              (throttle (get-throttle udp)))
+          (let ((pipeline (apply gst-pipeline
+                                 (gst-element camerasrc
+                                              camera-identifier-keyword camera-identifier
+                                              do-timestamp: "true"
+                                              name: "src")
+                                 (tie "video/x-raw, width={camera-width}, height={camera-height}, pixel-aspect-ratio=(fraction)1/1{camera-framerate}")
+                                 "queue name=queue"
+                                 ;; for some reason doing the convert before the scale ends up taking less cpu
+                                 ;; and as a side effect it ensures we always use the same format for the scale
+                                 "videoconvert"
+                                 (tie "video/x-raw, format=I420, width={camera-width}, height={camera-height}, pixel-aspect-ratio=(fraction)1/1")
+                                 (and downscale?
+                                      profile-camera?
+                                      "queue name=queuescale")
+                                 (and downscale?
+                                      "videoscale method=sinc sharpness=1.15")
+                                 (and downscale?
+                                      (tie "video/x-raw, width={max-width}, height={max-height}, pixel-aspect-ratio=(fraction)1/1"))
+                                 "tee name=tee"
+                                 (append
+                                   (collect (lambda (consumer)
+                                              (and (is? consumer Camera-Self-Consumer)
+                                                   (let ((profile (get-profile consumer)))
+                                                     (let ((name (get-name profile))
+                                                           (resolution (get-resolution profile)))
+                                                       (let ((width (get-width resolution))
+                                                             (height (get-height resolution))
+                                                             (scale? (nu/=? resolution max-resolution)))
+                                                         (list
+                                                           "tee^."
+                                                           (tie "queue name=queueself{name}")
+                                                           (and scale?
+                                                                "videoscale method=sinc sharpness=1.15")
+                                                           (and scale?
+                                                                (tie "video/x-raw, width={width}, height={height}, pixel-aspect-ratio=(fraction)1/1"))
+                                                           (and profile-camera?
+                                                                (tie "queue name=queueselfconvert{name}"))
+                                                           "videoconvert"
+                                                           (tie "video/x-raw, format=BGRA, width={width}, height={height}, pixel-aspect-ratio=(fraction)1/1")
+                                                           (tie "appsink sync=false async=false name=sinkself{name}")))))))
+                                            sinks)
+                                   (collect (lambda (consumer)
+                                              (and (is? consumer Camera-Video-Consumer)
+                                                   (let ((profile (get-profile consumer)))
+                                                     (let ((name (get-name profile))
+                                                           (level (get-level profile))
+                                                           (resolution (get-resolution profile))
+                                                           (min-bitrate (get-min-bitrate profile))
+                                                           (bitrate (get-bitrate profile))
+                                                           (codec (get-codec profile)))
+                                                       (let ((width (get-width resolution))
+                                                             (height (get-height resolution))
+                                                             (scale? (nu/=? resolution max-resolution))
+                                                             (effective-bitrate (fxround (effective-rate throttle min-bitrate bitrate))))
+                                                         (list
+                                                           "tee^."
+                                                           (tie "queue name=queue{name}")
+                                                           (and scale?
+                                                                "videoscale method=sinc sharpness=1.15")
+                                                           (and scale?
+                                                                (tie "video/x-raw, width={width}, height={height}, pixel-aspect-ratio=(fraction)1/1"))
+                                                           (and profile-camera?
+                                                                (tie "queue name=queueencode{name}"))
+                                                           (and (eq? codec 'h264)
+                                                                (let ((key-int-max (and camera-keyframes (fxround (* (cast <fl> framerate) camera-keyframes))))
+                                                                      (tune "zerolatency")
+                                                                      (speed-preset "superfast")
+                                                                      (threads (expt 2 (max 0 (- level 1)))))
+                                                                  (gst-element "x264enc"
+                                                                               key-int-max: key-int-max
+                                                                               bitrate: effective-bitrate
+                                                                               tune: tune
+                                                                               speed-preset: speed-preset
+                                                                               threads: threads
+                                                                               name: (tie "enc{name}"))))
+                                                           (tie "appsink sync=false async=false name=sink{name}")))))))
+                                            sinks)))))
+            (gst_object_set_name pipeline "video.camera")
+            (with-unref ((src (gst_bin_get_by_name pipeline "src")))
+              (with-unref ((pad (gst_element_get_static_pad src "src")))
+                (set! probe (gst_pad_add_rate_probe pad max-framerate #t))))
+            (for-each (lambda (consumer)
+                        (if (eq? (get-caps consumer) 'self)
+                            (let ((profile (get-profile consumer)))
+                              (let ((name (get-name profile))
+                                    (profile (get-profile consumer)))
+                                (let ((resolution (get-resolution profile))
+                                      (selfrate (get-selfrate profile)))
+                                  (let ((listener (open-stream-listener (format "cameraself{a}" name))))
+                                    (with-unref ((appsink (gst_bin_get_by_name pipeline (format "sinkself{a}" name))))
+                                      (gst_app_sink_connect_signals appsink listener)
+                                      (setup-consumer consumer listener appsink)
+                                      (with-unref ((queueself (gst_bin_get_by_name pipeline (tie "queueself{name}"))))
+                                        (with-unref ((pad (gst_element_get_static_pad queueself "sink")))
+                                          (let ((rate (if (get-processing? consumer) selfrate 0)))
+                                            (set-probe consumer (gst_pad_add_rate_probe pad rate #f))))))))))
                           (let ((profile (get-profile consumer)))
                             (let ((name (get-name profile))
-                                  (profile (get-profile consumer)))
-                              (let ((resolution (get-resolution profile))
-                                    (selfrate (get-selfrate profile)))
-                                (let ((listener (open-stream-listener (format "cameraself{a}" name))))
-                                  (with-unref ((appsink (gst_bin_get_by_name pipeline (format "sinkself{a}" name))))
-                                    (gst_app_sink_connect_signals appsink listener)
-                                    (setup-consumer consumer listener appsink)
-                                    (with-unref ((queueself (gst_bin_get_by_name pipeline (tie "queueself{name}"))))
-                                      (with-unref ((pad (gst_element_get_static_pad queueself "sink")))
-                                        (let ((rate (if (get-processing? consumer) selfrate 0)))
-                                          (set-probe consumer (gst_pad_add_rate_probe pad rate #f))))))))))
-                        (let ((profile (get-profile consumer)))
-                          (let ((name (get-name profile))
-                                (resolution (get-resolution profile))
-                                (framerate (get-framerate profile)))
-                            (let ((width (get-width resolution))
-                                  (height (get-height resolution))
-                                  (listener (open-stream-listener (format "camera{a}" name))))
-                              (with-unref ((appsink (gst_bin_get_by_name pipeline (format "sink{a}" name))))
-                                (gst_app_sink_connect_signals appsink listener)
-                                (setup-consumer consumer listener appsink (* width height 4))
-                                (with-unref ((queue (gst_bin_get_by_name pipeline (tie "queue{name}"))))
-                                  (with-unref ((pad (gst_element_get_static_pad queue "sink")))
-                                    (let ((rate (if (get-processing? consumer) framerate 0)))
-                                      (set-probe consumer (gst_pad_add_rate_probe pad rate #f)))))))))))
-                    sinks)
-          (set! self.pipeline pipeline)
-          (gst_element_set_state pipeline GST_STATE_READY)))))
+                                  (resolution (get-resolution profile))
+                                  (framerate (get-framerate profile)))
+                              (let ((width (get-width resolution))
+                                    (height (get-height resolution))
+                                    (listener (open-stream-listener (format "camera{a}" name))))
+                                (with-unref ((appsink (gst_bin_get_by_name pipeline (format "sink{a}" name))))
+                                  (gst_app_sink_connect_signals appsink listener)
+                                  (setup-consumer consumer listener appsink (* width height 4))
+                                  (with-unref ((queue (gst_bin_get_by_name pipeline (tie "queue{name}"))))
+                                    (with-unref ((pad (gst_element_get_static_pad queue "sink")))
+                                      (let ((rate (if (get-processing? consumer) framerate 0)))
+                                        (set-probe consumer (gst_pad_add_rate_probe pad rate #f)))))))))))
+                      sinks)
+            (set! self.pipeline pipeline)
+            (gst_element_set_state pipeline GST_STATE_READY))))))
   
   
   (method override (start-element self)
