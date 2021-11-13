@@ -890,12 +890,14 @@
   
   
   (slot name        getter generate)
+  (slot identifier  getter generate)
   (slot resolutions getter generate)
   
   
-  (method override (initialize self name resolutions)
+  (method override (initialize self name identifier resolutions)
     (nextmethod self)
     (set! self.name name)
+    (set! self.identifier identifier)
     (set! self.resolutions resolutions))
   
   
@@ -927,127 +929,117 @@
 
 
 (definition public (has-camera?)
-  (not-null? (cache-camera-providers)))
+  (not-null? (camera-providers)))
 
 
-(definition camera-providers
-  #f)
-
-(definition protected (cache-camera-providers)
-  (or camera-providers
-      (with-camera-devices
-        (lambda (devices)
-          (let ((providers (map (lambda (device)
-                                  (let ((name (gst_device_get_display_name device))
-                                        (resolutions (filter/sort-resolutions (camera-device-resolutions device))))
-                                    (new Camera-Provider name resolutions)))
-                                devices)))
-            (set! camera-providers providers)
-            providers)))))
-
-
-(definition protected maximum-camera-resolution
-  (* 1280 720))
-
-
-(definition protected (filter/sort-resolutions resolutions)
-  (define (keep-resolution? resolution)
-    (<= (resolution-area resolution) maximum-camera-resolution))
+(definition protected (camera-providers)
+  (define maximum-camera-resolution
+    (* 1280 720))
   
-  (define (resolution-area resolution)
-    (get-area (get-resolution resolution)))
+  (define (filter/sort-resolutions resolutions)
+    (define (keep-resolution? resolution)
+      (<= (resolution-area resolution) maximum-camera-resolution))
+    
+    (define (resolution-area resolution)
+      (get-area (get-resolution resolution)))
+    
+    (collect-if keep-resolution? (sort > resolutions key: resolution-area)))
   
-  (collect-if keep-resolution? (sort > resolutions key: resolution-area)))
+  (define (camera-device-identifier device)
+    (with-unref ((element (gst_device_create_element device)))
+      (cond-expand
+        (mac (g_object_get_int element "device-index"))
+        (windows (g_object_get_string element "device-path"))
+        (else #f))))
+  
+  (define (camera-device-resolutions device)
+    (let ((caps (gst_device_get_caps device)))
+      (prog1 (let ((all '()))
+               (loop (for i from 0 below (gst_caps_get_size caps))
+                     (let ((struc (gst_caps_get_structure caps i))
+                           (features (gst_caps_get_features caps i)))
+                       (when (and (equal? (gst_structure_get_name struc) "video/x-raw")
+                                  (gst_caps_features_is_system_memory features))
+                         (let ((width (gst_structure_get_int struc "width"))
+                               (height (gst_structure_get_int struc "height")))
+                           (let ((resolution (new Dimension width height)))
+                             (when (not (member? resolution all test: nu=?))
+                               (let ((value (gst_structure_get_value struc "framerate")))
+                                 (define (determine-framerate-min/max value)
+                                   (let ((type (g_value_type value)))
+                                     (cond ((= type (GST_TYPE_FRACTION))
+                                            (let ((framerate (fraction->bignum value)))
+                                              (values framerate framerate)))
+                                           ((= type (GST_TYPE_FRACTION_RANGE))
+                                            (values (fraction->bignum (gst_value_get_fraction_range_min value))
+                                                    (fraction->bignum (gst_value_get_fraction_range_max value))))
+                                           ((= type (GST_TYPE_LIST))
+                                            (let ((minimum #f)
+                                                  (maximum #f))
+                                              (gst-iterate-value-list value
+                                                (lambda (value)
+                                                  (receive (min max) (determine-framerate-min/max value)
+                                                    (when (or (not minimum)
+                                                              (< min minimum))
+                                                      (set! minimum min))
+                                                    (when (or (not maximum)
+                                                              (> max maximum))
+                                                      (set! maximum max)))))
+                                              (values minimum maximum))))))
+                                 
+                                 (define (fraction->bignum fraction)
+                                   (/ (gst_value_get_fraction_numerator fraction)
+                                      (gst_value_get_fraction_denominator fraction)))
+                                 
+                                 (receive (min max) (determine-framerate-min/max value)
+                                   (set! all (cons (new Camera-Resolution resolution min max) all))))))))))
+               all)
+        (gst_caps_unref caps))))
+  
+  (with-camera-devices
+    (lambda (devices)
+      (map (lambda (device)
+             (let ((name (gst_device_get_display_name device))
+                   (identifier (camera-device-identifier device))
+                   (resolutions (filter/sort-resolutions (camera-device-resolutions device))))
+               (new Camera-Provider name identifier resolutions)))
+           devices))))
 
 
 (definition protected (with-camera-devices proc)
+  (define (camera-devices)
+    (define (collect-devices)
+      (with-unref ((monitor (gst_device_monitor_new)))
+        (let ((caps (gst_caps_new_empty_simple "video/x-raw")))
+          (gst_device_monitor_add_filter monitor "Video/Source" caps)
+          (gst_caps_unref caps))
+        (let ((queue (new-queue)))
+          (let (loop (devices (gst_device_monitor_get_devices monitor)))
+            (if (not devices)
+                (begin
+                  (g_list_free devices)
+                  (queue-list queue))
+              (let ((device (gst_device_monitor_device_list_data devices)))
+                (if (equal? (gst_device_get_type_name device) camerasrc)
+                    (enqueue queue device)
+                  (gst_device_unref_hack device)))
+              (loop (gst_device_monitor_device_list_next devices)))))))
+    
+    ;; work around a gstreamer bug where devices is sometimes empty
+    ;; this is clearly a bug in gstreamer as gst-device-monitor will
+    ;; also sometimes fail to find the webcam on windows
+    (let (loop (n 0))
+      (if (>= n 100)
+          '()
+        (let ((devices (collect-devices)))
+          (if (not-null? devices)
+              devices
+            (sleep .01)
+            (loop (+ n 1)))))))
+  
   (let ((devices (camera-devices)))
     (prog1 (proc devices)
       (gst_devices_unref devices))))
-
-
-(definition protected (camera-devices)
-  (define (collect-devices)
-    (with-unref ((monitor (gst_device_monitor_new)))
-      (let ((caps (gst_caps_new_empty_simple "video/x-raw")))
-        (gst_device_monitor_add_filter monitor "Video/Source" caps)
-        (gst_caps_unref caps))
-      (let ((queue (new-queue)))
-        (let (loop (devices (gst_device_monitor_get_devices monitor)))
-          (if (not devices)
-              (begin
-                (g_list_free devices)
-                (queue-list queue))
-            (let ((device (gst_device_monitor_device_list_data devices)))
-              (if (equal? (gst_device_get_type_name device) camerasrc)
-                  (enqueue queue device)
-                (gst_device_unref_hack device)))
-            (loop (gst_device_monitor_device_list_next devices)))))))
-  
-  ;; work around a gstreamer bug where devices is sometimes empty
-  ;; this is clearly a bug in gstreamer as gst-device-monitor will
-  ;; also sometimes fail to find the webcam on windows
-  (let (loop (n 0))
-    (if (>= n 100)
-        '()
-      (let ((devices (collect-devices)))
-        (if (not-null? devices)
-            devices
-          (sleep .01)
-          (loop (+ n 1)))))))
-
-
-(definition protected (camera-device-identifier device)
-  (with-unref ((element (gst_device_create_element device)))
-    (cond-expand
-      (mac (g_object_get_int element "device-index"))
-      (windows (g_object_get_string element "device-path"))
-      (else #f))))
-
-
-(definition protected (camera-device-resolutions device)
-  (let ((caps (gst_device_get_caps device)))
-    (prog1 (let ((all '()))
-             (loop (for i from 0 below (gst_caps_get_size caps))
-                   (let ((struc (gst_caps_get_structure caps i))
-                         (features (gst_caps_get_features caps i)))
-                     (when (and (equal? (gst_structure_get_name struc) "video/x-raw")
-                                (gst_caps_features_is_system_memory features))
-                       (let ((width (gst_structure_get_int struc "width"))
-                             (height (gst_structure_get_int struc "height")))
-                         (let ((resolution (new Dimension width height)))
-                           (when (not (member? resolution all test: nu=?))
-                             (let ((value (gst_structure_get_value struc "framerate")))
-                               (define (determine-framerate-min/max value)
-                                 (let ((type (g_value_type value)))
-                                   (cond ((= type (GST_TYPE_FRACTION))
-                                          (let ((framerate (fraction->bignum value)))
-                                            (values framerate framerate)))
-                                         ((= type (GST_TYPE_FRACTION_RANGE))
-                                          (values (fraction->bignum (gst_value_get_fraction_range_min value))
-                                                  (fraction->bignum (gst_value_get_fraction_range_max value))))
-                                         ((= type (GST_TYPE_LIST))
-                                          (let ((minimum #f)
-                                                (maximum #f))
-                                            (gst-iterate-value-list value
-                                              (lambda (value)
-                                                (receive (min max) (determine-framerate-min/max value)
-                                                  (when (or (not minimum)
-                                                            (< min minimum))
-                                                    (set! minimum min))
-                                                  (when (or (not maximum)
-                                                            (> max maximum))
-                                                    (set! maximum max)))))
-                                            (values minimum maximum))))))
-                               
-                               (define (fraction->bignum fraction)
-                                 (/ (gst_value_get_fraction_numerator fraction)
-                                    (gst_value_get_fraction_denominator fraction)))
-                               
-                               (receive (min max) (determine-framerate-min/max value)
-                                 (set! all (cons (new Camera-Resolution resolution min max) all))))))))))
-             all)
-      (gst_caps_unref caps))))
 
 
 ;;;
@@ -1066,16 +1058,17 @@
   (world-setting 'world.profile-camera? #f))
 
 
+(definition protected (effective-camera-provider providers)
+  (let ((name (world-setting 'world.camera-name #f)))
+    (if (not name)
+        (car providers)
+      (or (find providers name key: get-name test: equal? return: 'item)
+          (car providers)))))
+
+
 (definition protected (effective-camera-information selfrate)
-  (let ((providers (cache-camera-providers)))
-    (define (effective-provider)
-      (let ((name (world-setting 'world.camera-name #f)))
-        (if (not name)
-            (car providers)
-          (or (find providers name key: get-name test: equal? return: 'item)
-              (car providers)))))
-    
-    (let ((provider (effective-provider)))
+  (let ((providers (camera-providers)))
+    (let ((provider (effective-camera-provider providers)))
       (let ((resolution (car (get-resolutions provider))))
         (define (effective-resolution)
           (get-resolution resolution))
@@ -1089,21 +1082,10 @@
                      (format ", framerate={a}/1" (fxround framerate-real)))))
             (else "")))
         
-        (with-camera-devices
-          (lambda (devices)
-            (values (camera-identifier-keyword)
-                    (read-camera-identifier devices)
-                    (effective-resolution)
-                    (effective-framerate))))))))
-
-
-(definition package (read-camera-identifier devices)
-  (let ((name (world-setting 'world.camera-name #f)))
-    (if (not name)
-        #f
-      (let ((device (find devices name key: gst_device_get_display_name test: equal? return: 'item)))
-        (and device
-             (camera-device-identifier device))))))
+        (values (camera-identifier-keyword)
+                (get-identifier provider)
+                (effective-resolution)
+                (effective-framerate))))))
 
 
 (definition protected (camera-identifier-keyword)
