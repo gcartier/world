@@ -888,6 +888,19 @@
 ;;;
 
 
+;; patch around a gstreamer bug in 10.16 where not
+;; specifying the framerate on my mac ends up using
+;; the default of 10000000/333333 and monterey then
+;; complains the framerate is higher than supported
+(cond-expand
+  (mac
+   (definition patch-version-10.16-framerate?
+     (let ((version (platformOperatingSystemVersion)))
+       (or (> (get-major version) 10)
+           (>= (get-minor version) 16)))))
+  (else))
+
+
 (class Camera-Provider extends Object
   
   
@@ -912,16 +925,14 @@
 (class Camera-Resolution extends Object
   
   
-  (slot resolution    getter generate)
-  (slot framerate-min getter generate)
-  (slot framerate-max getter generate)
+  (slot resolution getter generate)
+  (slot framerate  getter generate)
   
   
-  (method override (initialize self resolution framerate-min framerate-max)
+  (method override (initialize self resolution framerate)
     (nextmethod self)
     (set! self.resolution resolution)
-    (set! self.framerate-min framerate-min)
-    (set! self.framerate-max framerate-max))
+    (set! self.framerate framerate))
   
   
   (method override (print self output readably)
@@ -967,34 +978,39 @@
                            (let ((resolution (new Dimension width height)))
                              (when (not (member? resolution all test: nu=?))
                                (let ((value (gst_structure_get_value struc "framerate")))
-                                 (define (determine-framerate-min/max value)
-                                   (let ((type (g_value_type value)))
-                                     (cond ((= type (GST_TYPE_FRACTION))
-                                            (let ((framerate (fraction->bignum value)))
-                                              (values framerate framerate)))
-                                           ((= type (GST_TYPE_FRACTION_RANGE))
-                                            (values (fraction->bignum (gst_value_get_fraction_range_min value))
-                                                    (fraction->bignum (gst_value_get_fraction_range_max value))))
-                                           ((= type (GST_TYPE_LIST))
-                                            (let ((minimum #f)
-                                                  (maximum #f))
-                                              (gst-iterate-value-list value
-                                                (lambda (value)
-                                                  (receive (min max) (determine-framerate-min/max value)
-                                                    (when (or (not minimum)
-                                                              (< min minimum))
-                                                      (set! minimum min))
-                                                    (when (or (not maximum)
-                                                              (> max maximum))
-                                                      (set! maximum max)))))
-                                              (values minimum maximum))))))
+                                 ;; patch around a problem that only occurs on monterey so lets
+                                 ;; not take any chances and risk impacting the other platforms...
+                                 ;; gstreamer because of the approximation it does in converting a
+                                 ;; double to a fraction ends up passing a value sligthly greater
+                                 ;; than the range max which the mac rejects
+                                 ;; note that the problem might also occur with framerate being a
+                                 ;; list of ranges, but specifying an explicit framerate is so
+                                 ;; brittle lets only fix it if it actually happens
+                                 (define (determine-framerate value)
+                                   (cond-expand
+                                     (mac (if patch-version-10.16-framerate?
+                                              (let ((type (g_value_type value)))
+                                                (if (= type (GST_TYPE_FRACTION_RANGE))
+                                                    (let ((min (fraction->bignum (gst_value_get_fraction_range_min value)))
+                                                          (max (fraction->bignum (gst_value_get_fraction_range_max value))))
+                                                      (let ((min-real (exact->inexact min))
+                                                            (max-real (exact->inexact max)))
+                                                        (let ((round (round max-real))
+                                                              (floor (floor max-real)))
+                                                          (if (and (= floor round) ;; close to floor
+                                                                   (between? floor min-real max-real)) ;; inside range
+                                                              (format "{a}/1" (flonum->fixnum floor))
+                                                            #f))))
+                                                #f))
+                                            #f))
+                                     (else #f)))
                                  
                                  (define (fraction->bignum fraction)
                                    (/ (gst_value_get_fraction_numerator fraction)
                                       (gst_value_get_fraction_denominator fraction)))
                                  
-                                 (receive (min max) (determine-framerate-min/max value)
-                                   (set! all (cons (new Camera-Resolution resolution min max) all))))))))))
+                                 (let ((framerate (determine-framerate value)))
+                                   (set! all (cons (new Camera-Resolution resolution framerate) all))))))))))
                all)
         (gst_caps_unref caps))))
   
@@ -1056,19 +1072,6 @@
     (else "v4l2src")))
 
 
-;; patch around a gstreamer bug in 10.16 where not
-;; specifying the framerate on my mac ends up using
-;; the default of 10000000/333333 and monterey then
-;; complains the framerate is higher than supported
-(cond-expand
-  (mac
-   (definition patch-version-10.16-framerate?
-     (let ((version (platformOperatingSystemVersion)))
-       (or (> (get-major version) 10)
-           (>= (get-minor version) 16)))))
-  (else))
-
-
 (definition profile-camera?
   (world-setting 'world.profile-camera? #f))
 
@@ -1089,16 +1092,11 @@
           (get-resolution resolution))
         
         (define (effective-framerate)
-          (cond-expand
-            ;; at the moment the problem only occurs on mac monterey so lets
-            ;; not take any chances and risk impacting the other platforms...
-            (mac (if patch-version-10.16-framerate?
-                     (let ((highest-resolution (car (get-resolutions provider))))
-                       (let ((framerate-max (get-framerate-max highest-resolution)))
-                         (let ((framerate-real (min (exact->inexact framerate-max) (exact->inexact selfrate))))
-                           (format ", framerate={a}/1" (fxround framerate-real)))))
-                   ""))
-            (else "")))
+          ;; patch see camera-providers for details
+          (let ((framerate (get-framerate resolution)))
+            (if framerate
+                (format ", framerate={a}" framerate)
+              "")))
         
         (values (get-name provider)
                 (get-identifier provider)
