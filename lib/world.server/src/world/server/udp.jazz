@@ -273,19 +273,19 @@
                     (increase-received connection data)
                     (ecase kind
                       ((udp-heartbeat)
-                       (receive-heartbeat self data))
+                       (receive-heartbeat self connection sender data))
                       ((udp-nack)
-                       (receive-nack self data))
+                       (receive-nack self connection data))
                       ((udp-audio udp-video)
                        (receive-medias self connection kind data))
                       ((udp-state)
                        (receive-state self data))
                       ((udp-alive)
-                       (receive-alive self data))
+                       (receive-alive self connection sender data))
                       ((udp-profile-pulse)
-                       (receive-profile-pulse self data))
+                       (receive-profile-pulse self connection sender data))
                       ((udp-profile-media)
-                       (receive-profile-media self data))
+                       (receive-profile-media self connection data))
                       (else
                        (error "Unknown UDP kind: {s}" kind))))))))))))
   
@@ -411,47 +411,43 @@
               (get-streams group)))
   
   
-  (method (receive-heartbeat self data)
+  (method (receive-heartbeat self connection sender data)
     (with-record heartbeat
-      (let ((sender (read-header-sender data)))
-        ;; ack
-        (send-ack self sender data)
-        ;; throttling
-        (let ((connection (no->connection self sender)))
-          (when connection
-            (set-last-received-heartbeat connection (current-seconds))
-            (when (get-throttle-media? connection)
-              (set-throttle-media? connection #f)
-              (when record-events?
-                (record-event udp-id-throttle-off
-                              -1.
-                              (fixnum->flonum sender)
-                              -1.
-                              (fixnum->flonum (read-heartbeat-sequence data))
-                              -1.
-                              -1.
-                              -1.))))))))
+      ;; ack
+      (send-ack self connection sender data)
+      ;; throttling
+      (set-last-received-heartbeat connection (current-seconds))
+      (when (get-throttle-media? connection)
+        (set-throttle-media? connection #f)
+        (when record-events?
+          (record-event udp-id-throttle-off
+                        -1.
+                        (fixnum->flonum sender)
+                        -1.
+                        (fixnum->flonum (read-heartbeat-sequence data))
+                        -1.
+                        -1.
+                        -1.)))))
   
   
-  (method (receive-nack self data)
+  (method (receive-nack self connection data)
     (with-record nack
       (let ((sender (read-header-sender data))
             (channel-no (read-nack-channel data))
             (start (read-nack-start data))
             (gap (read-nack-gap data)))
-        (send-missing self sender channel-no start gap))))
+        (send-missing self connection sender channel-no start gap))))
   
   
   ;; receive and reorder all available packets
   (method protected (receive-medias self connection kind data)
     (declare (proper-tail-calls))
     (with-record media
-      (let ((no (read-media-channel data))
-            (sender (read-header-sender data)))
+      (let ((no (read-media-channel data)))
         ;; so a sequence of one doesn't allocate a pair
         (let (loop (ordered #f))
           (define (receive)
-            (resend-nacks self sender)
+            (resend-nacks self connection)
             (if (not ordered)
                 (receive-media self kind data)
               (for-each (lambda (data)
@@ -483,7 +479,7 @@
             (broadcast-media self channel kind data))))))
   
   
-  (method (send-missing self sender channel-no start gap)
+  (method (send-missing self connection sender channel-no start gap)
     (let ((channel (or (find-send-channel self channel-no)
                        (find-server-channel self channel-no))))
       (when channel
@@ -493,20 +489,18 @@
                 (let ((data (locate-data ring sequence)))
                   (if data
                       (with-record media
-                        (let ((connection (no->connection self sender)))
-                          (when connection
-                            (increase-media-resent data)
-                            (send-data self connection data)
-                            (when record-events?
-                              (let ((frame (read-media-frame data)))
-                                (record-event udp-id-resend-packet
-                                              (fixnum->flonum channel-no)
-                                              (fixnum->flonum sender)
-                                              (fixnum->flonum media-kind)
-                                              (fixnum->flonum sequence)
-                                              (fixnum->flonum frame)
-                                              -1.
-                                              -1.))))))
+                        (increase-media-resent data)
+                        (send-data self connection data)
+                        (when record-events?
+                          (let ((frame (read-media-frame data)))
+                            (record-event udp-id-resend-packet
+                                          (fixnum->flonum channel-no)
+                                          (fixnum->flonum sender)
+                                          (fixnum->flonum media-kind)
+                                          (fixnum->flonum sequence)
+                                          (fixnum->flonum frame)
+                                          -1.
+                                          -1.))))
                     (when record-events?
                       (record-event udp-id-absent-packet
                                     (fixnum->flonum channel-no)
@@ -599,54 +593,50 @@
     (mutex-unlock! server-mutex))
   
   
-  (method (resend-nacks self sender)
-    (let ((connection (no->connection self sender)))
-      (when connection
-        (let ((resending-nacks (get-resending-nacks connection)))
-          (when (not-null? resending-nacks)
-            (for-each (lambda (data)
-                        (send-data self connection data))
-                      resending-nacks)
-            (set-resending-nacks connection '()))))))
-  
-  
-  (method (send-ack self sender data)
-    (let ((connection (no->connection self sender)))
-      (when connection
-        (let ((monitor (get-monitor connection)))
-          (let ((bytes-sent (get-bytes-sent monitor))
-                (bytes-received (get-bytes-received monitor))
-                (missed-media-packets (get-missed-media-packets monitor)))
-            (define (extract)
-              (with-record heartbeat
-                (values (read-heartbeat-sent data)
-                        (read-heartbeat-sequence data)
-                        (read-heartbeat-bytes-sent data))))
-            
-            (receive (heartbeat-sent heartbeat-sequence heartbeat-bytes-sent) (extract)
-              (with-record ack
-                (let ((size (calculate-ack-size)))
-                  (let ((data (make-u8vector (+ size udp-code-size))))
-                    (write-header-kind data udp-ack)
-                    (write-header-sender data sender)
-                    (write-ack-heartbeat-sent data heartbeat-sent)
-                    (write-ack-heartbeat-sequence data heartbeat-sequence)
-                    (write-ack-heartbeat-bytes-sent data heartbeat-bytes-sent)
-                    (write-ack-sent data (current-seconds))
-                    (write-ack-bytes-sent data bytes-sent)
-                    (write-ack-bytes-received data bytes-received)
-                    (write-ack-missed-media-packets data missed-media-packets)
-                    (write-udp-code data)
+  (method (resend-nacks self connection)
+    (let ((resending-nacks (get-resending-nacks connection)))
+      (when (not-null? resending-nacks)
+        (for-each (lambda (data)
                     (send-data self connection data))
-                  (when record-events?
-                    (record-event udp-id-send-ack
-                                  -1.
-                                  (fixnum->flonum sender)
-                                  -1.
-                                  (fixnum->flonum heartbeat-sequence)
-                                  -1.
-                                  -1.
-                                  -1.))))))))))
+                  resending-nacks)
+        (set-resending-nacks connection '()))))
+  
+  
+  (method (send-ack self connection sender data)
+    (let ((monitor (get-monitor connection)))
+      (let ((bytes-sent (get-bytes-sent monitor))
+            (bytes-received (get-bytes-received monitor))
+            (missed-media-packets (get-missed-media-packets monitor)))
+        (define (extract)
+          (with-record heartbeat
+            (values (read-heartbeat-sent data)
+                    (read-heartbeat-sequence data)
+                    (read-heartbeat-bytes-sent data))))
+        
+        (receive (heartbeat-sent heartbeat-sequence heartbeat-bytes-sent) (extract)
+          (with-record ack
+            (let ((size (calculate-ack-size)))
+              (let ((data (make-u8vector (+ size udp-code-size))))
+                (write-header-kind data udp-ack)
+                (write-header-sender data sender)
+                (write-ack-heartbeat-sent data heartbeat-sent)
+                (write-ack-heartbeat-sequence data heartbeat-sequence)
+                (write-ack-heartbeat-bytes-sent data heartbeat-bytes-sent)
+                (write-ack-sent data (current-seconds))
+                (write-ack-bytes-sent data bytes-sent)
+                (write-ack-bytes-received data bytes-received)
+                (write-ack-missed-media-packets data missed-media-packets)
+                (write-udp-code data)
+                (send-data self connection data))
+              (when record-events?
+                (record-event udp-id-send-ack
+                              -1.
+                              (fixnum->flonum sender)
+                              -1.
+                              (fixnum->flonum heartbeat-sequence)
+                              -1.
+                              -1.
+                              -1.))))))))
   
   
   (method (broadcast-media self channel kind data)
@@ -706,22 +696,18 @@
             (done-keyframe connection channel))))))
     
   
-  (method (receive-alive self data)
+  (method (receive-alive self connection sender data)
+    (send-alive-ack self connection sender data))
+  
+  
+  (method (send-alive-ack self connection sender data)
     (with-record header
-      (let ((sender (read-header-sender data)))
-        (send-alive-ack self sender data))))
-  
-  
-  (method (send-alive-ack self sender data)
-    (let ((connection (no->connection self sender)))
-      (when connection
-        (with-record header
-          (let ((size (calculate-alive-ack-size)))
-            (let ((data (make-u8vector (+ size udp-code-size))))
-              (write-header-kind data udp-alive-ack)
-              (write-header-sender data sender)
-              (write-udp-code data)
-              (send-data self connection data)))))))
+      (let ((size (calculate-alive-ack-size)))
+        (let ((data (make-u8vector (+ size udp-code-size))))
+          (write-header-kind data udp-alive-ack)
+          (write-header-sender data sender)
+          (write-udp-code data)
+          (send-data self connection data)))))
 
   
   (method package (send-profile-media self connection sequence payload)
@@ -738,57 +724,47 @@
     (mutex-unlock! server-mutex))
   
   
-  (method (receive-profile-pulse self data)
-    (with-record profile-pulse
-      (let ((sender (read-header-sender data)))
-        (let ((connection (no->connection self sender)))
-          (when connection
-            (receive-profile-pulse connection data)
-            (send-profile-ack self sender data))))))
+  (method (receive-profile-pulse self connection sender data)
+    (receive-profile-pulse connection data)
+    (send-profile-ack self connection sender data))
   
   
-  (method (send-profile-ack self sender data)
-    (let ((connection (no->connection self sender)))
-      (when connection
-        (let ((now (current-seconds))
-              (time-base (get-profile-time-base connection))
-              (profile-monitor (get-profile-monitor connection)))
-          (let ((bytes-sent (get-bytes-sent profile-monitor))
-                (bytes-received (get-bytes-received profile-monitor)))
-            (define (extract)
-              (with-record profile-pulse
-                (values (read-profile-pulse-sent data)
-                        (read-profile-pulse-sequence data)
-                        (read-profile-pulse-bytes-sent data))))
-            
-            (receive (pulse-sent pulse-sequence pulse-bytes-sent) (extract)
-              (update-time time-base now pulse-sent
-                (lambda (raw-latency latency reason)
-                  ))
-              (with-record profile-ack
-                (let ((size (calculate-profile-ack-size)))
-                  (let ((data (make-u8vector (+ size udp-code-size))))
-                    (write-header-kind data udp-profile-ack)
-                    (write-header-sender data sender)
-                    (write-profile-ack-pulse-sent data pulse-sent)
-                    (write-profile-ack-pulse-sequence data pulse-sequence)
-                    (write-profile-ack-pulse-bytes-sent data pulse-bytes-sent)
-                    (write-profile-ack-sent data now)
-                    (write-profile-ack-latency data (get-raw-latency time-base))
-                    (write-profile-ack-bytes-sent data bytes-sent)
-                    (write-profile-ack-bytes-received data bytes-received)
-                    (write-udp-code data)
-                    (send-data self connection data)
-                    (increase-sent profile-monitor data))))))))))
+  (method (send-profile-ack self connection sender data)
+    (let ((now (current-seconds))
+          (time-base (get-profile-time-base connection))
+          (profile-monitor (get-profile-monitor connection)))
+      (let ((bytes-sent (get-bytes-sent profile-monitor))
+            (bytes-received (get-bytes-received profile-monitor)))
+        (define (extract)
+          (with-record profile-pulse
+            (values (read-profile-pulse-sent data)
+                    (read-profile-pulse-sequence data)
+                    (read-profile-pulse-bytes-sent data))))
+        
+        (receive (pulse-sent pulse-sequence pulse-bytes-sent) (extract)
+          (update-time time-base now pulse-sent
+            (lambda (raw-latency latency reason)
+              ))
+          (with-record profile-ack
+            (let ((size (calculate-profile-ack-size)))
+              (let ((data (make-u8vector (+ size udp-code-size))))
+                (write-header-kind data udp-profile-ack)
+                (write-header-sender data sender)
+                (write-profile-ack-pulse-sent data pulse-sent)
+                (write-profile-ack-pulse-sequence data pulse-sequence)
+                (write-profile-ack-pulse-bytes-sent data pulse-bytes-sent)
+                (write-profile-ack-sent data now)
+                (write-profile-ack-latency data (get-raw-latency time-base))
+                (write-profile-ack-bytes-sent data bytes-sent)
+                (write-profile-ack-bytes-received data bytes-received)
+                (write-udp-code data)
+                (send-data self connection data)
+                (increase-sent profile-monitor data))))))))
   
   
-  (method (receive-profile-media self data)
-    (with-record profile-media
-      (let ((sender (read-header-sender data)))
-        (let ((connection (no->connection self sender)))
-          (when connection
-            (send-profile-media-ack self connection data)
-            (receive-profile-media connection data))))))
+  (method (receive-profile-media self connection data)
+    (send-profile-media-ack self connection data)
+    (receive-profile-media connection data))
   
   
   (method package (send-profile-media-ack self connection data)
