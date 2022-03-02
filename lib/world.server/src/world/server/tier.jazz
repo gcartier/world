@@ -792,9 +792,9 @@
   
   
   (method (delegate-invite self delegate recipient)
-    (let ((recipient-delegate (find-delegate-by-ci-name self recipient)))
-      (if (not recipient-delegate)
-          (format "Unable to find {a}" recipient)
+    (let ((recipient-delegate (search-for-delegate self recipient)))
+      (if (string? recipient-delegate)
+          recipient-delegate
         (if (eq? delegate recipient-delegate)
             (format "Cannot invite yourself")
           (if (get-group recipient-delegate)
@@ -1514,7 +1514,7 @@
   
   (method (cache-universe-asset-entries self)
     (or universe-asset-entries
-        (let ((entries (zlib-deflate (object->u8vector (get-entries (get-index (get-repository universe-assets)))))))
+        (let ((entries (zlib-deflate (object->u8vector (entries->list (get-entries (get-index (get-repository universe-assets))))))))
           (set! universe-asset-entries entries)
           entries)))
 
@@ -1522,15 +1522,16 @@
   (method (collect-world-asset-entries self)
     (with-world-assets-mutex
       (lambda ()
-        (get-entries (get-index (get-repository world-assets))))))
+        (entries->list (get-entries (get-index (get-repository world-assets)))))))
   
   
   (method package (retrieve-universe-asset self path)
     (let ((repository (get-repository universe-assets)))
       (let ((entry (find-entry repository path)))
         (and entry
-             (bind (path digest seconds) entry
-               (list (retrieve-object repository digest) digest))))))
+             (let ((digest (get-digest entry))
+                   (flags (get-flags entry)))
+               (list (retrieve-object repository digest) digest flags))))))
   
   
   (method package (retrieve-world-asset self path)
@@ -1539,8 +1540,9 @@
         (let ((repository (get-repository world-assets)))
           (let ((entry (find-entry repository path)))
             (and entry
-                 (bind (path digest seconds) entry
-                   (list (retrieve-object repository digest) digest))))))))
+                 (let ((digest (get-digest entry))
+                       (flags (get-flags entry)))
+                   (list (retrieve-object repository digest) digest flags))))))))
   
   
   (method package (upload-world-asset self content digest)
@@ -1555,7 +1557,7 @@
       (lambda ()
         (let ((repository (get-repository world-assets)))
           (let ((delegate (find-delegate self client)))
-            (apply-changes repository changes)
+            (update-changes repository changes)
             (broadcast-assets self delegate changes))))))
   
   
@@ -1651,15 +1653,6 @@
   
   
   (method package (admin-command self client command arguments)
-    (define (search-unique-delegate target)
-      (let ((delegates (collect-if (lambda (delegate)
-                                     (search (get-name delegate) target ignore-case?: #t))
-                                   delegates)))
-        (case (length delegates)
-          ((0) (format "Unable to find {s}" target))
-          ((1) (car delegates))
-          (else "Ambiguous multiple names found"))))
-    
     (case command
       ((activity)
        (let ((file (logger-file)))
@@ -1803,7 +1796,7 @@
                   #f)))))))
       ((kick)
        (bind (who) arguments
-         (let ((delegate (search-unique-delegate who)))
+         (let ((delegate (search-for-delegate self who)))
            (if (string? delegate)
                delegate
              (kick-client self delegate)
@@ -2004,7 +1997,7 @@
                           (for-each dispatch-client (get-members requester-group))
                           #f))))
                    (else
-                    (let ((delegate (search-unique-delegate who)))
+                    (let ((delegate (search-for-delegate self who)))
                       (if (string? delegate)
                           delegate
                         (dispatch-client delegate)
@@ -2456,22 +2449,26 @@
   
   
   (method (kick-client self delegate (activity? #t))
-    (let ((client (get-client delegate))
-          (group (get-group delegate)))
-      (when activity?
-        (logger/activity self "Kick {a}" (get-name delegate)))
-      (server-unregister-streams self (get-no delegate))
-      (delegate-stop self delegate)
-      (delegate-deconnect self delegate broadcast-exited?: #f)
-      (disconnect-remote-proxy client)
-      (let ((processor (get-processor delegate)))
-        (when processor
-          (let ((processor-proxy (get-remote-proxy processor)))
-            (when (remote-proxy-connected? processor-proxy)
-              (client-kick processor-proxy client)))))
-      (when group
-        (register-disconnected-group (get-name delegate) group)
-        (broadcast-disconnected-to-group self delegate group))))
+    (if (is? delegate Mobile-Delegate)
+        (let ((port (get-port delegate)))
+          (mobile-deconnect self delegate)
+          (close-port port))
+      (let ((client (get-client delegate))
+            (group (get-group delegate)))
+        (when activity?
+          (logger/activity self "Kick {a}" (get-name delegate)))
+        (server-unregister-streams self (get-no delegate))
+        (delegate-stop self delegate)
+        (delegate-deconnect self delegate broadcast-exited?: #f)
+        (disconnect-remote-proxy client)
+        (let ((processor (get-processor delegate)))
+          (when processor
+            (let ((processor-proxy (get-remote-proxy processor)))
+              (when (remote-proxy-connected? processor-proxy)
+                (client-kick processor-proxy client)))))
+        (when group
+          (register-disconnected-group (get-name delegate) group)
+          (broadcast-disconnected-to-group self delegate group)))))
   
   
   ;;;
@@ -3009,9 +3006,9 @@
       (log-message self sender message)
       (case kind
         ((whisper)
-         (let ((delegate (find-delegate-by-ci-name self recipient)))
-           (if (not delegate)
-               (format "Unable to find {a}" recipient)
+         (let ((delegate (search-for-delegate self recipient)))
+           (if (string? delegate)
+               delegate
              (deliver-message self delegate sender kind message)
              #f)))
         ((group)
