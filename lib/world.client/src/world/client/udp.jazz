@@ -1107,43 +1107,6 @@
 ;;;
 
 
-(definition cutoff-latency
-  udp-live-retain-window)
-
-(definition cutoff-last-past-time
-  0.5)
-
-
-(definition max-latency <fx>
-  (flonum->timestamp 5.))
-
-
-(class UDP-Receive-Base extends UDP-Base
-  
-  
-  (slot stream      getter generate)
-  (slot media-kind  getter generate)
-  (slot source-kind getter generate)
-  
-  
-  (method override (initialize self stream media-kind source-kind)
-    (nextmethod self)
-    (set! self.stream stream)
-    (set! self.media-kind media-kind)
-    (set! self.source-kind (if live-streaming? 'live source-kind)))
-  
-  
-  (method override (effective-latency self)
-    (media-latency stream media-kind))
-  
-  
-  (method protected (latency-remote->local self latency remote) <fx>
-    (+ base remote latency)))
-
-
-(definition plateau-duration <fl>
-  5.)
-
 (definition plateau-grace <fx>
   (flonum->timestamp 1.))
 
@@ -1154,10 +1117,12 @@
   (flonum->timestamp 0.05))
 
 
-(class UDP-Audio-Base extends UDP-Receive-Base
+(class UDP-Receive-Base extends UDP-Base
   
   
-  (slot ring             accessors generate)
+  (slot stream           getter generate)
+  (slot media-kind       getter generate)
+  (slot source-kind      getter generate)
   (slot last-raw-latency getter generate)
   (slot plateau-start    getter generate)
   (slot plateau-highest  getter generate)
@@ -1165,7 +1130,10 @@
   
   
   (method override (initialize self stream media-kind source-kind)
-    (nextmethod self stream media-kind source-kind)
+    (nextmethod self)
+    (set! self.stream stream)
+    (set! self.media-kind media-kind)
+    (set! self.source-kind (if live-streaming? 'live source-kind))
     (set! self.last-raw-latency 0)
     (set! self.plateau-start 0)
     (set! self.plateau-highest #f)
@@ -1180,13 +1148,12 @@
     (set! self.state 'plateau))
   
   
-  (method (determine-earliest-ontime self local)
-    (let ((earliest (earliest-packet ring)))
-      (and earliest
-           (let ((earliest-dts (get-dts earliest)))
-             (let ((earliest-base (- local earliest-dts)))
-               (let ((earliest-latency (- earliest-base base)))
-                 (- earliest-latency udp-audio-tolerance)))))))
+  (method protected virtual (voice-under-threshold? self plateau-time)
+    #t)
+  
+  
+  (method protected virtual (determine-earliest-ontime self local)
+    #f)
   
   
   (method override (update-time self local remote update-proc)
@@ -1225,8 +1192,7 @@
                           (drop (- latency raw)))
                       ;; fall
                       (when (and (>= plateau-time plateau-minimum)
-                                 ;; progressively accept more voice over 30s to a max of 30%
-                                 (<= (voice-percentage ring) (min 30. (timestamp->flonum plateau-time))))
+                                 (voice-under-threshold? self plateau-time))
                         (set! latency plateau-highest)
                         (reset-plateau))))))
             ((rise)
@@ -1241,82 +1207,38 @@
                    (reset-plateau))))))
           ;; update
           (update-latency stream media-kind raw-latency latency)
-          (update-proc raw-latency latency udp-latency-raw))))))
+          (update-proc raw-latency latency udp-latency-raw)))))
+  
+  
+  (method override (effective-latency self)
+    (media-latency stream media-kind))
+  
+  
+  (method protected (latency-remote->local self latency remote) <fx>
+    (+ base remote latency)))
 
 
-(class UDP-Video-Base extends UDP-Receive-Base
+(class UDP-Audio-Base extends UDP-Receive-Base
   
   
-  (slot last-raw-latency getter generate)
-  (slot plateau-start    getter generate)
-  (slot plateau-highest  getter generate)
-  (slot state            getter generate)
+  (slot ring accessors generate)
   
   
-  (method override (initialize self stream media-kind source-kind)
-    (nextmethod self stream media-kind source-kind)
-    (set! self.last-raw-latency 0)
-    (set! self.plateau-start 0)
-    (set! self.plateau-highest #f)
-    (set! self.state 'plateau))
+  (method override (voice-under-threshold? self plateau-time)
+    ;; progressively accept more voice over 30s to a max of 30%
+    (<= (voice-percentage ring) (min 30. (timestamp->flonum plateau-time))))
   
   
-  (method override (reset self)
-    (nextmethod self)
-    (set! self.last-raw-latency 0)
-    (set! self.plateau-start 0)
-    (set! self.plateau-highest #f)
-    (set! self.state 'plateau))
-  
-  
-  (method override (update-time self local remote update-proc)
-    (let ((new-base (- local remote)))
-      (define (reset-plateau)
-        (set! plateau-start local)
-        (set! plateau-highest #f))
-      
-      (if (not base)
-          (begin
-            (set! base new-base)
-            (set! raw-latency 0)
-            (set! latency 0)
-            (reset-plateau)
-            (update-latency stream media-kind raw-latency latency)
-            (update-proc raw-latency latency udp-latency-raw))
-        (let ((raw (- new-base base)))
-          (set! raw-latency raw)
-          (case state
-            ((plateau)
-             (cond ;; up
-                   ((> raw (+ latency udp-video-tolerance))
-                    (set! state 'rise)
-                    (set! latency +inf.ts)
-                    (set! last-raw-latency raw))
-                   ;; extend
-                   ((>= raw (- latency drop-minimum))
-                    (reset-plateau))
-                   ;; down
-                   ((and (eq? source-kind 'live)
-                         (>= local (+ plateau-start plateau-grace)))
-                    (when (or (not plateau-highest)
-                              (> raw plateau-highest))
-                      (set! plateau-highest raw))
-                    (let ((plateau-time (- local plateau-start))
-                          (drop (- latency raw)))
-                      (when (>= plateau-time plateau-minimum)
-                        ;; fall
-                        (set! latency plateau-highest)
-                        (reset-plateau))))))
-            ((rise)
-             (if (> raw last-raw-latency)
-                 (set! last-raw-latency raw)
-               ;; plateau
-               (set! state 'plateau)
-               (set! latency last-raw-latency)
-               (reset-plateau))))
-          ;; update
-          (update-latency stream media-kind raw-latency latency)
-          (update-proc raw-latency latency udp-latency-raw))))))
+  (method override (determine-earliest-ontime self local)
+    (let ((earliest (earliest-packet ring)))
+      (and earliest
+           (let ((earliest-dts (get-dts earliest)))
+             (let ((earliest-base (- local earliest-dts)))
+               (let ((earliest-latency (- earliest-base base)))
+                 (- earliest-latency udp-audio-tolerance))))))))
+
+
+(class UDP-Video-Base extends UDP-Receive-Base)
 
 
 ;;;
