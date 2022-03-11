@@ -1128,6 +1128,14 @@
   (slot plateau-highest  getter generate)
   (slot state            getter generate)
   
+  (slot contour-raw-latency      <fx> getter generate)
+  (slot contour-latency          <fx> getter generate)
+  (slot contour-last-raw-latency      getter generate)
+  (slot contour-plateau-start         getter generate)
+  (slot contour-plateau-highest       getter generate)
+  (slot contour-state                 getter generate)
+  (slot contour-history               getter generate)
+  
   
   (method override (initialize self stream media-kind source-kind)
     (nextmethod self)
@@ -1137,7 +1145,8 @@
     (set! self.last-raw-latency 0)
     (set! self.plateau-start 0)
     (set! self.plateau-highest #f)
-    (set! self.state 'plateau))
+    (set! self.state 'plateau)
+    (reset-contour self))
   
   
   (method override (reset self)
@@ -1145,7 +1154,18 @@
     (set! self.last-raw-latency 0)
     (set! self.plateau-start 0)
     (set! self.plateau-highest #f)
-    (set! self.state 'plateau))
+    (set! self.state 'plateau)
+    (reset-contour self))
+  
+  
+  (method (reset-contour self)
+    (set! self.contour-raw-latency 0)
+    (set! self.contour-latency 0)
+    (set! self.contour-last-raw-latency 0)
+    (set! self.contour-plateau-start 0)
+    (set! self.contour-plateau-highest #f)
+    (set! self.contour-state 'plateau)
+    (set! self.contour-history (new Windowed-History 30. 60)))
   
   
   (method protected virtual (voice-under-threshold? self plateau-time)
@@ -1154,6 +1174,64 @@
   
   (method protected virtual (determine-earliest-ontime self local)
     #f)
+  
+  
+  (method (update-contour-base self local remote)
+    (set! contour-raw-latency 0)
+    (set! contour-latency 0)
+    (set! contour-plateau-start local)
+    (set! contour-plateau-highest #f))
+  
+  
+  (method (update-contour self local remote raw)
+    (define (reset-plateau)
+      (set! contour-plateau-start local)
+      (set! contour-plateau-highest #f))
+    
+    (define (record-plateau latency)
+      (record contour-history (current-seconds) (timestamp->flonum latency))
+      (record-event udp-id-contour-latency
+                    -1.
+                    -1.
+                    (fixnum->flonum media-kind)
+                    -1.
+                    -1.
+                    (timestamp->flonum contour-latency)
+                    -1.
+                    -1.
+                    -1.))
+    
+    (set! contour-raw-latency raw)
+    (case contour-state
+      ((plateau)
+       (cond ;; up
+             ((> raw (+ contour-latency udp-audio-tolerance))
+              (set! contour-state 'rise)
+              (set! contour-latency +inf.ts)
+              (set! contour-last-raw-latency raw)
+              (record-plateau raw))
+             ;; extend
+             ((>= raw (- contour-latency drop-minimum))
+              (reset-plateau))
+             ;; down
+             ((>= local (+ contour-plateau-start plateau-grace))
+              (when (or (not contour-plateau-highest)
+                        (> raw contour-plateau-highest))
+                (set! contour-plateau-highest raw))
+              (let ((plateau-time (- local contour-plateau-start)))
+                ;; fall
+                (when (>= plateau-time plateau-minimum)
+                  (set! contour-latency contour-plateau-highest)
+                  (reset-plateau)
+                  (record-plateau contour-latency))))))
+      ((rise)
+       (if (> raw contour-last-raw-latency)
+           (set! contour-last-raw-latency raw)
+         ;; plateau
+         (set! contour-state 'plateau)
+         (set! contour-latency contour-last-raw-latency)
+         (reset-plateau)
+         (record-plateau contour-latency)))))
   
   
   (method override (update-time self local remote update-proc)
@@ -1168,10 +1246,12 @@
             (set! raw-latency 0)
             (set! latency 0)
             (reset-plateau)
+            (update-contour-base self local remote)
             (update-latency stream media-kind raw-latency latency)
             (update-proc raw-latency latency udp-latency-raw))
         (let ((raw (- new-base base)))
           (set! raw-latency raw)
+          (update-contour self local remote raw)
           (case state
             ((plateau)
              (cond ;; up
