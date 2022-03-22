@@ -146,6 +146,8 @@
   (slot hierarchy-update-hook    initialize #f  accessors generate)
   (slot group-join-hook          initialize #f  accessors generate)
   (slot group-leave-hook         initialize #f  accessors generate)
+  (slot circle-acquire-hook      initialize #f  accessors generate)
+  (slot circle-join-hook         initialize #f  accessors generate)
   (slot stream-addable-hook      initialize #f  accessors generate)
   (slot stream-add-hook          initialize #f  accessors generate)
   (slot stream-remove-hook       initialize #f  accessors generate)
@@ -691,10 +693,10 @@
           (client-ready remote-processor remote-client)))))
   
   
-  (method package (create-group self name persistent? allow-audio-only? broadcast-hierarchy? auto-create?)
+  (method package (create-group self name persistent? require-camera? broadcast-hierarchy? auto-create?)
     (calling-server self
       (lambda ()
-        (client-create-group remote-server remote-client name persistent? allow-audio-only? broadcast-hierarchy? auto-create?))))
+        (client-create-group remote-server remote-client name persistent? require-camera? broadcast-hierarchy? auto-create?))))
   
   
   (method package (delete-group self name)
@@ -946,22 +948,28 @@
         (unpause remote-processor))))
   
   
-  (method package (client-invite self recipient)
+  (method package (client-invite self recipient circle-name)
     (calling-server self
       (lambda ()
-        (client-invite remote-server remote-client recipient))))
+        (client-invite remote-server remote-client recipient circle-name))))
   
   
-  (method package (client-accept self sender)
+  (method package (client-accept self sender circle-name)
     (calling-server self
       (lambda ()
-        (client-accept remote-server remote-client sender))))
+        (client-accept remote-server remote-client sender circle-name))))
   
   
-  (method package (client-decline self sender)
+  (method package (client-decline self sender circle-name)
     (calling-server self
       (lambda ()
-        (client-decline remote-server remote-client sender))))
+        (client-decline remote-server remote-client sender circle-name))))
+  
+  
+  (method package (client-problem self sender problem)
+    (calling-server self
+      (lambda ()
+        (client-problem remote-server remote-client sender problem))))
   
   
   (method package (client-leave self)
@@ -1104,16 +1112,51 @@
       (zone-loaded-hook zone error-string)))
   
   
-  (method package (server-invite self sender)
+  (method package (server-invite self sender circle-name require-camera?)
+    (define (layout box)
+      (when circle-name
+        (let ((border (child box 'border))
+              (yes (child box 'yes))
+              (no (child box 'no)))
+          (define (set-v view v)
+            (let ((pos (get-position view)))
+              (set-position view (new Point (get-h pos) v))))
+          
+          (set-v border 3)
+          (set-v yes 65)
+          (set-v no 65))))
+    
+    (define (acquire)
+      (if circle-name
+          (assert circle-acquire-hook
+            (circle-acquire-hook require-camera?))
+        (if (not (has-microphone?))
+            "No microphone found"
+          (if (not (acquire-microphone-pipeline))
+              "Unable to acquire microphone"
+            #f))))
+    
+    (define (problem problem)
+      (display-error (current-world) problem)
+      (client-problem self sender problem))
+    
     (post-event
       (lambda ()
         (with-task-mutex
           (lambda ()
             (disable-autotrack (current-world) feedback?: #f)
             (play-ambient-sound "warcraft/user/iPlayerInviteA" volume: .05)
-            (open-message (format "{a} invites you to an audio group" sender)
+            (open-message (if circle-name
+                              `(<span>
+                                 (<paragraph> justification: center
+                                   (<text> ,(format "{a} invites you to join" sender)))
+                                 (<paragraph> (<text> font: Spacer-Small " "))
+                                 (<paragraph> justification: center
+                                   (<text> color: {Color red: .938 green: .428 blue: .066} ,circle-name)))
+                            (format "{a} invites you to join an audio group" sender))
                           caption: "Invitation"
                           location: '(center (center -150))
+                          layouter: layout
                           type: 'question
                           yes: "Accept"
                           no: "Decline"
@@ -1123,42 +1166,47 @@
                                        (close dialog)
                                        (case button
                                          ((yes)
-                                          (if (not (has-microphone?))
-                                              (begin
-                                                (display-error (current-world) "No microphone found")
-                                                (client-decline self sender))
-                                            (if (not (acquire-microphone-pipeline))
-                                                (begin
-                                                  (display-error (current-world) "Unable to acquire microphone")
-                                                  (client-decline self sender))
-                                              (let ((no/streams/exception (client-accept self sender)))
+                                          (let ((err (acquire)))
+                                            (if err
+                                                (problem err)
+                                              (let ((no/streams/exception (client-accept self sender circle-name)))
                                                 (if (string? no/streams/exception)
                                                     (display-error (current-world) no/streams/exception)
-                                                  (bind (no allow-audio-only? duration . streams) no/streams/exception
-                                                    (start udp-client)
-                                                    (require-live-stream self)
-                                                    (streams-add self no allow-audio-only? streams)
-                                                    (play-microphone self)
-                                                    (when group-join-hook
-                                                      (group-join-hook))))))))
+                                                  (if circle-name
+                                                      (assert circle-join-hook
+                                                        (circle-join-hook circle-name no/streams/exception))
+                                                    (bind (no require-camera? duration . streams) no/streams/exception
+                                                      (start udp-client)
+                                                      (require-live-stream self)
+                                                      (streams-add self no require-camera? streams)
+                                                      (play-microphone self)
+                                                      (when group-join-hook
+                                                        (group-join-hook)))))))))
                                          ((no)
-                                          (client-decline self sender)))))))))))
+                                          (client-decline self sender circle-name)))))))))))
   
   
-  (method package (server-accept self recipient)
+  (method package (server-accept self recipient circle-name)
     (let ((world (current-world)))
-      (start udp-client)
-      (require-live-stream self)
-      (play-microphone self)
-      (when group-join-hook
-        (group-join-hook))
-      (display-message world (format "{a} accepted your invitation" recipient))))
+      (if circle-name
+          (chat-show world (format "{a} joined circle" recipient))
+        (start udp-client)
+        (require-live-stream self)
+        (play-microphone self)
+        (when group-join-hook
+          (group-join-hook)))))
   
   
-  (method package (server-decline self recipient)
+  (method package (server-decline self recipient circle-name)
     (let ((world (current-world)))
       (play-ambient-sound "warcraft/user/LFG_Denied" volume: .1)
-      (display-message world (format "{a} declined your invitation" recipient))))
+      (chat-show world (format "{a} declined your invitation" recipient))))
+  
+  
+  (method package (server-problem self recipient problem)
+    (let ((world (current-world)))
+      (play-ambient-sound "warcraft/user/LFG_Denied" volume: .1)
+      (chat-problem world (format "{a} problem: {a}" recipient problem))))
   
   
   (method package (server-join self recipient)
@@ -1239,7 +1287,7 @@
       (continuation-capture
         (lambda (return)
           (for-each (lambda (info)
-                      (bind (group allow-audio-only? zone . members) info
+                      (bind (group require-camera? zone . members) info
                         (when group
                           (for-each (lambda (member-info)
                                       (let ((name (car member-info)))
@@ -1249,21 +1297,21 @@
                     hierarchy)
           (cons #f (cons #f (cons #f '()))))))
     
-    (bind (new-group new-group-allow-audio-only? new-group-zone . new-group-members) (find-group)
+    (bind (new-group new-group-require-camera? new-group-zone . new-group-members) (find-group)
       (set! group new-group)
       (set! group-members new-group-members))
     (when hierarchy-update-hook
       (hierarchy-update-hook hierarchy)))
   
   
-  (method package (streams-add self group-no group-allow-audio-only? streams)
+  (method package (streams-add self group-no group-require-camera? streams)
     (for-each (lambda (info)
                 (bind (sender name stream-no origin source-kind video-level channels) info
-                  (stream-add self group-no group-allow-audio-only? sender name stream-no origin source-kind video-level channels)))
+                  (stream-add self group-no group-require-camera? sender name stream-no origin source-kind video-level channels)))
               streams))
   
   
-  (method package (stream-add self group-no group-allow-audio-only? sender name stream-no origin source-kind video-level channels)
+  (method package (stream-add self group-no group-require-camera? sender name stream-no origin source-kind video-level channels)
     (when (or (not stream-addable-hook)
               (stream-addable-hook group-no))
       (let ((stream (register-receive-stream udp-client sender name stream-no origin source-kind video-level channels)))
@@ -1299,7 +1347,7 @@
           ;; QUICK TRY
           (when (and (not has-video?)
                      (neq? source-kind 'screen)
-                     (not group-allow-audio-only?))
+                     group-require-camera?)
             (let ((channel (new UDP-Audio-Only-Channel-Hack stream stream-no udp-video source-kind 2 video-resolution video-framerate video-bitrate video-codec #f '() 'on)))
               (channel-output (current-video) channel)))
           (when stream-add-hook
