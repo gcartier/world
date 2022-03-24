@@ -1132,6 +1132,7 @@
   (slot stream           getter generate)
   (slot media-kind       getter generate)
   (slot source-kind      getter generate)
+  (slot rise-tolerance   getter generate)
   (slot last-raw-latency getter generate)
   (slot plateau-start    getter generate)
   (slot plateau-highest  getter generate)
@@ -1152,6 +1153,7 @@
     (set! self.stream stream)
     (set! self.media-kind media-kind)
     (set! self.source-kind (if live-streaming? 'live source-kind))
+    (set! self.rise-tolerance (if (= media-kind udp-audio) udp-audio-tolerance udp-video-tolerance))
     (set! self.last-raw-latency 0)
     (set! self.plateau-start 0)
     (set! self.plateau-highest #f)
@@ -1202,6 +1204,7 @@
     (define (record-plateau latency)
       (let ((latency (timestamp->flonum latency)))
         (record contour-history (current-seconds) latency)
+        @wait
         (record-event udp-id-contour-latency
                       -1.
                       -1.
@@ -1217,7 +1220,7 @@
     (case contour-state
       ((plateau)
        (cond ;; up
-             ((> raw (+ contour-latency udp-audio-tolerance))
+             ((> raw (+ contour-latency rise-tolerance))
               (set! contour-state 'rise)
               (set! contour-latency +inf.ts)
               (set! contour-last-raw-latency raw)
@@ -1293,7 +1296,7 @@
           (case state
             ((plateau)
              (cond ;; up
-                   ((> raw (+ latency udp-audio-tolerance))
+                   ((> raw (+ latency rise-tolerance))
                     (set! state 'rise)
                     (set! latency +inf.ts)
                     (set! last-raw-latency raw))
@@ -1330,6 +1333,26 @@
           ;; update
           (update-latency stream media-kind raw-latency latency)
           (update-proc raw-latency latency udp-latency-raw)))))
+  
+  
+  (method override (update-past self local remote)
+    (when (neq? source-kind 'live)
+      (unless (eq? state 'rise)
+        (let ((perfect-latency (- local (+ base remote))))
+          (when (> perfect-latency (+ latency rise-tolerance))
+            (set! latency perfect-latency)
+            (set! state 'plateau)
+            (set! plateau-start local)
+            (set! plateau-highest #f)
+            (update-past-latency stream media-kind latency))
+          (record-event udp-id-contour-latency
+                        -1.
+                        -1.
+                        (fixnum->flonum media-kind)
+                        -1.
+                        -1.
+                        (timestamp->flonum perfect-latency)
+                        -1.)))))
   
   
   (method override (effective-latency self)
@@ -1645,6 +1668,12 @@
   (slot base           <fx+> initialize #f getter generate)
   
   
+  (method override (initialize self sender name no origin source-kind video-level)
+    (nextmethod self sender name no origin source-kind video-level)
+    (when live-streaming?
+      (set! self.source-kind 'live)))
+  
+  
   (method protected (with-locked-channels self thunk (media-kind #f))
     (iterate-table channels
       (lambda (no channel)
@@ -1719,20 +1748,51 @@
     (mutex-unlock! latency-mutex))
   
   
+  (method protected (update-past-latency self media-kind latency)
+    (mutex-lock! latency-mutex)
+    (ecase media-kind
+      ((udp-audio)
+       (set! audio-latency latency))
+      (else
+       (set! video-latency latency)))
+    (mutex-unlock! latency-mutex))
+  
+  
   (method protected (media-latency self media-kind)
     (mutex-lock! latency-mutex)
-    (prog1 (let ((latency (ecase media-kind
-                            ((udp-audio) audio-latency)
-                            (else (cond ((or (not audio-on?)
-                                             (not base))
-                                         video-latency)
-                                        ((= audio-latency +inf.ts)
-                                         audio-latency)
-                                        (else
-                                         (+ audio-latency base)))))))
-             (if (= latency +inf.ts)
-                 latency
-               latency))
+    (prog1 (if (neq? source-kind 'live)
+               ;; non-live take max of audio and video
+               (ecase media-kind
+                 ((udp-audio)
+                  (cond ((or (not video-latency)
+                             (not base))
+                         audio-latency)
+                        ((= video-latency +inf.ts)
+                         video-latency)
+                        (else
+                         (max (- video-latency base)
+                              audio-latency))))
+                 (else
+                  (cond ((or (not audio-latency)
+                             (not base))
+                         video-latency)
+                        ((= audio-latency +inf.ts)
+                         audio-latency)
+                        (else
+                         (max (+ audio-latency base)
+                              video-latency)))))
+             ;; live slave video to audio
+             (ecase media-kind
+               ((udp-audio)
+                audio-latency)
+               (else
+                (cond ((or (not audio-on?)
+                           (not base))
+                       video-latency)
+                      ((= audio-latency +inf.ts)
+                       audio-latency)
+                      (else
+                       (+ audio-latency base))))))
       (mutex-unlock! latency-mutex))))
 
 
