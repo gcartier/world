@@ -1118,6 +1118,9 @@
 (definition drop-into-bumps-minimum <fx>
   (flonum->timestamp 0.2))
 
+(definition minimum-duration <fx>
+  (flonum->timestamp .2))
+
 
 (definition protected hack-latency
   #f)
@@ -1137,6 +1140,7 @@
   (slot plateau-start    getter generate)
   (slot plateau-highest  getter generate)
   (slot state            getter generate)
+  (slot ring             accessors generate)
   
   (slot contour-start                 getter generate)
   (slot contour-raw-latency      <fx> getter generate)
@@ -1184,10 +1188,6 @@
     #t)
   
   
-  (method protected virtual (determine-earliest-ontime self local)
-    #f)
-  
-  
   (method (update-contour-base self local remote)
     (set! contour-start (current-seconds))
     (set! contour-raw-latency 0)
@@ -1204,7 +1204,6 @@
     (define (record-plateau latency)
       (let ((latency (timestamp->flonum latency)))
         (record contour-history (current-seconds) latency)
-        @wait
         (record-event udp-id-contour-latency
                       -1.
                       -1.
@@ -1281,6 +1280,19 @@
             (and (>= bumps (if starting? 2 3))
                  (flonum->timestamp (/ total (cast <fl> count)))))))
       
+      ;; wait for ring to fill to minimum
+      (define (rise->plateau-latency)
+        (if (empty? ring)
+            #f
+          (let ((earliest (earliest-packet ring))
+                (latest (latest-packet ring)))
+            (let ((earliest-dts (get-dts earliest))
+                  (latest-dts (get-dts latest)))
+              (let ((total-duration (- latest-dts earliest-dts)))
+                (if (>= total-duration minimum-duration)
+                    (running-time-latency self local earliest-dts)
+                  #f))))))
+      
       (if (not base)
           (begin
             (set! base new-base)
@@ -1323,12 +1335,11 @@
             ((rise)
              (if (> raw last-raw-latency)
                  (set! last-raw-latency raw)
-               (let ((earliest-ontime (determine-earliest-ontime self local)))
-                 (if (and earliest-ontime (< earliest-ontime last-raw-latency))
-                     (set! last-raw-latency raw)
+               (let ((running-latency (rise->plateau-latency)))
+                 (when running-latency
                    ;; plateau
                    (set! state 'plateau)
-                   (set! latency (if earliest-ontime (max earliest-ontime last-raw-latency) last-raw-latency))
+                   (set! latency running-latency)
                    (reset-plateau))))))
           ;; update
           (update-latency stream media-kind raw-latency latency)
@@ -1338,21 +1349,17 @@
   (method override (update-past self local remote)
     (when (neq? source-kind 'live)
       (unless (eq? state 'rise)
-        (let ((perfect-latency (- local (+ base remote))))
-          (when (> perfect-latency (+ latency rise-tolerance))
-            (set! latency perfect-latency)
+        (let ((running-latency (running-time-latency self local remote)))
+          (when (> running-latency (+ latency rise-tolerance))
+            (set! latency running-latency)
             (set! state 'plateau)
             (set! plateau-start local)
             (set! plateau-highest #f)
-            (update-past-latency stream media-kind latency))
-          (record-event udp-id-contour-latency
-                        -1.
-                        -1.
-                        (fixnum->flonum media-kind)
-                        -1.
-                        -1.
-                        (timestamp->flonum perfect-latency)
-                        -1.)))))
+            (update-past-latency stream media-kind latency))))))
+  
+  
+  (method (running-time-latency self local remote)
+    (- local (+ base remote)))
   
   
   (method override (effective-latency self)
@@ -1366,21 +1373,9 @@
 (class UDP-Audio-Base extends UDP-Receive-Base
   
   
-  (slot ring accessors generate)
-  
-  
   (method override (voice-under-threshold? self plateau-time)
     ;; progressively accept more voice over 30s to a max of 30%
-    (<= (voice-percentage ring) (min 30. (timestamp->flonum plateau-time))))
-  
-  
-  (method override (determine-earliest-ontime self local)
-    (let ((earliest (earliest-packet ring)))
-      (and earliest
-           (let ((earliest-dts (get-dts earliest)))
-             (let ((earliest-base (- local earliest-dts)))
-               (let ((earliest-latency (- earliest-base base)))
-                 (- earliest-latency udp-audio-tolerance))))))))
+    (<= (voice-percentage ring) (min 30. (timestamp->flonum plateau-time)))))
 
 
 (class UDP-Video-Base extends UDP-Receive-Base)
@@ -1834,8 +1829,7 @@
                                 (else
                                  (new UDP-Video-Ring self no (get-origin stream) media-kind source-kind udp-process-size max-size: udp-process-max-size time-base: time-base overflow-proc: (udp-ring-overflow 'process udp-ring-kind-process)))))
       (unless (simulation?)
-        (when (= media-kind udp-audio)
-          (set-ring time-base self.process-ring))))
+        (set-ring time-base self.process-ring)))
     (unless (simulation?)
       (set! self.process-task (new Task (if (= media-kind udp-audio) 'udp-audio 'udp-video) (~ run-process self) priority: udp-process-priority)))
     (set! self.insert-rate-frame 0)
