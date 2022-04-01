@@ -19,12 +19,21 @@
         (jazz.handler)
         (jazz.markup)
         (jazz.outline)
+        (jazz.stream)
+        (jazz.stream.syntax (phase syntax))
         (jazz.tree)
         (jazz.ui)
         (world)
         (world.context)
         (world.interface.frame)
         (world.settings))
+
+
+(definition protected capture-playing
+  #f)
+
+(definition protected pipeline-playing
+  #f)
 
 
 (class Captures-Viewer extends World-Frame
@@ -73,11 +82,42 @@
     (close self))
   
   
+  (method (capture-playing? self capture)
+    (and capture-playing (pathname=? capture capture-playing)))
+  
+  
   (method (play-selected self)
     (let ((world (current-world)))
-      (let ((capture (get-single-selected-data (get-tree self))))
-        (when capture
-          (terminal capture)))))
+      (let ((tree (get-tree self)))
+        (define (update-row row playing?)
+          (let ((line (row->line tree row))
+                (col 0))
+            (let ((cell (new Cell line col)))
+              (let ((data (get-cell-data tree cell)))
+                (set-color data (playing-color self playing?)))
+              (invalidate-cell tree cell))))
+        
+        (let ((row (get-selected-row tree)))
+          (when row
+            (let ((capture (get-user-data row)))
+              (when capture
+                (let ((playing? (capture-playing? self capture)))
+                  ;; stop current
+                  (when capture-playing
+                    (let ((row (user-data-row tree capture-playing test: (lambda (x y) (and y (pathname=? x y))))))
+                      (when row
+                        (update-row row #f)))
+                    (stop-capture self capture-playing))
+                  ;; play new
+                  (when (not playing?)
+                    (update-row row #t)
+                    (play-capture self capture))))))))))
+  
+  
+  (method (playing-color self playing?)
+    (if playing?
+        {Color World-Blue}
+      {Color White}))
   
   
   ;;;
@@ -94,12 +134,14 @@
             (define (add-children father dir)
               (iterate-directory dir
                 (lambda (file)
-                  (let ((title (get-base file)))
-                    (add-row tree
-                             father: father
-                             children: (list (new Tree-Node title: title font: {Font Label-User} color: {Color White}))
-                             user-data: file)))
-                recursive?: #f))
+                  (unless (member? (get-name file) '(".DS_Store") test: filename=?)
+                    (let ((title (get-base file))
+                          (color (playing-color self (capture-playing? self file))))
+                      (add-row tree
+                               father: father
+                               children: (list (new Tree-Node title: title font: {Font Label-User} color: color))
+                               user-data: file)))
+                  recursive?: #f)))
             
             (let ((first? #t))
               (iterate-directory {Directory Documents "captures"}
@@ -116,7 +158,52 @@
                       (add-children father dir))))
                 files?: #f
                 directories?: #t
-                recursive?: #f))))))))
+                recursive?: #f)))))))
+  
+  
+  ;;;
+  ;;;; Play
+  ;;;
+  
+  
+  (method (extract-info self file)
+    (let ((extension (get-extension file)))
+      (bind (fmt channels rate) (split-string extension #\_)
+        (list fmt (string->number rate) (string->number channels)))))
+  
+  
+  (method (determine-blocksize self info)
+    (bind (fmt rate channels) info
+      (* 960 channels)))
+  
+  
+  (method (determine-caps self info)
+    (bind (fmt rate channels) info
+      (tie "audio/x-raw, format={fmt}, layout=interleaved, rate={rate}, channels={channels}")))
+  
+  
+  (method (play-capture self file)
+    (let ((info (extract-info self file)))
+      (let ((blocksize (determine-blocksize self info))
+            (caps (determine-caps self info)))
+        (let ((pipeline (gst-pipeline (format "filesrc blocksize={a} name=src" blocksize)
+                                      caps
+                                      (gst-element audiosink name: "sink"))))
+          (with-unref ((src (gst_bin_get_by_name pipeline "src")))
+            (g_object_set_string src "location" (path-normalize (parse file))))
+          (gst_element_set_state pipeline GST_STATE_PLAYING)
+          (wait-playing pipeline)
+          (set! capture-playing file)
+          (set! pipeline-playing pipeline)))))
+  
+  
+  (method (stop-capture self file)
+    (with-unref ((sink (gst_bin_get_by_name pipeline-playing "sink")))
+      (g_object_set_double sink "volume" 0.)
+      (sleep .1))
+    (gst_bin_release pipeline-playing)
+    (set! capture-playing #f)
+    (set! pipeline-playing #f)))
 
 
 ;;;
