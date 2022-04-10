@@ -1780,15 +1780,13 @@
 (class UDP-Receive-Channel extends UDP-Channel
   
   
-  (slot process-ring                      getter generate)
-  (slot process-task                      getter generate)
-  (slot replay-ring                       getter generate)
-  (slot insert-rate-frame                 getter generate)
-  (slot insert-rate                       getter generate)
-  (slot process-rate                      getter generate)
-  (slot last-audio-frame    initialize #f getter generate)
-  (slot last-audio-pts      initialize #f getter generate)
-  (slot last-audio-duration initialize #f getter generate)
+  (slot process-ring                    getter generate)
+  (slot process-task                    getter generate)
+  (slot replay-ring                     getter generate)
+  (slot insert-rate-frame               getter generate)
+  (slot insert-rate                     getter generate)
+  (slot process-rate                    getter generate)
+  (slot expected-pts      initialize #f getter generate)
   
   
   (method override (initialize self stream no media-kind source-kind level resolution framerate bitrate codec caps metadata send-state)
@@ -1852,9 +1850,7 @@
   
   (method override (reset self)
     (reset process-ring)
-    (set! last-audio-frame #f)
-    (set! last-audio-pts #f)
-    (set! last-audio-duration #f)
+    (set! expected-pts #f)
     ;; quick test
     (ecase media-kind
       ((udp-audio)
@@ -1905,30 +1901,42 @@
                     (fixnum->flonum flags)
                     (timestamp->flonum dts))))
   
+  
+  (method protected (give-gap self pts duration)
+    (let ((id/output (or (simulation-audio) no)))
+      (receive-audio (current-audio) id/output #f pts pts duration)
+      (set! expected-pts (+ pts duration))))
+  
 
   (method protected (give-audio self sender channel-no packet buffer latency)
     (site give-audio
       (let ((frame (get-frame packet))
-            (total (get-total packet))
             (dts (get-dts packet))
             (pts (get-pts packet))
             (duration (get-duration packet))
             (flags (get-flags packet)))
         (let ((id/output (or (simulation-audio) channel-no)))
-          ;; generate gaps for opus packet loss concealment
-          (when last-audio-frame
-            (let ((audio-gap (- frame last-audio-frame)))
-              (when (> audio-gap 1)
-                (let ((missing-pts (+ last-audio-pts last-audio-duration)))
-                  (let ((missing-duration (- pts missing-pts)))
-                    (let ((missing-pts (max 0 (+ missing-pts latency))))
-                      (receive-audio (current-audio) id/output #f missing-pts missing-pts missing-duration)))))))
-          (set! last-audio-frame frame)
-          (set! last-audio-pts pts)
-          (set! last-audio-duration duration)
           (let ((dts (max 0 (+ dts latency)))
                 (pts (max 0 (+ pts latency))))
-            (receive-audio (current-audio) id/output buffer dts pts duration))
+            (define (receive)
+              (receive-audio (current-audio) id/output buffer dts pts duration)
+              (set! expected-pts (+ pts duration)))
+            
+            (define (receive-gap pts duration)
+              (receive-audio (current-audio) id/output #f pts pts duration))
+            
+            (cond ;; perfect timestamp
+                  ((or (not expected-pts)
+                       (= pts expected-pts))
+                   (receive))
+                  ;; generate gap for opus packet loss concealment
+                  ((> pts expected-pts)
+                   (let ((gap (- pts expected-pts)))
+                     (when (< gap udp-audio-mixer)
+                       (receive-gap expected-pts gap)))
+                   (receive))
+                  ;; do not send decreasing timestamps
+                  ))
           (record-play-frame self sender frame flags dts pts)))))
   
   
