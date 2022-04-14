@@ -2235,6 +2235,59 @@
 
 
 ;;;
+;;;; File-Stream-Image-Src
+;;;
+
+
+(class File-Stream-Image-Src extends Video-Src implements Media-Stream
+  
+  
+  (slot file     getter generate)
+  (slot consumer getter generate)
+  
+  
+  (method override (initialize self location)
+    (nextmethod self)
+    (set! self.file (new-file {Directory Documents} (add-extension location "streamimage")))
+    (set! self.consumer #f))
+  
+  
+  (method override (start-element self)
+    (nextmethod self)
+    (set! consumer (car sinks))
+    (task-start self 'image-stream))
+  
+  
+  (method override (stop-element self)
+    (nextmethod self)
+    (task-stop self)
+    (set! file #f))
+  
+  
+  (method override (run-video self task)
+    (declare (proper-tail-calls))
+    (with-task task
+      (lambda (exit)
+        (read/consume-image self)
+        (task-done task exit))))
+  
+  
+  (method (read/consume-image self)
+    (with ((reader (new Stream-Reader file)))
+      (let ((frame (read-frame reader)))
+        (receive (buffer dts pts duration flags) frame
+          (consume-frame consumer buffer dts pts duration flags)))))
+  
+  
+  (method override (resettable? self)
+    #t)
+  
+  
+  (method override (reset-media self channel)
+    (read/consume-image self)))
+
+
+;;;
 ;;;; Draw-Video-Src
 ;;;
 
@@ -2325,14 +2378,13 @@
 
 
 ;;;
-;;;; Image-Stream-Video-Src
+;;;; File-Preprocess-Image-Src
 ;;;
 
 
-(class Image-Stream-Video-Src extends Draw-Video-Src
+(class File-Preprocess-Image-Src extends Draw-Video-Src implements File-Preprocessor
   
   
-  (slot location      getter generate)
   (slot file          getter generate)
   (slot color         getter generate)
   (slot alpha         getter generate)
@@ -2341,13 +2393,12 @@
   (slot duration      getter generate)
   (slot flags         getter generate)
   (slot extract-mutex getter generate)
+  (slot stat-probe)
   
   
-  (method override (initialize self location (resolution: resolution #f))
+  (method override (initialize self file)
     (nextmethod self)
-    (set! self.resolution resolution)
-    (set! self.location location)
-    (set! self.file (if (file? location) location (new-file {Directory Documents} location)))
+    (set! self.file file)
     (set! self.color #f)
     (set! self.alpha #f)
     (set! self.dts #f)
@@ -2357,8 +2408,17 @@
     (set! self.extract-mutex (make-mutex 'extract)))
   
   
+  (method override (get-stat-probe self)
+    stat-probe)
+  
+  
   (method override (new-draw-context self)
-    (new Draw-Context (or resolution draw-resolution) draw-framerate draw-bitrate tune: (bitwise-ior stillimage zerolatency)))
+    (let ((context (new Draw-Context draw-resolution draw-framerate draw-bitrate tune: (bitwise-ior stillimage zerolatency))))
+      (let ((pipeline (get-color-pipeline context)))
+        (with-unref ((src (gst_bin_get_by_name pipeline "src")))
+          (with-unref ((pad (gst_element_get_static_pad src "src")))
+            (set! stat-probe (gst_pad_add_stat_probe pad)))))
+      context))
   
   
   (method (extract/cache self task exit)
@@ -2387,11 +2447,12 @@
             (let ((effective-dts (flonum->timestamp (- (current-seconds) start-time))))
               (consume-frame consumer color effective-dts effective-dts duration flags))))
         (free-context self)
+        (consume-eos consumer)
         (continuation-return exit #f))))
   
   
   (method override (draw-stream self surface)
-    (let ((rect (new Rect 0 0 (get-width resolution) (get-height resolution))))
+    (let ((rect (new Rect 0 0 (get-width draw-resolution) (get-height draw-resolution))))
       (with ((image (new Image moniker: file)))
         (let ((size (image-size image)))
           (if (> (get-width size) (get-height size))
@@ -2402,17 +2463,7 @@
             (fill-image surface
                         rect
                         image
-                        mode: 'fit))))))
-  
-  
-  (method override (resettable? self)
-    #t)
-  
-  
-  (method override (reset-media self channel)
-    (receive (color alpha dts pts duration flags) (extract/cache self task exit)
-      (let ((effective-dts (flonum->timestamp (- (current-seconds) start-time))))
-        (consume-frame consumer color effective-dts effective-dts duration flags)))))
+                        mode: 'fit)))))))
 
 
 ;;;
