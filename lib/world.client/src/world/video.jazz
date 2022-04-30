@@ -508,7 +508,7 @@
             output))))
   
   
-  (method package (player-output self id (channel: channel #f) (player: player #f) (rank: rank #f) (position: position #f) (size: size #f) (level: level #f) (resolution: resolution #f) (framerate: framerate #f) (bitrate: bitrate #f) (codec: codec #f) (caps: caps #f) (sync-audio?: sync-audio? #f) (root-view: root-view #f))
+  (method package (player-output self id (stream-no: stream-no #f) (channel: channel #f) (player: player #f) (rank: rank #f) (position: position #f) (size: size #f) (level: level #f) (resolution: resolution #f) (framerate: framerate #f) (bitrate: bitrate #f) (codec: codec #f) (caps: caps #f) (sync-audio?: sync-audio? #f) (root-view: root-view #f))
     (or (table-ref outputs id #f)
         ;; the or is a quick hack to test self video
         (let ((player (or player (find-entity id))))
@@ -526,6 +526,7 @@
                           (else
                            (new Circle-Video-Sink
                              id
+                             stream-no
                              channel
                              player
                              position: position
@@ -544,7 +545,7 @@
             output))))
   
   
-  (method package (channel-output self channel (rank: rank #f) (sync-audio?: sync-audio? #f) (root-view: root-view #f))
+  (method package (channel-output self stream-no channel (rank: rank #f) (sync-audio?: sync-audio? #f) (root-view: root-view #f))
     (let ((no (get-no channel))
           (level (get-level channel))
           (resolution (get-resolution channel))
@@ -555,6 +556,7 @@
           (player (current-me)))
       (assert resolution
         (let ((output (player-output self no
+                        stream-no: stream-no
                         channel: channel
                         player: player
                         rank: rank
@@ -590,12 +592,12 @@
       output))
   
   
-  (method package (replace-output self output new-channel (sync-audio?: sync-audio? #f))
+  (method package (replace-output self output stream-no new-channel (sync-audio?: sync-audio? #f))
     (let ((id (get-id output)))
       (let ((rank (find-output-rank self output))
             (focused? (eq? output focused-output)))
         (close-output self id output layout?: #f)
-        (let ((new-output (channel-output self new-channel rank: rank sync-audio?: sync-audio?)))
+        (let ((new-output (channel-output self stream-no new-channel rank: rank sync-audio?: sync-audio?)))
           (when focused?
             (change-focused-output self new-output))
           new-output))))
@@ -613,6 +615,22 @@
       (update-layouts self)
       @version0
       (effective-base-profile-update)))
+  
+  
+  (method package (reorder-outputs self order)
+    (let ((queue (new-queue))
+          (remaining (copy ordered-outputs)))
+      (for-each (lambda (stream-no)
+                  (let ((output (find-if (lambda (output)
+                                           (and (is? output Circle-Video-Sink)
+                                                (equal? (get-stream-no output) stream-no)))
+                                         ordered-outputs)))
+                    (when output
+                      (enqueue queue output)
+                      (set! remaining (remove! output remaining)))))
+                order)
+      (let ((ordered (append! (queue-list queue) remaining)))
+        (set! ordered-outputs ordered))))
   
   
   (method package (find-output-rank self output)
@@ -802,7 +820,7 @@
   
   (method package (layout self num-players)
     (let ((window (current-window)))
-      (let ((bounds (get-bounds window)))
+      (let ((bounds (get-content-rect window)))
         (let ((l (get-left bounds))
               (t (get-top bounds))
               (r (get-right bounds))
@@ -1453,14 +1471,16 @@
 (class Camera-Self-Consumer extends Stream-Buffer-Consumer
   
   
-  (slot profile initialize #f getter generate)
-  (slot output  initialize #f accessors generate)
-  (slot probe   initialize #f accessors generate)
+  (slot stream-no initialize #f getter generate)
+  (slot profile   initialize #f getter generate)
+  (slot output    initialize #f accessors generate)
+  (slot probe     initialize #f accessors generate)
   
   
   (method override (initialize self . rest)
-    (bind-keywords ((profile #f) . others) rest
+    (bind-keywords ((stream-no #f) (profile #f) . others) rest
       (apply nextmethod self others)
+      (set! self.stream-no stream-no)
       (set! self.profile profile)
       (when processing?
         (open-self-output self))))
@@ -1514,6 +1534,7 @@
               (player me))
           (new Circle-Video-Sink
             id
+            stream-no
             channel
             player
             level: level
@@ -1867,7 +1888,7 @@
         (with-unref ((filesrc (gst_bin_get_by_name pipeline "filesrc"))
                      (appsink (gst_bin_get_by_name pipeline "appsink")))
           (gst_app_sink_connect_signals appsink listener)
-          (g_object_set_string filesrc "location" (path-normalize (parse (new-file {Directory Documents} (add-extension location "mp4")))))
+          (g_object_set_utf-8-string filesrc "location" (path-normalize (parse (new-file {Directory Documents} (add-extension location "mp4")))))
           (gst_element_set_state pipeline GST_STATE_READY)
           (set! self.pipeline pipeline)
           (setup-consumer (find-consumer self #f) listener appsink (* width height 4))))))
@@ -2003,7 +2024,7 @@
           (with-unref ((pad (gst_element_get_static_pad filesrc "src")))
             (set! stat-probe (gst_pad_add_stat_probe pad)))
           (gst_app_sink_connect_signals appsink listener)
-          (g_object_set_string filesrc "location" (path-normalize location))
+          (g_object_set_utf-8-string filesrc "location" (path-normalize location))
           (gst_element_set_state pipeline GST_STATE_READY)
           (set! self.pipeline pipeline)
           (let ((size (if prime?
@@ -2062,6 +2083,7 @@
   (slot profile      getter generate)
   (slot location     getter generate)
   (slot stream?      accessors explicit)
+  (slot loop?        getter generate)
   (slot file         getter generate)
   (slot reader       getter generate)
   (slot time-base    getter generate)
@@ -2071,11 +2093,12 @@
   (slot delayed-seek getter generate)
   
   
-  (method override (initialize self profile location (stream?: stream? #t))
+  (method override (initialize self profile location (stream?: stream? #t) (loop?: loop? #f))
     (nextmethod self)
     (set! self.profile profile)
     (set! self.location location)
     (set! self.stream? stream?)
+    (set! self.loop? loop?)
     (set! self.file #f)
     (set! self.reader #f)
     (set! self.time-base (new Time-Base))
@@ -2190,7 +2213,7 @@
             (let ((stream? stream?))
               (let ((frame (read-frame reader stream?)))
                 (if (not frame)
-                    (if stream-loop?
+                    (if loop?
                         (begin
                           (close reader)
                           (set! reader (new Stream-Reader file))
@@ -2209,6 +2232,67 @@
                             (site video-stream
                               (consume-frame consumer buffer dts pts duration flags)))))))))))
           (iter))))))
+
+
+;;;
+;;;; File-Stream-Image-Src
+;;;
+
+
+(class File-Stream-Image-Src extends Video-Src implements Media-Stream
+  
+  
+  (slot file     getter generate)
+  (slot consumer getter generate)
+  
+  
+  (method override (initialize self location)
+    (nextmethod self)
+    (set! self.file (new-file {Directory Documents} (add-extension location "streamimage")))
+    (set! self.consumer #f))
+  
+  
+  (method override (start-element self)
+    (nextmethod self)
+    (set! consumer (car sinks))
+    (task-start self 'image-stream))
+  
+  
+  (method override (stop-element self)
+    (nextmethod self)
+    (task-stop self)
+    (set! file #f))
+  
+  
+  (method override (get-stream? self)
+    #t)
+  
+  
+  (method override (set-stream? self flag)
+    )
+  
+  
+  (method override (run-video self task)
+    (declare (proper-tail-calls))
+    (with-task task
+      (lambda (exit)
+        (read/consume-image self)
+        (task-done task exit))))
+  
+  
+  (method (read/consume-image self)
+    (with ((reader (new Stream-Reader file)))
+      (let ((frame (read-frame reader)))
+        (receive (buffer dts pts duration flags) frame
+          (consume-frame consumer buffer dts pts duration flags)))))
+  
+  
+  (method override (resettable? self)
+    #t)
+  
+  
+  (method override (reset-media self channel)
+    (read/consume-image self)))
 
 
 ;;;
@@ -2302,14 +2386,13 @@
 
 
 ;;;
-;;;; Image-Stream-Video-Src
+;;;; File-Preprocess-Image-Src
 ;;;
 
 
-(class Image-Stream-Video-Src extends Draw-Video-Src
+(class File-Preprocess-Image-Src extends Draw-Video-Src implements File-Preprocessor
   
   
-  (slot location      getter generate)
   (slot file          getter generate)
   (slot color         getter generate)
   (slot alpha         getter generate)
@@ -2318,13 +2401,12 @@
   (slot duration      getter generate)
   (slot flags         getter generate)
   (slot extract-mutex getter generate)
+  (slot stat-probe)
   
   
-  (method override (initialize self location (resolution: resolution #f))
+  (method override (initialize self file)
     (nextmethod self)
-    (set! self.resolution resolution)
-    (set! self.location location)
-    (set! self.file (if (file? location) location (new-file {Directory Documents} location)))
+    (set! self.file file)
     (set! self.color #f)
     (set! self.alpha #f)
     (set! self.dts #f)
@@ -2334,43 +2416,51 @@
     (set! self.extract-mutex (make-mutex 'extract)))
   
   
+  (method override (get-stat-probe self)
+    stat-probe)
+  
+  
   (method override (new-draw-context self)
-    (new Draw-Context (or resolution draw-resolution) draw-framerate draw-bitrate tune: (bitwise-ior stillimage zerolatency)))
+    (let ((context (new Draw-Context draw-resolution draw-framerate draw-bitrate tune: (bitwise-ior stillimage zerolatency))))
+      (let ((pipeline (get-color-pipeline context)))
+        (with-unref ((src (gst_bin_get_by_name pipeline "src")))
+          (with-unref ((pad (gst_element_get_static_pad src "src")))
+            (set! stat-probe (gst_pad_add_stat_probe pad)))))
+      context))
   
   
   (method (extract/cache self task exit)
     (mutex-lock! extract-mutex)
-    (prog1
-        (if color
-            (values color alpha dts pts duration flags)
-          (let ((surface (get-surface context)))
-            (draw-stream self surface)
-            (receive (color alpha dts pts duration flags) (extract context task exit)
-              (set! self.color color)
-              (set! self.alpha alpha)
-              (set! self.dts dts)
-              (set! self.pts pts)
-              (set! self.duration duration)
-              (set! self.flags flags)
-              (values color alpha dts pts duration flags))))
+    (prog1 (if color
+               (values color alpha dts pts duration flags)
+             (let ((surface (get-surface context)))
+               (draw-stream self surface)
+               (receive (color alpha dts pts duration flags) (extract context task exit)
+                 (set! self.color color)
+                 (set! self.alpha alpha)
+                 (set! self.dts dts)
+                 (set! self.pts pts)
+                 (set! self.duration duration)
+                 (set! self.flags flags)
+                 (values color alpha dts pts duration flags))))
       (mutex-unlock! extract-mutex)))
   
   
   (method override (run-video self task)
     (declare (proper-tail-calls))
-    (let ((tier (current-client)))
-      (with-task task
-        (lambda (exit)
-          (receive (color alpha dts pts duration flags) (extract/cache self task exit)
-            (site image-stream
-              (let ((effective-dts (flonum->timestamp (- (current-seconds) start-time))))
-                (consume-frame consumer color effective-dts effective-dts duration flags))))
-          (free-context self)
-          (continuation-return exit #f)))))
+    (with-task task
+      (lambda (exit)
+        (receive (color alpha dts pts duration flags) (extract/cache self task exit)
+          (site image-stream
+            (let ((effective-dts (flonum->timestamp (- (current-seconds) start-time))))
+              (consume-frame consumer color effective-dts effective-dts duration flags))))
+        (free-context self)
+        (consume-eos consumer)
+        (continuation-return exit #f))))
   
   
   (method override (draw-stream self surface)
-    (let ((rect (new Rect 0 0 (get-width resolution) (get-height resolution))))
+    (let ((rect (new Rect 0 0 (get-width draw-resolution) (get-height draw-resolution))))
       (with ((image (new Image moniker: file)))
         (let ((size (image-size image)))
           (if (> (get-width size) (get-height size))
@@ -2381,17 +2471,7 @@
             (fill-image surface
                         rect
                         image
-                        mode: 'fit))))))
-  
-  
-  (method override (resettable? self)
-    #t)
-  
-  
-  (method override (reset-media self channel)
-    (receive (color alpha dts pts duration flags) (extract/cache self task exit)
-      (let ((effective-dts (flonum->timestamp (- (current-seconds) start-time))))
-        (consume-frame consumer color effective-dts effective-dts duration flags)))))
+                        mode: 'fit)))))))
 
 
 ;;;
@@ -3039,7 +3119,7 @@
       (let ((world (current-world)))
         (let ((pos (or position {Point 0 0}))
               (size (or size {Dimension 320 180})))
-          (let ((s (make-world-sheet 'video World-Sheet size resolution: resolution retina?: #f)))
+          (let ((s (make-world-sheet 'video World-Sheet size resolution: resolution scale?: #f)))
             (make-orthographic-matrix! (get-projection-matrix s) 0. (get-width world) 0. (get-height world) 0. 10.)
             (set-position s pos)
             (set-size s size)
@@ -3086,6 +3166,7 @@
   
   
   (slot id                initialize #f accessors generate)
+  (slot stream-no         initialize #f accessors generate)
   (slot channel           initialize #f accessors generate)
   (slot player            initialize #f accessors generate)
   (slot translation       initialize #f accessors generate)
@@ -3099,12 +3180,13 @@
   (slot interface-texture initialize #f accessors generate)
   
   
-  (method override (initialize self id channel entity . rest)
+  (method override (initialize self id stream-no channel entity . rest)
     (bind-keywords ((root-view #f) (position #f) (size #f) (flipped? #f) . others) rest
       (apply nextmethod self others)
       (let ((window (current-window)))
         (set! self.name (determine-name self channel))
         (set! self.id id)
+        (set! self.stream-no stream-no)
         (set! self.channel channel)
         (set! self.player entity)
         (when (and channel (sender? channel))
@@ -3131,7 +3213,7 @@
               (size {Dimension 1280 720})
               (expanse (resolution->expanse {Dimension 1280 720}))
               (resolution {Dimension 1280 720}))
-          (let ((texture (make-cairo-texture (get-width resolution) (get-height resolution) retina?: #t mipmap?: #t))
+          (let ((texture (make-cairo-texture (get-width resolution) (get-height resolution) scale?: #t mipmap?: #t))
                 (root (or root-view (new world.circle:Circle-View position: position size: size))))
             (let ((pane (make-sheet-pane
                           class: world.circle:Circle-Pane
@@ -3241,7 +3323,7 @@
   
   
   (method package (move-focused self)
-    (let ((bounds (get-bounds (current-window))))
+    (let ((bounds (get-content-rect (current-window))))
       (let ((focused (focused-rect bounds)))
         (let ((adjusted (adjust-focused bounds focused)))
           (move self adjusted)))))

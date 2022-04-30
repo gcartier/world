@@ -111,6 +111,9 @@
 (definition stream-what
   'media)
 
+(definition stream-loop?
+  #f)
+
 
 (class Server-Tier extends Serving-Tier implements Server-Interface
   
@@ -119,6 +122,7 @@
   (slot instances      initialize (make-table test: equal?) getter generate)
   (slot zones          initialize '()                       getter generate)
   (slot groups         initialize '()                       getter generate)
+  (slot circles-index  initialize (make-table test: equal?) getter generate)
   (slot hits           initialize 0                         getter generate)
   (slot aliveness-task initialize #f                        getter generate)
   (slot udp-server     initialize #f                        getter generate)
@@ -132,6 +136,7 @@
       ;; not sure about this, for now lets use the hardcoded server-no = 0
       (set-client-id/no id server-no @w (literal->id id self)))
     (reset-last-broadcast)
+    (setup-circles self)
     (setup-instances self)
     (setup-zones self))
   
@@ -467,7 +472,7 @@
   
   
   (method package (client-connect self client client-uuid personal-key machine-identity machine-caps machine-features character-avatar character-dye character-script)
-    (let ((identity (retrieve-identity directory personal-key)))
+    (let ((identity (retrieve-identity-new directory personal-key)))
       (if (not identity)
           "Invalid personal key"
         (let ((character-name (get-name identity))
@@ -801,7 +806,7 @@
             (format "Cannot invite yourself")
           (if (get-group recipient-delegate)
               (if (and circle-name (equal? (get-name (get-group recipient-delegate)) circle-name))
-                  #f
+                  (format "{a} is already in your circle" recipient)
                 (format "{a} is already in a group" recipient))
             (if (memq? delegate (get-invites recipient-delegate))
                 #f
@@ -839,7 +844,7 @@
                                    (set-mode delegate 'player))
                                  (join-group self delegate sender-group)
                                  sender-group)
-                             (let ((group (create-group self sender-delegate #f #f #t #f)))
+                             (let ((group (create-group self sender-delegate #f #f #f #f)))
                                (join-group self sender-delegate group)
                                (join-group self delegate group)
                                group))))
@@ -1185,7 +1190,8 @@
   
   
   (method package (client-unregister-stream self client stream-no)
-    (server-unregister-stream self stream-no))
+    (server-unregister-stream self stream-no)
+    #f)
   
   
   (method package (server-unregister/disconnect-streams self client-no)
@@ -1377,39 +1383,158 @@
   
   
   (method (group-streams self group)
-    (let ((origins (map get-no (get-members group)))
-          (streams (new-queue)))
-      (iterate-table (get-server-streams udp-server)
-        (lambda (no stream)
-          (define (collect-channels)
-            (let ((channels (new-queue)))
-              (iterate-table (get-channels stream)
-                (lambda (no channel)
-                  (let ((media-kind (get-media-kind channel))
-                        (source-kind (get-source-kind channel))
-                        (level (get-level channel))
-                        (resolution (get-resolution channel))
-                        (framerate (get-framerate channel))
-                        (bitrate (get-bitrate channel))
-                        (codec (get-codec channel))
-                        (caps (get-caps channel))
-                        (metadata (get-metadata channel))
-                        (send-state (get-send-state channel)))
-                    (enqueue channels (list no media-kind source-kind level resolution framerate bitrate codec caps metadata send-state)))))
-              (queue-list channels)))
-          
-          (let ((origin (get-origin stream)))
-            (when (or (memv? origin origins)
-                      (= origin server-no))
-              (let ((recipient (get-recipient stream)))
-                (when (eq? recipient group)
-                  (let ((sender (get-sender stream))
-                        (name (get-name stream))
-                        (source-kind (get-source-kind stream))
-                        (video-level (get-video-level stream))
-                        (channels (collect-channels)))
-                    (enqueue streams (list sender name no origin source-kind video-level channels)))))))))
-      (queue-list streams)))
+    (let ((origins (map get-no (get-members group))))
+      (collect (lambda (stream)
+                 (define (collect-channels)
+                   (let ((channels (new-queue)))
+                     (iterate-table (get-channels stream)
+                       (lambda (no channel)
+                         (let ((media-kind (get-media-kind channel))
+                               (source-kind (get-source-kind channel))
+                               (level (get-level channel))
+                               (resolution (get-resolution channel))
+                               (framerate (get-framerate channel))
+                               (bitrate (get-bitrate channel))
+                               (codec (get-codec channel))
+                               (caps (get-caps channel))
+                               (metadata (get-metadata channel))
+                               (send-state (get-send-state channel)))
+                           (enqueue channels (list no media-kind source-kind level resolution framerate bitrate codec caps metadata send-state)))))
+                     (queue-list channels)))
+                 
+                 (let ((origin (get-origin stream)))
+                   (and (or (memv? origin origins)
+                             (= origin server-no))
+                        (let ((recipient (get-recipient stream)))
+                          (and (eq? recipient group)
+                               (let ((sender (get-sender stream))
+                                     (name (get-name stream))
+                                     (no (get-no stream))
+                                     (source-kind (get-source-kind stream))
+                                     (video-level (get-video-level stream))
+                                     (channels (collect-channels)))
+                                 (list sender name no origin source-kind video-level channels)))))))
+               (get-server-ordered-streams udp-server))))
+  
+  
+  (method package (client-circle-property self circle-name property)
+    (let ((group (find-group self circle-name)))
+      (if (not group)
+          (format "{a}{? {a}~} doesn't exist anymore" (group-domain-name self circle-name) circle-name)
+        (case property
+          ((persistent?)
+           (get-persistent? group))
+          ((require-camera?)
+           (get-require-camera? group))))))
+  
+  
+  (method package (client-change-circle-property self circle-name property value)
+    (let ((group (find-group self circle-name)))
+      (if (not group)
+          (format "{a}{? {a}~} doesn't exist anymore" (group-domain-name self circle-name) circle-name)
+        (case property
+          ((persistent?)
+           (set-persistent? group value)
+           (update-circle-persistence self group circle-name value))
+          ((require-camera?)
+           (set-require-camera? group value)
+           (update-circle self group circle-name)))
+        #f)))
+  
+  
+  (method (setup-circles self)
+    (load-circles-index self)
+    (iterate-table circles-index
+      (lambda (circle-name filename)
+        (let ((file (persistent-circle-file self filename)))
+          (when (exists? file)
+            (let ((client-circle (load-circle self file)))
+              (let ((persistent? #t)
+                    (require-camera? (get-require-camera? client-circle)))
+                (let ((group (new Server-Group circle-name persistent? require-camera? 'start)))
+                  (set! groups (cons group groups))))))))))
+  
+  
+  (method (circles-directory self)
+    (new-directory directory "circles"))
+  
+  
+  (method (circles-index-file self)
+    (new-file (circles-directory self) ".index"))
+  
+  
+  (method (persistent-circle-file self filename)
+    (new-file (circles-directory self) filename))
+  
+  
+  (method (load-circles-index self)
+    (let ((file (circles-index-file self)))
+      (when (exists? file)
+        (load-table circles-index file))))
+  
+  
+  (method (save-circles-index self)
+    (let ((file (circles-index-file self)))
+      (create-directories file)
+      (save-table circles-index file)))
+  
+  
+  (method (find-persistent-circle self circle-name)
+    (let ((filename (table-ref circles-index circle-name #f)))
+      (and filename
+           (let ((file (persistent-circle-file self filename)))
+             (and (exists? file)
+                  file)))))
+  
+  
+  (method (update-circle-persistence self group circle-name persistent?)
+    (let ((dir (circles-directory self)))
+      (create-directories dir)
+      (cond ((not persistent?)
+             (let ((file (find-persistent-circle self circle-name)))
+               (when file
+                 (delete file)))
+             (table-clear circles-index circle-name))
+            (else
+             (let ((filename (add-extension (make-uuid) "circle")))
+               (table-set! circles-index circle-name filename)
+               (let ((file (persistent-circle-file self filename)))
+                 (store-circle self file group)))))
+      (save-circles-index self)))
+  
+  
+  (method (update-circle self group circle-name)
+    (when (get-persistent? group)
+      (let ((file (find-persistent-circle self circle-name)))
+        (when file
+          (create-directories file)
+          (store-circle self file group)))))
+  
+  
+  (method (store-circle self file group)
+    (let ((require-camera? (get-require-camera? group)))
+      (call-with-output-file (path-settings file)
+        (lambda (output)
+          (format output ";;;========={%}")
+          (format output ";;;  World{%}")
+          (format output ";;;========={%}")
+          (format output ";;;{%}")
+          (format output ";;;; Circle{%}")
+          (format output ";;;{%}")
+          (format output "{%}")
+          (format output "{%}")
+          (format output "(data jazz{%}")
+          (format output "{%}")
+          (format output "{%}")
+          (format output "(import world.server.circle){%}")
+          (format output "{%}")
+          (format output "{%}")
+          (format output "(form{%}")
+          (format output "  (<Client-Circle> require-camera?: {s}))){%}" require-camera?)))))
+  
+  
+  (method (load-circle self file)
+    (instantiate (read-form file)))
   
   
   (method package (client-list-group-members self name/no)
@@ -1960,31 +2085,34 @@
            ((media)
             (set! stream-what 'media)
             stream-what)
+           ((loop)
+            (set! stream-loop? (not stream-loop?))
+            stream-loop?)
            ((list)
             (stream-list self client))
            ((play)
-            (bind (location count spacing) rest
-              (or (stream-invalid self client location)
+            (bind (kind location count spacing) rest
+              (or (stream-invalid self client kind location)
                   (begin
                     (if (unspecified? count)
-                        (stream-play self client location)
+                        (stream-play self client kind location)
                       (delay-event
                         (lambda ()
                           (loop (for n from 0 below count)
                                 (when (and (specified? spacing) (/= n 0))
                                   (sleep spacing))
-                                (stream-play self client location #f)))))
+                                (stream-play self client kind location #f)))))
                     #f))))
            ((compare)
-            (bind (locations) rest
+            (bind (kind locations) rest
               (delay-event
                 (lambda ()
                   (loop (for location in locations)
-                        (stream-play self client location #f))))
+                        (stream-play self client kind location #f))))
               #f))
            ((stop)
-            (bind (location) rest
-              (stream-stop self client location)))
+            (bind (kind location) rest
+              (stream-stop self client kind location)))
            ((done)
             (let ((broadcast-hierarchy? #f))
               (iterate-table (get-send-streams udp-server)
@@ -2112,6 +2240,14 @@
                             (udp-socket-send-buffer-size port)
                             (udp-socket-send-again-count port)))
                     outgoing-max))))))))
+    
+    (define (send-evolution)
+      (send-threaded 0
+        (lambda ()
+          (let ((metadata (admin-metadata self requester-group))
+                (chronology (copy-chronology (current-chronology)))
+                (evolution (copy-evolution (current-evolution))))
+            (object->u8vector (list metadata chronology evolution) serialize)))))
     
     (define (send-replay)
       (send-threaded 0
@@ -2243,6 +2379,8 @@
     (case what
       ((info)
        (send-info))
+      ((evolution)
+       (send-evolution))
       ((replay)
        (send-replay))
       ((shared)
@@ -2537,7 +2675,7 @@
                                  (eof-object))
                           (read-mobile self port))))
       (unless (eof-object? personal-key)
-        (let ((identity (retrieve-identity directory personal-key)))
+        (let ((identity (retrieve-identity-new directory personal-key)))
           (if (not identity)
               (write-mobile self port "result" "connect" "Invalid personal key")
             (let ((character-name (get-name identity))
@@ -2812,9 +2950,10 @@
         (let ((group (get-group client-delegate))
               (streams (gather-streams)))
           (map (lambda (info)
-                 (bind (location audio? video) info
+                 (bind (kind location audio? video) info
                    (let ((base (filename-base location)))
-                     (list location
+                     (list kind
+                           location
                            (streaming-level-suffix video)
                            (if (some? (lambda (stream)
                                         (or (not group)
@@ -2840,7 +2979,7 @@
             (values stream send-stream))))))
   
   
-  (method (stream-invalid self client location)
+  (method (stream-invalid self client kind location)
     (let ((client-delegate (find-delegate self client)))
       ;; together robust
       (if (not client-delegate)
@@ -2850,36 +2989,50 @@
               "You are not in a group"
             (if (not (string? location))
                 "Invalid location"
-              (let ((audio? (exists? (new-file {Directory Documents} (add-extension location (audio-profile-extension))))))
-                (if audio?
-                    #f
-                  (if (null? (existing-video-profiles location))
-                      "No stream found"
-                    #f)))))))))
+              (if (eq? kind 'image)
+                  (let ((file (new-file {Directory Documents} (add-extension location streaming-image-extension))))
+                    (if (exists? file)
+                        #f
+                      "No stream found"))
+                (let ((audio? (exists? (new-file {Directory Documents} (add-extension location (audio-profile-extension))))))
+                  (if audio?
+                      #f
+                    (if (null? (existing-video-profiles location))
+                        "No stream found"
+                      #f))))))))))
   
   
-  (method (stream-play self client location (delay-streaming? #t))
+  (method (stream-play self client kind location (delay-streaming? #t))
     (let ((client-delegate (find-delegate self client)))
       (let ((group (get-group client-delegate)))
-        (let ((name (filename-name location))
-              (audio-file? (exists? (new-file {Directory Documents} (add-extension location (audio-profile-extension))))))
-          (let ((audio-channels (if (and audio-file?
-                                         (neq? stream-what 'video))
-                                    (list (make-server-audio-channel self location group))
-                                  '()))
-                (video-channels (if (eq? stream-what 'audio) '() (make-server-video-channels self location group))))
-            (let ((video-level (and (not-null? video-channels) (determine-stream-video-level video-channels)))
-                  (channels (append audio-channels video-channels)))
-              (receive (stream send-stream) (make-server-stream self name 'stream video-level channels group location: location)
-                (set-action-proc send-stream stream-controller-action)
-                (set-streams group (cons stream (get-streams group)))
-                (if delay-streaming?
-                    (delay-stream send-stream)
-                  (sleep stream-delay)
-                  (play send-stream)))))))))
+        (let ((name (filename-name location)))
+          (if (eq? kind 'image)
+              (let ((channels (list (make-server-image-channel self location))))
+                (receive (stream send-stream) (make-server-stream self name 'stream #f channels group location: location)
+                  (set-action-proc send-stream stream-controller-action)
+                  (set-streams group (cons stream (get-streams group)))
+                  (if delay-streaming?
+                      (delay-stream send-stream)
+                    (sleep stream-delay)
+                    (play send-stream))))
+            (let ((audio-file? (exists? (new-file {Directory Documents} (add-extension location (audio-profile-extension))))))
+              (let ((audio-channels (if (and audio-file?
+                                             (neq? stream-what 'video))
+                                        (list (make-server-audio-channel self location group))
+                                      '()))
+                    (video-channels (if (eq? stream-what 'audio) '() (make-server-video-channels self location group))))
+                (let ((video-level (and (not-null? video-channels) (determine-stream-video-level video-channels)))
+                      (channels (append audio-channels video-channels)))
+                  (receive (stream send-stream) (make-server-stream self name 'stream video-level channels group location: location)
+                    (set-action-proc send-stream stream-controller-action)
+                    (set-streams group (cons stream (get-streams group)))
+                    (if delay-streaming?
+                        (delay-stream send-stream)
+                      (sleep stream-delay)
+                      (play send-stream)))))))))))
   
   
-  (method (stream-stop self client location)
+  (method (stream-stop self client kind location)
     (let ((name (filename-name location)))
       (let ((streams (find-streams self name)))
         (if (null? streams)
@@ -2928,7 +3081,8 @@
             (lambda (stream-no channel-no)
               (let ((channel (register-send-channel udp-server stream-no channel-no media-kind source-kind level resolution framerate bitrate codec caps metadata send-state)))
                 (let ((src (new File-Stream-Audio-Src
-                             location))
+                             location
+                             loop?: stream-loop?))
                       (sink (new Stream-Frame-Consumer
                               consumer: (lambda (buffer dts pts duration flags)
                                           (send-server-media self channel-no buffer dts pts duration flags)))))
@@ -2959,13 +3113,38 @@
                            (let ((src (new File-Stream-Video-Src
                                         profile
                                         location
-                                        stream?: (stream-to-group? udp-server channel group)))
+                                        stream?: (stream-to-group? udp-server channel group)
+                                        loop?: stream-loop?))
                                  (sink (new Stream-Frame-Consumer
                                          consumer: (lambda (buffer dts pts duration flags)
                                                      (send-server-media self channel-no buffer dts pts duration flags)))))
                              (let ((pipeline (pipeline (list src sink))))
                                (set-pipeline channel pipeline)))))))))))
            existing-profiles)))
+  
+  
+  (method (make-server-image-channel self location)
+    (let ((media-kind udp-video)
+          (source-kind 'image)
+          (level #f)
+          (resolution draw-resolution)
+          (framerate #f)
+          (bitrate draw-bitrate)
+          (codec #f)
+          (caps #f)
+          (metadata '())
+          (send-state 'on))
+      (new Channel-Creator
+        (list media-kind source-kind level resolution framerate bitrate codec caps metadata send-state)
+        (lambda (stream-no channel-no)
+          (let ((channel (register-send-channel udp-server stream-no channel-no media-kind source-kind level resolution framerate bitrate codec caps metadata send-state)))
+            (let ((src (new File-Stream-Image-Src
+                         location))
+                  (sink (new Stream-Frame-Consumer
+                          consumer: (lambda (buffer dts pts duration flags)
+                                      (send-server-media self channel-no buffer dts pts duration flags)))))
+              (let ((pipeline (pipeline (list src sink))))
+                (set-pipeline channel pipeline))))))))
   
   
   (method package (send-server-media self channel-no buffer dts pts duration flags)

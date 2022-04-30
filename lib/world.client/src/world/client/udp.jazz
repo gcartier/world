@@ -1106,6 +1106,9 @@
 ;;;
 
 
+(definition stop-rising-grace <fx>
+  (flonum->timestamp .1))
+
 (definition plateau-grace <fx>
   (flonum->timestamp 1.))
 
@@ -1118,12 +1121,8 @@
 (definition drop-into-bumps-minimum <fx>
   (flonum->timestamp 0.2))
 
-
-(definition protected hack-latency
-  #f)
-
-(definition protected (set-hack-latency lat)
-  (set! hack-latency lat))
+(definition minimum-duration <fx>
+  (flonum->timestamp .2))
 
 
 (class UDP-Receive-Base extends UDP-Base
@@ -1132,10 +1131,12 @@
   (slot stream           getter generate)
   (slot media-kind       getter generate)
   (slot source-kind      getter generate)
+  (slot rise-tolerance   getter generate)
   (slot last-raw-latency getter generate)
   (slot plateau-start    getter generate)
   (slot plateau-highest  getter generate)
   (slot state            getter generate)
+  (slot ring             accessors generate)
   
   (slot contour-start                 getter generate)
   (slot contour-raw-latency      <fx> getter generate)
@@ -1152,6 +1153,7 @@
     (set! self.stream stream)
     (set! self.media-kind media-kind)
     (set! self.source-kind (if live-streaming? 'live source-kind))
+    (set! self.rise-tolerance (if (= media-kind udp-audio) udp-audio-tolerance udp-video-tolerance))
     (set! self.last-raw-latency 0)
     (set! self.plateau-start 0)
     (set! self.plateau-highest #f)
@@ -1178,12 +1180,8 @@
     (set! self.contour-history (new Windowed-History 30. 60)))
   
   
-  (method protected virtual (voice-under-threshold? self plateau-time)
+  (method protected virtual (voice-under-threshold? self)
     #t)
-  
-  
-  (method protected virtual (determine-earliest-ontime self local)
-    #f)
   
   
   (method (update-contour-base self local remote)
@@ -1217,7 +1215,7 @@
     (case contour-state
       ((plateau)
        (cond ;; up
-             ((> raw (+ contour-latency udp-audio-tolerance))
+             ((> raw (+ contour-latency rise-tolerance))
               (set! contour-state 'rise)
               (set! contour-latency +inf.ts)
               (set! contour-last-raw-latency raw)
@@ -1241,7 +1239,7 @@
            (set! contour-last-raw-latency raw)
          ;; plateau
          (set! contour-state 'plateau)
-         (set! contour-latency contour-last-raw-latency)
+         (set! contour-latency (+ contour-last-raw-latency stop-rising-grace))
          (reset-plateau)
          (record-plateau contour-latency)))))
   
@@ -1267,12 +1265,14 @@
                 (cond ((>= latency previous)
                        (set! rising? #t))
                       (else
-                       (when (and rising? (>= latency target))
-                         ;; skip first bump and average next 3
-                         (when (and (> bumps 0) (< count 3))
-                           (increase! total latency)
-                           (increase! count))
-                         (increase! bumps))
+                       (when rising?
+                         (let ((top previous))
+                           (when (>= top target)
+                             ;; skip first bump and average next 3
+                             (when (and (> bumps 0) (< count 3))
+                               (increase! total top)
+                               (increase! count))
+                             (increase! bumps))))
                        (set! rising? #f)))
                 (set! previous latency)))
             (and (>= bumps (if starting? 2 3))
@@ -1287,49 +1287,63 @@
             (update-contour-base self local remote)
             (update-latency stream media-kind raw-latency latency)
             (update-proc raw-latency latency udp-latency-raw))
-        (let ((raw (or hack-latency (- new-base base))))
-          (set! raw-latency raw)
-          (update-contour self local remote raw)
-          (case state
-            ((plateau)
-             (cond ;; up
-                   ((> raw (+ latency udp-audio-tolerance))
-                    (set! state 'rise)
-                    (set! latency +inf.ts)
-                    (set! last-raw-latency raw))
-                   ;; extend
-                   ((>= raw (- latency drop-minimum))
-                    (reset-plateau))
-                   ;; down
-                   ((and (eq? source-kind 'live)
-                         (>= local (+ plateau-start plateau-grace)))
-                    (when (or (not plateau-highest)
-                              (> raw plateau-highest))
-                      (set! plateau-highest raw))
-                    (let ((plateau-time (- local plateau-start)))
-                      ;; fall
-                      (when (and (>= plateau-time plateau-sampling)
-                                 (voice-under-threshold? self plateau-time))
-                        (let ((bumps-average (analyse-bumps plateau-highest)))
-                          (if bumps-average
-                              (let ((drop (- latency bumps-average)))
-                                (when (>= drop drop-into-bumps-minimum)
-                                  (set! latency bumps-average)))
-                            (set! latency plateau-highest)))
-                        (reset-plateau))))))
-            ((rise)
-             (if (> raw last-raw-latency)
-                 (set! last-raw-latency raw)
-               (let ((earliest-ontime (determine-earliest-ontime self local)))
-                 (if (and earliest-ontime (< earliest-ontime last-raw-latency))
-                     (set! last-raw-latency raw)
-                   ;; plateau
-                   (set! state 'plateau)
-                   (set! latency (if earliest-ontime (max earliest-ontime last-raw-latency) last-raw-latency))
-                   (reset-plateau))))))
-          ;; update
-          (update-latency stream media-kind raw-latency latency)
-          (update-proc raw-latency latency udp-latency-raw)))))
+        (unless (eq? source-kind 'image)
+          (let ((raw (- new-base base)))
+            (set! raw-latency raw)
+            (update-contour self local remote raw)
+            (case state
+              ((plateau)
+               (cond ;; up
+                     ((> raw (+ latency rise-tolerance))
+                      (set! state 'rise)
+                      (set! latency +inf.ts)
+                      (set! last-raw-latency raw))
+                     ;; extend
+                     ((>= raw (- latency drop-minimum))
+                      (reset-plateau))
+                     ;; down
+                     ((and (eq? source-kind 'live)
+                           (>= local (+ plateau-start plateau-grace)))
+                      (when (or (not plateau-highest)
+                                (> raw plateau-highest))
+                        (set! plateau-highest raw))
+                      (let ((plateau-time (- local plateau-start)))
+                        ;; fall
+                        (when (and (>= plateau-time plateau-sampling)
+                                   (voice-under-threshold? self))
+                          (let ((bumps-average (analyse-bumps plateau-highest)))
+                            (if bumps-average
+                                (let ((drop (- latency bumps-average)))
+                                  (when (>= drop drop-into-bumps-minimum)
+                                    (set! latency bumps-average)))
+                              (set! latency plateau-highest)))
+                          (reset-plateau))))))
+              ((rise)
+               (if (> raw last-raw-latency)
+                   (set! last-raw-latency raw)
+                 ;; plateau
+                 (set! state 'plateau)
+                 (set! latency (+ last-raw-latency stop-rising-grace))
+                 (reset-plateau))))
+            ;; update
+            (update-latency stream media-kind raw-latency latency)
+            (update-proc raw-latency latency udp-latency-raw))))))
+  
+  
+  (method override (update-past self local remote)
+    (when (neq? source-kind 'live)
+      (unless (eq? state 'rise)
+        (let ((running-latency (running-time-latency self local remote)))
+          (when (> running-latency (+ latency rise-tolerance))
+            (set! latency running-latency)
+            (set! state 'plateau)
+            (set! plateau-start local)
+            (set! plateau-highest #f)
+            (update-past-latency stream media-kind latency))))))
+  
+  
+  (method (running-time-latency self local remote)
+    (- local (+ base remote)))
   
   
   (method override (effective-latency self)
@@ -1340,24 +1354,15 @@
     (+ base remote latency)))
 
 
+(definition voice-threshold <fl>
+  10.)
+
+
 (class UDP-Audio-Base extends UDP-Receive-Base
   
   
-  (slot ring accessors generate)
-  
-  
-  (method override (voice-under-threshold? self plateau-time)
-    ;; progressively accept more voice over 30s to a max of 30%
-    (<= (voice-percentage ring) (min 30. (timestamp->flonum plateau-time))))
-  
-  
-  (method override (determine-earliest-ontime self local)
-    (let ((earliest (earliest-packet ring)))
-      (and earliest
-           (let ((earliest-dts (get-dts earliest)))
-             (let ((earliest-base (- local earliest-dts)))
-               (let ((earliest-latency (- earliest-base base)))
-                 (- earliest-latency udp-audio-tolerance))))))))
+  (method override (voice-under-threshold? self)
+    (<= (voice-percentage ring) voice-threshold)))
 
 
 (class UDP-Video-Base extends UDP-Receive-Base)
@@ -1404,39 +1409,30 @@
   (sleep (min not-ready-max-sleep timeout)))
 
 
+(definition voice-size
+  100)
+
+(definition (make-windowed-voice)
+  (new Windowed-Count voice-size))
+
+
 (class UDP-Audio-Ring extends UDP-Receive-Ring
   
   
-  (slot audio-duration initialize 0 getter generate)
-  (slot voice-count    initialize 0 getter generate)
+  (slot windowed-voice initialize (make-windowed-voice) getter generate)
   
   
   (method override (empty self)
     (nextmethod self)
-    (set! audio-duration 0)
-    (set! voice-count 0))
+    (set! windowed-voice (make-windowed-voice)))
   
   
   (method override (audio-added self packet)
-    (let ((duration (get-duration packet)))
-      (when duration
-        (set! audio-duration (+ audio-duration duration))))
-    (when (has-voice? packet)
-      (increase! voice-count)))
-  
-  
-  (method override (audio-removed self packet)
-    (let ((duration (get-duration packet)))
-      (when duration
-        (set! audio-duration (- audio-duration duration))))
-    (when (has-voice? packet)
-      (decrease! voice-count)))
+    (record windowed-voice (if (has-voice? packet) 1 0)))
   
   
   (method protected (voice-percentage self)
-    (if (= count 0)
-        0.
-      (percentage voice-count count)))
+    (percentage (get-count windowed-voice) voice-size))
   
   
   (method protected (process-audio self channel exit)
@@ -1467,8 +1463,7 @@
             (let ((running-time (gst_element_get_running_time appsrc))
                   (earliest <UDP-Packet> (vector-ref packets head)))
               (let ((write-time (determine-write-time self earliest latency udp-audio-process)))
-                (let ((late-time (+ write-time udp-audio-late))
-                      (giveup-time (+ write-time udp-audio-giveup)))
+                (let ((giveup-time (+ write-time udp-audio-giveup)))
                   (cond ;; giveup
                         ((>= running-time giveup-time)
                          (flush-earliest self)
@@ -1484,11 +1479,11 @@
                            (give-audio channel sender channel-no packet data latency))
                          (mutex-unlock! mutex)
                          (loop-wait))
-                        ;; wakeup on late
-                        ((< running-time late-time)
-                         (mutex-unlock! mutex wait-condvar (timestamp->flonum (- late-time running-time)))
+                        ;; not live wakeup on giveup
+                        ((neq? source-kind 'live)
+                         (mutex-unlock! mutex wait-condvar (timestamp->flonum (- giveup-time running-time)))
                          (loop-wait))
-                        ;; flush
+                        ;; live flush
                         (else
                          (flush-earliest self)
                          (mutex-unlock! mutex)
@@ -1645,6 +1640,12 @@
   (slot base           <fx+> initialize #f getter generate)
   
   
+  (method override (initialize self sender name no origin source-kind video-level)
+    (nextmethod self sender name no origin source-kind video-level)
+    (when live-streaming?
+      (set! self.source-kind 'live)))
+  
+  
   (method protected (with-locked-channels self thunk (media-kind #f))
     (iterate-table channels
       (lambda (no channel)
@@ -1719,20 +1720,51 @@
     (mutex-unlock! latency-mutex))
   
   
+  (method protected (update-past-latency self media-kind latency)
+    (mutex-lock! latency-mutex)
+    (ecase media-kind
+      ((udp-audio)
+       (set! audio-latency latency))
+      (else
+       (set! video-latency latency)))
+    (mutex-unlock! latency-mutex))
+  
+  
   (method protected (media-latency self media-kind)
     (mutex-lock! latency-mutex)
-    (prog1 (let ((latency (ecase media-kind
-                            ((udp-audio) audio-latency)
-                            (else (cond ((or (not audio-on?)
-                                             (not base))
-                                         video-latency)
-                                        ((= audio-latency +inf.ts)
-                                         audio-latency)
-                                        (else
-                                         (+ audio-latency base)))))))
-             (if (= latency +inf.ts)
-                 latency
-               latency))
+    (prog1 (if (neq? source-kind 'live)
+               ;; non-live take max of audio and video
+               (ecase media-kind
+                 ((udp-audio)
+                  (cond ((or (not video-latency)
+                             (not base))
+                         audio-latency)
+                        ((= video-latency +inf.ts)
+                         video-latency)
+                        (else
+                         (max (- video-latency base)
+                              audio-latency))))
+                 (else
+                  (cond ((or (not audio-latency)
+                             (not base))
+                         video-latency)
+                        ((= audio-latency +inf.ts)
+                         audio-latency)
+                        (else
+                         (max (+ audio-latency base)
+                              video-latency)))))
+             ;; live slave video to audio
+             (ecase media-kind
+               ((udp-audio)
+                audio-latency)
+               (else
+                (cond ((or (not audio-on?)
+                           (not base))
+                       video-latency)
+                      ((= audio-latency +inf.ts)
+                       audio-latency)
+                      (else
+                       (+ audio-latency base))))))
       (mutex-unlock! latency-mutex))))
 
 
@@ -1748,17 +1780,13 @@
 (class UDP-Receive-Channel extends UDP-Channel
   
   
-  (slot process-ring                      getter generate)
-  (slot process-task                      getter generate)
-  (slot replay-ring                       getter generate)
-  (slot insert-rate-frame                 getter generate)
-  (slot insert-rate                       getter generate)
-  (slot process-rate                      getter generate)
-  (slot last-audio-frame    initialize #f getter generate)
-  (slot last-audio-buffer   initialize #f getter generate)
-  (slot last-audio-pts      initialize #f getter generate)
-  (slot last-audio-dts      initialize #f getter generate)
-  (slot last-audio-duration initialize #f getter generate)
+  (slot process-ring                    getter generate)
+  (slot process-task                    getter generate)
+  (slot replay-ring                     getter generate)
+  (slot insert-rate-frame               getter generate)
+  (slot insert-rate                     getter generate)
+  (slot process-rate                    getter generate)
+  (slot expected-pts      initialize #f getter generate)
   
   
   (method override (initialize self stream no media-kind source-kind level resolution framerate bitrate codec caps metadata send-state)
@@ -1776,8 +1804,7 @@
                                 (else
                                  (new UDP-Video-Ring self no (get-origin stream) media-kind source-kind udp-process-size max-size: udp-process-max-size time-base: time-base overflow-proc: (udp-ring-overflow 'process udp-ring-kind-process)))))
       (unless (simulation?)
-        (when (= media-kind udp-audio)
-          (set-ring time-base self.process-ring))))
+        (set-ring time-base self.process-ring)))
     (unless (simulation?)
       (set! self.process-task (new Task (if (= media-kind udp-audio) 'udp-audio 'udp-video) (~ run-process self) priority: udp-process-priority)))
     (set! self.insert-rate-frame 0)
@@ -1823,11 +1850,7 @@
   
   (method override (reset self)
     (reset process-ring)
-    (set! last-audio-frame #f)
-    (set! last-audio-buffer #f)
-    (set! last-audio-dts #f)
-    (set! last-audio-pts #f)
-    (set! last-audio-duration #f)
+    (set! expected-pts #f)
     ;; quick test
     (ecase media-kind
       ((udp-audio)
@@ -1879,42 +1902,41 @@
                     (timestamp->flonum dts))))
   
   
-  (method (chop-audio self buffer buffer-duration duration)
-    (let ((size (fxround (exact->inexact (* (u8vector-length buffer) (/ duration buffer-duration))))))
-      (subu8vector buffer 0 size)))
+  (method protected (give-gap self pts duration)
+    (let ((id/output (or (simulation-audio) no)))
+      (receive-audio (current-audio) id/output #f pts pts duration)
+      (set! expected-pts (+ pts duration))))
   
 
   (method protected (give-audio self sender channel-no packet buffer latency)
     (site give-audio
       (let ((frame (get-frame packet))
-            (total (get-total packet))
             (dts (get-dts packet))
             (pts (get-pts packet))
             (duration (get-duration packet))
             (flags (get-flags packet)))
         (let ((id/output (or (simulation-audio) channel-no)))
-          ;; duplicate last buffer to fill missing audio which sounds a lot better
-          ;; than doing nothing and have gstreamer use silence which sounds gritchy
-          (when (and last-audio-frame (> last-audio-duration 0))
-            (let ((audio-gap (- frame last-audio-frame)))
-              (when (< audio-gap max-audio-gap)
-                (let ((missing-dts (+ last-audio-dts last-audio-duration))
-                      (missing-pts (+ last-audio-pts last-audio-duration)))
-                  (let (loop (missing-dts missing-dts) (missing-pts missing-pts) (missing-duration (- pts missing-pts)))
-                    (when (> missing-duration 0)
-                      (if (< missing-duration last-audio-duration)
-                          (let ((buffer (chop-audio self last-audio-buffer last-audio-duration missing-duration)))
-                            (receive-audio (current-audio) id/output buffer missing-dts missing-pts missing-duration))
-                        (receive-audio (current-audio) id/output last-audio-buffer missing-dts missing-pts last-audio-duration)
-                        (loop (+ missing-dts last-audio-duration) (+ missing-pts last-audio-duration) (- missing-duration last-audio-duration)))))))))
-          (set! last-audio-frame frame)
-          (set! last-audio-buffer buffer)
-          (set! last-audio-dts dts)
-          (set! last-audio-pts pts)
-          (set! last-audio-duration duration)
           (let ((dts (max 0 (+ dts latency)))
                 (pts (max 0 (+ pts latency))))
-            (receive-audio (current-audio) id/output buffer dts pts duration))
+            (define (receive)
+              (receive-audio (current-audio) id/output buffer dts pts duration)
+              (set! expected-pts (+ pts duration)))
+            
+            (define (receive-gap pts duration)
+              (receive-audio (current-audio) id/output #f pts pts duration))
+            
+            (cond ;; perfect timestamp
+                  ((or (not expected-pts)
+                       (= pts expected-pts))
+                   (receive))
+                  ;; generate gap for opus packet loss concealment
+                  ((> pts expected-pts)
+                   (let ((gap (- pts expected-pts)))
+                     (when (< gap udp-audio-mixer)
+                       (receive-gap expected-pts gap)))
+                   (receive))
+                  ;; do not send decreasing timestamps
+                  ))
           (record-play-frame self sender frame flags dts pts)))))
   
   
@@ -1941,4 +1963,4 @@
 ;;;
 
 
-(class UDP-Audio-Only-Channel-Hack extends UDP-Receive-Channel))
+(class UDP-Audio-Only-Video-Channel extends UDP-Receive-Channel))

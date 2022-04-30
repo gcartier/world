@@ -45,9 +45,6 @@
     (mutex-unlock! spawn-mutex)))
 
 
-(definition protected worker-process-port
-  #f)
-
 (definition protected worker
   #f)
 
@@ -55,23 +52,10 @@
   (assert (not (worker?))
     (with-spawn-mutex
       (lambda ()
-        (define (connect/spawn-worker)
-          (if master-process
-              (values #f (connect-worker (request-worker-port master-process)))
-            (spawn-worker)))
-        
         (or worker
-            (receive (process-port wrk) (connect/spawn-worker)
-              (set! worker-process-port process-port)
+            (let ((wrk (spawn-unique-worker)))
               (set! worker wrk)
               wrk))))))
-
-(definition public (require-worker-port)
-  (let ((worker (require-worker)))
-    (get-service (find-connection (get-presence worker) (get-uuid (get-ior worker))))))
-
-(definition public (set-worker wrk)
-  (set! worker wrk))
 
 
 (definition world-repositories
@@ -101,43 +85,72 @@
   (world-setting 'world.worker-debug? #f))
 
 
-(definition protected (setup-worker-process)
+(definition (setup-worker-process)
   (load-unit 'jazz.presence)
   (load-unit 'jazz.presence.transmission)
   (load-unit 'jazz.presence.remotable.IOR))
 
 
-(definition protected (spawn-worker)
-  (let ((crashes (worker-crashes))
+(definition (spawn-unique-worker)
+  (let ((worker-file (worker-file))
+        (crashes (worker-crashes))
         (cache (worker-cache))
         (optimize? (worker-optimize?))
         (debug? (worker-debug?)))
-    (spawn-slave "worker" (get-worker-filename)
-      (lambda (master slave cookie)
-        (process-setup slave crashes cache optimize? debug? world-repositories))
-      (lambda (master slave cookie)
-        slave)
-      purpose: 'working
-      debug?: debug?
-      wait?: #t)))
+    (define (load-remote-worker port)
+      (start-remote-presence purpose: 'working)
+      (let ((remote-register (connect-remote-register "localhost" port purpose: 'working)))
+        (load-object remote-register 'world.worker.remote 'world-remote-worker)))
+    
+    (cond ((not (file-exists? worker-file))
+           (let ((port (spawn-worker debug?)))
+             (call-with-output-file worker-file
+               (lambda (output)
+                 (write port output)
+                 (force-output output)))
+             (let ((worker (load-remote-worker port)))
+               (process-setup worker crashes cache optimize? debug? world-repositories)
+               worker)))
+          (else
+           (let ((port (call-with-input-file worker-file read)))
+             (let ((worker (load-remote-worker port)))
+               (process-connect worker)
+               worker))))))
 
 
-(definition protected (connect-worker port)
-  (start-remote-presence purpose: 'working)
-  (let ((remote-register (connect-remote-register "localhost" port purpose: 'working)))
-    (load-object remote-register 'world.worker.remote 'world-remote-worker)))
+(definition (spawn-worker debug?)
+  (define (determine-path)
+    (or (find-kernel-file (add-extension (get-worker-filename) (executable-extension kernel-platform)))
+        (error "Unable to find worker executable")))
+  
+  (let ((path (determine-path)))
+    (let ((arguments `("-:darR" @maybe-use-in-production!? "-:daqQ-"
+                       ;; it is not completly correct at the moment to always
+                       ;; debug the slave because of the evaluate always hack
+                       ,@(let ((arg (command-argument "debugger")))
+                           (if (and debug? arg)
+                               (list "-debugger" arg)
+                             '()))
+                       "-called-from" "world")))
+      (let ((process (open-process
+                       (list
+                         path: path
+                         arguments: arguments
+                         stdin-redirection: #t
+                         stdout-redirection: #t
+                         stderr-redirection: #t
+                         show-console: #f))))
+        (read process)))))
 
 
-(definition protected (quit-worker-process)
+(definition (deconnect-worker-process)
   (when worker
-    (unless master-process
-      (closing-remote-proxy worker)
-      (process-quit worker)
-      (process-status worker-process-port))
+    (closing-remote-proxy worker)
+    (process-deconnect worker (get-uuid (require-presence 'working)))
     (set! worker #f)))
 
 
-(definition protected (calling-worker thunk)
+(definition (calling-worker thunk)
   (thunk))
 
 
@@ -344,7 +357,7 @@
 
 
 (unless (worker?)
-  (add-exit-job! quit-worker-process))
+  (add-exit-job! deconnect-worker-process))
 
 
 (unless (worker?)
