@@ -142,6 +142,7 @@
   (slot live-stream              initialize #f  accessors generate)
   (slot microphone-channel       initialize #f  accessors generate)
   (slot camera-channel           initialize #f  accessors generate)
+  (slot camera-channels          initialize #f  accessors generate)
   (slot server-entered-hook      initialize #f  accessors generate)
   (slot server-exited-hook       initialize #f  accessors generate)
   (slot server-disconnected-hook initialize #f  accessors generate)
@@ -1336,6 +1337,7 @@
               (stream-addable-hook group-no))
       (let ((stream (register-receive-stream udp-client sender name stream-no origin source-kind video-level channels)))
         (let ((receive-video-level (stream-receive-video-level stream))
+              (highest-video #f)
               (has-video? #f))
           (iterate-table (get-channels stream)
             (lambda (channel-no channel)
@@ -1354,26 +1356,30 @@
                          (when output
                            (setup-audio (get-root (get-interface-pane output))))))))
                   ((udp-video)
-                   (when (get-caps channel)
-                     (let ((level (get-level channel)))
-                       (when (eqv? level receive-video-level)
-                         (let ((video (current-video)))
-                           (let ((output (channel-output video stream-no channel)))
-                             (let ((ring (get-process-ring channel)))
-                               (play-video output)
-                               (set-output channel output)
-                               (set-appsrc ring (get-color-appsrc output)))
-                             (when (not (get-focused-output video))
-                               (change-focused-output video output))
-                             (set! has-video? #t)))))))))))
-          ;; audio only
+                   (if (or (get-caps channel)
+                           ;; patch for already processed streamaudio files without caps
+                           (neq? source-kind 'live))
+                       (let ((level (get-level channel)))
+                         (when (eqv? level receive-video-level)
+                           (let ((video (current-video)))
+                             (let ((output (channel-output video stream-no channel)))
+                               (let ((ring (get-process-ring channel)))
+                                 (play-video output)
+                                 (set-output channel output)
+                                 (set-appsrc ring (get-color-appsrc output)))
+                               (when (not (get-focused-output video))
+                                 (change-focused-output video output))
+                               (set! has-video? #t)))))
+                     (when (or (not highest-video)
+                               (> (get-level channel) (get-level highest-video)))
+                       (set! highest-video channel))))))))
+          ;; video placeholder
           (when (and (not has-video?)
                      (neq? source-kind 'screen)
-                     (neq? source-kind 'view)
-                     group-require-camera?)
-            (let ((channel (new UDP-Audio-Only-Video-Channel stream stream-no udp-video source-kind 2 video-resolution video-framerate video-bitrate video-codec #f '() 'on)))
-              (let ((output (channel-output (current-video) stream-no channel)))
-                (set-output channel output))))
+                     (neq? source-kind 'view))
+            (let ((output (channel-output (current-video) stream-no highest-video process?: #f)))
+              (set-video-placeholder stream output)
+              (set-output highest-video output)))
           (when stream-add-hook
             (stream-add-hook stream))))))
   
@@ -1433,15 +1439,19 @@
                                  (receive-video-level (stream-receive-video-level stream))
                                  (video (current-video)))
                              (when (eqv? level receive-video-level)
-                               (let ((output (get-output channel)))
-                                 (unless output
-                                   (let ((output (channel-output video (get-no stream) channel)))
-                                     (let ((ring (get-process-ring channel)))
-                                       (play-video output)
-                                       (set-output channel output)
-                                       (set-appsrc ring (get-color-appsrc output)))
-                                     (when (not (get-focused-output video))
-                                       (change-focused-output video output))))))))))))))
+                               (let ((placeholder (get-video-placeholder stream)))
+                                 (let ((output (if placeholder
+                                                   (begin
+                                                     (terminal 'replace-placeholder)
+                                                     (set-video-placeholder stream #f)
+                                                     (replace-output video placeholder (get-no stream) channel))
+                                                 (channel-output video (get-no stream) channel))))
+                                   (let ((ring (get-process-ring channel)))
+                                     (play-video output)
+                                     (set-output channel output)
+                                     (set-appsrc ring (get-color-appsrc output)))
+                                   (when (not (get-focused-output video))
+                                     (change-focused-output video output)))))))))))))
               channels-init))
   
   
@@ -1531,7 +1541,8 @@
                               (set-flow (get-process-ring actual-channel) #f)
                               (let ((new-output (replace-output video output stream-no channel)))
                                 (play-video new-output)
-                                (set-flow (get-process-ring channel) (get-color-flow new-output)))))))))))
+                                (set-output channel new-output)
+                                (set-appsrc (get-process-ring channel) (get-color-appsrc new-output)))))))))))
               udp-video))))))
   
   
@@ -2046,7 +2057,8 @@
                             (set-flow (get-process-ring actual-channel) #f)
                             (let ((new-output (replace-output video output stream-no streaming-channel)))
                               (play-video new-output)
-                              (set-flow (get-process-ring streaming-channel) (get-color-flow new-output)))))))))))
+                              (set-output streaming-channel new-output)
+                              (set-appsrc (get-process-ring streaming-channel) (get-color-appsrc new-output)))))))))))
             ;; send
             (iterate-table (get-send-streams udp-client)
               (lambda (no stream)
@@ -2080,7 +2092,9 @@
                                           (when (and self-channel
                                                      (neq? channel self-channel)
                                                      (= channel-level new-video-level))
-                                            (replace-output video self-output self-stream-no channel sync-audio?: #t))))))
+                                            (let ((new-output (replace-output video self-output self-stream-no channel sync-audio?: #t)))
+                                              (play-video new-output)
+                                              (set-output channel new-output)))))))
                                   stream-video-channels)))))))
             ;; camera
             (when camera-channel
@@ -2226,7 +2240,8 @@
                     ;; any channel will do as they all share the same pipeline
                     (let ((channel (car channels)))
                       (cameraon-debug 4 channel)
-                      (set! camera-channel channel)))))
+                      (set! camera-channel channel))
+                    (set! camera-channels channels))))
               (cameraon-debug 5 camera-channel)
               (set! live-stream stream)
               stream)))))
@@ -2350,7 +2365,8 @@
                             (reset channel)
                             (let ((ring (get-process-ring channel)))
                               (play-audio output)
-                              (set-flow ring (get-flow output)))))))
+                              (set-output channel output)
+                              (set-appsrc ring (get-appsrc output)))))))
                     preserved))
         (iterate-table (get-receive-channels udp)
           (lambda (no channel)
@@ -2391,6 +2407,14 @@
         (cameraon-debug 2)
         (media-on self (get-no live-stream) udp-video)
         (play camera-channel)
+        (let ((channels-init (collect (lambda (channel)
+                                        (let ((info (require-consumer-caps channel)))
+                                          (and info
+                                               (receive (caps resolution) info
+                                                 (list (get-no channel) caps resolution)))))
+                                      camera-channels)))
+          (when (not-null? channels-init)
+            (media-init self channels-init)))
         (set-send-state camera-channel 'on)
         (update-parameter world 'camera)
         (when feedback?
@@ -2455,17 +2479,8 @@
   
   (method (invalidate-audio-state self output)
     (let ((channel (get-channel output)))
-      (define (find-audio-only-video-channel stream)
-        (table-search (lambda (no channel)
-                        (and (= (get-media-kind channel) udp-video)
-                             (is? channel UDP-Audio-Only-Video-Channel)
-                             channel))
-                      (get-channels stream)))
-      
       (when channel
-        (let ((video-channel (let ((stream (get-stream channel)))
-                               (or (locate-stream-video-channel stream)
-                                   (find-audio-only-video-channel stream)))))
+        (let ((video-channel (locate-stream-video-channel (get-stream channel))))
           (when video-channel
             (let ((output (get-output video-channel)))
               (when output
