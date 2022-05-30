@@ -61,6 +61,8 @@
         (world.io)
         (world.log)
         (world.logging)
+        (world.moment)
+        (world.moment.syntax (phase syntax))
         (world.player)
         (world.profile)
         (world.profiling)
@@ -1675,25 +1677,39 @@
                     garbage-collect
                     (estimate-cpu%)
                     (length (top-threads))
+                    (current-process-memory)
                     last-gc-live
                     last-gc-movable
                     last-gc-nonmovable
+                    (leaks-tracer-live-count)
                     (let ((port (get-udp-port udp-client)))
                       (list (udp-socket-receive-buffer-size port)
                             (udp-socket-send-buffer-size port)
                             (udp-socket-send-again-count port)))
                     (camera-caps self)))))))))
     
+    (define (send-monitor)
+      (send-threaded 0
+        (lambda ()
+          (bind-values (last-gc-heap-size last-gc-alloc last-gc-live last-gc-movable last-gc-nonmovable) (process-memory)
+            (object->u8vector
+              (list (current-process-memory)
+                    last-gc-live
+                    last-gc-movable
+                    last-gc-nonmovable
+                    (leaks-tracer-live-count)
+                    (current-process-threads)))))))
+    
+    (define (send-health)
+      (send-threaded 0
+        (lambda ()
+          (object->u8vector
+            (map get-max-usage (get-ordered-outputs (current-video)))))))
+    
     (define (send-energy)
       (send-threaded 0
         (lambda ()
-          (cond-expand
-            (mac
-             (let ((threads (collect-process-threads)))
-               (let ((percentage (apply + (map second threads))))
-                 (object->u8vector (list (format "{a} {r precision: 1}%" character-name (* percentage 100.)))))))
-            (else
-             (object->u8vector (list (format "{a} unknown" character-name))))))))
+          (object->u8vector (current-process-threads)))))
     
     (define (send-capture)
       (start-captures)
@@ -1714,23 +1730,17 @@
     
     (define (send-evolution)
       (let ((metadata (admin-metadata self))
-            (chronology (copy-chronology (current-chronology)))
-            (evolution (copy-evolution (current-evolution)))
-            (entries (copy-log-entries)))
-        (let ((replay-thread
-                (send-threaded 0
-                  (lambda ()
-                    (object->u8vector (list metadata chronology evolution) serialize)))))
-          (send-threaded 'log
-            (lambda ()
-              (thread-join! replay-thread)
-              (object->u8vector entries serialize))))))
+            (chronology (empty-chronology))
+            (evolution (copy-evolution (current-evolution))))
+        (send-threaded 0
+          (lambda ()
+            (object->u8vector (list metadata chronology evolution) serialize)))))
     
     (define (send-replay)
       (let ((metadata (admin-metadata self))
             (chronology (copy-chronology (current-chronology)))
             (evolution (copy-evolution (current-evolution)))
-            (entries (copy-log-entries))
+            (moments (copy-moments))
             (captures (copy-captures)))
         (let ((replay-thread
                 (send-threaded 0
@@ -1738,16 +1748,16 @@
                     (object->u8vector (list metadata chronology evolution) serialize))
                   (lambda ()
                     (gather-replay-missing udp-client action)))))
-          (let ((log-thread
-                  (send-threaded 'log
+          (let ((moments-thread
+                  (send-threaded 'moments
                     (lambda ()
                       (thread-join! replay-thread)
-                      (object->u8vector entries serialize)))))
+                      (object->u8vector moments serialize)))))
             (for-each (lambda (capture)
                         (bind (name info . data) capture
                           (send-threaded (format "{a}/{a}" name (rawaudio-extension info))
                             (lambda ()
-                              (thread-join! log-thread)
+                              (thread-join! moments-thread)
                               data))))
                       captures)))))
     
@@ -1779,10 +1789,10 @@
         (when (exists? file)
           (send-content 0 file))))
     
-    (define (send-log)
+    (define (send-moments)
       (send-threaded 0
         (lambda ()
-          (object->u8vector (retrieve-logging-entries)))))
+          (object->u8vector (retrieve-moments) serialize))))
     
     (define (send-gst-validate)
       (send-threaded 0
@@ -1923,6 +1933,10 @@
        (send-caps))
       ((info)
        (send-info))
+      ((monitor)
+       (send-monitor))
+      ((health)
+       (send-health))
       ((energy)
        (send-energy))
       ((capture)
@@ -1941,8 +1955,8 @@
        (send-shared-file))
       ((settings)
        (send-settings))
-      ((log)
-       (send-log))
+      ((moments)
+       (send-moments))
       ((gst-validate)
        (send-gst-validate))
       ((gst-device-monitor gst-inspect gst-launch gst-play)
@@ -2191,18 +2205,21 @@
   
   
   (method package (require-live-stream self)
+    (cameraon-debug 1)
     (or live-stream
         (let ((camera? (has-camera?)))
           (let ((channels (cons (make-microphone-channel)
                                 (if camera?
                                     (make-camera-channels)
                                   '()))))
+            (cameraon-debug 2)
             (let ((stream (make-stream "Live" 'live (camera-profile-override-level) channels)))
               ;; microphone
               (let ((channel (locate-audio-channel stream)))
                 (set! microphone-channel channel))
               ;; camera
               (when camera?
+                (cameraon-debug 3)
                 (let ((channels (collect-video-channels stream)))
                   (let ((pipeline (make-shared-camera-pipeline (get-no stream) channels)))
                     (for-each (lambda (channel)
@@ -2210,17 +2227,22 @@
                               channels)
                     ;; any channel will do as they all share the same pipeline
                     (let ((channel (car channels)))
+                      (cameraon-debug 4 channel)
                       (set! camera-channel channel)))))
+              (cameraon-debug 5 camera-channel)
               (set! live-stream stream)
               stream)))))
   
   
   (method package (close-live-stream self)
+    (cameraon-debug 1)
     (when live-stream
+      (cameraon-debug 2)
       (close-send-stream udp-client live-stream)
       (set! live-stream #f)
       (set! microphone-channel #f)
-      (set! camera-channel #f)))
+      (set! camera-channel #f)
+      (cameraon-debug 3 camera-channel)))
   
   
   ;;;
@@ -2365,8 +2387,10 @@
   
   
   (method package (play-camera self (feedback?: feedback? #f))
+    (cameraon-debug 1)
     (let ((world (current-world)))
       (unless (on? camera-channel)
+        (cameraon-debug 2)
         (channel-on self (get-no live-stream) udp-video)
         (play camera-channel)
         (set-send-state camera-channel 'on)
@@ -2376,7 +2400,9 @@
   
   
   (method package (release-camera self (feedback?: feedback? #f))
+    (cameraon-debug 1)
     (let ((world (current-world)))
+      (cameraon-debug 2)
       (when (on? camera-channel)
         (release camera-channel)
         (set-send-state camera-channel 'off)

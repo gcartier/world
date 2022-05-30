@@ -56,6 +56,8 @@
         (world.io)
         (world.layout)
         (world.media)
+        (world.moment)
+        (world.moment.syntax (phase syntax))
         (world.pane)
         (world.profile)
         (world.quad-texture)
@@ -110,7 +112,7 @@
   (world-setting 'world.screen-share-min-bitrate 256))
 
 (definition protected screen-share-bitrate
-  (world-setting 'world.screen-share-bitrate 1024))
+  (world-setting 'world.screen-share-bitrate 2048))
 
 (definition protected screen-share-codec
   (world-setting 'world.screen-share-codec 'h264))
@@ -126,7 +128,7 @@
   (world-setting 'world.view-share-min-bitrate 256))
 
 (definition protected view-share-bitrate
-  (world-setting 'world.view-share-bitrate 1024))
+  (world-setting 'world.view-share-bitrate 2048))
 
 (definition protected view-share-codec
   (world-setting 'world.view-share-codec 'h264))
@@ -657,18 +659,8 @@
       (define (receive)
         (when (eq? (get-stream-state output) 'off)
           (set-stream-state output 'on))
-        (write-video output buffer dts pts duration timestamp-offset)
-        (when (and record-events? udp-record-src/sink?)
-          (let ((origin (get-origin (get-stream (get-channel output)))))
-            (record-event udp-id-sink-media
-                          (fixnum->flonum id)
-                          (fixnum->flonum origin)
-                          (fixnum->flonum udp-video)
-                          -1.
-                          -1.
-                          -1.
-                          (timestamp->flonum dts)))))
-      
+        (write-video output buffer dts pts duration timestamp-offset))
+
       (when (and output (not (get-stream-disconnected? output)))
         (cond ((get-wait-keyframe? output)
                (when (frame-keyframe? flags)
@@ -800,7 +792,7 @@
     (when (not-null? ordered-outputs)
       (let ((rectangles (layout self (length ordered-outputs))))
         (when rectangles
-          (let ((reordered-outputs (if (and (eq? video-layout 'gallery) self-output)
+          (let ((reordered-outputs (if (and (eq? video-layout 'gallery) (memq? self-output ordered-outputs))
                                        (append (remove self-output ordered-outputs) (list self-output))
                                      ordered-outputs)))
             (for-each (lambda (output rect)
@@ -830,7 +822,10 @@
              (layout-tiles num-players (new Rect 10 70 210 (- b 100))))
             ((gallery)
              (if (= num-players 1)
-                 (list (adjust-focused bounds (focused-rect bounds)))
+                 (let ((rect (car (layout-tiles 2 bounds))))
+                   (let ((size (rect-size rect)))
+                     (let ((pos (center size (rect-size bounds))))
+                       (list (position/size->rect pos size)))))
                (reverse (layout-tiles num-players bounds))))
             (else
              #f))))))
@@ -979,6 +974,10 @@
 
 
 (definition public (has-camera?)
+  (let ((providers (camera-providers)))
+    (cameraon-debug (length providers) 'provider)
+    (not-null? providers))
+  @w
   (not-null? (camera-providers)))
 
 
@@ -1263,13 +1262,13 @@
                                  "queue name=queue"
                                  ;; for some reason doing the convert before the scale ends up taking less cpu
                                  ;; and as a side effect it ensures we always use the same format for the scale
-                                 "videoconvert"
+                                 "videoconvert name=convert"
                                  (tie "video/x-raw, format=I420, width={camera-width}, height={camera-height}, pixel-aspect-ratio=(fraction)1/1")
                                  (and downscale?
                                       profile-camera?
-                                      "queue name=queuescale")
+                                      "queue name=queuedownscale")
                                  (and downscale?
-                                      "videoscale method=sinc sharpness=1.15")
+                                      "videoscale method=sinc sharpness=1.15 name=downscale")
                                  (and downscale?
                                       (tie "video/x-raw, width={max-width}, height={max-height}, pixel-aspect-ratio=(fraction)1/1"))
                                  "tee name=tee"
@@ -1286,12 +1285,12 @@
                                                            "tee^."
                                                            (tie "queue name=queueself{name}")
                                                            (and scale?
-                                                                "videoscale method=sinc sharpness=1.15")
+                                                                (tie "videoscale method=sinc sharpness=1.15 name=scaleself{name}"))
                                                            (and scale?
                                                                 (tie "video/x-raw, width={width}, height={height}, pixel-aspect-ratio=(fraction)1/1"))
                                                            (and profile-camera?
                                                                 (tie "queue name=queueselfconvert{name}"))
-                                                           "videoconvert"
+                                                           (tie "videoconvert name=convertself{name}")
                                                            (tie "video/x-raw, format=BGRA, width={width}, height={height}, pixel-aspect-ratio=(fraction)1/1")
                                                            (tie "appsink sync=false async=false name=sinkself{name}")))))))
                                             sinks)
@@ -1312,7 +1311,7 @@
                                                            "tee^."
                                                            (tie "queue name=queue{name}")
                                                            (and scale?
-                                                                "videoscale method=sinc sharpness=1.15")
+                                                                (tie "videoscale method=sinc sharpness=1.15 name=scale{name}"))
                                                            (and scale?
                                                                 (tie "video/x-raw, width={width}, height={height}, pixel-aspect-ratio=(fraction)1/1"))
                                                            (and profile-camera?
@@ -1408,10 +1407,17 @@
     (release-consumers self))
   
   
+  ;; the following 2 methods are never called at the moment
+  ;; as send-state only sends waiting state for images, and
+  ;; also resetting the camera is probably a really bad idea
+  ;; especially as the number of people in a circle grows
+  
+  @not-used
   (method override (resettable? self)
     #t)
   
   
+  @not-used
   (method override (reset-media self channel)
     (force-keyframes self)))
 
@@ -1559,20 +1565,10 @@
   
   (method override (consume-buffer self buffer)
     (site self
-      (when output
+      (if (not output)
+          (gst_buffer_unref buffer)
         (set-stream-state output 'drawn)
-        (draw-buffer output buffer)
-        (when (and record-events? udp-record-src/sink?)
-          (let ((size (gst_buffer_get_size buffer))
-                (dts (gst_buffer_get_dts buffer)))
-            (record-event udp-id-src-media
-                          -1. ;; todo channel no
-                          (fixnum->flonum client-no)
-                          (fixnum->flonum udp-video)
-                          -1.
-                          -1.
-                          (fixnum->flonum size)
-                          (timestamp->flonum dts)))))))
+        (draw-buffer output buffer))))
   
   
   (method override (consume-eos self)
@@ -2513,6 +2509,9 @@
   (slot stream-playing?               initialize #f getter generate)
   (slot stream-disconnected?          initialize #f getter generate)
   (slot source-adapter                initialize #f getter generate)
+  (slot src-count            <fx>     initialize 0  getter generate)
+  (slot sink-count           <fx>     initialize 0  getter generate)
+  (slot max-usage            <fx>     initialize 0  getter generate)
   
   
   (method override (initialize self (level: level #f) (resolution: resolution #f) (framerate: framerate #f) (bitrate: bitrate #f) (codec: codec #f) (caps: caps #f) (process?: process? #t) (alpha-overlay: alpha-overlay #f) (alpha?: alpha? #f) (sync-audio?: sync-audio? #f) (visualizer?: visualizer? #f))
@@ -2614,13 +2613,13 @@
                                       (if sync-audio?
                                           "queue min-threshold-time=200000000 name=queue"
                                         "queue name=queue")
-                                      (and (not hardware?) (eq? codec 'h264) (tie "avdec_h264 max-threads=1"))
-                                      (and (not hardware?) (eq? codec 'mpeg) (tie "avdec_mpeg4 max-threads=1"))
+                                      (and (not hardware?) (eq? codec 'h264) (tie "avdec_h264 max-threads=1 name=dec"))
+                                      (and (not hardware?) (eq? codec 'mpeg) (tie "avdec_mpeg4 max-threads=1 name=dec"))
                                       ;; try
                                       (and hardware? "h264parse")
                                       (and hardware? "vtdec_hw")
-                                      "videoscale"
-                                      "videoconvert"
+                                      "videoscale name=scale"
+                                      "videoconvert name=convert"
                                       (tie "video/x-raw, format=BGRA, width={width}, height={height}, pixel-aspect-ratio=(fraction)1/1")
                                       (if visualizer?
                                           (tie "appsink sync=false name=sink")
@@ -2798,6 +2797,10 @@
                                        -1.
                                        -1.))))))
             (gst_app_src_write color-appsrc color (u8vector-length color) dts pts duration)
+            (increase! src-count)
+            (let ((usage (- src-count sink-count)))
+              (when (> usage max-usage)
+                (set! max-usage usage)))
             (when alpha?
               ;; QUICK TEST
               (when alpha-appsrc
@@ -2823,8 +2826,10 @@
   (method override (process self task exit)
     (let ((color (wait-video self task exit color-listener color-appsink))
           (alpha (and alpha? (wait-video self task exit alpha-listener alpha-appsink))))
+      (increase! sink-count)
       (site video-output
-        (unless freeze?
+        (if freeze?
+            (gst_buffer_unref color)
           (draw self color alpha))
         (when (eq? stream-state 'on)
           (set-stream-state self 'drawn)))))
@@ -2857,8 +2862,8 @@
     )
   
   
-  (method package virtual (draw-buffer self buffer)
-    )
+  (method package virtual abstract (draw-buffer self buffer)
+    (error "Call to abstract draw-buffer"))
   
   
   @ziggy
@@ -3356,16 +3361,7 @@
   
   
   (method override (draw self color alpha)
-    (update self color alpha media-texture)
-    (when (and record-events? channel)
-      (record-event udp-id-draw-video
-                    -1.
-                    (fixnum->flonum client-no)
-                    (fixnum->flonum udp-video)
-                    -1.
-                    -1.
-                    -1.
-                    (timestamp->flonum (gst_buffer_get_dts color)))))
+    (update self color alpha media-texture))
   
   
   (method override (draw-buffer self buffer)
