@@ -18,6 +18,7 @@
 (import (jazz.cairo)
         (jazz.component)
         (jazz.event)
+        (jazz.flow)
         (jazz.geometry)
         (jazz.graphic)
         (jazz.graphic.image)
@@ -30,6 +31,7 @@
         (jazz.screen)
         (jazz.settings)
         (jazz.stream)
+        (jazz.stream.platform)
         (jazz.stream.syntax (phase syntax))
         (jazz.syntax (phase syntax))
         (jazz.time)
@@ -49,6 +51,7 @@
         (world.entity)
         (world.event)
         (world.foreign)
+        (world.hardware (cond mac))
         (world.hook)
         (world.id)
         (world.interface)
@@ -90,6 +93,9 @@
 
 (definition protected video-hardware?
   (world-setting 'world.video-hardware? #f))
+
+(definition protected (set-video-hardware? hardware?)
+  (set! video-hardware? hardware?))
 
 
 (definition protected camera-profile
@@ -2486,10 +2492,13 @@
   (slot bitrate                       initialize #f accessors generate)
   (slot codec                         initialize #f accessors generate)
   (slot caps                          initialize #f accessors generate)
+  (slot codec-data                    initialize #f accessors generate)
+  (slot hardware?                     initialize #f accessors generate)
   (slot process?                      initialize #f accessors generate)
   (slot sync-audio?                   initialize #f accessors generate)
   (slot visualizer?                   initialize #f accessors generate)
   (slot alpha-overlay                 initialize #f accessors generate)
+  (slot color-flow                    initialize #f accessors generate)
   (slot color-pipeline                initialize #f accessors generate)
   (slot color-appsrc                  initialize #f accessors generate)
   (slot color-appsink                 initialize #f accessors generate)
@@ -2500,6 +2509,7 @@
   (slot alpha-appsrc                  initialize #f accessors generate)
   (slot alpha-appsink                 initialize #f accessors generate)
   (slot alpha-listener                initialize #f accessors generate)
+  (slot hardware-pipeline             initialize #f accessors generate)
   (slot image-surface                 initialize #f accessors generate)
   (slot image-inhibit?                initialize #f accessors generate)
   (slot freeze?                       initialize #f getter generate)
@@ -2525,6 +2535,8 @@
     (set! self.bitrate bitrate)
     (set! self.codec codec)
     (set! self.caps caps)
+    (set! self.codec-data (and caps (caps->codec-data caps)))
+    (set! self.hardware? (and video-hardware? caps codec-data))
     (set! self.process? process?)
     (set! self.sync-audio? sync-audio?)
     (set! self.visualizer? visualizer?)
@@ -2606,87 +2618,90 @@
   
   
   (method package virtual (setup-pipeline self)
-    (when process?
-      (let ((width (get-width resolution))
-            (height (get-height resolution))
-            (hardware? video-hardware?))
-        (let ((listener (open-stream-listener "videocolor"))
-              (pipeline (gst-pipeline (format "appsrc{? caps=\"{a}\"~} min-latency=30000000 name=src" caps)
-                                      (if sync-audio?
-                                          "queue min-threshold-time=200000000 name=queue"
-                                        "queue name=queue")
-                                      (and (not hardware?) (eq? codec 'h264) (tie "avdec_h264 max-threads=1 name=dec"))
-                                      (and (not hardware?) (eq? codec 'mpeg) (tie "avdec_mpeg4 max-threads=1 name=dec"))
-                                      ;; try
-                                      (and hardware? "h264parse")
-                                      (and hardware? "vtdec_hw")
-                                      "videoscale name=scale"
-                                      "videoconvert name=convert"
-                                      (tie "video/x-raw, format=BGRA, width={width}, height={height}, pixel-aspect-ratio=(fraction)1/1")
-                                      (if visualizer?
-                                          (tie "appsink sync=false name=sink")
-                                        (tie "appsink name=sink")))))
-          (gst_object_set_name pipeline (string-append "video." name))
-          (with-unref ((appsrc (gst_bin_get_by_name pipeline "src"))
-                       (appsink (gst_bin_get_by_name pipeline "sink")))
-            (with-unref ((pad (gst_element_get_static_pad appsink "sink")))
-              (let ((probe (gst_pad_add_video_probe pad (get-write-file listener))))
-                (gst_app_sink_connect_signals appsink listener)
-                (when (not caps)
-                  (case codec
-                    ((h264)
-                     (gst-app-src-set-caps appsrc "video/x-h264"
-                       "width"         'int      width
-                       "height"        'int      height
-                       "framerate"     'fraction (cons framerate 1)
-                       "stream-format" 'string   "byte-stream"
-                       "alignment"     'string   "au"))
-                    (else
-                     (gst-app-src-set-caps appsrc "video/x-raw"
-                       "format"    'string   "I420"
-                       "width"     'int      width
-                       "height"    'int      height
-                       "framerate" 'fraction (cons framerate 1)))))
-                (g-object-set appsrc
-                              "is-live"     'boolean #t
-                              "stream-type" 'int     GST_APP_STREAM_TYPE_STREAM
-                              "format"      'int     GST_FORMAT_TIME)
-                (gst_element_set_state pipeline GST_STATE_READY)
-                (set! self.color-pipeline pipeline)
-                (set! self.color-appsrc appsrc)
-                (set! self.color-appsink appsink)
-                (set! self.color-listener listener)
-                (set! self.color-probe probe)))))
-        (when alpha?
-          (let ((listener (open-stream-listener "videoalpha"))
-                (pipeline (gst-pipeline "appsrc min-latency=30000000 name=src"
-                                        "avdec_h264 max-threads=1 name=dec"
-                                        "appsink name=sink")))
-            (gst_object_set_name pipeline (string-append "videoalpha." name))
-            (with-unref ((appsrc (gst_bin_get_by_name pipeline "src"))
-                         (appsink (gst_bin_get_by_name pipeline "sink")))
+    (let ((width (get-width resolution))
+          (height (get-height resolution)))
+      (let ((listener (open-stream-listener "videocolor"))
+            (pipeline (gst-pipeline (format "appsrc{? caps=\"{a}\"~} min-latency=30000000 name=src" caps)
+                                    (if sync-audio?
+                                        "queue min-threshold-time=200000000 name=queue"
+                                      "queue name=queue")
+                                    (and (eq? codec 'h264) (tie "avdec_h264 max-threads=1 name=dec"))
+                                    (and (eq? codec 'mpeg) (tie "avdec_mpeg4 max-threads=1 name=dec"))
+                                    "videoscale name=scale"
+                                    "videoconvert name=convert"
+                                    (tie "video/x-raw, format=BGRA, width={width}, height={height}, pixel-aspect-ratio=(fraction)1/1")
+                                    (if visualizer?
+                                        (tie "appsink sync=false name=sink")
+                                      (tie "appsink name=sink")))))
+        (gst_object_set_name pipeline (string-append "video." name))
+        (with-unref ((appsrc (gst_bin_get_by_name pipeline "src"))
+                     (appsink (gst_bin_get_by_name pipeline "sink")))
+          (with-unref ((pad (gst_element_get_static_pad appsink "sink")))
+            (let ((probe (gst_pad_add_video_probe pad (get-write-file listener))))
               (gst_app_sink_connect_signals appsink listener)
-              (gst-app-src-set-caps appsrc "video/x-h264"
-                "width"         'int      width
-                "height"        'int      height
-                "framerate"     'fraction (cons framerate 1)
-                "stream-format" 'string   "byte-stream"
-                "alignment"     'string   "au")
+              (when (not caps)
+                (case codec
+                  ((h264)
+                   (gst-app-src-set-caps appsrc "video/x-h264"
+                     "width"         'int      width
+                     "height"        'int      height
+                     "framerate"     'fraction (cons framerate 1)
+                     "stream-format" 'string   "byte-stream"
+                     "alignment"     'string   "au"))
+                  (else
+                   (gst-app-src-set-caps appsrc "video/x-raw"
+                     "format"    'string   "I420"
+                     "width"     'int      width
+                     "height"    'int      height
+                     "framerate" 'fraction (cons framerate 1)))))
               (g-object-set appsrc
                             "is-live"     'boolean #t
                             "stream-type" 'int     GST_APP_STREAM_TYPE_STREAM
                             "format"      'int     GST_FORMAT_TIME)
               (gst_element_set_state pipeline GST_STATE_READY)
-              (set! self.alpha-pipeline pipeline)
-              (set! self.alpha-appsrc appsrc)
-              (set! self.alpha-appsink appsink)
-              (set! self.alpha-listener listener)
-              (set! self.image-surface (new Image-Surface (new Dimension width height)))))))))
+              (set! self.color-pipeline pipeline)
+              (set! self.color-appsrc appsrc)
+              (set! self.color-appsink appsink)
+              (set! self.color-listener listener)
+              (set! self.color-probe probe)
+              (set! self.color-flow (new GStreamer-Flow pipeline appsrc appsink))))))
+      (when alpha?
+        (let ((listener (open-stream-listener "videoalpha"))
+              (pipeline (gst-pipeline "appsrc min-latency=30000000 name=src"
+                                      "avdec_h264 max-threads=1 name=dec"
+                                      "appsink name=sink")))
+          (gst_object_set_name pipeline (string-append "videoalpha." name))
+          (with-unref ((appsrc (gst_bin_get_by_name pipeline "src"))
+                       (appsink (gst_bin_get_by_name pipeline "sink")))
+            (gst_app_sink_connect_signals appsink listener)
+            (gst-app-src-set-caps appsrc "video/x-h264"
+              "width"         'int      width
+              "height"        'int      height
+              "framerate"     'fraction (cons framerate 1)
+              "stream-format" 'string   "byte-stream"
+              "alignment"     'string   "au")
+            (g-object-set appsrc
+                          "is-live"     'boolean #t
+                          "stream-type" 'int     GST_APP_STREAM_TYPE_STREAM
+                          "format"      'int     GST_FORMAT_TIME)
+            (gst_element_set_state pipeline GST_STATE_READY)
+            (set! self.alpha-pipeline pipeline)
+            (set! self.alpha-appsrc appsrc)
+            (set! self.alpha-appsink appsink)
+            (set! self.alpha-listener listener)
+            (set! self.image-surface (new Image-Surface (new Dimension width height))))))))
+  
+  
+  (method protected virtual abstract (setup-hardware self)
+    (error "Call to abstract setup-hardware"))
   
   
   (method override (setup-element self)
     (nextmethod self)
-    (setup-pipeline self))
+    (when process?
+      (if hardware?
+          (setup-hardware self)
+        (setup-pipeline self))))
   
   
   (method (task-start self name)
@@ -2708,57 +2723,66 @@
   (method override (start-element self)
     (nextmethod self)
     (when process?
-      (task-start self 'video-output)
-      (gst_element_set_state color-pipeline GST_STATE_PAUSED)
-      (when alpha?
-        (gst_element_set_state alpha-pipeline GST_STATE_PAUSED))))
+      (if hardware?
+          (start hardware-pipeline)
+        (task-start self 'video-output)
+        (gst_element_set_state color-pipeline GST_STATE_PAUSED)
+        (when alpha?
+          (gst_element_set_state alpha-pipeline GST_STATE_PAUSED)))))
   
   
   (method override (play-element self)
     (nextmethod self)
     (when process?
-      (gst_element_set_state color-pipeline GST_STATE_PLAYING)
-      (when alpha?
-        (gst_element_set_state alpha-pipeline GST_STATE_PLAYING))))
+      (when (not hardware?)
+        (gst_element_set_state color-pipeline GST_STATE_PLAYING)
+        (when alpha?
+          (gst_element_set_state alpha-pipeline GST_STATE_PLAYING)))))
   
   
   (method override (pause-element self)
     (nextmethod self)
     (when process?
-      (gst_element_set_state color-pipeline GST_STATE_PAUSED)
-      (when alpha?
-        (gst_element_set_state alpha-pipeline GST_STATE_PAUSED))))
+      (when (not hardware?)
+        (gst_element_set_state color-pipeline GST_STATE_PAUSED)
+        (when alpha?
+          (gst_element_set_state alpha-pipeline GST_STATE_PAUSED)))))
   
   
   (method override (stop-element self)
     (nextmethod self)
     (when process?
-      (gst_element_set_state color-pipeline GST_STATE_READY)
-      (when alpha?
-        (gst_element_set_state alpha-pipeline GST_STATE_READY))
-      (task-stop self)))
+      (if hardware?
+          (stop hardware-pipeline)
+        (gst_element_set_state color-pipeline GST_STATE_READY)
+        (when alpha?
+          (gst_element_set_state alpha-pipeline GST_STATE_READY))
+        (task-stop self))))
   
   
   (method override (release-element self)
     (nextmethod self)
     (when process?
-      (gst_pad_probe_free color-probe)
-      (set! color-probe #f)
-      (gst_bin_release color-pipeline)
-      (set! color-pipeline #f)
-      (set! color-appsrc #f)
-      (set! color-appsink #f)
-      (close-stream-listener color-listener)
-      (set! color-listener #f)
-      (when alpha?
-        (gst_bin_release alpha-pipeline)
-        (close image-surface)
-        (set! alpha-pipeline #f)
-        (set! alpha-appsrc #f)
-        (set! alpha-appsink #f)
-        (set! image-surface #f)
-        (close-stream-listener alpha-listener)
-        (set! alpha-listener #f))
+      (if hardware?
+          (release hardware-pipeline)
+        (gst_pad_probe_free color-probe)
+        (set! color-probe #f)
+        (gst_bin_release color-pipeline)
+        (set! color-pipeline #f)
+        (set! color-appsrc #f)
+        (set! color-appsink #f)
+        (close-stream-listener color-listener)
+        (set! color-listener #f)
+        (when alpha?
+          (gst_bin_release alpha-pipeline)
+          (close image-surface)
+          (set! alpha-pipeline #f)
+          (set! alpha-appsrc #f)
+          (set! alpha-appsink #f)
+          (set! image-surface #f)
+          (close-stream-listener alpha-listener)
+          (set! alpha-listener #f)))
+      (set! color-flow #f)
       (set-stream-state self 'off)))
   
   
@@ -2769,48 +2793,50 @@
   
   
   (method protected virtual (write-video self color dts pts duration timestamp-offset (alpha #f))
-    ;; QUICK TEST
-    (when color-appsrc
+    (if hardware?
+        (decode hardware-pipeline color dts pts duration)
       ;; QUICK TEST
-      (when color
-        (play-video self)
-        (let ((timestamp-offset (or timestamp-offset (adapt-time source-adapter color-appsrc dts))))
-          (let ((dts (max 0 (+ dts timestamp-offset)))
-                (pts (max 0 (+ pts timestamp-offset))))
-            (when record-events?
-              (let ((running-time (gst_element_get_running_time color-appsrc)))
-                (let ((distance (- running-time dts)))
-                  (cond ((< distance udp-video-early)
-                         (record-event udp-id-media-early
-                                       -1.
-                                       -1.
-                                       (fixnum->flonum udp-video)
-                                       -1.
-                                       -1.
-                                       -1.
-                                       -1.))
-                        ((> distance udp-video-late)
-                         (record-event udp-id-media-late
-                                       -1.
-                                       -1.
-                                       (fixnum->flonum udp-video)
-                                       -1.
-                                       -1.
-                                       -1.
-                                       -1.))))))
-            (gst_app_src_write color-appsrc color (u8vector-length color) dts pts duration)
-            (increase! src-count)
-            (let ((usage (- src-count sink-count)))
-              (when (> usage max-usage)
-                (set! max-usage usage)))
-            (when alpha?
-              ;; QUICK TEST
-              (when alpha-appsrc
+      (when color-appsrc
+        ;; QUICK TEST
+        (when color
+          (play-video self)
+          (let ((timestamp-offset (or timestamp-offset (adapt-time source-adapter color-appsrc dts))))
+            (let ((dts (max 0 (+ dts timestamp-offset)))
+                  (pts (max 0 (+ pts timestamp-offset))))
+              (when record-events?
+                (let ((running-time (gst_element_get_running_time color-appsrc)))
+                  (let ((distance (- running-time dts)))
+                    (cond ((< distance udp-video-early)
+                           (record-event udp-id-media-early
+                                         -1.
+                                         -1.
+                                         (fixnum->flonum udp-video)
+                                         -1.
+                                         -1.
+                                         -1.
+                                         -1.))
+                          ((> distance udp-video-late)
+                           (record-event udp-id-media-late
+                                         -1.
+                                         -1.
+                                         (fixnum->flonum udp-video)
+                                         -1.
+                                         -1.
+                                         -1.
+                                         -1.))))))
+              (gst_app_src_write color-appsrc color (u8vector-length color) dts pts duration)
+              (increase! src-count)
+              (let ((usage (- src-count sink-count)))
+                (when (> usage max-usage)
+                  (set! max-usage usage)))
+              (when alpha?
                 ;; QUICK TEST
-                (when alpha
-                  (gst_app_src_write alpha-appsrc alpha (u8vector-length alpha) dts pts duration))))))
-        (when seek-callback
-          (seek-callback dts)))))
+                (when alpha-appsrc
+                  ;; QUICK TEST
+                  (when alpha
+                    (gst_app_src_write alpha-appsrc alpha (u8vector-length alpha) dts pts duration))))))
+          (when seek-callback
+            (seek-callback dts))))))
       
   
   (method (run-video self task)
@@ -3220,7 +3246,8 @@
                         expanse: expanse
                         resolution: resolution
                         texture: texture
-                        flipped?: flipped?)))
+                        flipped?: flipped?
+                        hardware?: hardware?)))
             (set! self.media-pane pane)
             (set! self.media-sheet (get-sheet pane))
             (set! self.media-texture texture)))
@@ -3256,6 +3283,14 @@
     (close interface-pane)
     (close media-pane)
     (nextmethod self))
+  
+  
+  (method override (setup-hardware self)
+    (cond-expand
+      (mac
+       (set! hardware-pipeline (new Hardware-Pipeline resolution codec-data self bind-delay: (if sync-audio? .2 0)))
+       (set! color-flow (new Time-Flow (let ((start (current-monotonic-nanoseconds))) (lambda () (- (current-monotonic-nanoseconds) start))))))
+      (else)))
   
   
   (method package (update-panes self)
