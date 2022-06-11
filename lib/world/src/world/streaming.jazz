@@ -142,7 +142,7 @@
             (when pipeline
               (let ((src (get-src pipeline)))
                 (goto-stream src #f #f))))))
-    (let ((highest-video (locate-highest-video-channel stream))
+    (let ((highest-video (find-highest-video-channel stream))
           (reader (locate-seek-reader stream)))
       ;; video seeks to keyframe so use its
       ;; frame's dts to seek in all channels
@@ -207,7 +207,7 @@
 
 
 (definition (locate-seek-reader stream)
-  (let ((highest-video (locate-highest-video-channel stream)))
+  (let ((highest-video (find-highest-video-channel stream)))
     (if highest-video
         (let ((src (get-src (get-pipeline highest-video))))
           (get-reader src))
@@ -216,7 +216,7 @@
           (get-reader src))))))
 
 
-(definition (locate-highest-video-channel stream)
+(definition (find-highest-video-channel stream)
   (let ((highest-channel #f))
     (iterate-table (get-channels stream)
       (lambda (no channel)
@@ -247,7 +247,10 @@
               (mutex-lock! mutex)
               (receive-audio (current-audio) output buffer dts pts duration #f)
               (mutex-unlock! mutex)))))
-      (send-client-media client channel-no buffer dts pts duration flags))))
+      (send-client-media client channel-no buffer dts pts duration flags)
+      (let ((recorder (get-recorder channel)))
+        (when recorder
+          (world.recording:record-media recorder buffer dts pts duration flags))))))
 
 
 (definition public (make-stream-audio-channel location)
@@ -322,7 +325,14 @@
         (let ((output (get-output channel)))
           (when output
             (receive-video (current-video) output buffer dts pts duration flags #f))))
-      (send-client-media client channel-no buffer dts pts duration flags))))
+      (send-client-media client channel-no buffer dts pts duration flags)
+      (let ((udp-client (get-udp-client client)))
+        (when udp-client
+          (let ((channel (find-send-channel udp-client channel-no)))
+            (when channel
+              (let ((recorder (get-recorder channel)))
+                (when recorder
+                  (world.recording:record-media recorder buffer dts pts duration flags))))))))))
 
 
 (definition public (make-draw-channel draw-proc action-proc)
@@ -733,12 +743,19 @@
 
 
 (definition public (mux-streams audio video output)
+  (declare (proper-tail-calls))
   (let ((audio-reader (new Stream-Reader audio))
         (video-reader (new Stream-Reader video)))
     (let ((audio-caps (get-caps audio-reader))
           (video-caps (get-caps video-reader))
           (location (path-normalize (parse output))))
+      (assert audio-caps)
+      (assert video-caps)
       (let ((pipeline (gst-pipeline (format "appsrc caps=\"{a}\" name=audio" audio-caps)
+                                    ;"audioconvert"
+                                    ;"audioresample"
+                                    ;(tie "audio/x-raw, format=S16LE, layout=interleaved, rate=48000, channels=2")
+                                    ;"opusenc name=enc"
                                     "qtmux name=mux"
                                     (tie "filesink location={location} name=sink")
                                     (list
@@ -748,7 +765,6 @@
         (with-unref ((audiosrc (gst_bin_get_by_name pipeline "audio"))
                      (videosrc (gst_bin_get_by_name pipeline "video")))
           (define (process-audio)
-            (declare (proper-tail-calls))
             (let (loop)
               (let ((frame (read-frame audio-reader)))
                 (when frame
@@ -757,7 +773,6 @@
                     (loop))))))
           
           (define (process-video)
-            (declare (proper-tail-calls))
             (let (loop)
               (let ((frame (read-frame video-reader)))
                 (when frame
@@ -780,27 +795,29 @@
             (thread-join! video-thread)
             (close audio-reader)
             (close video-reader)
-            ;; quick hack as somehow waiting for eos doesn't ensure
-            ;; all data has been processed and saved to the filesink
-            (sleep 1)
             (set-pipeline-flushing? pipeline #f)
             (gst_element_send_event pipeline (gst_event_new_eos))
             ;; wait for eos message
             (with-unref ((bus (gst_pipeline_get_bus pipeline)))
-              (let (loop)
-                (let ((msg (gst_bus_pop bus)))
-                  (if (not msg)
-                      (begin
-                        (sleep .001)
-                        (loop))
-                    (let ((type (GST_MESSAGE_TYPE msg)))
-                      (if (/= type GST_MESSAGE_EOS)
-                          (begin
-                            (gst_message_unref msg)
-                            (sleep .001)
-                            (loop))
-                        (gst_message_unref msg)))))))
+              (let (loop (n 0))
+                (if (> n 1000)
+                    (error "Did not receive eos message")
+                  (let ((msg (gst_bus_pop bus)))
+                    (if (not msg)
+                        (begin
+                          (sleep .001)
+                          (loop (+ n 1)))
+                      (let ((type (GST_MESSAGE_TYPE msg)))
+                        (if (/= type GST_MESSAGE_EOS)
+                            (begin
+                              (gst_message_unref msg)
+                              (sleep .001)
+                              (loop (+ n 1)))
+                          (gst_message_unref msg))))))))
             (set-pipeline-flushing? pipeline #t)
+            ;; quick hack as somehow waiting for eos doesn't ensure
+            ;; all data has been processed and saved to the filesink
+            (sleep 1)
             (gst_bin_release pipeline)))))))
 
 
