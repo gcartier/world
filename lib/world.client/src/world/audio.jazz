@@ -15,6 +15,7 @@
 
 
 (import (jazz.event)
+        (jazz.flow)
         (jazz.io)
         (jazz.listener)
         (jazz.platform)
@@ -373,24 +374,17 @@
       (close-audio)))
   
   
-  (method package (receive-server-audio self id buffer dts pts duration timestamp-offset)
-    (let ((output (find-output self id)))
-      (when (and output (not (get-stream-disconnected? output)))
-        (when (eq? (get-stream-state output) 'off)
-          (set-stream-state output 'on))
-        (write-audio output buffer dts pts duration timestamp-offset))))
+  (method package (receive-audio self output buffer dts pts duration timestamp-offset)
+    (unless (get-stream-disconnected? output)
+      (when (eq? (get-stream-state output) 'off)
+        (set-stream-state output 'on))
+      (write-audio output buffer dts pts duration timestamp-offset)))
   
   
   (method package (receive-visualizer-audio self output buffer dts pts duration)
     (when (eq? (get-stream-state output) 'off)
       (set-stream-state output 'on))
-    (write-audio output buffer dts pts duration #f))
-  
-  
-  (method package (receive-audio self id/output buffer dts pts duration timestamp-offset)
-    (if (is? id/output Audio-Sink)
-        (receive-visualizer-audio self id/output buffer dts pts duration)
-      (receive-server-audio self id/output buffer dts pts duration timestamp-offset))))
+    (write-audio output buffer dts pts duration #f)))
 
 
 ;;;
@@ -400,7 +394,7 @@
 
 (definition protected speakersink
   (cond-expand
-    (windows "wasapisink")
+    (windows "wasapisink" @wasapi2-not-working-on-some-machines (if (>=windows10?) "wasapi2sink" "wasapisink"))
     (mac "osxaudiosink")
     (else "pulsesink")))
 
@@ -720,11 +714,22 @@
 ;;;
 
 
-(definition protected microphonesrc
+(definition protected microphone-directsound?
+  (world-setting 'world.microphone-directsound? #f))
+
+(definition protected (set-microphone-directsound? directsound?)
+  (set! microphone-directsound? directsound?)
+  (set! microphonesrc (determine-microphonesrc)))
+
+
+(definition protected (determine-microphonesrc)
   (cond-expand
-    (windows "wasapisrc")
+    (windows (if microphone-directsound? "directsoundsrc" "wasapisrc") @wasapi2-not-working-on-some-machines (if (>=windows10?) "wasapi2src" "wasapisrc"))
     (mac "osxaudiosrc")
     (else "pulsesrc")))
+
+(definition protected microphonesrc
+  (determine-microphonesrc))
 
 
 (definition protected microphone-pipeline
@@ -1333,6 +1338,7 @@
   (slot sound?                 initialize #f accessors explicit)
   (slot pipeline               initialize #f accessors generate)
   (slot bin                    initialize #f accessors generate)
+  (slot flow                   initialize #f accessors generate)
   (slot appsrc                 initialize #f accessors generate)
   (slot volelem                initialize #f accessors generate)
   (slot panelem                initialize #f accessors generate)
@@ -1395,8 +1401,9 @@
   (method package (setup-bin self)
     ;; min-latency should be at least .01s greater than adapter-tolerance
     ;; else a rising rebase will generate audible gritches in the audio mixer
+    (assert caps)
     (let ((bin ((if mix? gst-bin gst-pipeline)
-                (format "appsrc{? caps=\"{a}\"~}{?: min-latency=40000000~} name=src" caps (not sound?))
+                (format "appsrc caps=\"{a}\"{?: min-latency=40000000~} name=src" caps (not sound?))
                 (and (not sound?) "queue name=queue")
                 (and (eq? codec 'mp3) "avdec_mp3 name=dec")
                 (and (eq? codec 'aac) "avdec_aac name=dec")
@@ -1425,19 +1432,13 @@
                             (cond-expand
                               (windows #f)
                               (else (gst_bin_get_by_name bin "panorama")))))
-        (when (not caps)
-          (case codec
-            ((opus)
-             (gst-app-src-set-caps appsrc "audio/x-opus"
-               "channel-mapping-family" 'int 0))
-            ((vorbis)
-             (gst-app-src-set-caps appsrc "audio/x-vorbis"))))
         (g-object-set appsrc
           "is-live"     'boolean #t
           "stream-type" 'int     GST_APP_STREAM_TYPE_STREAM
           "format"      'int     GST_FORMAT_TIME)
         (gst_element_set_state bin GST_STATE_READY)
         (set! self.bin bin)
+        (set! self.flow (new GStreamer-Flow #f appsrc #f))
         (set! self.appsrc appsrc)
         (set! self.volelem volelem)
         (set! self.panelem panelem))))
@@ -1481,6 +1482,7 @@
     (gst_bin_release bin)
     (set! bin #f)
     (set! appsrc #f)
+    (set! flow #f)
     (set-stream-state self 'off))
   
   

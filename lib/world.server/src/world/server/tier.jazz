@@ -1253,16 +1253,19 @@
                     recipients)))))
   
   
-  (method package (client-channel-init self client channel-no caps resolution)
+  (method package (client-media-init self client channels-init)
     (let ((delegate (find-delegate self client)))
       ;; together robust
       (if (not delegate)
           (format "Delegate not found")
-        (let ((channel (find-server-channel udp-server channel-no)))
-          ;; together robust
-          (when channel
-            (set-caps channel caps)
-            (set-resolution channel resolution)))
+        (for-each (lambda (channel-init)
+                    (bind (channel-no caps resolution) channel-init
+                      (let ((channel (find-server-channel udp-server channel-no)))
+                        ;; together robust
+                        (when channel
+                          (set-caps channel caps)
+                          (set-resolution channel resolution)))))
+                  channels-init)
         (let ((group (get-group delegate)))
           (when group
             (for-each (lambda (member)
@@ -1271,12 +1274,12 @@
                             (let ((client (get-client member)))
                               (calling-client self member
                                 (lambda ()
-                                  (stream-channel-init client channel-no caps resolution)))))))
+                                  (stream-media-init client channels-init)))))))
                       (get-members group))))
         #f)))
   
   
-  (method package (client-channel-on self client stream-no media-kind)
+  (method package (client-media-on self client stream-no media-kind)
     (let ((delegate (find-delegate self client)))
       ;; together robust
       (if (not delegate)
@@ -1296,12 +1299,12 @@
                             (let ((client (get-client member)))
                               (calling-client self member
                                 (lambda ()
-                                  (stream-channel-on client stream-no media-kind)))))))
+                                  (stream-media-on client stream-no media-kind)))))))
                       (get-members group))))
         #f)))
   
   
-  (method package (client-channel-off self client stream-no media-kind)
+  (method package (client-media-off self client stream-no media-kind)
     (let ((delegate (find-delegate self client)))
       ;; together robust
       (if (not delegate)
@@ -1321,7 +1324,7 @@
                             (let ((client (get-client member)))
                               (calling-client self member
                                 (lambda ()
-                                  (stream-channel-off client stream-no media-kind)))))))
+                                  (stream-media-off client stream-no media-kind)))))))
                       (get-members group))))
         #f)))
   
@@ -2130,7 +2133,9 @@
                     (set! broadcast-hierarchy? #t))))
               (when broadcast-hierarchy?
                 (broadcast-hierarchy self)))
-            #f))))
+            #f)
+           ((convert)
+            (stream-convert self)))))
       ((stop)
        (logger "Stop server")
        (stop-server self)
@@ -3141,27 +3146,30 @@
   
   
   (method (make-server-image-channel self location)
-    (let ((media-kind udp-video)
-          (source-kind 'image)
-          (level #f)
-          (resolution draw-resolution)
-          (framerate #f)
-          (bitrate draw-bitrate)
-          (codec #f)
-          (caps #f)
-          (metadata '())
-          (send-state 'on))
-      (new Channel-Creator
-        (list media-kind source-kind level resolution framerate bitrate codec caps metadata send-state)
-        (lambda (stream-no channel-no)
-          (let ((channel (register-send-channel udp-server stream-no channel-no media-kind source-kind level resolution framerate bitrate codec caps metadata send-state)))
-            (let ((src (new File-Stream-Image-Src
-                         location))
-                  (sink (new Stream-Frame-Consumer
-                          consumer: (lambda (buffer dts pts duration flags)
-                                      (send-server-media self channel-no buffer dts pts duration flags)))))
-              (let ((pipeline (pipeline (list src sink))))
-                (set-pipeline channel pipeline))))))))
+    (let ((file (new-file {Directory Documents} (add-extension location "streamimage"))))
+      (let ((reader (new Stream-Reader file)))
+        (let ((media-kind udp-video)
+              (source-kind 'image)
+              (level #f)
+              (resolution (get-resolution reader))
+              (framerate (get-framerate reader))
+              (bitrate (get-bitrate reader))
+              (codec (get-codec reader))
+              (caps (get-caps reader))
+              (metadata '())
+              (send-state 'on))
+          (close reader)
+          (new Channel-Creator
+            (list media-kind source-kind level resolution framerate bitrate codec caps metadata send-state)
+            (lambda (stream-no channel-no)
+              (let ((channel (register-send-channel udp-server stream-no channel-no media-kind source-kind level resolution framerate bitrate codec caps metadata send-state)))
+                (let ((src (new File-Stream-Image-Src
+                             location))
+                      (sink (new Stream-Frame-Consumer
+                              consumer: (lambda (buffer dts pts duration flags)
+                                          (send-server-media self channel-no buffer dts pts duration flags)))))
+                  (let ((pipeline (pipeline (list src sink))))
+                    (set-pipeline channel pipeline))))))))))
   
   
   (method package (send-server-media self channel-no buffer dts pts duration flags)
@@ -3175,6 +3183,48 @@
         (close-send-stream udp-server stream)
         (set-streams group (remove! server-stream (get-streams group)))
         (maybe-delete-group self #f group))))
+  
+  
+  (method (stream-convert self)
+    (continuation-capture
+      (lambda (exit)
+        (let ((video-extensions (streaming-video-extensions))
+              (image-extension streaming-image-extension)
+              (converted 0))
+          (iterate-streams
+            (lambda (file)
+              (let ((extension (get-extension file)))
+                (cond ((member? extension video-extensions test: extension=?)
+                       (with ((patcher (new Stream-Patcher file)))
+                         (when (not (get-caps patcher))
+                           (if (neq? (get-codec patcher) 'h264)
+                               (continuation-return exit (format "Unable to patch non-h264 {a}" (get-name file)))
+                             (let ((resolution (get-resolution patcher))
+                                   (framerate (get-framerate patcher)))
+                               (let ((width (get-width resolution))
+                                     (height (get-height resolution)))
+                                 (let ((caps (tie "video/x-h264, stream-format=byte-stream, alignment=au, width={width}, height={height}, framerate={framerate}")))
+                                   (patch-caps patcher caps)
+                                   (patch-write patcher)
+                                   (increase! converted))))))))
+                      ((extension=? extension image-extension)
+                       (with ((patcher (new Stream-Patcher file)))
+                         (when (not (get-caps patcher))
+                           (let ((resolution draw-resolution)
+                                 (framerate draw-framerate)
+                                 (bitrate draw-bitrate)
+                                 (codec draw-codec))
+                             (let ((width (get-width resolution))
+                                   (height (get-height resolution)))
+                               (let ((caps (tie "video/x-h264, stream-format=byte-stream, alignment=au, width={width}, height={height}, framerate={framerate}")))
+                                 (patch-resolution patcher resolution)
+                                 (patch-framerate patcher framerate)
+                                 (patch-bitrate patcher bitrate)
+                                 (patch-codec patcher codec)
+                                 (patch-caps patcher caps)
+                                 (patch-write patcher)
+                                 (increase! converted)))))))))))
+          converted))))
   
   
   ;;;

@@ -1,0 +1,200 @@
+;;;===============
+;;;  WorldScheme
+;;;===============
+;;;
+;;;; Hardware Decoding
+;;;
+;;;  The Initial Developer of the Original Code is Guillaume Cartier.
+;;;  Portions created by the Initial Developer are Copyright (C) 2012-2018
+;;;  the Initial Developer. All Rights Reserved.
+;;;
+;;;  Contributor(s):
+
+
+(module world.hardware jazz
+
+
+(cond-expand
+  (mac
+
+
+(import (jazz.io)
+        (jazz.listener)
+        (jazz.opengl.glew)
+        (jazz.opengl.window)
+        (jazz.platform)
+        (jazz.stream)
+        (jazz.stream.platform)
+        (jazz.syntax (phase syntax))
+        (jazz.window)
+        (world)
+        (world.configure)
+        (world.context)
+        (world.moment)
+        (world.render)
+        (world.ring)
+        (world.time)
+        (world.window))
+
+
+;;;
+;;;; Pipeline
+;;;
+
+
+(class Hardware-Pipeline extends Object
+  
+  
+  (slot decoder             initialize #f getter generate)
+  (slot first-dts           initialize #f getter generate)
+  (slot first-retrieve      initialize #f getter generate)
+  (slot listener            initialize #f getter generate)
+  (slot listen-thread       initialize #f getter generate)
+  (slot context             initialize #f getter generate)
+  (slot texture             initialize #f getter generate)
+  (slot bind-thread         initialize #f getter generate)
+  (slot bind-ring           initialize #f getter generate)
+  (slot bind-delay     <fl> initialize 0. getter generate)
+  (slot bound-callback      initialize #f getter generate)
+  (slot bound-frame         initialize #f getter generate)
+  (slot error-count         initialize 0  getter generate)
+  (slot stop?               initialize #f getter generate)
+  
+  
+  (method override (initialize self resolution codec-data texture (bind-delay: bind-delay #f) (bound-callback: bound-callback #f))
+    (let ((decoder (createHardwareDecoder (get-width resolution) (get-height resolution) codec-data (u8vector-length codec-data))))
+      (if (fixnum? decoder)
+          (let ((err (case decoder
+                       ((1) "Unable to create format description")
+                       ((2) "Unable to create decompression session")
+                       (else "Unknown error"))))
+            (begin
+              (warning-moment err category: 'hardware function: 'create-decoder)
+              (set! self.decoder #f)))
+        (set! self.decoder decoder)
+        (set! self.listener (open-stream-listener "decode"))
+        (set! self.context (platformGetContext (get-handle (current-window))))
+        (set! self.texture texture)
+        (set! self.bind-ring (new Time-Ring 8 max-size: 32))
+        (set! self.bind-delay (or bind-delay 0.))
+        (set! self.bound-callback bound-callback)
+        (setHardwareDecoderListener decoder (get-write-file listener)))))
+  
+  
+  (method public (start self)
+    (when decoder
+      (set! listen-thread (new-thread (lambda () (run-listen self)) 'hardware-listen))
+      (set! bind-thread (new-thread (lambda () (run-bind self)) 'hardware-bind))
+      (thread-base-priority-set! listen-thread video-priority)
+      (thread-base-priority-set! bind-thread video-priority)
+      (thread-start! listen-thread)
+      (thread-start! bind-thread)))
+  
+  
+  (method public (stop self)
+    (when decoder
+      (set! stop? #t)
+      (stopHardwareDecoder decoder)
+      (terminate bind-ring)
+      (let ((thread (current-thread)))
+        (unless (eq? thread listen-thread)
+          (thread-join! listen-thread))
+        (unless (eq? thread bind-thread)
+          (thread-join! bind-thread)))))
+  
+  
+  (method public (release self)
+    (when decoder
+      (destroyHardwareDecoder decoder)))
+  
+  
+  (method (handle-error self function err)
+    (warning-moment err category: 'hardware function: function)
+    (increase! error-count)
+    (when (>= error-count 10)
+      (stop self)))
+  
+  
+  (method (run-listen self)
+    (declare (proper-tail-calls))
+    (let (loop)
+      (process-listen self loop)))
+  
+  
+  (method (process-listen self loop)
+    (declare (proper-tail-calls))
+    (let ((c (wait listener)))
+      (case c
+        ((#\.)
+         (unless stop?
+           (when (not first-retrieve)
+             (set! first-retrieve (current-seconds)))
+           (let ((frame (hardwareRetrieveFrame decoder)))
+             (insert bind-ring (+ first-retrieve bind-delay (timestamp->flonum (hardwareFramePTS frame))) frame))
+           (loop)))
+        ((#\#)
+         (let ((status (wait-status listener)))
+           (case status
+             ((#\1)
+              (handle-error self 'callback "Decoder returned no data"))
+             ((#\2)
+              (handle-error self 'callback "Frame was dropped"))
+             ((#\3)
+              (handle-error self 'callback "Unexpected image type"))
+             (else
+              (handle-error self 'callback (format "Decoder status {a}" status))))
+           (loop)))
+        ((#\$)
+         (let ((err (wait-error listener)))
+           (handle-error self 'callback (format "Decoder error {a}" err))
+           (loop)))
+        ((#\@)))))
+  
+  
+  (method (run-bind self)
+    (declare (proper-tail-calls))
+    (let (loop)
+      (process-bind self loop)))
+  
+  
+  (method (process-bind self loop)
+    (declare (proper-tail-calls))
+    (let ((frame (wait bind-ring)))
+      (unless (or (eq? frame 'terminate) stop?)
+        (let ((window (current-window))
+              (interface (current-interface))
+              (world (current-world)))
+          (with-render-mutex
+            (lambda ()
+              (with-context-current window
+                (lambda ()
+                  (glActiveTexture GL_TEXTURE0)
+                  (glBindTexture GL_TEXTURE_RECTANGLE_ARB texture)
+                  (let ((success? (hardwareBindFrame decoder frame context)))
+                    (glBindTexture GL_TEXTURE_RECTANGLE_ARB 0)
+                    (when (not success?)
+                      (handle-error self 'bind "Unable to bind frame")))
+                  (when bound-callback
+                    (bound-callback)))))))
+        (when bound-frame
+          (hardwareReleaseFrame bound-frame))
+        (set! bound-frame frame)
+        (loop))))
+  
+  
+  (method public (decode self buffer dts pts duration)
+    (when decoder
+      (unless stop?
+        (when (not first-dts)
+          (set! first-dts dts))
+        (let ((dts (max 0 (- dts first-dts)))
+              (pts (max 0 (- pts first-dts))))
+          (let ((size (u8vector-length buffer)))
+            (let ((code (hardwareDecodeFrame decoder buffer size dts pts duration)))
+              (when (/= code 0)
+                (let ((err (case code
+                             ((1) "Unable to create block buffer")
+                             ((2) "Unable to create sample buffer")
+                             (else "Decode error"))))
+                  (handle-error self 'decode err)))))))))))
+  (else)))

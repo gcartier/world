@@ -142,7 +142,7 @@
             (when pipeline
               (let ((src (get-src pipeline)))
                 (goto-stream src #f #f))))))
-    (let ((highest-video (locate-highest-video-channel stream))
+    (let ((highest-video (find-highest-video-channel stream))
           (reader (locate-seek-reader stream)))
       ;; video seeks to keyframe so use its
       ;; frame's dts to seek in all channels
@@ -207,7 +207,7 @@
 
 
 (definition (locate-seek-reader stream)
-  (let ((highest-video (locate-highest-video-channel stream)))
+  (let ((highest-video (find-highest-video-channel stream)))
     (if highest-video
         (let ((src (get-src (get-pipeline highest-video))))
           (get-reader src))
@@ -216,7 +216,7 @@
           (get-reader src))))))
 
 
-(definition (locate-highest-video-channel stream)
+(definition (find-highest-video-channel stream)
   (let ((highest-channel #f))
     (iterate-table (get-channels stream)
       (lambda (no channel)
@@ -241,11 +241,16 @@
   (let ((channel-no (get-no channel)))
     (lambda (buffer dts pts duration flags)
       (when mirror?
-        (let ((mutex (get-audio-mirror-mutex channel)))
-          (mutex-lock! mutex)
-          (receive-audio (current-audio) channel-no buffer dts pts duration #f)
-          (mutex-unlock! mutex)))
-      (send-client-media client channel-no buffer dts pts duration flags))))
+        (let ((output (get-output channel)))
+          (when output
+            (let ((mutex (get-audio-mirror-mutex channel)))
+              (mutex-lock! mutex)
+              (receive-audio (current-audio) output buffer dts pts duration #f)
+              (mutex-unlock! mutex)))))
+      (send-client-media client channel-no buffer dts pts duration flags)
+      (let ((recorder (get-recorder channel)))
+        (when recorder
+          (world.recording:record-media recorder buffer dts pts duration flags))))))
 
 
 (definition public (make-stream-audio-channel location)
@@ -267,13 +272,14 @@
           (lambda (stream-no channel-no)
             (let ((client (current-client)))
               (let ((channel (register-send-channel (get-udp-client client) stream-no channel-no media-kind source-kind level resolution framerate bitrate codec caps metadata send-state)))
-                (channel-output (current-audio) channel)
-                (let ((src (new File-Stream-Audio-Src
-                             location))
-                      (sink (new Stream-Frame-Consumer
-                              consumer: (client-audio-consumer client channel mirror?: #t))))
-                  (let ((pipeline (pipeline (list src sink))))
-                    (set-pipeline channel pipeline)))))))))))
+                (let ((output (channel-output (current-audio) channel)))
+                  (set-output channel output)
+                  (let ((src (new File-Stream-Audio-Src
+                               location))
+                        (sink (new Stream-Frame-Consumer
+                                consumer: (client-audio-consumer client channel mirror?: #t))))
+                    (let ((pipeline (pipeline (list src sink))))
+                      (set-pipeline channel pipeline))))))))))))
 
 
 (definition public (make-microphone-channel)
@@ -312,11 +318,21 @@
                 profiles)))
 
 
-(definition protected (client-video-consumer client channel-no (mirror?: mirror? #f))
-  (lambda (buffer dts pts duration flags)
-    (when mirror?
-      (receive-video (current-video) channel-no buffer dts pts duration flags #f))
-    (send-client-media client channel-no buffer dts pts duration flags)))
+(definition protected (client-video-consumer client channel (mirror?: mirror? #f))
+  (let ((channel-no (get-no channel)))
+    (lambda (buffer dts pts duration flags)
+      (when mirror?
+        (let ((output (get-output channel)))
+          (when output
+            (receive-video (current-video) output buffer dts pts duration flags #f))))
+      (send-client-media client channel-no buffer dts pts duration flags)
+      (let ((udp-client (get-udp-client client)))
+        (when udp-client
+          (let ((channel (find-send-channel udp-client channel-no)))
+            (when channel
+              (let ((recorder (get-recorder channel)))
+                (when recorder
+                  (world.recording:record-media recorder buffer dts pts duration flags))))))))))
 
 
 (definition public (make-draw-channel draw-proc action-proc)
@@ -335,40 +351,45 @@
       (lambda (stream-no channel-no)
         (let ((client (current-client)))
           (let ((channel (register-send-channel (get-udp-client client) stream-no channel-no media-kind source-kind level resolution framerate bitrate codec caps metadata send-state)))
-            (channel-output (current-video) stream-no channel)
-            (let ((src (new Draw-Video-Src
-                         draw-proc: draw-proc))
-                  (sink (new Stream-Frame-Consumer
-                          consumer: (client-video-consumer client channel-no mirror?: #t))))
-              (let ((pipeline (pipeline (list src sink))))
-                (set-pipeline channel pipeline)
-                (set-action-proc channel action-proc)))))))))
+            (let ((output (channel-output (current-video) stream-no channel)))
+              (set-output channel output)
+              (let ((src (new Draw-Video-Src
+                           draw-proc: draw-proc))
+                    (sink (new Stream-Frame-Consumer
+                            consumer: (client-video-consumer client channel mirror?: #t))))
+                (let ((pipeline (pipeline (list src sink))))
+                  (set-pipeline channel pipeline)
+                  (set-action-proc channel action-proc))))))))))
 
 
 (definition public (make-image-channel location (action-proc: action-proc #f))
-  (let ((media-kind udp-video)
-        (source-kind 'image)
-        (level #f)
-        (resolution draw-resolution)
-        (framerate #f)
-        (bitrate draw-bitrate)
-        (codec #f)
-        (caps #f)
-        (metadata '())
-        (send-state 'on))
-    (new Channel-Creator
-      (list media-kind source-kind level resolution framerate bitrate codec caps metadata send-state)
-      (lambda (stream-no channel-no)
-        (let ((client (current-client)))
-          (let ((channel (register-send-channel (get-udp-client client) stream-no channel-no media-kind source-kind level resolution framerate bitrate codec caps metadata send-state)))
-            (channel-output (current-video) stream-no channel)
-            (let ((src (new File-Stream-Image-Src
-                         location))
-                  (sink (new Stream-Frame-Consumer
-                          consumer: (client-video-consumer client channel-no mirror?: #t))))
-              (let ((pipeline (pipeline (list src sink))))
-                (set-pipeline channel pipeline)
-                (set-action-proc channel action-proc)))))))))
+  (let ((file (new-file {Directory Documents} (add-extension location "streamimage"))))
+    (let ((reader (new Stream-Reader file)))
+      (let ((media-kind udp-video)
+            (source-kind 'image)
+            (level #f)
+            (resolution (get-resolution reader))
+            (framerate (get-framerate reader))
+            (bitrate (get-bitrate reader))
+            (codec (get-codec reader))
+            (caps (get-caps reader))
+            (metadata '())
+            (send-state 'on))
+        (close reader)
+        (new Channel-Creator
+          (list media-kind source-kind level resolution framerate bitrate codec caps metadata send-state)
+          (lambda (stream-no channel-no)
+            (let ((client (current-client)))
+              (let ((channel (register-send-channel (get-udp-client client) stream-no channel-no media-kind source-kind level resolution framerate bitrate codec caps metadata send-state)))
+                (let ((output (channel-output (current-video) stream-no channel)))
+                  (set-output channel output)
+                  (let ((src (new File-Stream-Image-Src
+                               location))
+                        (sink (new Stream-Frame-Consumer
+                                consumer: (client-video-consumer client channel mirror?: #t))))
+                    (let ((pipeline (pipeline (list src sink))))
+                      (set-pipeline channel pipeline)
+                      (set-action-proc channel action-proc))))))))))))
 
 
 (definition public (make-stream-video-channels location (action-proc: action-proc #f))
@@ -397,16 +418,16 @@
                              (when (or (eq? profile active-profile) unique-profile?)
                                (let ((video (current-video)))
                                  (let ((output (channel-output video stream-no channel sync-audio?: #t)))
+                                   (set-output channel output)
                                    (when (not (get-focused-output video))
-                                     (change-focused-output video output))
-                                   output)))
+                                     (change-focused-output video output)))))
                              (let ((stream? (or (<= level (get-level active-profile)) unique-profile?)))
                                (let ((src (new File-Stream-Video-Src
                                             profile
                                             location
                                             stream?: stream?))
                                      (sink (new Stream-Frame-Consumer
-                                             consumer: (client-video-consumer client channel-no mirror?: #t))))
+                                             consumer: (client-video-consumer client channel mirror?: #t))))
                                  (let ((pipeline (pipeline (list src sink))))
                                    (set-pipeline channel pipeline)
                                    (set-action-proc channel action-proc)))))))))))))
@@ -430,7 +451,8 @@
           (let ((client (current-client)))
             (let ((channel (register-send-channel (get-udp-client client) stream-no channel-no media-kind source-kind level resolution framerate bitrate codec caps metadata send-state)))
               (let ((video (current-video)))
-                (let ((output (channel-output video stream-no channel)))
+                (let ((output (channel-output video stream-no channel process?: #f)))
+                  (set-output channel output)
                   (when (not (get-focused-output video))
                     (change-focused-output video output))
                   output)))))))))
@@ -484,11 +506,13 @@
                             (let ((channel (find-if (lambda (channel)
                                                       (= (get-level channel) (get-level profile)))
                                                     channels)))
-                              (new Camera-Video-Consumer
-                                channel-no: (get-no channel)
-                                profile: profile
-                                processing?: (and (<= (get-level profile) level-override)
-                                                  (streaming-level? client (get-level profile) level-override)))))
+                              (let ((consumer (new Camera-Video-Consumer
+                                                channel-no: (get-no channel)
+                                                profile: profile
+                                                processing?: (and (<= (get-level profile) level-override)
+                                                                  (streaming-level? client (get-level profile) level-override)))))
+                                (set-consumer channel consumer)
+                                consumer)))
                           profiles)))
           (pipeline `(,src ,@self-sinks ,@sinks)))))))
 
@@ -511,17 +535,18 @@
           (lambda (stream-no channel-no)
             (let ((client (current-client)))
               (let ((channel (register-send-channel (get-udp-client client) stream-no channel-no media-kind source-kind level resolution framerate bitrate codec caps metadata send-state)))
-                (channel-output (current-video) stream-no channel)
-                (let ((src (new View-Video-Src
-                             resolution: resolution
-                             framerate: view-share-framerate
-                             min-bitrate: view-share-min-bitrate
-                             bitrate: view-share-bitrate
-                             codec: view-share-codec))
-                      (sink (new View-Video-Consumer
-                              channel-no)))
-                  (let ((pipeline (pipeline (list src sink))))
-                    (set-pipeline channel pipeline)))))))))))
+                (let ((output (channel-output (current-video) stream-no channel process?: #f)))
+                  (set-output channel output)
+                  (let ((src (new View-Video-Src
+                               resolution: resolution
+                               framerate: view-share-framerate
+                               min-bitrate: view-share-min-bitrate
+                               bitrate: view-share-bitrate
+                               codec: view-share-codec))
+                        (sink (new View-Video-Consumer
+                                channel-no)))
+                    (let ((pipeline (pipeline (list src sink))))
+                      (set-pipeline channel pipeline))))))))))))
 
 
 (definition public (make-screen-channel)
@@ -540,17 +565,18 @@
       (lambda (stream-no channel-no)
         (let ((client (current-client)))
           (let ((channel (register-send-channel (get-udp-client client) stream-no channel-no media-kind source-kind level resolution framerate bitrate codec caps metadata send-state)))
-            (channel-output (current-video) stream-no channel)
-            (let ((src (new Screen-Video-Src
-                         resolution: screen-share-resolution
-                         framerate: screen-share-framerate
-                         min-bitrate: screen-share-min-bitrate
-                         bitrate: screen-share-bitrate
-                         codec: screen-share-codec))
-                  (sink (new Screen-Video-Consumer
-                          channel-no)))
-              (let ((pipeline (pipeline (list src sink))))
-                (set-pipeline channel pipeline)))))))))
+            (let ((output (channel-output (current-video) stream-no channel process?: #f)))
+              (set-output channel output)
+              (let ((src (new Screen-Video-Src
+                           resolution: screen-share-resolution
+                           framerate: screen-share-framerate
+                           min-bitrate: screen-share-min-bitrate
+                           bitrate: screen-share-bitrate
+                           codec: screen-share-codec))
+                    (sink (new Screen-Video-Consumer
+                            channel-no)))
+                (let ((pipeline (pipeline (list src sink))))
+                  (set-pipeline channel pipeline))))))))))
 
 
 ;;;
@@ -717,12 +743,19 @@
 
 
 (definition public (mux-streams audio video output)
+  (declare (proper-tail-calls))
   (let ((audio-reader (new Stream-Reader audio))
         (video-reader (new Stream-Reader video)))
     (let ((audio-caps (get-caps audio-reader))
           (video-caps (get-caps video-reader))
           (location (path-normalize (parse output))))
+      (assert audio-caps)
+      (assert video-caps)
       (let ((pipeline (gst-pipeline (format "appsrc caps=\"{a}\" name=audio" audio-caps)
+                                    ;"audioconvert"
+                                    ;"audioresample"
+                                    ;(tie "audio/x-raw, format=S16LE, layout=interleaved, rate=48000, channels=2")
+                                    ;"opusenc name=enc"
                                     "qtmux name=mux"
                                     (tie "filesink location={location} name=sink")
                                     (list
@@ -732,7 +765,6 @@
         (with-unref ((audiosrc (gst_bin_get_by_name pipeline "audio"))
                      (videosrc (gst_bin_get_by_name pipeline "video")))
           (define (process-audio)
-            (declare (proper-tail-calls))
             (let (loop)
               (let ((frame (read-frame audio-reader)))
                 (when frame
@@ -741,7 +773,6 @@
                     (loop))))))
           
           (define (process-video)
-            (declare (proper-tail-calls))
             (let (loop)
               (let ((frame (read-frame video-reader)))
                 (when frame
@@ -764,27 +795,29 @@
             (thread-join! video-thread)
             (close audio-reader)
             (close video-reader)
-            ;; quick hack as somehow waiting for eos doesn't ensure
-            ;; all data has been processed and saved to the filesink
-            (sleep 1)
             (set-pipeline-flushing? pipeline #f)
             (gst_element_send_event pipeline (gst_event_new_eos))
             ;; wait for eos message
             (with-unref ((bus (gst_pipeline_get_bus pipeline)))
-              (let (loop)
-                (let ((msg (gst_bus_pop bus)))
-                  (if (not msg)
-                      (begin
-                        (sleep .001)
-                        (loop))
-                    (let ((type (GST_MESSAGE_TYPE msg)))
-                      (if (/= type GST_MESSAGE_EOS)
-                          (begin
-                            (gst_message_unref msg)
-                            (sleep .001)
-                            (loop))
-                        (gst_message_unref msg)))))))
+              (let (loop (n 0))
+                (if (> n 1000)
+                    (error "Did not receive eos message")
+                  (let ((msg (gst_bus_pop bus)))
+                    (if (not msg)
+                        (begin
+                          (sleep .001)
+                          (loop (+ n 1)))
+                      (let ((type (GST_MESSAGE_TYPE msg)))
+                        (if (/= type GST_MESSAGE_EOS)
+                            (begin
+                              (gst_message_unref msg)
+                              (sleep .001)
+                              (loop (+ n 1)))
+                          (gst_message_unref msg))))))))
             (set-pipeline-flushing? pipeline #t)
+            ;; quick hack as somehow waiting for eos doesn't ensure
+            ;; all data has been processed and saved to the filesink
+            (sleep 1)
             (gst_bin_release pipeline)))))))
 
 
@@ -820,7 +853,7 @@
           (list kind level resolution framerate bitrate codec caps))))
     
     (bind (kind level resolution framerate bitrate codec caps) (determine-properties)
-      (with ((writer (new Stream-Writer dest kind level resolution framerate bitrate codec caps: caps)))
+      (with ((writer (new Stream-Writer dest kind level resolution framerate bitrate codec caps)))
         (let ((offset 0))
           (for-each (lambda (file)
                       (let ((start-time (current-seconds)))
@@ -880,7 +913,7 @@
     (define (convert-to temp-file)
       (let ((start-time (current-seconds)))
         (let ((reader (new Stream-Reader file)))
-          (let ((writer (new Stream-Writer temp-file (get-kind reader) (get-level reader) (get-resolution reader) (get-framerate reader) (get-bitrate reader) (get-codec reader) caps: (get-caps reader))))
+          (let ((writer (new Stream-Writer temp-file (get-kind reader) (get-level reader) (get-resolution reader) (get-framerate reader) (get-bitrate reader) (get-codec reader) (get-caps reader))))
             (format :terminal "{a}" name)
             (let (loop (count 0))
               (let ((frame (read-frame reader)))
