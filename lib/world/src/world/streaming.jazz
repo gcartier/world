@@ -937,6 +937,91 @@
 
 
 ;;;
+;;;; Parse
+;;;
+
+
+(definition protected (parse-stream file)
+  (let ((temp (new-brother file (add-extension (get-base file) "temp"))))
+    (with ((reader (new Stream-Reader file)))
+      (let ((pipeline (gst-pipeline "appsrc name=src"
+                                    "queue"
+                                    "h264parse"
+                                    "video/x-h264, stream-format=avc"
+                                    "appsink sync=false name=sink")))
+        (with-unref ((appsrc (gst_bin_get_by_name pipeline "src"))
+                     (appsink (gst_bin_get_by_name pipeline "sink")))
+          (let ((dts-flags (make-table))
+                (read-count 0)
+                (write-count 0)
+                (done? #f))
+            (define (run-read)
+              (declare (proper-tail-calls))
+              (let (loop)
+                (let ((frame (read-frame reader)))
+                  (if (not frame)
+                      (set! done? #t)
+                    (increase! read-count)
+                    (receive (buffer dts pts duration flags) frame
+                      (table-set! dts-flags dts flags)
+                      (gst_app_src_write appsrc buffer (u8vector-length buffer) dts pts duration))
+                    (loop)))))
+            
+            (define (run-write)
+              (declare (proper-tail-calls))
+              (let ((kind (get-kind reader))
+                    (level (get-level reader))
+                    (resolution (get-resolution reader))
+                    (framerate (get-framerate reader))
+                    (bitrate (get-bitrate reader))
+                    (codec (get-codec reader))
+                    (caps (get-caps reader)))
+                (let ((width (get-width resolution))
+                      (height (get-height resolution)))
+                  (let ((data (make-u8vector (* width height 4)))
+                        (info (make-u64vector app-sink-info-size)))
+                    (with ((writer (new Stream-Writer temp kind level resolution framerate bitrate codec caps)))
+                      (let (loop)
+                        (let ((size (gst_app_sink_try_pull_frame appsink data info)))
+                          (if (= size -1)
+                              (begin
+                                (sleep .01)
+                                (loop))
+                            (increase! write-count)
+                            (let ((buffer (subu8vector data 0 size))
+                                  (dts (u64vector-ref info 0))
+                                  (pts (u64vector-ref info 1))
+                                  (duration (u64vector-ref info 2)))
+                              (let ((flags (table-ref dts-flags dts)))
+                                (write-frame writer buffer dts pts duration flags)
+                                (if (and done? (>= write-count read-count))
+                                    (with-unref ((pad (gst_element_get_static_pad appsink "sink")))
+                                      (let ((caps (gst_pad_get_current_caps pad)))
+                                        (let ((caps-string (gst_caps_to_string caps)))
+                                          (set-caps writer caps-string))
+                                        (gst_caps_unref caps)))
+                                  (loop))))))))))))
+            
+            (let ((read-thread (new-thread run-read 'read))
+                  (write-thread (new-thread run-write 'write)))
+              (gst-app-src-set-caps appsrc "video/x-h264"
+                "stream-format" 'string   "byte-stream"
+                "alignment"     'string   "au")
+              (g-object-set appsrc
+                            "is-live"     'boolean #t
+                            "stream-type" 'int     GST_APP_STREAM_TYPE_STREAM
+                            "format"      'int     GST_FORMAT_TIME)
+              (gst_element_set_state pipeline GST_STATE_PLAYING)
+              (thread-start! read-thread)
+              (thread-start! write-thread)
+              (thread-join! read-thread)
+              (thread-join! write-thread)
+              (gst_element_release pipeline))))))
+    (rename file (new-file {Directory Documents "streams" "notlost"} (get-name file)))
+    (rename temp file)))
+
+
+;;;
 ;;;; Record
 ;;;
 
