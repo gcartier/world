@@ -18,7 +18,8 @@
   (mac
 
 
-(import (jazz.io)
+(import (jazz.flow)
+        (jazz.io)
         (jazz.listener)
         (jazz.opengl.glew)
         (jazz.opengl.window)
@@ -47,7 +48,8 @@
   
   (slot decoder             initialize #f getter generate)
   (slot base-time           initialize #f getter generate)
-  (slot first-dts           initialize #f getter generate)
+  (slot base-timestamp      initialize #f getter generate)
+  (slot timestamp-offset    initialize #f getter generate)
   (slot listener            initialize #f getter generate)
   (slot listen-thread       initialize #f getter generate)
   (slot context             initialize #f getter generate)
@@ -84,6 +86,7 @@
   (method public (start self)
     (when decoder
       (set! base-time (current-seconds))
+      (set! base-timestamp (current-monotonic-nanoseconds))
       (set! listen-thread (new-thread (lambda () (run-listen self)) 'hardware-listen))
       (set! bind-thread (new-thread (lambda () (run-bind self)) 'hardware-bind))
       (thread-base-priority-set! listen-thread video-priority)
@@ -109,6 +112,16 @@
       (destroyHardwareDecoder decoder)))
   
   
+  (method protected (reset self)
+    (set! base-time (current-seconds))
+    (set! base-timestamp (current-monotonic-nanoseconds))
+    (set! timestamp-offset #f))
+  
+  
+  (method protected (running-time self)
+    (- (current-monotonic-nanoseconds) base-timestamp))
+  
+  
   (method (handle-error self function err)
     (warning-moment err category: 'hardware function: function)
     (increase! error-count)
@@ -116,13 +129,15 @@
       (stop self)))
   
   
-  (method public (decode self buffer dts pts duration)
+  (method public (decode self buffer dts pts duration timestamp-offset)
     (when decoder
       (unless stop?
-        (when (not first-dts)
-          (set! first-dts dts))
-        (let ((dts (max 0 (- dts first-dts)))
-              (pts (max 0 (- pts first-dts))))
+        (when (not timestamp-offset)
+          (let ((running-time (running-time self)))
+            (let ((offset (- running-time dts)))
+              (set! timestamp-offset offset))))
+        (let ((dts (max 0 (+ dts timestamp-offset)))
+              (pts (max 0 (+ pts timestamp-offset))))
           (let ((size (u8vector-length buffer)))
             (let ((code (hardwareDecodeFrame decoder buffer size dts pts duration)))
               (when (/= code 0)
@@ -146,7 +161,11 @@
         ((#\.)
          (unless stop?
            (let ((frame (hardwareRetrieveFrame decoder)))
-             (insert bind-ring (+ base-time bind-delay (timestamp->flonum (hardwareFramePTS frame))) frame))
+             (let ((time (+ base-time .3 @w bind-delay (timestamp->flonum (hardwareFramePTS frame)))))
+               @bla
+               (when (< time (current-seconds))
+                 (tell 'BLA (- (current-seconds) time) (timestamp->flonum (hardwareFramePTS frame))))
+               (insert bind-ring time frame)))
            (loop)))
         ((#\#)
          (let ((status (wait-status listener)))
@@ -195,5 +214,31 @@
         (when bound-frame
           (hardwareReleaseFrame bound-frame))
         (set! bound-frame frame)
-        (loop))))))
+        (loop)))))
+
+
+;;;
+;;;; Flow
+;;;
+
+
+(class Hardware-Flow extends Flow
+  
+  
+  (slot pipeline getter generate)
+  (slot latency  getter generate)
+  
+  
+  (method override (initialize self pipeline latency)
+    (nextmethod self)
+    (set! self.pipeline pipeline)
+    (set! self.latency latency))
+  
+  
+  (method override (running-time self)
+    (running-time pipeline))
+  
+  
+  (method override (base-latency self)
+    latency)))
   (else)))
