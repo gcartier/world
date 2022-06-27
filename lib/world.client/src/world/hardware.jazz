@@ -11,6 +11,10 @@
 ;;;  Contributor(s):
 
 
+;; quicky comment to force recompilation needed for
+;; jazz.stream.platform now using delayed load
+
+
 (module world.hardware jazz
 
 
@@ -18,7 +22,8 @@
   (mac
 
 
-(import (jazz.io)
+(import (jazz.flow)
+        (jazz.io)
         (jazz.listener)
         (jazz.opengl.glew)
         (jazz.opengl.window)
@@ -42,26 +47,30 @@
 ;;;
 
 
+(definition hardware-latency <fl>
+  .3)
+
+
 (class Hardware-Pipeline extends Object
   
   
   (slot decoder             initialize #f getter generate)
-  (slot first-dts           initialize #f getter generate)
-  (slot first-retrieve      initialize #f getter generate)
+  (slot base-time           initialize #f getter generate)
+  (slot base-timestamp      initialize #f getter generate)
+  (slot timestamp-offset    initialize #f getter generate)
   (slot listener            initialize #f getter generate)
   (slot listen-thread       initialize #f getter generate)
   (slot context             initialize #f getter generate)
   (slot texture             initialize #f getter generate)
   (slot bind-thread         initialize #f getter generate)
   (slot bind-ring           initialize #f getter generate)
-  (slot bind-delay     <fl> initialize 0. getter generate)
   (slot bound-callback      initialize #f getter generate)
   (slot bound-frame         initialize #f getter generate)
   (slot error-count         initialize 0  getter generate)
   (slot stop?               initialize #f getter generate)
   
   
-  (method override (initialize self resolution codec-data texture (bind-delay: bind-delay #f) (bound-callback: bound-callback #f))
+  (method override (initialize self resolution codec-data texture (bound-callback: bound-callback #f))
     (let ((decoder (createHardwareDecoder (get-width resolution) (get-height resolution) codec-data (u8vector-length codec-data))))
       (if (fixnum? decoder)
           (let ((err (case decoder
@@ -75,14 +84,15 @@
         (set! self.listener (open-stream-listener "decode"))
         (set! self.context (platformGetContext (get-handle (current-window))))
         (set! self.texture texture)
-        (set! self.bind-ring (new Time-Ring 8 max-size: 32))
-        (set! self.bind-delay (or bind-delay 0.))
+        (set! self.bind-ring (new Time-Ring 8 max-size: 256))
         (set! self.bound-callback bound-callback)
         (setHardwareDecoderListener decoder (get-write-file listener)))))
   
   
   (method public (start self)
     (when decoder
+      (set! base-time (current-seconds))
+      (set! base-timestamp (current-monotonic-nanoseconds))
       (set! listen-thread (new-thread (lambda () (run-listen self)) 'hardware-listen))
       (set! bind-thread (new-thread (lambda () (run-bind self)) 'hardware-bind))
       (thread-base-priority-set! listen-thread video-priority)
@@ -108,11 +118,40 @@
       (destroyHardwareDecoder decoder)))
   
   
+  (method protected (reset self)
+    (set! base-time (current-seconds))
+    (set! base-timestamp (current-monotonic-nanoseconds))
+    (set! timestamp-offset #f))
+  
+  
+  (method protected (running-time self)
+    (- (current-monotonic-nanoseconds) base-timestamp))
+  
+  
   (method (handle-error self function err)
     (warning-moment err category: 'hardware function: function)
     (increase! error-count)
     (when (>= error-count 10)
       (stop self)))
+  
+  
+  (method public (decode self buffer dts pts duration timestamp-offset)
+    (when decoder
+      (unless stop?
+        (when (not timestamp-offset)
+          (let ((running-time (running-time self)))
+            (let ((offset (- running-time dts)))
+              (set! timestamp-offset offset))))
+        (let ((dts (max 0 (+ dts timestamp-offset)))
+              (pts (max 0 (+ pts timestamp-offset))))
+          (let ((size (u8vector-length buffer)))
+            (let ((code (hardwareDecodeFrame decoder buffer size dts pts duration)))
+              (when (/= code 0)
+                (let ((err (case code
+                             ((1) "Unable to create block buffer")
+                             ((2) "Unable to create sample buffer")
+                             (else "Decode error"))))
+                  (handle-error self 'decode err)))))))))
   
   
   (method (run-listen self)
@@ -127,10 +166,9 @@
       (case c
         ((#\.)
          (unless stop?
-           (when (not first-retrieve)
-             (set! first-retrieve (current-seconds)))
            (let ((frame (hardwareRetrieveFrame decoder)))
-             (insert bind-ring (+ first-retrieve bind-delay (timestamp->flonum (hardwareFramePTS frame))) frame))
+             (let ((time (+ base-time hardware-latency (timestamp->flonum (hardwareFramePTS frame)))))
+               (insert bind-ring time frame)))
            (loop)))
         ((#\#)
          (let ((status (wait-status listener)))
@@ -179,22 +217,31 @@
         (when bound-frame
           (hardwareReleaseFrame bound-frame))
         (set! bound-frame frame)
-        (loop))))
+        (loop)))))
+
+
+;;;
+;;;; Flow
+;;;
+
+
+(class Hardware-Flow extends Flow
   
   
-  (method public (decode self buffer dts pts duration)
-    (when decoder
-      (unless stop?
-        (when (not first-dts)
-          (set! first-dts dts))
-        (let ((dts (max 0 (- dts first-dts)))
-              (pts (max 0 (- pts first-dts))))
-          (let ((size (u8vector-length buffer)))
-            (let ((code (hardwareDecodeFrame decoder buffer size dts pts duration)))
-              (when (/= code 0)
-                (let ((err (case code
-                             ((1) "Unable to create block buffer")
-                             ((2) "Unable to create sample buffer")
-                             (else "Decode error"))))
-                  (handle-error self 'decode err)))))))))))
+  (slot pipeline getter generate)
+  (slot latency  getter generate)
+  
+  
+  (method override (initialize self pipeline latency)
+    (nextmethod self)
+    (set! self.pipeline pipeline)
+    (set! self.latency latency))
+  
+  
+  (method override (running-time self)
+    (running-time pipeline))
+  
+  
+  (method override (base-latency self)
+    latency)))
   (else)))
