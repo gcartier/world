@@ -15,9 +15,11 @@
 
 
 (import (jazz.cairo)
+        (jazz.graphic)
         (jazz.io)
         (jazz.opengl.glew)
         (jazz.opengl.texture)
+        (gaea.dye)
         (gaea.geometry)
         (world)
         (world.asset)
@@ -25,7 +27,6 @@
         (world.camera)
         (world.context)
         (world.image)
-        (world.material)
         (world.programs)
         (world.shape)
         (world.texture))
@@ -36,6 +37,15 @@
     (cond ((filename=? name "left.png") 'left)
           ((filename=? name "lf.png") 'lf)
           (else #f))))
+
+
+;; quicky until we read a .skybox
+(definition public (skybox-fog path)
+  (cond ((equal? path "world/nebula") (dye .402 .004 .680 1.))
+        ((equal? path "world/calm_sea") (dye .524 .710 .732 1.))
+        ((equal? path "world/dark_sea") (dye .804 .551 .004 1.))
+        ((equal? path "world/earth") (dye 0. 0. 0. 1.))
+        (else (error "Unable to create skybox fog for {a}" path))))
 
 
 (definition skyboxes
@@ -57,7 +67,8 @@
                   (when kind
                     (let ((dirpath (filename-dir path)))
                       (let ((skybox-path (substring dirpath (string-length "skybox/") (- (string-length dirpath) 1))))
-                        (enqueue queue (new Skybox assets skybox-path kind)))))))))))
+                        (let ((fog (skybox-fog skybox-path)))
+                          (enqueue queue (new Skybox assets skybox-path kind fog))))))))))))
       (sort di<? (queue-list queue) key: get-path))))
 
 
@@ -100,13 +111,16 @@
   (slot path                    getter generate)
   (slot kind      initialize #f getter generate)
   (slot sample    initialize #f getter generate)
-  (slot material  initialize #f getter generate)
+  (slot world     initialize #f getter generate)
+  (slot sky       initialize #f getter generate)
+  (slot fog       initialize #f getter generate)
   
   
-  (method override (initialize self assets path kind)
+  (method override (initialize self assets path kind fog)
     (set! self.assets assets)
     (set! self.path path)
-    (set! self.kind kind))
+    (set! self.kind kind)
+    (set! self.fog fog))
   
   
   (method override (print self output readably)
@@ -154,18 +168,51 @@
                  (make-image "up")
                  (make-image "dn")))))
       
-      (unless material
+      (define (with-fog front back left right down proc)
+        (define (apply-fog image (full? #f))
+          (let ((width (get-width size))
+                (height (get-height size))
+                (color (dye->color fog)))
+            (let ((surface (if (u8vector? image)
+                               (let ((cairo-format CAIRO_FORMAT_ARGB32))
+                                 (let ((stride (cairo_format_stride_for_width cairo-format width)))
+                                   (new Surface (cairo_image_surface_create_for_data (still-u8vector-body image) CAIRO_FORMAT_ARGB32 width height stride))))
+                             (new Surface image handle-shared?: #t))))
+              (if full?
+                  (fill-rect surface (new Rect 0 0 width height) color)
+                (let ((mid (fxround/ height 3))
+                      (low (fxround/ height 2)))
+                  (let ((alpha (copy-object color #f)))
+                    (set-alpha alpha 0.)
+                    (gradient-fill-rect surface (new Rect 0 mid width low) (list (list 0 alpha) (list 1 color)) direction: 'vertical)
+                    (fill-rect surface (new Rect 0 low width height) color))))
+              (flush surface)
+              (close surface)
+              image)))
+        
+        (proc (apply-fog front)
+              (apply-fog back)
+              (apply-fog left)
+              (apply-fog right)
+              (apply-fog down #t)))
+      
+      (unless world
         (with-images
           (lambda (front back left right up down)
             (let ((texture (new Image-Texture (get-width size) (get-height size))))
               (map-texture-cube texture front back up down right left)
+              (set! world texture)
+              (with-fog front back left right down
+                (lambda (front back left right down)
+                  (let ((texture (new Image-Texture (get-width size) (get-height size))))
+                    (map-texture-cube texture front back up down right left)
+                    (set! sky texture))))
               (close-image front)
               (close-image back)
               (close-image left)
               (close-image right)
               (close-image up)
-              (close-image down)
-              (set! material (new Material name: 'skybox texture: texture))))))))
+              (close-image down)))))))
   
   
   (method public (sample-texture self)
@@ -196,7 +243,7 @@
             (view-matrix (make-view-matrix& (vertex& 0. 0. 0.) (get-lookat camera))))
         (use skybox-program)
         (glDepthFunc GL_LEQUAL)
-        (bind-uniforms skybox-program projection-matrix view-matrix material)
+        (bind-uniforms skybox-program projection-matrix view-matrix sky)
         (draw-array skybox-mesh)
         (unbind-uniforms skybox-program)
         (glDepthFunc GL_LESS)
