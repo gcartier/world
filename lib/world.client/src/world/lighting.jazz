@@ -16,56 +16,83 @@
 
 (import (gaea.dye)
         (gaea.geometry)
+        (gaea.homogeneous)
         (world)
-        (world.context))
+        (world.autoload)
+        (world.buffer)
+        (world.context)
+        (world.mesh))
 
 
-(definition *current-lighting*
-  #f)
-
-(definition public (current-lighting)
-  *current-lighting*)
-
-(definition public (set-current-lighting lighting)
-  (set! *current-lighting* lighting)
-  (set-?l lighting))
+(proclaim (warn optimizations))
 
 
 ;;;
-;;;; Lighting
+;;;; Share
 ;;;
 
 
-(class Lighting extends Object
-  
-  
-  (slot ambient-color       <f32vector+> initialize #f                accessors generate)
-  (slot lights              <object>     initialize '()               accessors generate)
-  (slot lights-count        <fx>         initialize 0                 accessors generate)
-  (slot sector-lights       <object>     initialize '()               accessors generate)
-  (slot sector-lights-count <fx>         initialize 0                 accessors generate)
-  (slot sun-effective       <dye>        initialize (dye 0. 0. 0. 0.) accessors generate)
-  (slot sun-coordinates     <vertex>     initialize (vertex 0. 0. 0.) accessors generate)
-  
-  
-  (method protected (setup-lights self l)
-    (let ((world (current-world)))
-      (set! lights l)
-      (set! lights-count (min (get-dynamic-lights world) (length l)))))
-  
-  
-  (method protected (setup-sector-lights self l)
-    (let ((world (current-world)))
-      (set! sector-lights l)
-      (set! sector-lights-count (min (get-dynamic-lights world) (length l)))))
-  
-  
-  ;; quick hack for tests
-  (method protected (effective-lights self)
-    (append lights sector-lights))
-  
-  
-  ;; quick hack for tests
-  (method protected (effective-lights-count self)
-    (let ((world (current-world)))
-      (min (get-dynamic-lights world) (+ lights-count sector-lights-count))))))
+(definition public (make-shared-mesh model-mesh <Mesh>)
+  (let ((vertices-buffer (get-vertices-buffer model-mesh))
+        (neighbors-buffer (get-neighbors-buffer model-mesh))
+        (lightmap-buffer (get-lightmap-buffer model-mesh))
+        (instance-buffer (get-instance-buffer model-mesh))
+        (feedback-buffer (get-feedback-buffer model-mesh))
+        (material (get-material model-mesh)))
+    (let ((lightmap-size (get-size lightmap-buffer)))
+      (let ((lightmap (make-f32vector lightmap-size)))
+        (let ((mesh (new Mesh
+                      vertices-buffer: vertices-buffer
+                      neighbors-buffer: neighbors-buffer
+                      instance-buffer: instance-buffer
+                      feedback-buffer: feedback-buffer
+                      material: material)))
+          (allocate-lightmap mesh)
+          (set-data (get-lightmap-buffer mesh) lightmap lightmap-size lightmap-floats)
+          (setup-array mesh)
+          mesh)))))
+
+
+;;;
+;;;; Bake
+;;;
+
+
+;; to unify with the zone method
+(definition public (bake-entity-uniform-lighting entity <Entity> blocklight <fl> skylight <fl> sun-position <vertex>)
+  (cache-model entity)
+  (let ((meshes (get-meshes entity)))
+    (loop (for mesh in-vector meshes)
+          (bake-mesh-uniform-lighting entity mesh blocklight skylight sun-position))))
+
+
+;; to unify with the zone method
+(definition (bake-mesh-uniform-lighting entity <Entity> mesh <Mesh> blocklight <fl> skylight <fl> sun-position <vertex>)
+  (let ((vertices-buffer (get-vertices-buffer mesh))
+        (lightmap-buffer (get-lightmap-buffer mesh)))
+    (let ((vertices-size (get-size vertices-buffer))
+          (vertices-indices (get-indices vertices-buffer))
+          (lightmap-size (get-size lightmap-buffer))
+          (lightmap-indices (get-indices lightmap-buffer)))
+      (let ((vertices (make-f32vector vertices-size))
+            (lightmap (make-f32vector lightmap-size))
+            (indices (assert (= vertices-indices lightmap-indices) vertices-indices))
+            (matrix (matrix-multiply& (get-matrix entity) (get-global-matrix (cache-model entity)))))
+        (download-stream-data vertices-buffer 0 vertices vertices-size)
+        (loop (for n from 0 below indices)
+              (let ((vertex-offset (* n vertex-floats))
+                    (lightmap-offset (* n lightmap-floats)))
+                (let ((vert (vertex& (f32vector-ref vertices vertex-offset)
+                                     (f32vector-ref vertices (+ vertex-offset 1))
+                                     (f32vector-ref vertices (+ vertex-offset 2))))
+                      (normal (vertex& (f32vector-ref vertices (+ vertex-offset 3))
+                                       (f32vector-ref vertices (+ vertex-offset 4))
+                                       (f32vector-ref vertices (+ vertex-offset 5)))))
+                  (let ((pos (matrix-transform& matrix vert)))
+                    (let ((sun-direction (vertex-normalize& (vertex-& sun-position pos))))
+                      (let ((sun-diffuse (dot-product& normal sun-direction)))
+                        (let ((shade (+ .5 (/ (abs sun-diffuse) 2.))))
+                          (f32vector-set! lightmap lightmap-offset blocklight)
+                          (f32vector-set! lightmap (+ lightmap-offset 1) skylight)
+                          (f32vector-set! lightmap (+ lightmap-offset 2) shade))))))))
+        (upload-stream-data lightmap-buffer 0 lightmap lightmap-size))))))
