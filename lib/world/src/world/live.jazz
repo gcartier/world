@@ -297,6 +297,11 @@
   (slot status-color            <object>            initialize #f              getter generate)
   (slot status-duration         <object>            initialize #f              getter generate)
   (slot status-sheet            <object>            initialize #f              getter generate)
+  (slot action                  <object>            initialize #f              getter generate)
+  (slot action-time             <object>            initialize #f              getter generate)
+  (slot action-duration         <object>            initialize #f              getter generate)
+  (slot action-proc             <object>            initialize #f              getter generate)
+  (slot action-sheet            <object>            initialize #f              getter generate)
   (slot working?                <bool>              initialize #f              getter generate)
   (slot working-color           <object>            initialize #f              getter generate)
   (slot working-step            <fx>                initialize 0               getter generate)
@@ -570,6 +575,7 @@
   (method protected virtual (prepare-sheets self)
     (set! message-sheet (make-world-sheet 'message World-Sheet message-size))
     (set! status-sheet (make-world-sheet 'status World-Sheet status-size))
+    (set! action-sheet (make-world-sheet 'action World-Sheet action-size))
     (set! working-sheet (make-world-sheet 'working World-Sheet working-size))
     (set! compass-sheet (make-world-sheet 'compass World-Sheet compass-size))
     (set! map-sheet (make-world-sheet 'map World-Sheet map-size))
@@ -580,6 +586,7 @@
   (method protected virtual (resize-sheets self)
     (make-orthographic-matrix! (get-projection-matrix message-sheet) 0. width 0. height 0. 10.)
     (make-orthographic-matrix! (get-projection-matrix status-sheet) 0. width 0. height 0. 10.)
+    (make-orthographic-matrix! (get-projection-matrix action-sheet) 0. width 0. height 0. 10.)
     (make-orthographic-matrix! (get-projection-matrix working-sheet) 0. width 0. height 0. 10.)
     (make-orthographic-matrix! (get-projection-matrix compass-sheet) 0. width 0. height 0. 10.)
     (make-orthographic-matrix! (get-projection-matrix map-sheet) 0. width 0. height 0. 10.)
@@ -786,6 +793,7 @@
       (detach-shaders block-program)
       (close message-sheet)
       (close status-sheet)
+      (close action-sheet)
       (close working-sheet)
       (close compass-sheet)
       (close map-sheet)
@@ -1215,6 +1223,9 @@
   
   
   ;; Game
+  (method (on-perform-action self evt)
+    (perform-action self))
+  
   (method (on-bullet self evt)
     ;; done in process-keys
     )
@@ -2476,6 +2487,8 @@
           (draw-message self))
         (when status
           (draw-status self))
+        (when action
+          (draw-action self))
         (when working?
           (draw-working self)))))
   
@@ -2662,6 +2675,7 @@
   (method package (sheets-layout self)
     (layout-message self)
     (layout-status self)
+    (layout-action self)
     (layout-working self)
     (layout-compass)
     (layout-map)
@@ -2931,6 +2945,99 @@
       ((Saucer) 19.5)
       ((Rocket) 65.)
       (else (ground-speed actor))))
+  
+  
+  ;;;
+  ;;;; Action
+  ;;;
+  
+  
+  (method package (run-action self task <Task>)
+    (declare (proper-tail-calls))
+    (with-task task
+      (lambda (exit)
+        (let (iter (previous (current-monotonic)))
+          (let ((time (current-monotonic))
+                (duration 0.))
+            (let ((elapse (- time previous)))
+              (unless (> elapse max-elapse)
+                (with-task-mutex
+                  (lambda ()
+                    (unless (stopping? task)
+                      (let ((start (current-monotonic)))
+                        (site action
+                          (unless (check-action self)
+                            (when action-proc
+                              (fade-action self))))
+                        (increase! duration (- (current-monotonic) start))))))))
+            (task-wait task action-period duration exit)
+            (iter time))))))
+  
+  
+  (method (check-action self)
+    (let ((zone (current-zone))
+          (universe (current-universe))
+          (me (current-me)))
+      (let ((origin (transformed-center me))
+            (direction (get-sight (get-lookat me)))
+            (max-distance 2.5))
+        (let ((radiuses (transformed-radiuses me)))
+          (let ((wider-radiuses (vertex (max (vertex-x radiuses) .75) ;; for thin models like the fox
+                                        (* (vertex-y radiuses) 1.1) ;; so we can stand on top of a block
+                                        (vertex-z radiuses))))
+            (define (polygon-filter poly)
+              (get-action-message (id->block (decode-id (get-data1 poly)))))
+            
+            (bind-values (center direction collisions) (collide&stop$ origin (vertex+& origin (vertex-scalar*& direction max-distance)) (get-lookat me) wider-radiuses max-distance: max-distance area-cube: (update-area-cube me) polygon-filter: polygon-filter ignore-non-physical?: #f ignore-entities?: #f)
+              (if (null? collisions)
+                  #f
+                (prog1 (let ((poly (get-polygon (car collisions))))
+                         (let ((element (get-element poly)))
+                           (if (and element (equal? (get-model element) "warcraft/creature/cow"))
+                               (begin
+                                 (display-action self "E : Join Circle"
+                                   (lambda ()
+                                     (display-message self "You wish!")))
+                                 #t)
+                             (with-polygon-interaction universe poly
+                               (lambda (poly clicked fore)
+                                 (call-with-position zone clicked
+                                   (lambda (section block-id <fx> data-id <fx> i <fx> j <fx> k <fx> x <fl> y <fl> z <fl> with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!)
+                                     (let ((block (id/data-id->block block-id data-id)))
+                                       (let ((action-message (get-action-message block)))
+                                         (if (not action-message)
+                                             #f
+                                           (let ((message (action-message block-id data-id))
+                                                 (right-mouse (get-right-mouse block)))
+                                             (display-action self (format "E : {a}" message)
+                                               (lambda ()
+                                                 (right-mouse section block-id data-id i j k x y z with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!)
+                                                 (let ((history (current-history)))
+                                                   (unless (or (and (get-paused? history) (not (stepping-history?)))
+                                                               (id? block-id BedBlock Chest WorkbenchBlock SignPost WallSign))
+                                                     (let ((position (vertex& x y z)))
+                                                       (bidirectional-change 'action (current-seconds)
+                                                         (lambda (store push)
+                                                           (store push position))
+                                                         (lambda (store push)
+                                                           (store push position))
+                                                         (lambda (store push)
+                                                           (store push)))))))))
+                                           #t))))))))))
+                  (free-collisions$ collisions)))))))))
+  
+  
+  (method (fade-action self)
+    (set! action-time (current-monotonic))
+    (set! action-duration 0.)
+    (set! action-proc #f))
+  
+  
+  (method (perform-action self)
+    (when action-proc
+      (action-proc)
+      (unless (check-action self)
+        (fade-action self))))
   
   
   ;;;
@@ -5526,6 +5633,71 @@
               (flush surface)
               (map-texture (get-texture status-sheet))
               (render-sheet status-sheet)))))))
+
+  
+  ;;;
+  ;;;; Action
+  ;;;
+  
+  
+  (method package (display-action self msg proc)
+    (set! action msg)
+    (set! action-duration +inf.0)
+    (set! action-time (current-monotonic))
+    (set! action-proc proc))
+  
+  
+  (method (layout-action self)
+    (let ((window (current-window)))
+      (let ((world-width (get-width window))
+            (world-height (get-height window)))
+        (let ((h (center (get-width action-sheet) world-width))
+              (v (- world-height 70 (get-height action-size))))
+          (set-position action-sheet (new Point h v))))))
+  
+  
+  (method (draw-action self)
+    (let ((elapse (- (current-monotonic) action-time))
+          (duration action-duration))
+      (let ((fade duration)
+            (done (+ duration .25)))
+        (if (> elapse done)
+            (begin
+              (set! action #f)
+              (set! action-time #f))
+          (let ((alpha (if (> elapse fade) (/ (- done elapse) (- done fade)) #f)))
+            (let ((surface (get-surface (get-texture action-sheet)))
+                  (font {Font Action})
+                  (color {Color Gray})
+                  (faded {Color red: 0 green: 0 blue: 0 alpha: 0.})
+                  (background (if (not alpha)
+                                  {Color red: 0 green: 0 blue: 0 alpha: .5}
+                                (new Color red: 0 green: 0 blue: 0 alpha: (* .5 alpha)))))
+              (clear surface)
+              (gradient-fill-rect surface (new Rect 0 0 400 80)
+                (list (list 0 faded)
+                      (list 1 background))
+                direction: 'horizontal)
+              (gradient-fill-rect surface (new Rect 400 0 800 80)
+                (list (list 0 background)
+                      (list 1 faded))
+                direction: 'horizontal)
+              (set-font surface font)
+              (let ((color (if (not alpha)
+                               color
+                             (let ((color (copy-object color #f)))
+                               (set-alpha color alpha)
+                               color)))
+                    (shadow-color (if (not alpha)
+                                      {Color Black}
+                                    (let ((color (copy-object {Color Black} #f)))
+                                      (set-alpha color alpha)
+                                      color)))
+                    (h (center (text-width font action) (get-width action-sheet))))
+                (draw-text surface h 26 action color shadow-color: shadow-color))
+              (flush surface)
+              (map-texture (get-texture action-sheet))
+              (render-sheet action-sheet)))))))
 
   
   ;;;
