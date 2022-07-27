@@ -1,0 +1,231 @@
+;;;===============
+;;;  WorldScheme
+;;;===============
+;;;
+;;;; UDP Processor Client
+;;;
+;;;  The Initial Developer of the Original Code is Guillaume Cartier.
+;;;  Portions created by the Initial Developer are Copyright (C) 2012-2018
+;;;  the Initial Developer. All Rights Reserved.
+;;;
+;;;  Contributor(s):
+
+
+(module world.client.processor jazz
+
+
+(import (jazz.syntax (phase syntax))
+        (world)
+        (world.configure)
+        (world.context)
+        (world.event)
+        (world.format)
+        (world.record (phase syntax))
+        (world.settings)
+        (world.task)
+        (world.udp))
+
+
+(class UDP-Processor-Client extends Object
+  
+  
+  (slot client-no       initialize #f  getter generate)
+  (slot udp-port        initialize #f  getter generate)
+  (slot udp-stopping?   initialize #f  getter generate)
+  (slot processor-host  initialize #f  getter generate)
+  (slot processor-port  initialize #f  getter generate)
+  (slot write-mutex     initialize #f  getter generate)
+  (slot alive-task      initialize #f  getter generate)
+  (slot receive-task    initialize #f  getter generate)
+  (slot started?        initialize #f  getter generate)
+  (slot monitor         initialize #f  getter generate)
+  (slot invalid-packets initialize 0   getter generate)
+  
+  
+  (method override (initialize self client-no)
+    (nextmethod self)
+    (set! self.client-no client-no)
+    (set! write-mutex (make-mutex 'write)))
+  
+  
+  (method package (connect self local-address host service)
+    (set! udp-port (open-udp (list
+                               local-address: local-address
+                               address: host
+                               port-number: service)))
+    (setup-udp-port-buffers udp-port)
+    (set! udp-stopping? #f)
+    (let ()
+      (define (send-connect)
+        (with-write-mutex self
+          (lambda ()
+            (with-record processor-connect
+              (let ((data (make-u8vector (+ (calculate-connect-size) udp-code-size))))
+                (write-header-kind data udp-connect)
+                (write-header-sender data client-no)
+                (write-processor-connect-sent data (current-seconds))
+                (write-udp-code data)
+                (write-data data udp-port))))))
+      
+      (set! processor-host #f)
+      (set! processor-port #f)
+      (set! monitor (new UDP-Monitor))
+      (let ()
+        (declare (proper-tail-calls))
+        (let (loop (n 0))
+          (define (read-udp)
+            (input-port-timeout-set! udp-port .01)
+            (prog1 (read udp-port)
+              (input-port-timeout-set! udp-port +inf.0)))
+          
+          (send-connect)
+          (let ((reply (read-udp)))
+            (with-record processor-connected
+              (if (or (eof-object? reply) (/= (read-header-kind reply) udp-connected))
+                  (if (>= n 100)
+                      (begin
+                        (terminal 'BAILOUT 'did 'not 'receive 'udp-connected)
+                        (exit 1))
+                    (loop (+ n 1)))
+                (let ((source-info (udp-source-socket-info udp-port)))
+                  (set! processor-host (socket-info-address source-info))
+                  (set! processor-port (socket-info-port-number source-info)))
+                (set! alive-task (new Task 'udp-alive (~ run-alive self) priority: alive-priority))
+                (set! receive-task (new Task 'udp-receive (~ run-receive self) priority: udp-priority))
+                (start-task alive-task)
+                (start-task receive-task))))))))
+
+  
+  (method (deconnect self)
+    (set! udp-stopping? #t)
+    (stop-task alive-task)
+    (set! alive-task #f)
+    (close-port udp-port)
+    (thread-join! (get-thread receive-task))
+    (set! udp-port #f)
+    (set! receive-task #f))
+  
+  
+  (method (start self)
+    (unless started?
+      (set! started? #t)))
+  
+  
+  (method (stop self)
+    (when started?
+      (set! started? #f)))
+  
+  
+  (method (with-write-mutex self thunk)
+    (unwind-protect
+        (begin
+          (mutex-lock! write-mutex)
+          (thunk))
+      (mutex-unlock! write-mutex)))
+  
+  
+  (method protected (increase-sent self data)
+    (increase-sent monitor data))
+  
+  
+  (method protected (increase-received self data)
+    (increase-received monitor data))
+  
+  
+  ;;;
+  ;;;; Send
+  ;;;
+  
+  
+  (method (send-data self data)
+    (send-processor self data)
+    (increase-sent self data))
+  
+  
+  (method (send-processor self data)
+    ;; quick temporary hack to get back the safe behavior
+    ;; of retrying-write until port being false is fixed
+    (when udp-port
+      (udp-destination-set! processor-host processor-port udp-port)
+      (send-udp data udp-port)))
+  
+  
+  ;;;
+  ;;;; Alive
+  ;;;
+  
+  
+  (method (run-alive self task <Task>)
+    (declare (proper-tail-calls))
+    (with-task task
+      (lambda (exit)
+        (let (iter (previous (current-monotonic)))
+          (let ((time (current-monotonic)))
+            (let ((elapse (- time previous)))
+              (unless (stopping? task)
+                (site alive
+                  (send-alive self)))
+              (let ((duration (- (current-monotonic) time)))
+                (task-wait task alive-period duration exit))
+              (iter time)))))))
+  
+  
+  ;;;
+  ;;;; Receive
+  ;;;
+  
+  
+  (method (run-receive self task)
+    (declare (proper-tail-calls))
+    (with-task task
+      (lambda (exit)
+        (let (loop)
+          (let ((data (catch-exception-filter
+                        (lambda (exc)
+                          udp-stopping?)
+                        (lambda (exc)
+                          (continuation-return exit #f))
+                        (lambda ()
+                          (read-data udp-port)))))
+            (when data
+              (site udp-receive
+                (receive-data self data))
+              (loop)))))))
+  
+  
+  (method protected (receive-data self data)
+    (if (or (< (u8vector-length data) 4)
+            (/= (read-udp-code data) udp-code))
+        (increase! invalid-packets)
+      (increase-received self data)
+      (let ((kind (with-record header
+                    (read-header-kind data))))
+        (if (not started?)
+            (ecase kind
+              ((udp-connected))
+              ((udp-alive-ack)
+               (receive-alive-ack self data))
+              (else
+               (error "Unknown UDP kind: {s}" kind)))
+          (ecase kind
+            ((udp-connected))
+            ((udp-alive-ack)
+             (receive-alive-ack self data))
+            (else
+             (error "Unknown UDP kind: {s}" kind)))))))
+  
+  
+  (method (receive-alive-ack self data)
+    )
+  
+  
+  (method (send-alive self)
+    (with-write-mutex self
+      (lambda ()
+        (with-record header
+          (let ((size (calculate-alive-size)))
+            (let ((data (make-u8vector (+ size udp-code-size))))
+              (write-header-kind data udp-alive)
+              (write-header-sender data client-no)
+              (write-udp-code data)
+              (send-data self data)))))))))

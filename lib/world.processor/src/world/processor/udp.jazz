@@ -1,0 +1,212 @@
+;;;===============
+;;;  WorldScheme
+;;;===============
+;;;
+;;;; Processor UDP
+;;;
+;;;  The Initial Developer of the Original Code is Guillaume Cartier.
+;;;  Portions created by the Initial Developer are Copyright (C) 2012-2018
+;;;  the Initial Developer. All Rights Reserved.
+;;;
+;;;  Contributor(s):
+
+
+(module world.processor.udp jazz
+
+
+(import (jazz.syntax (phase syntax))
+        (world)
+        (world.configure)
+        (world.context)
+        (world.event)
+        (world.format)
+        (world.record (phase syntax))
+        (world.server.problem)
+        (world.settings)
+        (world.task)
+        (world.udp))
+
+
+(class UDP-Processor extends Object
+  
+  
+  (slot udp-port        initialize #f  getter generate)
+  (slot udp-stopping?   initialize #f  getter generate)
+  (slot no-connections  initialize #f  getter generate)
+  (slot receive-task    initialize #f  getter generate)
+  (slot invalid-packets initialize 0   getter generate)
+  
+  
+  (method package (start self host service)
+    (set! udp-port (open-udp (list
+                               local-address: host
+                               local-port-number: service)))
+    (setup-udp-port-buffers udp-port)
+    (set! udp-stopping? #f)
+    (set! no-connections (make-table))
+    (set! receive-task (new Task 'udp-receive (~ run-receive self) priority: udp-priority))
+    (start-task receive-task))
+  
+  
+  (method package (stop self)
+    (set! udp-stopping? #t)
+    (close-port udp-port)
+    (thread-join! (get-thread receive-task))
+    (set! udp-port #f)
+    (set! receive-task #f))
+  
+  
+  ;;;
+  ;;;; Connection
+  ;;;
+  
+  
+  (method (register-connection self no connection)
+    (table-set! no-connections no connection))
+  
+  
+  (method (unregister-connection self no)
+    (table-clear no-connections no))
+  
+  
+  (method protected (no->connection self no)
+    (table-ref no-connections no #f))
+  
+  
+  ;;;
+  ;;;; Receive
+  ;;;
+  
+  
+  (method (run-receive self task)
+    (declare (proper-tail-calls))
+    (with-task task
+      (lambda (exit)
+        (let (loop)
+          (let ((data (catch-exception-filter
+                        (lambda (exc)
+                          udp-stopping?)
+                        (lambda (exc)
+                          (continuation-return exit #f))
+                        (lambda ()
+                          (read-data udp-port)))))
+            (when data
+              (site udp-receive
+                (receive-data self data))
+              (loop)))))))
+  
+  
+  (method (receive-data self data)
+    (if (< (u8vector-length data) 4)
+        (begin
+          (problem "Receiving data: Invalid packet: {a}" data)
+          (increase! invalid-packets))
+      (let ((code (read-udp-code data)))
+        (if (/= code udp-code)
+            (begin
+              (problem "Receiving data: Invalid code: {a}" code)
+              (increase! invalid-packets))
+          (with-record header
+            (let ((kind (read-header-kind data))
+                  (sender (read-header-sender data)))
+              (if (= kind udp-connect)
+                  (connect-source self data)
+                (let ((connection (no->connection self sender)))
+                  (when connection
+                    (increase-received connection data)
+                    (ecase kind
+                      ((udp-alive)
+                       (receive-alive self connection sender data))
+                      (else
+                       (error "Unknown UDP kind: {s}" kind))))))))))))
+  
+  
+  (method (connect-source self data)
+    (with-record processor-connect
+      (let ((sender (read-header-sender data))
+            (sent (read-processor-connect-sent data))
+            (source-info (udp-source-socket-info udp-port)))
+        (let ((source-host (socket-info-address source-info))
+              (source-port (socket-info-port-number source-info)))
+          (define (send-connected connection)
+            (with-record processor-connected
+              (udp-destination-set! source-host source-port udp-port)
+              (let ((size (calculate-processor-connected-size)))
+                (let ((data (make-u8vector (+ size udp-code-size))))
+                  (write-header-kind data udp-connected)
+                  (write-header-sender data server-no)
+                  (write-processor-connected-connect-sent data sent)
+                  (write-udp-code data)
+                  (write-data data udp-port)
+                  (increase-sent connection data)))))
+          
+          (let ((existing-connection (no->connection self sender)))
+            (if existing-connection
+                (send-connected existing-connection)
+              (let ((connection (new UDP-Connection source-host source-port)))
+                (register-connection self sender connection)
+                (send-connected connection))))))))
+  
+  
+  (method package (deconnect-source self no)
+    (let ((connection (no->connection self no)))
+      (when connection
+        (unregister-connection self no))))
+    
+  
+  (method (receive-alive self connection sender data)
+    (send-alive-ack self connection sender data))
+  
+  
+  (method (send-alive-ack self connection sender data)
+    (with-record header
+      (let ((size (calculate-alive-ack-size)))
+        (let ((data (make-u8vector (+ size udp-code-size))))
+          (write-header-kind data udp-alive-ack)
+          (write-header-sender data sender)
+          (write-udp-code data)
+          (send-data self connection data)))))
+  
+  
+  (method (send-data self connection data)
+    (send-connection self connection data)
+    (increase-sent connection data))
+  
+  
+  (method (send-connection self connection data)
+    (udp-destination-set! (get-host connection) (get-port connection) udp-port)
+    (write-data data udp-port)))
+
+
+;;;
+;;;; UDP Connection
+;;;
+
+
+(class UDP-Connection extends Object
+  
+  
+  (slot host    getter generate)
+  (slot port    getter generate)
+  (slot monitor getter generate)
+  
+  
+  (method override (initialize self host port)
+    (nextmethod self)
+    (set! self.host host)
+    (set! self.port port)
+    (set! self.monitor (new UDP-Monitor)))
+  
+  
+  (method override (print self output readably)
+    (print-unreadable self output
+      (lambda (output)
+        (format output "{a} {a}" host port))))
+  
+  
+  (method protected (increase-sent self data)
+    (increase-sent monitor data))
+  
+  
+  (method protected (increase-received self data)
+    (increase-received monitor data))))
