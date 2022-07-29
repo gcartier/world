@@ -28,57 +28,6 @@
 
 
 ;;;
-;;;; Task
-;;;
-
-
-(definition public (run-processor task <Task>)
-  (declare (proper-tail-calls))
-  (with-task task
-    (lambda (exit)
-      (let (iter (previous (current-monotonic)))
-        (let ((time (current-monotonic)))
-          (let ((elapse (- time previous)))
-            (unless (stopping? task)
-              (site processor
-                (broadcast-update)))
-            (let ((duration (- (current-monotonic) time)))
-              (task-wait task processor-period duration exit))
-            (iter time)))))))
-
-
-(definition public (run-client task <Task>)
-  (declare (proper-tail-calls))
-  (with-task task
-    (lambda (exit)
-      (let (iter (previous (current-monotonic)))
-        (let ((time (current-monotonic)))
-          (let ((elapse (- time previous)))
-            (unless (stopping? task)
-              (site client
-                (send-update)))
-            (let ((duration (- (current-monotonic) time)))
-              (task-wait task client-period duration exit))
-            (iter time)))))))
-
-
-(definition public (run-client-alive task <Task>)
-  (declare (proper-tail-calls))
-  (with-task task
-    (lambda (exit)
-      (let (iter (previous (current-monotonic)))
-        (let ((time (current-monotonic)))
-          (let ((elapse (- time previous)))
-            (unless (stopping? task)
-              (site alive
-                (let ((client (current-client)))
-                  (send-client-alive client))))
-            (let ((duration (- (current-monotonic) time)))
-              (task-wait task alive-period duration exit))
-            (iter time)))))))
-
-
-;;;
 ;;;; Outgoing
 ;;;
 
@@ -103,8 +52,11 @@
 (definition protected outgoing-size <fx>
   0)
 
+(definition protected (set-outgoing-size size <fx>)
+  (set! outgoing-size size))
 
-(definition (maybe-grow-outgoing new-size <fx>)
+
+(definition protected (maybe-grow-outgoing new-size <fx>)
   (define (grow vect <f64vector> old-reserved <fx> new-reserved <fx>) <f64vector>
     (let ((new-vect (make-f64vector new-reserved)))
       (subf64vector-move! vect 0 old-reserved new-vect 0)
@@ -117,47 +69,41 @@
 
 
 ;;;
-;;;; Client
+;;;; Droppable
 ;;;
 
 
-(definition protected (outgoing-push val <fl>)
-  (let ((new-size (+ outgoing-size 1)))
-    (maybe-grow-outgoing new-size)
-    (f64vector-set! outgoing-changes outgoing-size val)
-    (set! outgoing-size new-size)))
+(definition protected droppable-mutex
+  (make-mutex 'droppable))
+
+(definition protected (with-droppable-mutex thunk)
+    (unwind-protect
+        (begin
+          (mutex-lock! droppable-mutex)
+          (thunk))
+      (mutex-unlock! droppable-mutex)))
 
 
-(definition protected (send-update)
-  (with-outgoing-mutex
-    (lambda ()
-      (when (> outgoing-size 0)
-        ;; quick first draft to optimize
-        (let ((changes (make-f64vector outgoing-size)))
-          (subf64vector-move! outgoing-changes 0 outgoing-size changes 0)
-          (send-client-update (current-client) changes)
-          (set! outgoing-size 0))))))
+(definition protected droppable-max <fx>
+  1024)
+
+(definition protected droppable-changes <f64vector>
+  (make-f64vector droppable-max))
+
+(definition protected droppable-size <fx>
+  0)
+
+(definition protected (set-droppable-size size <fx>)
+  (set! droppable-size size))
 
 
-;;;
-;;;; Processor
-;;;
-
-
-(definition protected (push-client-changes changes <f64vector>)
-  (let ((len (f64vector-length changes)))
-    (let ((new-size (+ outgoing-size len)))
-      (maybe-grow-outgoing new-size)
-      (subf64vector-move! changes 0 len outgoing-changes outgoing-size)
-      (set! outgoing-size new-size))))
-
-
-(definition protected (broadcast-update)
-  (with-outgoing-mutex
-    (lambda ()
-      (when (> outgoing-size 0)
-        ;; quick first draft to optimize
-        (let ((changes (make-f64vector outgoing-size)))
-          (subf64vector-move! outgoing-changes 0 outgoing-size changes 0)
-          (broadcast-processor-update (current-tier) changes)
-          (set! outgoing-size 0)))))))
+(definition protected (maybe-grow-droppable new-size <fx>)
+  (define (grow vect <f64vector> old-reserved <fx> new-reserved <fx>) <f64vector>
+    (let ((new-vect (make-f64vector new-reserved)))
+      (subf64vector-move! vect 0 old-reserved new-vect 0)
+      new-vect))
+  
+  (when (> new-size droppable-max)
+    (let ((new-reserved (fxround (* (cast <fl> new-size) GOLDEN_GROWTH))))
+      (set! droppable-changes (grow droppable-changes droppable-size new-reserved))
+      (set! droppable-max new-reserved)))))
