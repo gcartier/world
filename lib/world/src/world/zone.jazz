@@ -189,6 +189,9 @@
 (definition protected eye-diameter^3 <fx>
   0)
 
+(definition protected eye-proximity <fx>
+  3)
+
 
 (definition protected (eye-update)
   (set! eye-frustum-uptodate? #f))
@@ -273,8 +276,8 @@
   (slot level-state                              initialize #f)
   (slot opened-chest                             initialize #f                        accessors generate)
   (slot inventory-blocks                         initialize (make-vector 63 #f)       getter generate)
+  (slot preload-task                <object>     initialize #f                        getter generate)
   (slot generate-task               <object>     initialize #f                        getter generate)
-  (slot generate-thread             <object>     initialize #f                        accessors generate)
   (slot instantiate-task            <object>     initialize #f                        getter generate)
   (slot interface-task              <object>     initialize #f                        getter generate)
   (slot render-task                 <object>     initialize #f                        getter generate)
@@ -335,6 +338,7 @@
     (set! debug-sections? (or show-sections? show-chunks? (world-setting 'world.debug-sections? #f)))
     (when (window?)
       (unless (void? self)
+        (set! preload-task (new Task 'preload run-preload exit: exit-preload priority: preload-priority))
         (set! generate-task (new Task 'generate run-generate exit: exit-generate priority: generate-priority))
         (set! instantiate-task (new Task 'instantiate run-instantiate exit: exit-instantiate priority: instantiate-priority)))
       (set! interface-task (new Task 'interface (~ run-interface self) priority: interface-priority))
@@ -700,6 +704,7 @@
   (method package (start-tasks self)
     (when (window?)
       (unless (void? self)
+        (start-task preload-task)
         (start-task generate-task)
         (start-task instantiate-task))
       (start-task interface-task)
@@ -753,6 +758,7 @@
       (set-render-boost? #f)
       (set-player-boost? #f)
       (unless (void? self)
+        (stop-task preload-task)
         ;; stop generate before instantiate
         (stop-task generate-task)
         ;; stop instantiate before entities
@@ -2094,13 +2100,6 @@
             (update-eye-neighbors distance))))))
   
   
-  (method package (position-sector-index self pos <vertex>) <index>
-    (let ((size (cast <fl> sector-size)))
-      (indexed (fxfloor (fl& (/ (vertex-x pos) size)))
-               (fxfloor (fl& (/ (vertex-y pos) size)))
-               (fxfloor (fl& (/ (vertex-z pos) size))))))
-  
-  
   (method (new-sector self index <index>) <Sector>
     (define (center i <fx>)
       (* (+ (cast <fl> i) .5) sector-size))
@@ -2203,15 +2202,15 @@
           (vector-set! eye-neighbors n #f)))
   
   
-  (method package (eye-frustum-sectors self camera view-distance)
+  (method package (eye-frustum-sectors self motion camera view-distance)
     (declare (proper-tail-calls))
     (declare (optimize-dead-local-variables))
     (declare (inline))
     (declare (inlining-limit 1000))
     (proclaim (not check bounds types zero))
     (when (not eye-frustum-uptodate?)
-      (let ((camera-index (get-sector-index camera)))
-        (let ((sectors (eye-neighbor-sectors self camera-index view-distance))
+      (let ((motion-index (motion-sector-index motion)))
+        (let ((sectors (eye-neighbor-sectors self motion-index view-distance))
               (count 0))
           (loop (for i from 0 below (vector-length sectors))
                 (let ((sector <Sector> (vector-ref sectors i)))
@@ -2245,15 +2244,24 @@
       (let ((sectors (get-eye-sectors self))
             (a <fx> (- (index-x index) eye-radius))
             (b <fx> (- (index-y index) eye-radius))
-            (c <fx> (- (index-z index) eye-radius)))
+            (c <fx> (- (index-z index) eye-radius))
+            (l (- eye-radius eye-proximity))
+            (u (+ eye-radius eye-proximity)))
         (if (not eye-index)
             (loop (for i from 0 below eye-diameter)
                   (loop (for j from 0 below eye-diameter)
                         (loop (for k from 0 below eye-diameter)
                               (vector-set! sectors (sectors-index self i j k)
-                                (sector-new (+ a i)
-                                            (+ b j)
-                                            (+ c k))))))
+                                (let ((sector (sector-new (+ a i)
+                                                          (+ b j)
+                                                          (+ c k)))
+                                      (proximity? (and (>= i l) (<= i u)
+                                                       (>= j l) (<= j u)
+                                                       (>= k l) (<= k u))))
+                                  (when proximity?
+                                    (set-proximity? sector #t)
+                                    (update-preload sector))
+                                  sector)))))
           (let ((last (- eye-diameter 1))
                 (dx (- (index-x index) (index-x eye-index)))
                 (dy (- (index-y index) (index-y eye-index)))
@@ -2282,10 +2290,18 @@
                                           ;; free
                                           (sector-free sector)))
                                       (if fi
-                                          (begin
-                                            ;; move
-                                            (vector-set! sectors ti (vector-ref sectors fi))
-                                            (vector-set! sectors fi #f))
+                                          ;; move
+                                          (let ((sector (vector-ref sectors fi))
+                                                (proximity? (and (>= tx l) (<= tx u)
+                                                                 (>= ty l) (<= ty u)
+                                                                 (>= tz l) (<= tz u))))
+                                            (vector-set! sectors ti sector)
+                                            (vector-set! sectors fi #f)
+                                            (unless (eqv? (get-proximity? sector) proximity?)
+                                              (set-proximity? sector proximity?)
+                                              (if (not proximity?)
+                                                  (set-section sector #f)
+                                                (update-preload sector))))
                                         ;; new
                                         (vector-set! sectors ti (sector-new (+ a tx) (+ b ty) (+ c tz))))))))))))))
       ;; update neighbors
