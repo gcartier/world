@@ -57,8 +57,17 @@
   4)
 
 
-(definition protected chunk-buffer
+(definition protected inflated-chunk
   (make-u8vector 262144))
+
+
+(definition inflated-chunk-mutex
+  (make-mutex 'inflated-chunk))
+
+(definition (with-inflated-chunk-mutex thunk)
+  (mutex-lock! inflated-chunk-mutex)
+  (prog1 (thunk)
+    (mutex-unlock! inflated-chunk-mutex)))
 
 
 ;; looks like we don't need to adjust for negative values like stated on the wiki
@@ -677,51 +686,43 @@
                             (deserialize-chunk self chunk-x chunk-z digest chunk-raw))))))))))))))
   
   
-  (definition inflate-mutex
-    (make-mutex 'inflate))
-  
-  (definition (with-inflate-mutex thunk)
-    (mutex-lock! inflate-mutex)
-    (prog1 (thunk)
-      (mutex-unlock! inflate-mutex)))
-  
-  
   (method (deserialize-chunk self chunk-x chunk-z digest raw) <World-Chunk>
-    (define (inflate-chunk chunk-raw)
-      (with-inflate-mutex
+    (define (inflate/read-tag)
+      ;; inflated-chunk access needs to be protected
+      ;; in order to use constant space zlib-inflate!
+      (with-inflated-chunk-mutex
         (lambda ()
           (let (iter)
-            (let ((inflated (zlib-inflate! chunk-buffer chunk-raw)))
-              (or inflated
-                  (begin
-                    (set! chunk-buffer (make-u8vector (fxround (* (u8vector-length chunk-buffer) GOLDEN_GROWTH))))
-                    (iter))))))))
+            (or (zlib-inflate! inflated-chunk raw)
+                (begin
+                  (set! inflated-chunk (make-u8vector (fxround (* (u8vector-length inflated-chunk) GOLDEN_GROWTH))))
+                  (iter))))
+          (with ((reader <NBT-Reader> (new NBT-Reader inflated-chunk)))
+            (read-tag reader)))))
     
-    (let ((chunk-data <u8vector> (inflate-chunk raw)))
-      (with ((reader <NBT-Reader> (new NBT-Reader chunk-data)))
-        (let ((tag (read-tag reader)))
-          (let ((compound (tag-assoc "Level" (tag-value tag))))
-            (let ((state (or (tag-assoc "State" compound) Generated))
-                  (biomes (tag-assoc "Biomes" compound))
-                  (heightmap (tag-assoc "HeightMap" compound))
-                  (entities (tag-assoc "Entities" compound))
-                  (block-entities (tag-assoc "TileEntities" compound))
-                  (sections (tag-assoc "Sections" compound))
-                  (elements (tag-assoc "Elements" compound)))
-              (let ((chunk (new World-Chunk (planar-index chunk-x chunk-z) state digest (and (serving?) raw) self tag biomes heightmap entities block-entities sections elements)))
-                (when sections
-                  (for-each (lambda (section)
-                              (let ((yPos (cast <fx> (tag-assoc "Y" section)))
-                                    (blocks (tag-assoc "Blocks" section))
-                                    (data (tag-assoc "Data" section))
-                                    (blocklight (tag-assoc "BlockLight" section))
-                                    (skylight (tag-assoc "SkyLight" section)))
-                                (when (or (not truncate-y)
-                                          (>= yPos (cast <fx> truncate-y)))
-                                  (register-section chunk yPos (new World-Section chunk yPos blocks data blocklight skylight)))))
-                            (list-payload-content sections)))
-                (generated chunk)
-                chunk)))))))
+    (let ((tag (inflate/read-tag)))
+      (let ((compound (tag-assoc "Level" (tag-value tag))))
+        (let ((state (or (tag-assoc "State" compound) Generated))
+              (biomes (tag-assoc "Biomes" compound))
+              (heightmap (tag-assoc "HeightMap" compound))
+              (entities (tag-assoc "Entities" compound))
+              (block-entities (tag-assoc "TileEntities" compound))
+              (sections (tag-assoc "Sections" compound))
+              (elements (tag-assoc "Elements" compound)))
+          (let ((chunk (new World-Chunk (planar-index chunk-x chunk-z) state digest (and (serving?) raw) self tag biomes heightmap entities block-entities sections elements)))
+            (when sections
+              (for-each (lambda (section)
+                          (let ((yPos (cast <fx> (tag-assoc "Y" section)))
+                                (blocks (tag-assoc "Blocks" section))
+                                (data (tag-assoc "Data" section))
+                                (blocklight (tag-assoc "BlockLight" section))
+                                (skylight (tag-assoc "SkyLight" section)))
+                            (when (or (not truncate-y)
+                                      (>= yPos (cast <fx> truncate-y)))
+                              (register-section chunk yPos (new World-Section chunk yPos blocks data blocklight skylight)))))
+                        (list-payload-content sections)))
+            (generated chunk)
+            chunk)))))
   
   
   (method package (load-section self section-x <fx> section-y <fx> section-z <fx> (create?: create? #f)) <World-Section+>
