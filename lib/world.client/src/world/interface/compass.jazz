@@ -20,6 +20,7 @@
         (jazz.graphic)
         (gaea.geometry)
         (world)
+        (world.client.tier)
         (world.colors)
         (world.context)
         (world.interface.panel)
@@ -31,6 +32,11 @@
 (definition player-g (get-green player-color))
 (definition player-b (get-blue player-color))
 (definition player-a (get-alpha player-color))
+
+(definition circle-r (get-red group-color))
+(definition circle-g (get-green group-color))
+(definition circle-b (get-blue group-color))
+(definition circle-a (get-alpha group-color))
 
 
 ;;;
@@ -74,7 +80,7 @@
   
   
   (slot scale     initialize 1.                  accessors generate)
-  (slot players   initialize (make-vector 64 #f) getter generate)
+  (slot targets   initialize (make-vector 64 #f) getter generate)
   (slot xs        initialize (make-f64vector 64) getter generate)
   (slot ys        initialize (make-f64vector 64) getter generate)
   (slot count     initialize 0                   getter generate)
@@ -122,55 +128,64 @@
                   (cairo_line_to context (- w) 0.)
                   (cairo_set_source_rgba context 1. 1. 0. 1.)
                   (cairo_fill context))))
-            ;; players
-            (vector-set! players 0 me)
+            ;; targets
+            (vector-set! targets 0 me)
             (f64vector-set! xs 0 cx)
             (f64vector-set! ys 0 cy)
             (set! count 1)
             (let ((position (get-position me))
                   (sight (get-sight me)))
               (receive (left top) (cairo_user_to_device context 0. 0.)
+                (define (draw-target target target-position target-sight target-r target-g target-b target-a)
+                  (with-preserved-matrix surface
+                    (lambda ()
+                      (let ((delta (vertex- target-position position)))
+                        (define (draw-player x y near?)
+                          (let ((radius 4.5))
+                            (cairo_set_source_rgba context target-r target-g target-b target-a)
+                            (cairo_arc context x y radius 0. PI*2)
+                            (if near?
+                                (cairo_fill context)
+                              (cairo_stroke context)))
+                          (receive (x y) (cairo_user_to_device context x y)
+                            (vector-set! targets count target)
+                            (f64vector-set! xs count (- x left))
+                            (f64vector-set! ys count (- y top))
+                            (increase! count)))
+                        
+                        (let ((dx (vertex-x delta))
+                              (dz (vertex-z delta)))
+                          (if (and (= dx 0.)
+                                   (= dz 0.))
+                              (draw-player 0. 0. #t)
+                            (let ((dir (vertex-scalar/ (vertex& dx 0. dz) scale)))
+                              (let ((distance (vertex-norm dir)))
+                                (let ((near? (<= distance (- radius 3.)))
+                                      (angle (vector-signed-angle sight target-sight (vertex 0. 1. 0.))))
+                                  (let ((dir (rotate-vertex-upon angle (vertex 0. 1. 0.) dir)))
+                                    (cairo_translate context cx cy)
+                                    (cairo_rotate context angle)
+                                    (if near?
+                                        (draw-player (vertex-x dir) (vertex-z dir) #t)
+                                      (let ((dir (vertex-scalar* (vertex-normalize dir) radius)))
+                                        (draw-player (vertex-x dir) (vertex-z dir) #f)))))))))))))
+                
                 (for-each (lambda (player)
                             (unless (eq? player me)
-                              (with-preserved-matrix surface
-                                (lambda ()
-                                  (let ((delta (vertex- (get-position player) position)))
-                                    (define (draw-player x y near?)
-                                      (let ((radius 4.5))
-                                        (if (get-disconnected? player)
-                                            (cairo_set_source_rgba context .5 .5 .5 1.)
-                                          (cairo_set_source_rgba context player-r player-g player-b player-a))
-                                        (cairo_arc context x y radius 0. PI*2)
-                                        (if near?
-                                            (cairo_fill context)
-                                          (cairo_stroke context)))
-                                      (receive (x y) (cairo_user_to_device context x y)
-                                        (vector-set! players count player)
-                                        (f64vector-set! xs count (- x left))
-                                        (f64vector-set! ys count (- y top))
-                                        (increase! count)))
-                                    
-                                    (let ((dx (vertex-x delta))
-                                          (dz (vertex-z delta)))
-                                      (if (and (= dx 0.)
-                                               (= dz 0.))
-                                          (draw-player 0. 0. #t)
-                                        (let ((dir (vertex-scalar/ (vertex& dx 0. dz) scale)))
-                                          (let ((distance (vertex-norm dir)))
-                                            (let ((near? (<= distance (- radius 3.)))
-                                                  (angle (vector-signed-angle sight (get-sight player) (vertex 0. 1. 0.))))
-                                              (let ((dir (rotate-vertex-upon angle (vertex 0. 1. 0.) dir)))
-                                                (cairo_translate context cx cy)
-                                                (cairo_rotate context angle)
-                                                (if near?
-                                                    (draw-player (vertex-x dir) (vertex-z dir) #t)
-                                                  (let ((dir (vertex-scalar* (vertex-normalize dir) radius)))
-                                                    (draw-player (vertex-x dir) (vertex-z dir) #f))))))))))))))
-                          (nearest-players self))))
+                              (let ((position (get-position player))
+                                    (sight (get-sight player)))
+                                (if (get-disconnected? player)
+                                    (draw-target player position sight .5 .5 .5 1.)
+                                  (draw-target player position sight player-r player-g player-b player-a)))))
+                          (nearest-players self))
+                (for-each (lambda (circle)
+                            (bind (name position) circle
+                              (draw-target circle position (vertex& 0. 0. -1.) circle-r circle-g circle-b circle-a)))
+                          (nearest-circles self))))
             ;; so we do not leak memory
             (when (> old-count count)
               (loop (for n from count below old-count)
-                    (vector-set! players n #f))))))))
+                    (vector-set! targets n #f))))))))
   
   
   (method (nearest-players self)
@@ -184,6 +199,16 @@
             (subseq players 0 64))))))
   
   
+  (method (nearest-circles self)
+    (let ((client (current-client))
+          (queue (new-queue)))
+      (iterate-table (get-circles client)
+        (lambda (name info)
+          (bind (position) info
+            (enqueue queue (list name position)))))
+      (queue-list queue)))
+  
+  
   ;;;
   ;;;; Tooltip
   ;;;
@@ -194,7 +219,7 @@
   
   
   (method override (get-tooltip-bounds self pos)
-    (let ((nearest (nearest-player self pos)))
+    (let ((nearest (nearest-target self pos)))
       (and nearest
            (nearest-bounds self nearest))))
   
@@ -203,7 +228,7 @@
     7)
   
   
-  (method (nearest-player self pos)
+  (method (nearest-target self pos)
     (let ((nearest #f))
       (loop (for rank from 0 below count)
             (when (and (in-rect? pos (nearest-bounds self rank))
@@ -230,13 +255,23 @@
   
   
   (method override (get-tooltip-context self pos)
+    (define (present-target target)
+      (cond ((is? target Player) (present-player target))
+            (else (present-circle target))))
+    
     (define (present-player player)
       `(<span>
          (<paragraph>
            (<text> color: World-Green ,(->string (or (get-name player) (anonymous (current-tier))))))))
     
-    (let ((nearest (nearest-player self pos)))
+    (define (present-circle circle)
+      (bind (name) circle
+        `(<span>
+           (<paragraph>
+             (<text> color: World-Green ,(->string name))))))
+    
+    (let ((nearest (nearest-target self pos)))
       (and nearest
-           (let ((text (present-player (vector-ref players nearest)))
+           (let ((text (present-target (vector-ref targets nearest)))
                  (bounds (nearest-bounds self nearest)))
              (tooltip-context self text bounds padding: 0)))))))
