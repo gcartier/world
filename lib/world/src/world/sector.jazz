@@ -27,6 +27,7 @@
         (world.index)
         (world.mesh)
         (world.queue)
+        (world.region)
         (world.section)
         (world.support)
         (world.task))
@@ -43,12 +44,88 @@
 
 
 ;;;
+;;;; Request
+;;;
+
+
+(definition protected request-queue <Priorities-Queue>
+  (new Priorities-Queue 5 65536))
+
+
+(definition public (push-request sector priority)
+  (push request-queue sector priority))
+
+(definition public (popping-request proc)
+  (popping request-queue +infinity proc))
+
+(definition public (reset-request)
+  (reset request-queue #f))
+
+(definition public (trim-request-priority priority)
+  (trim-priority request-queue priority #f))
+
+(definition public (trim-request priority)
+  (trim request-queue priority #f))
+
+
+(definition protected (stop-request)
+  (push-request #f 0))
+
+
+(definition protected (run-request task <Task>)
+  (declare (proper-tail-calls))
+  (let ((zone (current-zone)))
+    (with-task task
+      (lambda (exit)
+        (let (iter)
+          (popping-request
+            (lambda (sector priority)
+              (if (not sector)
+                  (continuation-return exit #f)
+                (unless (stopping? task)
+                  (request-section-and-wait zone sector priority))
+                (iter)))))))))
+
+
+(definition request-periods <vector>
+  (vector .0001 .0005 .0005 .001 .001))
+
+
+(definition (request-section-and-wait zone <Zone> sector <Sector> priority <fx>)
+  (let ((index (get-index sector))
+        (request-priority (+ 2 priority)))
+    (let ((section-x (index-x index))
+          (section-y (index-y index))
+          (section-z (index-z index)))
+      (let ((chunk-locator (static (make-index))))
+        (cond ((>= priority 2)
+               ;; request neighbor sections for instantiate-visual
+               (loop (for a from -1 to 1)
+                     (loop (for b from -1 to 1)
+                           (loop (for c from -1 to 1)
+                                 (section->chunk-locator! chunk-locator (+ section-x a) (+ section-y b) (+ section-z c))
+                                 (when (request-chunk zone chunk-locator)
+                                   (let ((period (vector-ref request-periods priority)))
+                                     (sleep period)))))))
+              (else
+               (section->chunk-locator! chunk-locator section-x section-y section-z)
+               (when (request-chunk zone chunk-locator)
+                 (let ((period (vector-ref request-periods priority)))
+                   (sleep period)))))))))
+
+1
+(definition protected (exit-request task <Task>)
+  (reset-request)
+  (stop-request))
+
+
+;;;
 ;;;; Preload
 ;;;
 
 
 (definition protected preload-queue <Priorities-Queue>
-  (new Priorities-Queue 1 1024))
+  (new Priorities-Queue 1 65536))
 
 
 (definition public (push-preload sector)
@@ -58,10 +135,11 @@
   (pop preload-queue +infinity))
 
 (definition public (reset-preload)
-  (reset preload-queue))
+  (reset preload-queue #f))
 
 (definition public (trim-preload)
-  (trim preload-queue 0))
+  (trim-request-priority 0)
+  (trim preload-queue 0 (lambda (sector <Sector> priority) (set-preload? sector #f))))
 
 
 (definition protected (stop-preload)
@@ -82,7 +160,7 @@
               (iter))))))))
 
 
-(definition (preload-section zone sector)
+(definition (preload-section zone <Zone> sector <Sector>)
   (when (and (get-preload? sector)
              (not (get-section sector)))
     (site preload
@@ -112,10 +190,11 @@
   (pop instantiate-queue +infinity))
 
 (definition public (reset-instantiate)
-  (reset instantiate-queue))
+  (reset instantiate-queue #f))
 
 (definition public (trim-instantiate)
-  (trim instantiate-queue 0))
+  (trim-request-priority 1)
+  (trim instantiate-queue 0 (lambda (sector <Sector> priority) (set-instantiate? sector #f))))
 
 
 (definition protected (stop-instantiate)
@@ -136,7 +215,7 @@
               (iter))))))))
 
 
-(definition (instantiate-sector zone sector)
+(definition (instantiate-sector zone <Zone> sector <Sector>)
   (when (and (get-instantiate? sector)
              (not (get-elements sector)))
     (site instantiate
@@ -174,10 +253,11 @@
   (pop generate-queue +infinity))
 
 (definition public (reset-generate)
-  (reset generate-queue))
+  (reset generate-queue #f))
 
-(definition public (trim-generate priority) <fx>
-  (trim generate-queue priority))
+(definition public (trim-generate) <fx>
+  (trim-request 2)
+  (trim generate-queue 0 (lambda (sector <Sector> priority) (set-visual-generating? sector #f))))
 
 
 (definition protected (stop-generate)
@@ -215,11 +295,11 @@
 (definition public (push-free sector)
   (push free-queue sector 0))
 
-(definition public (pop-free)
+(definition public (pop-free) <Sector+>
   (pop free-queue +infinity))
 
 (definition public (reset-free)
-  (reset free-queue))
+  (reset free-queue #f))
 
 
 (definition protected (stop-free)
@@ -228,15 +308,14 @@
 
 (definition protected (run-free task <Task>)
   (declare (proper-tail-calls))
-  (let ((zone (current-zone)))
-    (with-task task
-      (lambda (exit)
-        (let (iter)
-          (let ((sector (pop-free)))
-            (if (not sector)
-                (continuation-return exit #f)
-              (free sector)
-              (iter))))))))
+  (with-task task
+    (lambda (exit)
+      (let (iter)
+        (let ((sector (pop-free)))
+          (if (not sector)
+              (continuation-return exit #f)
+            (free sector)
+            (iter)))))))
 
 
 (definition protected (exit-free task <Task>)
@@ -346,6 +425,7 @@
   
   (method package (update-preload self)
     (when (not section)
+      (push-request self 0)
       (push-preload self)))
   
   
@@ -356,10 +436,11 @@
   
   (method package (update-instantiate self)
     (when (not elements)
+      (push-request self 1)
       (push-instantiate self)))
   
   
-  (method package (free-instantiate self zone)
+  (method package (free-instantiate self zone <Zone>)
     (when elements
       (for-each (lambda (child)
                   (remove-element zone child))
@@ -396,10 +477,11 @@
     
     (when (and (not visual-generating?)
                (or (not visual-uptodate?)
-                   (< visual-revision (get-revision (get-generator zone)))))
+                   (< visual-revision (get-revision (allege (get-generator zone))))))
       (let ((priority (sector-priority)))
         (set! visual-generating? #t)
         (increase-sectors-generating zone 1)
+        (push-request self (+ 2 priority))
         (push-generate self priority))))
   
   
@@ -502,6 +584,6 @@
   ;;;
   
   
-  (method package (setup-feedback self mesh <Mesh> triangles <fx+>)
+  (method package (setup-feedback self mesh <Mesh> triangles <fx>)
     (allocate-feedback mesh)
     (setup-feedback-data (get-feedback-buffer mesh) (* triangles triangle-feedback-floats) feedback-floats))))

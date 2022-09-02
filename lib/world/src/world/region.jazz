@@ -70,10 +70,28 @@
     (mutex-unlock! inflated-chunk-mutex)))
 
 
-(definition protected (region-index section-x section-y section-z)
+(definition protected (section->region-index section-x <fx> section-y <fx> section-z <fx>) <index>
   (indexed (quotient/ section-x region-size)
            (quotient/ section-y region-size)
            (quotient/ section-z region-size)))
+
+
+(definition protected (section->chunk-locator section-x <fx> section-y <fx> section-z <fx>) <index>
+  (indexed section-x
+           (quotient/ section-y region-size)
+           section-z))
+
+
+(definition protected (section->chunk-locator! res <index> section-x <fx> section-y <fx> section-z <fx>)
+  (index-x-set! res section-x)
+  (index-y-set! res (quotient/ section-y region-size))
+  (index-z-set! res section-z))
+
+
+(definition protected (region/chunk->locator region-index <index> chunk-index <planar-index>) <index>
+  (indexed (+ (* (index-x region-index) region-size) (planar-index-x chunk-index))
+           (* (index-y region-index) region-size)
+           (+ (* (index-z region-index) region-size) (planar-index-z chunk-index))))
 
 
 ;; looks like we don't need to adjust for negative values like stated on the wiki
@@ -590,6 +608,20 @@
     (load-chunk self (section->chunk-index section-index)))
   
   
+  (method package (store-chunk self chunk-index chunk-raw)
+    (with-chunks-mutex self
+      (lambda ()
+        (or (table-ref chunks chunk-index #f)
+            (let ((chunk-x (planar-index-x chunk-index))
+                  (chunk-z (planar-index-z chunk-index))
+                  (digest #f))
+              (let ((chunk (if (not chunk-raw) ;; quick test to think through
+                               (make-chunk self chunk-index)
+                             (deserialize-chunk self chunk-x chunk-z digest chunk-raw))))
+                (table-set! chunks chunk-index chunk)
+                chunk))))))
+  
+  
   (method package (find-chunk self section-index <planar-index>) <World-Chunk+>
     (table-ref chunks (section->chunk-index section-index) #f))
   
@@ -644,23 +676,19 @@
   (method package (read-chunk self chunk-index <planar-index>) <World-Chunk+>
     (let ((chunk-x (planar-index-x chunk-index))
           (chunk-z (planar-index-z chunk-index)))
-      (let ((header-offset (chunk-header-offset self chunk-x chunk-z)))
+      (let ((header-offset (chunk-header-offset self chunk-x chunk-z))
+            (chunk-locator (region/chunk->locator index chunk-index)))
         (assert (<= header-offset 4092))
-        ;; quick hack to always retrieve until bugs fixed
+        ;; always retrieve for now
         (if (client?)
-            (let ((server-chunk-raw (retrieve-chunk (current-client) index chunk-index #f)))
-              (if server-chunk-raw
-                  (let ((digest #f @always-retrieve (object->u8vector (digest-u8vector server-chunk-raw 'SHA-1))))
-                    (deserialize-chunk self chunk-x chunk-z digest server-chunk-raw))
+            (or (let ((chunk (retrieve-chunk (get-zone dimension) chunk-locator)))
+                  (assert (eq? (get-region chunk) self)
+                    chunk))
                 ;; quick try
-                (make-chunk self chunk-index)))
+                (make-chunk self chunk-index))
           (let ((offset (get-chunk-offset self header-offset)))
             (if (not offset)
-                (let ((server-chunk-raw (and (client?) (error "not now") (retrieve-chunk (current-client) index chunk-index #f))))
-                  (if server-chunk-raw
-                      (let ((digest #f @always-retrieve (object->u8vector (digest-u8vector server-chunk-raw 'SHA-1))))
-                        (deserialize-chunk self chunk-x chunk-z digest server-chunk-raw))
-                    #f))
+                #f
               (input-port-byte-position port offset)
               (let ((chunk-header (u8vector 0 0 0 0 0)))
                 (read-subu8vector chunk-header 0 5 port)
@@ -670,14 +698,7 @@
                       (error "Unsupported compression type {s}" compression-type)
                     (let ((chunk-raw (make-u8vector deflated-size)))
                       (read-subu8vector chunk-raw 0 deflated-size port)
-                      (let ((digest #f @always-retrieve (object->u8vector (digest-u8vector chunk-raw 'SHA-1))))
-                        (let ((server-chunk-raw (and (client?) (error "not now") (retrieve-chunk (current-client) index chunk-index digest))))
-                          (if server-chunk-raw
-                              (let ((digest #f @always-retrieve (object->u8vector (digest-u8vector server-chunk-raw 'SHA-1))))
-                                (let ((chunk (deserialize-chunk self chunk-x chunk-z digest server-chunk-raw)))
-                                  (modified chunk)
-                                  chunk))
-                            (deserialize-chunk self chunk-x chunk-z digest chunk-raw))))))))))))))
+                      (deserialize-chunk self chunk-x chunk-z #f chunk-raw)))))))))))
   
   
   (method (deserialize-chunk self chunk-x chunk-z digest raw) <World-Chunk>

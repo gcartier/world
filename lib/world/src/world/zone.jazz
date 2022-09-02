@@ -78,6 +78,8 @@
         (world.light)
         (world.lighting)
         (world.mesh)
+        (world.moment)
+        (world.moment.syntax (phase syntax))
         (world.motion)
         (world.music)
         (world.network)
@@ -156,6 +158,13 @@
 
 (definition show-sections? <bool>
   (world-setting 'world.show-sections? #f))
+
+
+(definition debug-requests?
+  (world-setting 'world.debug-requests? #f))
+
+(definition debug-retrieves?
+  (world-setting 'world.debug-retrieves? #f))
 
 
 ;; index of the eye sector
@@ -255,6 +264,9 @@
   (slot areas                       <table>      initialize #f                        getter generate)
   (slot subarea-size                <fx>         initialize 2                         getter generate)
   (slot debug-areas?                <bool>       initialize #f                        accessors generate)
+  (slot chunk-requests              <table>      initialize (make-table test: equal?) getter generate)
+  (slot chunk-requests-mutex        <object>     initialize (make-mutex 'chunk-requests) getter generate)
+  (slot chunk-requests-shutdown?    <bool>       initialize #f                        getter generate)
   (slot expanses                    <table>      initialize #f                        getter generate)
   (slot assets                      <object>     initialize '()                       getter generate)
   (slot players                     <list>       initialize '()                       getter generate)
@@ -282,6 +294,7 @@
   (slot level-state                              initialize #f)
   (slot opened-chest                             initialize #f                        accessors generate)
   (slot inventory-blocks                         initialize (make-vector 63 #f)       getter generate)
+  (slot request-task                <object>     initialize #f                        getter generate)
   (slot preload-task                <object>     initialize #f                        getter generate)
   (slot generate-task               <object>     initialize #f                        getter generate)
   (slot instantiate-task            <object>     initialize #f                        getter generate)
@@ -345,6 +358,7 @@
     (set! debug-sections? (world-setting 'world.debug-sections? #f))
     (when (window?)
       (unless (void? self)
+        (set! request-task (new Task 'request run-request exit: exit-request priority: request-priority))
         (set! preload-task (new Task 'preload run-preload exit: exit-preload priority: preload-priority))
         (set! generate-task (new Task 'generate run-generate exit: exit-generate priority: generate-priority))
         (set! instantiate-task (new Task 'instantiate run-instantiate exit: exit-instantiate priority: instantiate-priority)))
@@ -611,6 +625,7 @@
           (shutdown-selection world)
           (when (window?)
             (uninstall-interface self))
+          (shutdown-chunk-requests self)
           (stop-tasks self)
           (save-zone self)
           (save-designer self)
@@ -718,6 +733,7 @@
   (method package (start-tasks self)
     (when (window?)
       (unless (void? self)
+        (start-task request-task)
         (start-task preload-task)
         (start-task generate-task)
         (start-task instantiate-task))
@@ -779,6 +795,7 @@
       (set-render-boost? #f)
       (set-player-boost? #f)
       (unless (void? self)
+        (stop-task request-task)
         (stop-task preload-task)
         ;; stop generate before instantiate
         (stop-task generate-task)
@@ -1881,7 +1898,7 @@
     (let ((section-x (index-x index))
           (section-y (index-y index))
           (section-z (index-z index)))
-      (let ((region-index (region-index section-x section-y section-z)))
+      (let ((region-index (section->region-index section-x section-y section-z)))
         (let ((region (load-region dimension region-index)))
           (load-section-chunk region (planar-index section-x section-z))))))
   
@@ -1890,19 +1907,31 @@
     (let ((section-x (index-x index))
           (section-y (index-y index))
           (section-z (index-z index)))
-      (let ((region-index (region-index section-x section-y section-z)))
+      (let ((region-index (section->region-index section-x section-y section-z)))
         (let ((region (if create?
                           (load-region dimension region-index)
                         (load-region-if dimension region-index))))
           (and region
                (load-section-chunk region (planar-index section-x section-z)))))))
+    
   
+  (method package (store-chunk self region-index chunk-index chunk-raw)
+    (let ((region (load-region dimension region-index)))
+      (store-chunk region chunk-index chunk-raw)))
+
   
   (method package (find-chunk self section-x section-y section-z) <World-Chunk+>
-    (let ((region-index (region-index section-x section-y section-z)))
+    (let ((region-index (section->region-index section-x section-y section-z)))
       (let ((region (find-region dimension region-index)))
         (and region
              (find-chunk region (planar-index section-x section-z))))))
+  
+  
+  (method package (find-chunk-by-locator self chunk-locator <index>) <World-Chunk+>
+    (let ((section-x (index-x chunk-locator))
+          (section-y (* (index-y chunk-locator) region-size))
+          (section-z (index-z chunk-locator)))
+      (find-chunk self section-x section-y section-z)))
   
   
   (method package (count-chunks self)
@@ -1911,6 +1940,105 @@
         (lambda (region)
           (increase! count (count-chunks region))))
       count))
+  
+  
+  (proclaim (not check types))
+  
+  
+  (method package (request-chunk self chunk-locator <index>)
+    (mutex-lock! chunk-requests-mutex)
+    (prog1 (cond (chunk-requests-shutdown?
+                  #f)
+                 ((table-ref chunk-requests chunk-locator #f)
+                  #f)
+                 ((find-chunk-by-locator self chunk-locator)
+                  #f)
+                 (else
+                  (when debug-requests?
+                    (terminal-string (format " .{a} " chunk-locator)))
+                  (let ((chunk-mutex (make-mutex 'chunk))
+                        (chunk-locator (copy-index chunk-locator)))
+                    (mutex-lock! chunk-mutex)
+                    (table-set! chunk-requests chunk-locator chunk-mutex)
+                    (request-chunk (current-tier) chunk-locator))
+                  #t))
+        (mutex-unlock! chunk-requests-mutex)))
+  
+  
+  (method package (receive-chunk self chunk-locator chunk-raw)
+    (mutex-lock! chunk-requests-mutex)
+    (unless chunk-requests-shutdown?
+      (when debug-requests?
+        (terminal-string (format " <{a} " chunk-locator)))
+      (let ((chunk-mutex (table-ref chunk-requests chunk-locator)))
+        (let ((chunk-x (index-x chunk-locator))
+              (chunk-y (index-y chunk-locator))
+              (chunk-z (index-z chunk-locator)))
+          (let ((region-index (section->region-index chunk-x chunk-y chunk-z))
+                (chunk-index (section->chunk-index (planar-index chunk-x chunk-z))))
+            (let ((chunk (store-chunk self region-index chunk-index chunk-raw)))
+              (mutex-specific-set! chunk-mutex chunk))))
+        (table-clear chunk-requests chunk-locator)
+        (mutex-unlock! chunk-mutex)))
+    (mutex-unlock! chunk-requests-mutex))
+  
+  
+  (method package (retrieve-chunk self chunk-locator)
+    (mutex-lock! chunk-requests-mutex)
+    (if chunk-requests-shutdown?
+        (prog1 (store-empty-chunk self chunk-locator)
+          (mutex-unlock! chunk-requests-mutex))
+      (let ((chunk-mutex (table-ref chunk-requests chunk-locator #f)))
+        (if chunk-mutex
+            (begin
+              (when debug-requests?
+                (terminal-string (format " &{a}{a} " (thread-name (current-thread)) chunk-locator)))
+              (mutex-unlock! chunk-requests-mutex)
+              (mutex-lock! chunk-mutex)
+              (mutex-unlock! chunk-mutex)
+              (mutex-specific chunk-mutex))
+          (when debug-synchronized?
+            (let ((name (thread-name (current-thread))))
+              (unless (or (eq? name 'preload)
+                          (eq? name 'instantiate)
+                          (eq? name 'generate))
+                (synchronized-debug "{a} {a}" name chunk-locator))))
+          (let ((chunk-mutex (make-mutex 'chunk)))
+            (when (or debug-requests? debug-retrieves?)
+              (terminal-string (format " ${a}{a} " (thread-name (current-thread)) chunk-locator)))
+            (mutex-lock! chunk-mutex)
+            (table-set! chunk-requests chunk-locator chunk-mutex)
+            (request-chunk (current-tier) chunk-locator)
+            (mutex-unlock! chunk-requests-mutex)
+            (mutex-lock! chunk-mutex)
+            (mutex-unlock! chunk-mutex)
+            (mutex-specific chunk-mutex))))))
+  
+  
+  (method package (shutdown-chunk-requests self)
+    (mutex-lock! chunk-requests-mutex)
+    (set! chunk-requests-shutdown? #t)
+    (iterate-table chunk-requests
+      (lambda (chunk-locator chunk-mutex)
+        (let ((chunk (store-empty-chunk self chunk-locator)))
+          (mutex-specific-set! chunk-mutex chunk))
+        (table-clear chunk-requests chunk-locator)
+        (mutex-unlock! chunk-mutex)))
+    (mutex-unlock! chunk-requests-mutex))
+  
+  
+  ;; store an empty chunk as a simple way to
+  ;; unblock any task waiting on a retrieve chunk
+  (method (store-empty-chunk self chunk-locator)
+    (let ((chunk-x (index-x chunk-locator))
+          (chunk-y (index-y chunk-locator))
+          (chunk-z (index-z chunk-locator)))
+      (let ((region-index (section->region-index chunk-x chunk-y chunk-z))
+            (chunk-index (section->chunk-index (planar-index chunk-x chunk-z))))
+        (store-chunk self region-index chunk-index #f))))
+  
+  
+  (proclaim (check types))
   
   
   ;;;
@@ -2246,6 +2374,22 @@
               (close sector)))
           (vector-set! eye-sectors n #f)
           (vector-set! eye-neighbors n #f)))
+  
+  
+  (method package (initial-preload self index)
+    (when (client?)
+      ;; to maximize the time that received chunks
+      ;; will be alive before being garbage collected
+      (gc)
+      (let ((x (index-x index))
+            (y (index-y index))
+            (z (index-z index)))
+        (loop (for i from (- eye-preload) to eye-preload)
+              (loop (for j from (- eye-preload) below eye-preload)
+                    (loop (for k from (- eye-preload) below eye-preload)
+                          (let ((chunk-locator (static (make-index))))
+                            (section->chunk-locator! chunk-locator (+ x i) (+ y j) (+ z k))
+                            (request-chunk self chunk-locator))))))))
   
   
   (method package (eye-frustum-sectors self motion camera view-distance)
