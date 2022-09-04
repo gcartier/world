@@ -16,6 +16,7 @@
 
 (import (jazz.component)
         (jazz.markup)
+        (gaea.geometry)
         (world)
         (world.index)
         (world.tag))
@@ -26,6 +27,13 @@
 
 (definition protected section-size <fx>
   16)
+
+
+(definition protected (position->section-index pos <vertex>) <index>
+  (let ((size (cast <fl> section-size)))
+    (indexed (fxfloor (/ (vertex-x pos) size))
+             (fxfloor (/ (vertex-y pos) size))
+             (fxfloor (/ (vertex-z pos) size)))))
 
 
 (definition protected (make-section section-y)
@@ -46,21 +54,19 @@
 (class World-Section extends Object
   
   
-  (slot index            <index+>   initialize #f getter explicit)
-  (slot chunk                                     accessors generate)
-  (slot tags                                      getter generate)
-  (slot y                                         accessors generate)
-  (slot blocks           <u8vector>               getter generate)
-  (slot data             <u8vector>               getter generate)
-  (slot blocklight       <u8vector>               getter generate)
-  (slot skylight         <u8vector>               getter generate)
-  (slot elements                                  getter generate)
-  (slot elements-list               initialize #f getter generate)
-  (slot elements-designer           initialize #f getter generate)
-  (slot touched          <fx>       initialize 0  accessors generate)
+  (slot index              <index+>   initialize #f getter explicit)
+  (slot chunk                                       accessors generate)
+  (slot tags                                        getter generate)
+  (slot y                                           accessors generate)
+  (slot blocks             <u8vector>               getter generate)
+  (slot data               <u8vector>               getter generate)
+  (slot blocklight         <u8vector>               getter generate)
+  (slot skylight           <u8vector>               getter generate)
+  (slot elements-container                          getter generate)
+  (slot touched            <fx>       initialize 0  accessors generate)
   
   
-  (method override (initialize self chunk tags y blocks data blocklight skylight elements)
+  (method override (initialize self chunk tags y blocks data blocklight skylight elements-raw)
     (set! self.chunk chunk)
     (set! self.tags tags)
     (set! self.y y)
@@ -68,7 +74,7 @@
     (set! self.data data)
     (set! self.blocklight blocklight)
     (set! self.skylight skylight)
-    (set! self.elements elements))
+    (set! self.elements-container (and elements-raw (instantiate-elements self elements-raw))))
   
   
   (method override (print self output readably)
@@ -100,63 +106,58 @@
   ;;;
   ;;;; Elements
   ;;;
+
+
+  (method package (instantiate-elements self elements-raw)
+    (let ((content (u8vector->object elements-raw)))
+      (call-with-input-string (list init: content readtable: jazz-readtable)
+        (lambda (port)
+          (let ((form (read-form-from port)))
+            (instantiate form))))))
   
   
-  (method package (cache-designer self)
-    (or elements-designer
+  (method package (with-designer self proc (convert?: convert? #f))
+    (define (setup-designer)
+      (if elements-container
+          (let ((form (get-form elements-container)))
+            (values (new Former form: form reference: elements-container) elements-container))
         (let ((units '(world.data)))
           (let ((tag '(<Section-Container>))
                 (data (new Data zone-version 'jazz units #f)))
-            (let ((form (construct-form tag (imports-locator units) data))
-                  (container (new Section-Container)))
-              (set-section container self)
-              (let ((des (new Former form: form reference: container)))
-                (set! elements-designer des)
-                des))))))
+            (let ((form (construct-form tag (imports-locator units) data)))
+              (let ((container (instantiate form)))
+                (values (new Former form: form reference: container) container)))))))
+    
+    (define (save-designer designer container)
+      (let ((form (get-form designer)))
+        (if (null? (get-children form))
+            (begin
+              (tags-remove tags "Elements")
+              (set! elements-container #f))
+          (let ((port (open-output-string)))
+            ;; for now save as string
+            (save-to-port designer port)
+            (let ((content (object->u8vector (get-output-string port))))
+              (tags-add tags "Elements" TAG_Byte_Array content)
+              (set! elements-container (if convert? (instantiate form) container)))))))
+    
+    (receive (designer container) (setup-designer)
+      (prog1 (proc designer container)
+        (save-designer designer container)
+        (unless convert?
+          (modified chunk)
+          (save-region (get-region chunk))))))
+
+
+  (method package (container-elements self)
+    (and elements-container (get-children elements-container)))
   
   
-  (method package (save-designer self)
-    (when elements-designer
-      (if (null? (get-children (get-form elements-designer)))
-          (begin
-            (tags-remove tags "Elements")
-            (set! elements #f)
-            (set! elements-designer #f))
-        (let ((port (open-output-string)))
-          ;; for now save as string
-          (save-to-port elements-designer port)
-          (let ((content (object->u8vector (get-output-string port))))
-            (tags-add tags "Elements" TAG_Byte_Array content)
-            (set! elements content))))))
-  
-  
-  (method package (instantiate-elements self)
-    (when (not elements-list)
-      (if (not elements)
-          (begin
-            (set! elements-list '())
-            (set! elements-designer #f))
-        (let ((content (u8vector->object elements)))
-          (call-with-input-string (list init: content readtable: jazz-readtable)
-            (lambda (port)
-              (let ((form (read-form-from port)))
-                (let ((container (instantiate form)))
-                  (set-section container self)
-                  (set! elements-list (get-children container))
-                  (set! elements-designer (new Former form: form reference: container)))))))
-        (set! elements #f)))
-    elements-list)
-  
-  
-  (method package (add-element self obj)
-    (if (not elements-list)
-        (set! elements-list (list obj))
-      (set! elements-list (append elements-list (list obj)))))
-  
-  
-  (method package (remove-element self obj)
-    (when elements-list
-      (set! elements-list (remove obj elements-list)))))
+  (method package (find-entity-by-id self id)
+    (and elements-container
+         (find-if (lambda (entity)
+                    (equal? (get-id entity) id))
+                  (get-children elements-container)))))
 
 
 ;;;
@@ -167,15 +168,4 @@
 (class Section-Container extends Component
   
   
-  (property version initialize #f accessors generate)
-  
-  
-  (slot section initialize #f accessors generate)
-  
-  
-  (method override (print self output readably)
-    (print-unreadable self output
-      (lambda (output)
-        (with-index section
-          (lambda (section-x section-y section-z)
-            (format output "{a} {a} {a}" section-x section-y section-z))))))))
+  (property version initialize #f accessors generate)))
