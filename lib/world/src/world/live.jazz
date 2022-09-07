@@ -285,6 +285,7 @@
   (slot user-assets             <object>            initialize #f              getter generate)
   (slot textures                <object>            initialize #f              getter generate)
   (slot models                  <object>            initialize #f              getter generate)
+  (slot models-mutex            <object>            initialize #f              getter generate)
   (slot history?                <bool>              initialize #t              getter generate)
   (slot history-trail           <fx>                initialize 250             getter generate)
   (slot history-camera          <Camera>            initialize (make-camera)   getter generate)
@@ -409,6 +410,7 @@
     (set-block-pumps? (world-setting 'world.block-pumps? #f))
     (set! tick-slice? (not (world-setting 'world.inhibit-slicing? #f)))
     (set! models (make-table test: equal?))
+    (set! models-mutex (make-mutex 'models))
     (update-world-up self ambient-gravity)
     (prepare-sounds self)
     (setup-history)
@@ -3530,8 +3532,16 @@
           (values (find-model self path class: class) #f)))))
   
   
+  (method public (reload-model self path)
+    (mutex-lock! models-mutex)
+    (table-clear models path)
+    (mutex-unlock! models-mutex))
+  
+  
   (method public (loaded-model self path)
-    (table-ref models path #f))
+    (mutex-lock! models-mutex)
+    (prog1 (table-ref models path #f)
+      (mutex-unlock! models-mutex)))
   
   
   (method public (search-model self path)
@@ -3587,21 +3597,25 @@
         (or (try "b3d" import-b3d)
             (try "ms3d" import-ms3d))))
     
-    (if (symbol? path)
-        (registered-model path)
-      (or (table-ref models path #f)
-          (bind-values (file model) (search-assets)
-            (if (not model)
-                (if (not error?)
-                    #f
-                  (signal (new Model-Not-Found-Error message: (format "Unable to find model: {a}" path))))
-              (set-file model file)
-              (table-set! models path model)
-              model)))))
+    (mutex-lock! models-mutex)
+    (prog1 (if (symbol? path)
+               (registered-model path)
+             (or (table-ref models path #f)
+                 (bind-values (file model) (search-assets)
+                   (if (not model)
+                       (if (not error?)
+                           #f
+                         (signal (new Model-Not-Found-Error message: (format "Unable to find model: {a}" path))))
+                     (set-file model file)
+                     (table-set! models path model)
+                     model))))
+      (mutex-unlock! models-mutex)))
   
   
   (method package (reset-models self)
-    (set! models (make-table test: equal?)))
+    (mutex-lock! models-mutex)
+    (set! models (make-table test: equal?))
+    (mutex-unlock! models-mutex))
   
   
   (method (collect-events self)
@@ -4579,7 +4593,7 @@
               (when (or (eq? what 'added)
                         (eq? what 'removed))
                 (set! models-showcase? #t)))
-            (when (table-ref models path #f)
+            (when (loaded-model self path)
               (table-set! models-reload path #t))))
         
         (define (maybe-reload-model entity path)
@@ -4597,7 +4611,7 @@
                   (showcase-entities (and showcase (cache-elements showcase))))
               (iterate-table models-reload
                 (lambda (path ignore)
-                  (table-clear models path)
+                  (reload-model self path)
                   (for-each (lambda (entity)
                               (maybe-reload-model entity path))
                             entities)
