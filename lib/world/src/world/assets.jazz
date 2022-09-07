@@ -47,11 +47,11 @@
     )
   
   
-  (method protected virtual (retrieve-directory self path . rest)
+  (method protected virtual (retrieve-file self path)
     )
   
   
-  (method protected virtual (retrieve-file self path)
+  (method protected virtual (retrieve-directory self path . rest)
     )
   
   
@@ -154,6 +154,42 @@
                         removed)))))))
   
   
+  (method public (request-file self path)
+    (let ((index (cache-index self)))
+      (let ((entry (find-entry index path))
+            (remote-entry (find-entry remote-index path))
+            (file (new-file (get-working repository) (tokenise-filename path))))
+        (if (not remote-entry)
+            (signal (new Asset-Not-Found-Error message: (format "Asset not found: {a}" path)))
+          (if (and entry (equal? (get-digest entry) (get-digest remote-entry))
+                ;; this test is a fail safe against someone deleting
+                ;; a file from their assets directory without the jas
+                ;; index being updated
+                (exists? file))
+              (lambda ()
+                file)
+            (let ((block (request-asset self path)))
+              (lambda ()
+                (bind (content digest flags) (block)
+                  (store-object repository content digest)
+                  (retrieve-file repository digest file flags)
+                  (update index path 'file (list remote-entry))
+                  (save-to-file index)
+                  file))))))))
+  
+  
+  (method override (retrieve-file self path)
+    (define (retrieve)
+      (let ((block (request-file self path)))
+        (block)))
+    
+    (if (inhibit-working?)
+        (retrieve)
+      (working self
+        (lambda ()
+          (retrieve)))))
+  
+  
   (method override (retrieve-directory self dirpath (progress: progress #f))
     (let ((dirpath (normalize-directory dirpath)))
       (define (count-entries)
@@ -166,14 +202,18 @@
       
       (let ((count (and progress (not (inhibit-working?)) (count-entries))))
         (define (retrieve)
-          (let ((n 0))
+          (let ((n 0)
+                (blocks (new-queue)))
             (iterate-entries self
               (lambda (path)
                 (when (starts-with? path dirpath)
                   (when count
                     (working-progress self progress (percentage n count)))
-                  (retrieve-file self path)
+                  (enqueue blocks (request-file self path))
                   (increase! n))))
+            (for-each (lambda (block)
+                        (block))
+                      (queue-list blocks))
             (when count
               (working-progress self progress (percentage n count)))
             (make-directory self dirpath)))
@@ -186,35 +226,9 @@
                 (retrieve))))))))
   
   
-  (method override (retrieve-file self path)
-    (let ((index (cache-index self)))
-      (let ((entry (find-entry index path))
-            (remote-entry (find-entry remote-index path))
-            (file (new-file (get-working repository) (tokenise-filename path))))
-        (if (not remote-entry)
-            (signal (new Asset-Not-Found-Error message: (format "Asset not found: {a}" path)))
-          (if (and entry (equal? (get-digest entry) (get-digest remote-entry))
-                ;; this test is a fail safe against someone deleting
-                ;; a file from their assets directory without the jas
-                ;; index being updated
-                (exists? file))
-              file
-            (let ()
-              (define (retrieve)
-                (bind (content digest flags) (retrieve-asset self path)
-                  (store-object repository content digest)
-                  (retrieve-file repository digest file flags)
-                  (update index path 'file (list remote-entry))
-                  (save-to-file index)
-                  file))
-              
-              (when debug-retrieve?
-                (terminal 'retrieve-file path))
-              (if (inhibit-working?)
-                  (retrieve)
-                (working self
-                  (lambda ()
-                    (retrieve))))))))))
+  (method protected virtual (request-asset self path)
+    (lambda ()
+      (retrieve-asset self path)))
   
   
   (method protected virtual (retrieve-asset self path)
@@ -267,15 +281,6 @@
     (get-index repository))
   
   
-  (method override (retrieve-directory self dirpath . rest)
-    (let ((dirpath (normalize-directory dirpath)))
-      (iterate-entries self
-        (lambda (path)
-          (when (starts-with? path dirpath)
-            (retrieve-file self path))))
-      (make-directory self dirpath)))
-  
-  
   (method override (retrieve-file self path)
     (let ((entry (find-entry repository path))
           (file (new-file (get-working repository) (tokenise-filename path))))
@@ -284,6 +289,15 @@
               (flags (get-flags entry)))
           (retrieve-file repository digest file flags)
           file))))
+  
+  
+  (method override (retrieve-directory self dirpath . rest)
+    (let ((dirpath (normalize-directory dirpath)))
+      (iterate-entries self
+        (lambda (path)
+          (when (starts-with? path dirpath)
+            (retrieve-file self path))))
+      (make-directory self dirpath)))
   
   
   (method override (make-directory self path) <Directory>
@@ -325,12 +339,12 @@
             idx))))
   
   
-  (method override (retrieve-directory self path . rest)
-    (make-directory self path))
-  
-  
   (method override (retrieve-file self path)
     (make-file self path))
+  
+  
+  (method override (retrieve-directory self path . rest)
+    (make-directory self path))
   
   
   (method override (make-directory self path) <Directory>

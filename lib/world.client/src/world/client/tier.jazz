@@ -118,6 +118,8 @@
   (slot welcomed?                initialize #f  accessors generate)
   (slot mutex                                   getter generate)
   (slot form                     initialize #f  getter generate)
+  (slot asset-requests                          getter generate)
+  (slot asset-requests-mutex                    getter generate)
   (slot zone-daytime             initialize #f  getter generate)
   (slot zone-asset-entries       initialize #f  getter generate)
   (slot spawnpoint               initialize #f  getter generate)
@@ -190,6 +192,8 @@
         (bailout-point 'tcp-read)))
     (set! configuration (instantiate-client))
     (set! mutex (make-mutex 'client))
+    (set! asset-requests (make-table test: equal?))
+    (set! asset-requests-mutex (make-mutex 'asset-requests))
     (set! players-cache (make-table test: eqv?))
     (prepare-assets self)
     (connect-to-server self)
@@ -851,23 +855,50 @@
         (client-list-hierarchy remote-server))))
   
   
+  ;;;
+  ;;;; Assets
+  ;;;
+  
+  
+  (method package (request-asset self where path)
+    (mutex-lock! asset-requests-mutex)
+    (let ((locator (cons where path)))
+      (prog1 (or (table-ref asset-requests locator #f)
+                 (let ((asset-mutex (make-mutex 'asset)))
+                   (mutex-lock! asset-mutex)
+                   (table-set! asset-requests locator asset-mutex)
+                   (case where
+                     ((universe)
+                      (calling-server self
+                        (lambda ()
+                          (request-universe-asset remote-server remote-client path))))
+                     ((world)
+                      (calling-server self
+                        (lambda ()
+                          (request-world-asset remote-server remote-client path))))
+                     ((zone)
+                      (calling-processor self
+                        (lambda ()
+                          (request-zone-asset remote-processor remote-client path)))))
+                   asset-mutex))
+        (mutex-unlock! asset-requests-mutex))))
+  
+  
+  (method package (receive-asset self where path info)
+    (mutex-lock! asset-requests-mutex)
+    (let ((locator (cons where path)))
+      (let ((asset-mutex (table-ref asset-requests locator)))
+        (mutex-specific-set! asset-mutex info)
+        (table-clear asset-requests locator)
+        (mutex-unlock! asset-mutex)))
+    (mutex-unlock! asset-requests-mutex))
+  
+  
   (method package (retrieve-asset self where path)
-    (let ((info (case where
-                  ((universe)
-                   (calling-server self
-                     (lambda ()
-                       (retrieve-universe-asset remote-server path))))
-                  ((world)
-                   (calling-server self
-                     (lambda ()
-                       (retrieve-world-asset remote-server path))))
-                  ((zone)
-                   (calling-processor self
-                     (lambda ()
-                       (retrieve-zone-asset remote-processor path)))))))
-      (if (not info)
-          (error "Unable to retrieve asset: {a}" path)
-        info)))
+    (let ((asset-mutex (request-asset self where path)))
+      (mutex-lock! asset-mutex)
+      (mutex-unlock! asset-mutex)
+      (mutex-specific asset-mutex)))
   
   
   (method package (upload-assets self where)
