@@ -490,13 +490,28 @@
   ;;;
   
   
+  (method package (client-invitation self client invitation-word name)
+    (let ((invitation (retrieve-invitation directory invitation-word)))
+      (if (not invitation)
+          (list #f "Invalid invitation")
+        (let ((key (generate-identity directory))
+              (type #f)
+              (role #f)
+              (admin? #f)
+              (email #f)
+              (inviter invitation-word))
+          (add-identity directory key name type role admin? email inviter)
+          (list key #f)))))
+  
+  
   (method package (client-connect self client client-uuid personal-key machine-identity machine-caps machine-features character-avatar character-dye character-script)
     (let ((identity (retrieve-identity-new directory personal-key)))
       (if (not identity)
           "Invalid personal key"
         (let ((character-name (get-name identity))
               (character-role (or (get-role identity) default-role))
-              (character-admin? (get-admin? identity)))
+              (character-admin? (get-admin? identity))
+              (character-verified? (get-verified? identity)))
           ;; no developer role until builder fully stable
           (when (and (eq? character-role 'developer)
                      (not character-admin?))
@@ -530,7 +545,7 @@
                                           existing-delegate)
                                         (else
                                          (let ((id (make-unique-id)))
-                                           (let ((delegate (new Client-Delegate client 'connected client-uuid id (literal->id id self) character-name character-avatar character-dye character-script character-role character-admin? personal-key))
+                                           (let ((delegate (new Client-Delegate client 'connected client-uuid id (literal->id id self) character-name character-avatar character-dye character-script character-role character-admin? character-verified? personal-key))
                                                  (connected (date-truncate-nanosecond (current-date))))
                                              (modify-identity directory personal-key
                                                (lambda (designer identity)
@@ -563,6 +578,7 @@
                             character-name
                             character-role
                             character-admin?
+                            character-verified?
                             universe-asset-entries
                             world-asset-entries
                             banner
@@ -1945,6 +1961,44 @@
             (profile-stop connection))))))
   
   
+  (method package (invitation-list self client)
+    (let ((delegate (find-delegate self client)))
+      (let ((personal-key (get-personal-key delegate))
+            (invitations (make-table test: equal?)))
+        ;; collect client invitations
+        (iterate-invitations directory
+          (lambda (invitation-word invitation)
+            (let ((inviter (get-inviter invitation))
+                  (created (get-created invitation)))
+              (when (equal? inviter personal-key)
+                (table-set! invitations invitation-word (list invitation-word
+                                                              (present-date-day created)
+                                                              '()))))))
+        ;; iterate matching identities
+        (iterate-identities directory
+          (lambda (key identity)
+            (let ((invitation-word (get-invitation identity)))
+              (let ((info (table-ref invitations invitation-word #f)))
+                (when info
+                  (let ((name (get-name identity))
+                        (connected (get-connected identity))
+                        (status (get-status identity)))
+                    (set-third! info (append! (third info) (list (list name connected status))))))))))
+        (table-values invitations))))
+  
+  
+  (method package (invitation-add self client invitation-word)
+    (let ((delegate (find-delegate self client)))
+      (let ((inviter (get-personal-key delegate)))
+        (add-invitation directory invitation-word inviter)))
+    #f)
+  
+  
+  (method package (invitation-remove self client invitation-word)
+    (remove-invitation directory invitation-word)
+    #f)
+  
+  
   (method package (admin-metadata self (requester-delegate/group #f))
     (define (send-streams)
       (streams-metadata (get-send-streams udp-server)))
@@ -2056,43 +2110,49 @@
                     "Identity not found"
                   (show key)))))
            ((add)
-            (bind (name type role admin? email) rest
-              (let ((key (generate-identity directory))
-                    (type (if (unspecified? type) #f type))
-                    (role (if (unspecified? role) #f role))
-                    (admin? (if (unspecified? admin?) #f admin?))
-                    (email (if (unspecified? email) #f email)))
-                (add-identity directory key name type role admin? email)
-                (show key))))
+            (let ((delegate (find-delegate self client)))
+              (bind (name type role admin? email) rest
+                (let ((key (generate-identity directory))
+                      (type (if (unspecified? type) #f type))
+                      (role (if (unspecified? role) #f role))
+                      (admin? (if (unspecified? admin?) #f admin?))
+                      (email (if (unspecified? email) #f email))
+                      (inviter (get-personal-key delegate)))
+                  (add-identity directory key name type role admin? email inviter)
+                  (show key)))))
            ((create)
-            (bind (names type role) rest
-              (define (parse-names)
-                (map (lambda (name)
-                       (if (ends-with? name ">")
-                           (let ((pos (find name #\< reversed?: #t)))
-                             (if pos
-                                 (values (trim-whitespace (substring name 0 (- pos 1))) (substring name (+ pos 1) (- (string-length name) 1)))
-                               (values name #f)))
-                         (values name #f)))
-                     (map trim-whitespace (split-string names #\,))))
-              
-              (let ((type (if (unspecified? type) #f type))
-                    (role (if (unspecified? role) #f role))
-                    (admin? #f))
-                (map (lambda (info)
-                       (receive (name email) info
-                         (let ((key (generate-identity directory)))
-                           (add-identity directory key name type role admin? email)
-                           (list name email key))))
-                     (parse-names)))))
+            (let ((delegate (find-delegate self client)))
+              (bind (names type role) rest
+                (define (parse-names)
+                  (map (lambda (name)
+                         (if (ends-with? name ">")
+                             (let ((pos (find name #\< reversed?: #t)))
+                               (if pos
+                                   (values (trim-whitespace (substring name 0 (- pos 1))) (substring name (+ pos 1) (- (string-length name) 1)))
+                                 (values name #f)))
+                           (values name #f)))
+                       (map trim-whitespace (split-string names #\,))))
+                
+                (let ((type (if (unspecified? type) #f type))
+                      (role (if (unspecified? role) #f role))
+                      (admin? #f)
+                      (inviter (get-personal-key delegate)))
+                  (map (lambda (info)
+                         (receive (name email) info
+                           (let ((key (generate-identity directory)))
+                             (add-identity directory key name type role admin? email inviter)
+                             (list name email key))))
+                       (parse-names))))))
            ((existing)
-            (bind (key name type role admin? email) rest
-              (let ((type (if (unspecified? type) #f type))
-                    (role (if (unspecified? role) #f role))
-                    (admin? (if (unspecified? admin?) #f admin?))
-                    (email (if (unspecified? email) #f email)))
-                (add-identity directory key name type role admin? email)
-                (show key))))
+            (let ((delegate (find-delegate self client)))
+              (bind (key name type role admin? email) rest
+                (let ((type (if (unspecified? type) #f type))
+                      (role (if (unspecified? role) #f role))
+                      (admin? (if (unspecified? admin?) #f admin?))
+                      (email (if (unspecified? email) #f email))
+                      (inviter (get-personal-key delegate)))
+                  (add-identity directory key name type role admin? email inviter)
+                  (show key)))))
            ((modify)
             (bind (target name type role admin? email) rest
               (let ((key (find-identity-key directory target)))
@@ -2120,6 +2180,48 @@
                   #f))))
            ((convert)
             (convert-identities directory)))))
+      ((invitation)
+       (bind (action . rest) arguments
+         (define (show word)
+           (let ((invitation (retrieve-invitation directory word)))
+             (let ((inviter (get-inviter invitation))
+                   (created (get-created invitation)))
+               `(,word
+                 ,inviter
+                 ,@(list created: (present-date created))))))
+         
+         (case action
+           ((list)
+            (bind (target) rest
+              (let ((queue (new-queue)))
+                (iterate-invitations directory
+                  (lambda (word invitation)
+                    (let ((inviter (get-inviter invitation))
+                          (created (get-created invitation)))
+                      (when (or (unspecified? target)
+                                (search word target ignore-case?: #t))
+                        (enqueue queue `(,word
+                                         ,inviter
+                                         ,@(list created: (present-date created))))))))
+                (queue-list queue))))
+           ((show)
+            (bind (target) rest
+              (let ((word (find-invitation-word directory target)))
+                (if (not word)
+                    "Invitation not found"
+                  (show word)))))
+           ((add)
+            (let ((delegate (find-delegate self client)))
+              (bind (word inviter) rest
+                (add-invitation directory word inviter)
+                (show word))))
+           ((remove)
+            (bind (target) rest
+              (let ((word (find-invitation-word directory target)))
+                (if (not word)
+                    "Invitation not found"
+                  (remove-invitation directory word)
+                  #f)))))))
       ((kick)
        (bind (who) arguments
          (let ((delegate (search-for-delegate self who)))
@@ -2916,7 +3018,8 @@
               (write-mobile self port "result" "connect" "Invalid personal key")
             (let ((character-name (get-name identity))
                   (character-role (or (get-role identity) default-role))
-                  (character-admin? (get-admin? identity)))
+                  (character-admin? (get-admin? identity))
+                  (character-verified? (get-verified? identity)))
               (let ((existing-delegate (find-delegate-by-name self character-name)))
                 (if (and existing-delegate (not (get-disconnected? existing-delegate)))
                     (begin
@@ -2927,7 +3030,7 @@
                                           existing-delegate)
                                         (else
                                          (let ((id (make-unique-id)))
-                                           (new Mobile-Delegate port 'started id (literal->id id self) character-name character-role character-admin?))))))
+                                           (new Mobile-Delegate port 'started id (literal->id id self) character-name character-role character-admin? character-verified?))))))
                     (let ((client-id #f)
                           (client-no (get-no delegate)))
                       (write-mobile self port "result" "connect" (list
