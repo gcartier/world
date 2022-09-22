@@ -2650,27 +2650,36 @@
           (send-reply "Already attached" #f)
         (logger "Attach server")
         (let ((debugger action))
-          (thread-int! (primordial-thread)
+          (background
             (lambda ()
               (let ((exception-debugger (get-exception-debugger))
                     (exception-hook (jazz:get-exception-hook)))
+                ;; setup-debuggee because of calling tcp-client-peer-socket-info
+                ;; can take a very long time to timeout so run in the background
                 (let ((exc (setup-debuggee debugger: debugger connection-exception-exit?: #f)))
                   (if exc
-                      (send-reply "Unable to connect to debugger" #f)
-                    (set! preserved-exception-debugger exception-debugger)
-                    (set! preserved-exception-hook exception-hook)
-                    (start-repl-thread (current-thread) #f (current-console-port))
-                    (select-debugger-console)
-                    (current-input-port (console-input-port))
-                    (current-output-port (console-output-port))
-                    (ready-to-controller)
-                    (iterate-processors
-                      (lambda (zone processor)
-                        (let ((remote-processor (get-remote-proxy processor)))
-                          (calling-processor self processor
-                            (lambda ()
-                              (attach remote-processor debugger))))))
-                    (send-reply "attached" #t)))))))))
+                      (with-task-mutex
+                        (lambda ()
+                          (send-reply "Unable to connect to debugger" #f)))
+                    (thread-int! (primordial-thread)
+                      (lambda ()
+                        (with-reentrant-task-mutex
+                          (lambda ()
+                            (set! preserved-exception-debugger exception-debugger)
+                            (set! preserved-exception-hook exception-hook)
+                            (start-repl-thread (current-thread) #f (current-console-port))
+                            (select-debugger-console)
+                            (current-input-port (console-input-port))
+                            (current-output-port (console-output-port))
+                            (ready-to-controller)
+                            (iterate-processors
+                              (lambda (zone processor)
+                                (let ((remote-processor (get-remote-proxy processor)))
+                                  (calling-processor self processor
+                                    (lambda ()
+                                      (attach remote-processor debugger))))))
+                            (send-reply "attached" #t)))))))))
+            'attach))))
     
     (define (detach-from-debugger)
       (if (not (get-controller-debugger))
@@ -2722,8 +2731,8 @@
                           (admin-request-chunk self requester cookie sender name chunk done?))
                         (loop-chunk (+ part 1) (+ pos chunk-size))))))))))))
     
-    (define (background thunk)
-      (let ((thread (new-thread thunk 'request)))
+    (define (background thunk (name 'request))
+      (let ((thread (new-thread thunk name)))
         (thread-base-priority-set! thread background-priority)
         (thread-start! thread)
         thread))
