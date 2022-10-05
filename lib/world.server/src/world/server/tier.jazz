@@ -121,14 +121,15 @@
 (class Server-Tier extends Serving-Tier implements Server-Interface
   
   
-  (slot configuration                                       getter generate)
-  (slot instances      initialize (make-table test: equal?) getter generate)
-  (slot zones          initialize '()                       getter generate)
-  (slot groups         initialize '()                       getter generate)
-  (slot circles-index  initialize (make-table test: equal?) getter generate)
-  (slot hits           initialize 0                         getter generate)
-  (slot aliveness-task initialize #f                        getter generate)
-  (slot udp-server     initialize #f                        getter generate)
+  (slot configuration                                        getter generate)
+  (slot instances       initialize (make-table test: equal?) getter generate)
+  (slot zones           initialize '()                       getter generate)
+  (slot zones-available initialize '()                       getter generate)
+  (slot groups          initialize '()                       getter generate)
+  (slot circles-index   initialize (make-table test: equal?) getter generate)
+  (slot hits            initialize 0                         getter generate)
+  (slot aliveness-task  initialize #f                        getter generate)
+  (slot udp-server      initialize #f                        getter generate)
   
   
   (method override (initialize self dir)
@@ -314,6 +315,10 @@
     (let ((zones-dir (zones-dir self))
           (queue (new-queue)))
       (when (exists? zones-dir)
+        (let ((zones-file (new-file zones-dir ".zones")))
+          (when (exists? zones-file)
+            (set! zones-available (call-with-input-file (path-settings zones-file)
+                                    read-all))))
         (iterate-directory zones-dir
           (lambda (path kind)
             (let ((zone-dir (new-directory zones-dir path)))
@@ -325,6 +330,16 @@
           directories?: #t
           recursive?: #t))
       (set! zones (queue-list queue))))
+  
+  
+  (method (save-zones self)
+    (let ((zones-dir (zones-dir self)))
+      (let ((zones-file (new-file zones-dir ".zones")))
+        (call-with-output-file (path-settings zones-file)
+          (lambda (output)
+            (for-each (lambda (path)
+                        (format output "{s}{%}" path))
+                      zones-available))))))
   
   
   (method package (zones-dir self)
@@ -807,6 +822,18 @@
                         (calling-client self delegate
                           (lambda ()
                             (hierarchy-update client hierarchy)))))))
+                delegates)))
+  
+  
+  (method (broadcast-zones self)
+    (let ((hierarchy (collect-hierarchy self))
+          (zones (available-zones self)))
+      (for-each (lambda (delegate)
+                  (when (eq? (get-state delegate) 'started)
+                    (let ((client (get-client delegate)))
+                      (calling-client self delegate
+                        (lambda ()
+                          (zones-update client hierarchy zones))))))
                 delegates)))
   
   
@@ -1823,8 +1850,31 @@
       (for-each (lambda (path)
                   (enqueue queue (cons (cons 'zone path)
                                        (last path))))
-                zones)
+                zones-available)
       (queue-list queue)))
+  
+  
+  (method (zone-available self path)
+    (unless (member? path zones-available)
+      (set! zones-available (sort-zones self (cons path zones-available)))
+      (save-zones self)))
+  
+  
+  (method (zone-unavailable self path)
+    (when (member? path zones-available)
+      (set! zones-available (sort-zones self (remove path zones-available test: equal?)))
+      (save-zones self)))
+  
+  
+  (method (zone-has-people? self zone)
+    (some? (lambda (delegate)
+             (equal? (get-zone delegate) zone))
+           delegates))
+  
+  
+  (method (sort-zones self paths)
+    (sort nu<? paths key: (lambda (path)
+                            (cons (if (= (length path) 1) 0 1) path))))
   
   
   (method (change-client-zone self client zone)
@@ -2499,6 +2549,37 @@
          (format "v{a}{a}" (present version) environment-suffix)))
       ((who)
        (map get-name delegates))
+      ((zone)
+       (bind (action . rest) arguments
+         (case action
+           ((list)
+            (bind (target) rest
+              (let ((queue (new-queue)))
+                (for-each (lambda (path)
+                            (let ((pathname (join path "/")))
+                              (when (or (unspecified? target)
+                                        (search pathname target ignore-case?: #t))
+                                (let ((available? (member? path zones-available)))
+                                  (let ((info (list path available?)))
+                                    (enqueue queue info))))))
+                          (sort-zones self zones))
+                (queue-list queue))))
+           ((available)
+            (bind (path) rest
+              (zone-available self path)
+              (broadcast-zones self)
+              #f))
+           ((unavailable)
+            (bind (path) rest
+              (let ((zone (cons 'zone path)))
+                (if (zone-has-people? self zone)
+                    "has people"
+                  (zone-unavailable self path)
+                  (let ((processor (find-processor zone)))
+                    (when processor
+                      (quit-processor processor)))
+                  (broadcast-zones self)
+                  #f)))))))
       (else
        (let ((requester client))
          (let ((requester-delegate (find-delegate self requester)))
