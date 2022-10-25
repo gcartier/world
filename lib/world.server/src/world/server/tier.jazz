@@ -24,6 +24,7 @@
         (jazz.logger)
         (jazz.markup)
         (jazz.network)
+        (jazz.network.websocket)
         (jazz.platform)
         (jazz.process)
         (jazz.presence)
@@ -154,7 +155,7 @@
   (method override (startup self)
     (nextmethod self)
     (start-aliveness-task self)
-    (start-mobile-server (~ mobile-connect self))
+    (start-mobile-server (new-directory directory "certificates") (~ mobile-connect self))
     (start-udp-server self)
     (delay-spawn-start-zone self)
     (add-exit-job! quit-processors))
@@ -786,10 +787,12 @@
       (for-each (lambda (delegate)
                   (when (eq? (get-state delegate) 'started)
                     (when (equal? (get-zone delegate) zone)
-                      (let ((client (get-client delegate)))
-                        (calling-client self delegate
-                          (lambda ()
-                            (circle-added client name stone)))))))
+                      (if (is? delegate Mobile-Delegate)
+                          (send-circle-added self delegate name stone)
+                        (let ((client (get-client delegate)))
+                          (calling-client self delegate
+                            (lambda ()
+                              (circle-added client name stone))))))))
                 delegates)))
   
   
@@ -799,10 +802,12 @@
       (for-each (lambda (delegate)
                   (when (eq? (get-state delegate) 'started)
                     (when (equal? (get-zone delegate) zone)
-                      (let ((client (get-client delegate)))
-                        (calling-client self delegate
-                          (lambda ()
-                            (circle-removed client name)))))))
+                      (if (is? delegate Mobile-Delegate)
+                          (send-circle-removed self delegate name)
+                        (let ((client (get-client delegate)))
+                          (calling-client self delegate
+                            (lambda ()
+                              (circle-removed client name))))))))
                 delegates)))
   
   
@@ -830,10 +835,12 @@
           (zones (available-zones self)))
       (for-each (lambda (delegate)
                   (when (eq? (get-state delegate) 'started)
-                    (let ((client (get-client delegate)))
-                      (calling-client self delegate
-                        (lambda ()
-                          (zones-update client hierarchy zones))))))
+                    (if (is? delegate Mobile-Delegate)
+                        (send-zones-update self delegate hierarchy zones)
+                      (let ((client (get-client delegate)))
+                        (calling-client self delegate
+                          (lambda ()
+                            (zones-update client hierarchy zones)))))))
                 delegates)))
   
   
@@ -923,9 +930,11 @@
           (set-verified? verified-delegate #t)
           (set-verifier verified-delegate verifier-key)
           (broadcast-hierarchy self)
-          (calling-client self verified-delegate
-            (lambda ()
-              (server-verified verified-client verifier)))))))
+          (if (is? verified-delegate Mobile-Delegate)
+              (send-verified self verified-delegate verifier)
+            (calling-client self verified-delegate
+              (lambda ()
+                (server-verified verified-client verifier))))))))
   
   
   (method package (client-invite self client recipient circle-name)
@@ -3188,34 +3197,38 @@
   ;;;
   
   
-  (method (read-mobile self port)
-    (let ((code (make-string 4)))
-      (if (= (read-substring code 0 4 port) 4)
-          (if (equal? code mobile-code)
-              (let ((obj (read port)))
-                (if (eof-object? obj)
-                    obj
-                  (object->json obj)))
-            (throw-connection-broke (format "Invalid code: {a}" code)))
-        (throw-connection-broke "Read code received eof"))))
+  (method (read-mobile self server port)
+    (let ((frame (read-frame server 0 port)))
+      (if (eof-object? frame)
+          frame
+        (let ((text (unmask server frame)))
+          (call-with-input-u8vector (list init: text readtable: json-readtable)
+            (lambda (port)
+              (let ((code (make-string 4)))
+                (if (= (read-substring code 0 4 port) 4)
+                    (if (equal? code mobile-code)
+                        (read-json port)
+                      (throw-connection-broke (format "Invalid code: {a}" code)))
+                  (throw-connection-broke "Read code received eof")))))))))
   
   
-  (method (write-mobile self port kind message obj)
-    (print-json (list kind message obj) port)
-    (write-char #\| port)
-    (force-output port))
+  (method (write-mobile self server port kind message obj)
+    (let ((output (open-output-string)))
+      (print-json (list kind message obj) output)
+      (let ((data (get-output-string output)))
+        (write-frame server 'text data #t port))))
   
   
-  (method package (mobile-connect self port)
+  (method package (mobile-connect self server port)
     (input-port-readtable-set! port json-readtable)
     (let ((personal-key (catch (connection-exception? exc
                                  (problem "Connecting mobile: {a}" (exception-reason exc))
                                  (eof-object))
-                          (read-mobile self port))))
+                          (read-mobile self server port))))
       (unless (eof-object? personal-key)
         (let ((identity (retrieve-identity directory personal-key)))
           (if (not identity)
-              (write-mobile self port "result" "connect" "Invalid personal key")
+              (write-mobile self server port "result" "connect" "Invalid personal key")
             (let ((character-name (get-name identity))
                   (character-role (or (get-role identity) default-role))
                   (character-admin? (get-admin? identity))
@@ -3231,15 +3244,15 @@
                                           existing-delegate)
                                         (else
                                          (let ((id (make-unique-id)))
-                                           (new Mobile-Delegate port 'started id (literal->id id self) character-name character-role character-admin? character-verified? character-verifier))))))
+                                           (new Mobile-Delegate server port 'started id (literal->id id self) character-name character-role character-admin? character-verified? character-verifier))))))
                     (let ((client-id #f)
                           (client-no (get-no delegate)))
-                      (write-mobile self port "result" "connect" (list
-                                                                   client-id
-                                                                   client-no
-                                                                   character-name
-                                                                   character-role
-                                                                   character-admin?))
+                      (write-mobile self server port "result" "connect" (list
+                                                                          client-id
+                                                                          client-no
+                                                                          character-name
+                                                                          character-role
+                                                                          character-admin?))
                       (set-zone delegate 'start)
                       (unless existing-delegate
                         (set! delegates (cons delegate delegates)))
@@ -3301,40 +3314,41 @@
   
   (method (serve-mobile self delegate)
     (declare (proper-tail-calls))
-    (let ((port (get-port delegate)))
+    (let ((server (get-server delegate))
+          (port (get-port delegate)))
       (let (loop)
         (let ((obj (catch (connection-exception? exc
                             (problem "Serving mobile: {a}" (exception-reason exc))
                             (eof-object))
-                     (read-mobile self port))))
+                     (read-mobile self server port))))
           (if (eof-object? obj)
               (mobile-disconnect self delegate)
             (if (not (pair? obj))
                 (begin
-                  (write-mobile self port "result" "" (format "Invalid command: {a}" obj))
+                  (write-mobile self server port "result" "" (format "Invalid command: {a}" obj))
                   (loop))
               (bind (command . arguments) obj
                 (if (equal? command "deconnect")
                     (begin
-                      (write-mobile self port "result" command #f)
+                      (write-mobile self server port "result" command #f)
                       (mobile-deconnect self delegate))
                   (cond ((equal? command "message")
                          (bind (kind recipient message) arguments
                            (let ((kind (string->symbol kind)))
-                             (write-mobile self port "result" command (mobile-message self delegate kind recipient message)))))
+                             (write-mobile self server port "result" command (mobile-message self delegate kind recipient message)))))
                         ((equal? command "invite")
                          (bind (recipient) arguments
-                           (write-mobile self port "result" command (mobile-invite self delegate recipient))))
+                           (write-mobile self server port "result" command (mobile-invite self delegate recipient))))
                         ((equal? command "accept")
                          (bind (sender) arguments
-                           (write-mobile self port "result" command (mobile-accept self delegate sender))))
+                           (write-mobile self server port "result" command (mobile-accept self delegate sender))))
                         ((equal? command "decline")
                          (bind (sender) arguments
-                           (write-mobile self port "result" command (mobile-decline self delegate sender))))
+                           (write-mobile self server port "result" command (mobile-decline self delegate sender))))
                         ((equal? command "leave")
-                         (write-mobile self port "result" command (mobile-leave self delegate)))
+                         (write-mobile self server port "result" command (mobile-leave self delegate)))
                         (else
-                         (write-mobile self port "result" command (format "Unknown command: {a}" command))))
+                         (write-mobile self server port "result" command (format "Unknown command: {a}" command))))
                   (loop)))))))))
   
   
@@ -3355,91 +3369,111 @@
   (method (send-detach self delegate)
     (calling-mobile self delegate
       (lambda ()
-        (write-mobile self (get-port delegate) "call" "detach" '()))))
+        (write-mobile self (get-server delegate) (get-port delegate) "call" "detach" '()))))
   
   
   (method (send-people self delegate hierarchy)
     (calling-mobile self delegate
       (lambda ()
-        (write-mobile self (get-port delegate) "call" "people" (list hierarchy)))))
+        (write-mobile self (get-server delegate) (get-port delegate) "call" "people" (list hierarchy)))))
+  
+  
+  (method (send-zones-update self delegate hierarchy zones)
+    ;; todo
+    )
   
   
   (method (send-entered self delegate client-no client-name)
     (calling-mobile self delegate
       (lambda ()
-        (write-mobile self (get-port delegate) "call" "entered" (list client-no client-name)))))
+        (write-mobile self (get-server delegate) (get-port delegate) "call" "entered" (list client-no client-name)))))
   
   
   (method (send-exited self delegate client-name)
     (calling-mobile self delegate
       (lambda ()
-        (write-mobile self (get-port delegate) "call" "exited" (list client-name)))))
+        (write-mobile self (get-server delegate) (get-port delegate) "call" "exited" (list client-name)))))
   
   
   (method (send-disconnected self delegate client-name)
     (calling-mobile self delegate
       (lambda ()
-        (write-mobile self (get-port delegate) "call" "disconnected" (list client-name)))))
+        (write-mobile self (get-server delegate) (get-port delegate) "call" "disconnected" (list client-name)))))
   
   
   (method (send-reconnected self delegate client-name)
     (calling-mobile self delegate
       (lambda ()
-        (write-mobile self (get-port delegate) "call" "reconnected" (list client-name)))))
+        (write-mobile self (get-server delegate) (get-port delegate) "call" "reconnected" (list client-name)))))
   
   
   (method (send-message self delegate sender kind message)
     (calling-mobile self delegate
       (lambda ()
-        (write-mobile self (get-port delegate) "call" "message" (list sender kind message)))))
+        (write-mobile self (get-server delegate) (get-port delegate) "call" "message" (list sender kind message)))))
   
   
   (method (send-messages self delegate messages)
     (calling-mobile self delegate
       (lambda ()
-        (write-mobile self (get-port delegate) "call" "messages" (list messages)))))
+        (write-mobile self (get-server delegate) (get-port delegate) "call" "messages" (list messages)))))
   
   
   (method (send-invite self recipient-delegate sender)
     (calling-mobile self recipient-delegate
       (lambda ()
-        (write-mobile self (get-port recipient-delegate) "call" "invite" (list sender)))))
+        (write-mobile self (get-server recipient-delegate) (get-port recipient-delegate) "call" "invite" (list sender)))))
   
   
   (method (send-accept self sender-delegate recipient)
     (calling-mobile self sender-delegate
       (lambda ()
-        (write-mobile self (get-port sender-delegate) "call" "accept" (list recipient)))))
+        (write-mobile self (get-server sender-delegate) (get-port sender-delegate) "call" "accept" (list recipient)))))
   
   
   (method (send-decline self sender-delegate recipient)
     (calling-mobile self sender-delegate
       (lambda ()
-        (write-mobile self (get-port sender-delegate) "call" "decline" (list recipient)))))
+        (write-mobile self (get-server sender-delegate) (get-port sender-delegate) "call" "decline" (list recipient)))))
   
   
   (method (send-problem self sender-delegate recipient)
     (calling-mobile self sender-delegate
       (lambda ()
-        (write-mobile self (get-port sender-delegate) "call" "problem" (list recipient)))))
+        (write-mobile self (get-server sender-delegate) (get-port sender-delegate) "call" "problem" (list recipient)))))
   
   
   (method (send-join self delegate recipient)
     (calling-mobile self delegate
       (lambda ()
-        (write-mobile self (get-port delegate) "call" "join" (list recipient)))))
+        (write-mobile self (get-server delegate) (get-port delegate) "call" "join" (list recipient)))))
   
   
   (method (send-leave self delegate recipient)
     (calling-mobile self delegate
       (lambda ()
-        (write-mobile self (get-port delegate) "call" "leave" (list recipient)))))
+        (write-mobile self (get-server delegate) (get-port delegate) "call" "leave" (list recipient)))))
   
   
   (method (send-disband self delegate)
     (calling-mobile self delegate
       (lambda ()
-        (write-mobile self (get-port delegate) "call" "disband" '()))))
+        (write-mobile self (get-server delegate) (get-port delegate) "call" "disband" '()))))
+  
+  
+  (method (send-circle-added self delegate name stone)
+    ;; todo
+    )
+  
+  
+  (method (send-circle-removed self delegate name)
+    ;; todo
+    )
+  
+  
+  (method (send-verified self delegate verifier)
+    ;; todo
+    )
   
   
   ;;;
