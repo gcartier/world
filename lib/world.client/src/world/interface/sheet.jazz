@@ -17,10 +17,14 @@
 (import (jazz.geometry)
         (jazz.ui)
         (jazz.view)
+        (gaea.array)
+        (gaea.buffer)
         (gaea.geometry)
         (gaea.opengl.glew)
         (gaea.opengl.render)
+        (gaea.pipeline)
         (gaea.texture)
+        (gaea.uniform)
         (world)
         (world.context)
         (world.foreign)
@@ -56,23 +60,25 @@
       (new class name: name)
     (let ((world (current-world)))
       (let ((sheet (new class name: name))
-            (program (cond (hardware? (get-sheet-hardware-program world))
-                           (flipped? (get-sheet-flipped-program world))
-                           (else (get-sheet-program world)))))
+            (pipeline (cond (hardware? (require-pipeline 'sheet-hardware))
+                            (flipped? (require-pipeline 'sheet-flipped))
+                            (else (require-pipeline 'sheet)))))
         (set-size-noevent sheet size)
-        (set-program sheet program)
+        (set-pipeline sheet pipeline)
         (setup-array/buffer sheet)
         (set-resolution sheet resolution)
         (set-texture sheet (or texture (make-cairo-texture (get-width (or resolution size)) (get-height (or resolution size)) scale?: scale?)))
+        ;; metal quicky
+        (setup-uniform (get-texture sheet) (get-pipeline sheet) "texture_sampler")
         sheet))))
 
 
 (class World-Sheet extends Layout-View implements Mousable
   
   
-  (slot program           <object> initialize #f            accessors generate)
+  (slot pipeline          <object> initialize #f            accessors generate)
   (slot array             <object> initialize #f            accessors generate)
-  (slot buffer            <object> initialize #f            accessors generate)
+  (slot uniform           <object> initialize #f            accessors generate)
   (slot resolution        <object> initialize #f            accessors generate)
   (slot texture           <object> initialize #f            accessors generate)
   (slot projection-matrix <object> initialize (make-matrix) accessors generate)
@@ -80,6 +86,21 @@
   
   
   (method package (setup-array/buffer self)
+    (let ((content #f32(  0.0 10.0 0.0 1.0   0.0 0.0 0.0 0.0
+                         10.0 10.0 0.0 1.0   1.0 0.0 0.0 0.0
+                          0.0  0.0 0.0 1.0   0.0 1.0 0.0 0.0
+                         10.0  0.0 0.0 1.0   1.0 1.0 0.0 0.0
+                          0.0  0.0 0.0 1.0   0.0 1.0 0.0 0.0
+                         10.0 10.0 0.0 1.0   1.0 0.0 0.0 0.0 )))
+      (let ((buffer (new Buffer content)))
+        (set! array (new Array pipeline 1 6 buffer))))
+    
+    (let ((content (make-f32vector 16))
+          (matrix (make-orthographic-matrix 0.0 10.0 0.0 10.0 0.0 10.0)))
+      (matrix-transfer! matrix content 0)
+      (set! uniform (new Uniform-Buffer "Matrices" 0 content))
+      (uniform-binding pipeline uniform))
+    @metal
     (with-reentrant-render-mutex
       (lambda ()
         (receive (array buffer) (let ((h (cast <fl> (get-h position)))
@@ -105,6 +126,7 @@
   
   (method override (destroy self)
     (nextmethod self)
+    @metal
     (with-reentrant-render-mutex
       (lambda ()
         (glDeleteVertexArrays* array)
@@ -136,10 +158,12 @@
     (when (not resolution)
       (when texture
         (close texture))
-      (set! texture (make-cairo-texture (get-width size) (get-height size) scale?: #t))))
+      (set! texture (make-cairo-texture (get-width size) (get-height size) scale?: #t))
+      (setup-uniform texture pipeline "texture_sampler")))
   
   
   (method protected (refresh-array/buffer self)
+    @metal
     (with-reentrant-render-mutex
       (lambda ()
         (when array
@@ -219,8 +243,17 @@
   ;;;
   
   
-  (method public (render-sheet self)
+  ;; metal encoder optional until all converted
+  (method public (render-sheet self (encoder #f))
     (draw-player self)
+    
+    (bind-uniform encoder uniform 0)
+    (with-pipeline pipeline encoder
+      (lambda ()
+        (bind-texture texture encoder)
+        (draw-array array encoder)))
+    
+    @metal (
     (glEnable GL_BLEND)
     (glDisable GL_DEPTH_TEST)
     (use program)
@@ -231,4 +264,4 @@
     (unbind-uniforms program)
     (unuse program)
     (glEnable GL_DEPTH_TEST)
-    (glDisable GL_BLEND))))
+    (glDisable GL_BLEND)))))
