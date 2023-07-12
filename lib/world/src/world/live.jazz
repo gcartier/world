@@ -302,6 +302,7 @@
   (slot models                  <object>            initialize #f              getter generate)
   (slot models-mutex            <object>            initialize #f              getter generate)
   (slot paintings               <object>            initialize #f              getter generate)
+  (slot paintings-mutex         <object>            initialize #f              getter generate)
   (slot history?                <bool>              initialize #t              getter generate)
   (slot history-trail           <fx>                initialize 250             getter generate)
   (slot history-camera          <Camera>            initialize (make-camera)   getter generate)
@@ -429,6 +430,8 @@
     (set! tick-slice? (not (world-setting 'world.inhibit-slicing? #f)))
     (set! models (make-table test: equal?))
     (set! models-mutex (make-mutex 'models))
+    (set! paintings (make-table test: equal?))
+    (set! paintings-mutex (make-mutex 'paintings))
     (update-world-up self ambient-gravity)
     (prepare-sounds self)
     (setup-history)
@@ -3550,7 +3553,7 @@
   
   
   (method package (collect-models self (fullpath?: fullpath? #f))
-    (let ((models (make-table test: equal?)))
+    (let ((table (make-table test: equal?)))
       (let ((idle "_Idle"))
         (let ((b3d (add-extension idle "b3d"))
               (ms3d (add-extension idle "ms3d")))
@@ -3565,10 +3568,10 @@
                                         (else #f))))
                         (when kind
                           (let ((path (if fullpath? path (path->model self path))))
-                            (unless (table-ref models path #f)
+                            (unless (table-ref table path #f)
                               (let ((asset (new Asset assets path)))
-                                (table-set! models path asset))))))))))))))
-      (table-values models)))
+                                (table-set! table path asset))))))))))))))
+      (table-values table)))
   
   
   (method package (path->model self path)
@@ -3637,8 +3640,10 @@
   (method (with-reentrant-models-mutex self thunk)
     (if (eq? (mutex-state models-mutex) (current-thread))
         (thunk)
-      (mutex-lock! models-mutex)
-      (prog1 (thunk)
+      (unwind-protect
+          (begin
+            (mutex-lock! models-mutex)
+            (thunk))
         (mutex-unlock! models-mutex))))
   
   
@@ -3729,41 +3734,81 @@
   
   
   (method package (collect-paintings self)
-    (when (not paintings)
-      (let ((table (make-table test: equal?)))
-        (iterate-assets self
-          (lambda (assets)
-            (iterate-entries assets
-              (lambda (path)
-                (when (starts-with? path "painting/")
-                  (when (member? (filename-extension path) '("png" "tga" "jpg" "jpeg") test: extension=?)
-                    (let ((asset (new Asset assets path)))
-                      (table-set! table (asset-path asset) asset))))))))
-        (set! paintings table)))
-    paintings)
+    (let ((table (make-table test: equal?)))
+      (iterate-assets self
+        (lambda (assets)
+          (iterate-entries assets
+            (lambda (path)
+              (when (starts-with? path "painting/")
+                (when (member? (filename-extension path) '("png" "tga" "jpg" "jpeg") test: extension=?)
+                  (let ((path (path->painting self path)))
+                    (unless (table-ref paintings path #f)
+                      (let ((asset (new Asset assets path)))
+                        (table-set! table path asset))))))))))
+      (table-values table)))
+  
+  
+  (method package (path->painting self path)
+    (substring path (string-length "painting/") (string-length path)))
+  
+  
+  (method (with-reentrant-paintings-mutex self thunk)
+    (if (eq? (mutex-state paintings-mutex) (current-thread))
+        (thunk)
+      (unwind-protect
+          (begin
+            (mutex-lock! paintings-mutex)
+            (thunk))
+        (mutex-unlock! paintings-mutex))))
   
   
   (method package (reset-paintings self)
-    (set! paintings #f))
+    (with-reentrant-paintings-mutex self
+      (lambda ()
+        (set! paintings (make-table test: equal?)))))
   
   
-  (method package (find-painting self name)
-    (let ((paintings (collect-paintings self)))
-      (let ((value (table-ref paintings name #f)))
-        (cond ((not value)
-               (error "Unable to find painting model: {a}" name))
-              ((is? value Asset)
-               (let ((file (retrieve-file value))
+  (method public (find-painting-safe self path)
+    (catch (Asset-Not-Found-Error err
+             (values (find-model self "warcraft/base/talktomeexclamationred") (get-message err)))
+      (catch (Model-Not-Found-Error err
+               (values (find-model self "warcraft/base/talktomeexclamationblue") (get-message err)))
+        (values (find-painting self path) #f))))
+  
+  
+  (method package (find-painting self path)
+    (define (search-assets)
+      (continuation-capture
+        (lambda (return)
+          (iterate-assets self
+            (lambda (assets)
+              (let ((info (search-in assets)))
+                (when info
+                  (continuation-return return info)))))
+          (values #f #f))))
+    
+    (define (search-in assets)
+      (let ((path (string-append "painting/" path)))
+        (and (contains-file? assets path)
+             (let ((asset (new Asset assets path)))
+               (let ((file (retrieve-file asset))
                      ;; need a better approach for metadata
                      (metadata #f))
                  (let ((texture (make-file-texture file metadata: metadata)))
                    (bind-values (atlas texture uv) (atlas-texture texture)
                      (let ((material (new Material atlas: atlas texture: texture)))
                        (let ((model (make-painting-model material uv)))
-                         (table-set! paintings name model)
-                         model))))))
-              (else
-               value)))))
+                         (values file model))))))))))
+    
+    (with-reentrant-paintings-mutex self
+      (lambda ()
+        (or (table-ref paintings path #f)
+            (bind-values (file painting) (search-assets)
+              (if (not painting)
+                  (signal (new Model-Not-Found-Error message: (format "Unable to find painting: {a}" path)))
+                (set-file painting file)
+                (table-set! paintings path painting)
+                painting))))))
   
   
   (method (collect-events self)
