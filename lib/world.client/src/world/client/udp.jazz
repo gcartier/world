@@ -38,6 +38,7 @@
         (world.player)
         (world.profile)
         (world.profiling)
+        (world.queue)
         (world.record (phase syntax))
         (world.rate)
         (world.ring)
@@ -83,6 +84,9 @@
   (slot upload-state               initialize #f  getter generate)
   (slot upload-rate                initialize #f  getter generate)
   (slot upload-congestion          initialize #f  getter generate)
+  (slot upload-queue               initialize #f  getter generate)
+  (slot upload-task                initialize #f  getter generate)
+  (slot upload-done?               initialize #f  getter generate)
   (slot invalid-packets            initialize 0   getter generate)
   (slot resending-nacks            initialize '() getter generate)
   (slot last-send-state            initialize #f  getter generate)
@@ -147,6 +151,8 @@
       (set! upload-rate (new UDP-Rate-Sample))
       (set! upload-congestion (new UDP-Congestion))
       (init upload-congestion upload-state udp-datagram-max)
+      (set! upload-queue (new Priorities-Queue 2))
+      (set! upload-done? #f)
       (set! simulator #f)
       (when record-events?
         (record-event udp-id-connecting
@@ -209,6 +215,9 @@
   (method (start self)
     (unless started?
       (unless (simulation?)
+        (set! upload-done? #f)
+        (set! upload-task (new Task 'upload (~ run-upload self) priority: upload-priority))
+        (start-task upload-task)
         (set! state-task (new Task 'state (~ run-state self) priority: state-priority))
         (start-task state-task)
         (set! heartbeat-task (new Task 'heartbeat (~ run-heartbeat self) priority: heartbeat-priority))
@@ -224,6 +233,9 @@
   
   (method (stop self)
     (when started?
+      (set! upload-done? #t)
+      (thread-join! (get-thread upload-task))
+      (set! upload-task #f)
       (stop-task state-task)
       (set! state-task #f)
       (stop-task heartbeat-task)
@@ -420,7 +432,10 @@
               (define (send)
                 (send-media channel client-no buffer dts pts duration flags
                   (lambda (data)
-                    (send-data self data))))
+                    (let ((priority (if (= kind udp-audio)
+                                        0
+                                      1)))
+                      (upload-send self data priority)))))
               
               (define (advance-frame!)
                 (let ((frame (next-frame-sequence! channel)))
@@ -548,6 +563,121 @@
     (when udp-port
       (udp-destination-set! server-host server-port udp-port)
       (send-udp data udp-port)))
+  
+  
+  ;;;
+  ;;;; Upload
+  ;;;
+  
+  
+  (method (upload-send self data priority)
+    (push upload-queue data priority))
+  
+  
+  (method (receive-media-ack self data)
+    (mutex-lock! upload-mutex)
+    (with-record media-ack
+      (let ((sequence (read-media-ack-order data)))
+        (let ((packet-state (ack-received upload-state sequence)))
+          (when packet-state
+            (ack-received upload-rate upload-state packet-state)
+            (ack-received upload-congestion upload-rate packet-state)
+            (record-event udp-id-rate-sample
+                          -1.
+                          -1.
+                          -1.
+                          (fixnum->flonum sequence)
+                          (bytes->mbps (get-delivery-rate upload-rate))
+                          -1.
+                          -1.)))))
+    (mutex-unlock! upload-mutex))
+  
+  
+  (method (upload-data self data)
+    (with-record media
+      (let ((sent (current-seconds))
+            (sequence (next-media-order! self))
+            (size (u8vector-length data)))
+        (write-media-order data sequence)
+        (send-data self data)
+        (let ((packet-state (packet-sent upload-state sent sequence size)))
+          (packet-sent upload-rate upload-state packet-state)
+          (packet-sent upload-congestion)))))
+  
+  
+  (method (pop-upload self)
+    (pop upload-queue 0))
+  
+  
+  (method (run-upload self task)
+    (declare (proper-tail-calls))
+    (with-task task
+      (lambda (exit)
+        (let (loop (n 0) (data (pop-upload self)) (next (current-seconds)))
+          (if upload-done?
+              (continuation-return exit #f)
+            (wake-upload self n data next loop))))))
+  
+  
+  (method (wake-upload self n data next loop)
+    (declare (proper-tail-calls))
+    (define (wait size)
+      (/ size (get-pacing-rate upload-congestion)))
+    
+    (define (pace next)
+      (sleep (- next (current-seconds))))
+    
+    (mutex-lock! upload-mutex)
+    (cond ;; no data
+          ((eof-object? data)
+           ;(terminal-string ".")
+           (set-app-limited upload-state (+ (get-delivered upload-state) (get-inflight upload-state)))
+           (pace next)
+           (mutex-unlock! upload-mutex)
+           (loop (+ n 1) (pop-upload self) (+ next .0001)))
+          ;; data
+          (else
+           (let ((size (u8vector-length data))
+                 (inflight (get-inflight upload-state))
+                 (cw (get-cwnd upload-congestion)))
+             (cond ;; exceeding congestion window
+                   ((> (+ (get-inflight upload-state) size) (get-cwnd upload-congestion))
+                    ;(terminal-string "$")
+                    (pace next)
+                    (mutex-unlock! upload-mutex)
+                    (loop (+ n 1) data (+ next .0001)))
+                   ;; send packet
+                   (else
+                    ;(terminal-string "^")
+                    (upload-data self data)
+                    (pace next)
+                    (mutex-unlock! upload-mutex)
+                    (loop (+ n 1) (pop-upload self) (+ next (wait size)))))))))
+  
+  
+  (method package (upload-info self)
+    (and (> (get-sent upload-state) 0)
+         (let ((average-rtt (get-average (get-movingRTT upload-state)))
+               (btlbw (get-btlbw upload-congestion))
+               (pacing-rate (get-pacing-rate upload-congestion))
+               (delivery-rate (get-delivery-rate upload-rate))
+               (delivery-average (get-delivery-average upload-rate))
+               (upload-rate (get-last-upload-rate statistics))
+               (upload-drop (percentage (get-lost upload-state) (get-sent upload-state)) @w (get-upload-drop statistics))
+               (delayed (size upload-queue))
+               (limited? (get-app-limited? upload-rate)))
+           (and average-rtt
+                upload-rate
+                upload-drop
+                (format "RTT: {r precision: 3}s, btlbw: {r precision: 3}, Pacing: {r precision: 1}Mbps, Upload: {r precision: 1}Mbps, Delivery: {r precision: 1}Mbps, Drop: {r precision: 1}%, Delayed: {a}, Limited: {a}"
+                        average-rtt
+                        (bytes->mbps btlbw)
+                        (bytes->mbps pacing-rate)
+                        (bytes->mbps upload-rate)
+                        (bytes->mbps delivery-rate)
+                        upload-drop
+                        delayed
+                        (if limited? "Yes" "No"))))))
   
   
   ;;;
@@ -701,6 +831,7 @@
               ((udp-ack))
               ((udp-nack))
               ((udp-audio udp-video))
+              ((udp-media-ack))
               ((udp-state))
               ((udp-reset))
               ((udp-live-ack)
@@ -722,6 +853,8 @@
              (receive-nack self data))
             ((udp-audio udp-video)
              (receive-medias self kind data))
+            ((udp-media-ack)
+             (receive-media-ack self data))
             ((udp-state)
              (receive-state self data))
             ((udp-reset)
