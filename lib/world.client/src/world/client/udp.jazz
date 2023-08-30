@@ -234,6 +234,7 @@
   (method (stop self)
     (when started?
       (set! upload-done? #t)
+      (push upload-queue (eof-object) 0)
       (thread-join! (get-thread upload-task))
       (set! upload-task #f)
       (stop-task state-task)
@@ -430,12 +431,14 @@
           (when channel
             (let ((kind (get-media-kind channel)))
               (define (send)
+                (when (and (= kind udp-video) (frame-keyframe? flags))
+                  (trim-upload self))
                 (send-media channel client-no buffer dts pts duration flags
                   (lambda (data)
                     (let ((priority (if (= kind udp-audio)
                                         0
                                       1)))
-                      (upload-send self data priority)))))
+                      (push-upload self data priority)))))
               
               (define (advance-frame!)
                 (let ((frame (next-frame-sequence! channel)))
@@ -570,8 +573,53 @@
   ;;;
   
   
-  (method (upload-send self data priority)
+  (method (push-upload self data priority)
     (push upload-queue data priority))
+  
+  
+  (method (pop-upload self timeout)
+    (pop upload-queue timeout))
+  
+  
+  (hub get-queue)
+  (method (trim-upload self)
+    ;; trim video
+    @w
+    (let ((size (get-size (get-queue upload-queue 1))))
+      (when (> size 0)
+        (terminal-string (format " {a} " size))))
+    (trim-priority upload-queue 1 #f))
+  
+  
+  (method (send-media-data self data)
+    (with-record media
+      (let ((sent (current-seconds))
+            (sequence (next-media-order! self))
+            (size (u8vector-length data)))
+        (write-media-order data sequence)
+        (with-write-mutex self
+          (lambda ()
+            (parameterize ((testing? #t))
+            (send-data self data))))
+        (let ((packet-state (packet-sent upload-state sent sequence size)))
+          (packet-sent upload-rate upload-state packet-state)
+          (packet-sent upload-congestion)))))
+  
+  
+  (method (send-media-pulse self sent)
+    (let ((sequence (next-media-order! self)))
+      (with-write-mutex self
+        (lambda ()
+          (with-record media-pulse
+            (let ((size (calculate-media-pulse-size)))
+              (let ((data (make-u8vector (+ size udp-code-size))))
+                (write-header-kind data udp-media-pulse)
+                (write-header-sender data client-no)
+                (write-media-pulse-order data sequence)
+                (write-udp-code data)
+                (parameterize ((testing? #t))
+                (send-data self data)))))))
+      (pulse-sent upload-state sent)))
   
   
   (method (receive-media-ack self data)
@@ -593,70 +641,70 @@
     (mutex-unlock! upload-mutex))
   
   
-  (method (upload-data self data)
-    (with-record media
-      (let ((sent (current-seconds))
-            (sequence (next-media-order! self))
-            (size (u8vector-length data)))
-        (write-media-order data sequence)
-        (send-data self data)
-        (let ((packet-state (packet-sent upload-state sent sequence size)))
-          (packet-sent upload-rate upload-state packet-state)
-          (packet-sent upload-congestion)))))
-  
-  
-  (method (pop-upload self)
-    (pop upload-queue 0))
-  
-  
   (method (run-upload self task)
     (declare (proper-tail-calls))
     (with-task task
       (lambda (exit)
-        (let (loop (n 0) (data (pop-upload self)) (next (current-seconds)))
+        (let (loop (n 0) (data (pop-upload self 0)) (next-delivery-time (current-seconds)))
           (if upload-done?
               (continuation-return exit #f)
-            (wake-upload self n data next loop))))))
+            (wake-upload self n data next-delivery-time loop))))))
   
   
-  (method (wake-upload self n data next loop)
+  (method (wake-upload self n data next-delivery-time loop)
     (declare (proper-tail-calls))
-    (define (wait size)
+    (define (wait next-delivery-time)
+      (sleep (- next-delivery-time (current-seconds))))
+    
+    (define (pace size)
       (/ size (get-pacing-rate upload-congestion)))
     
-    (define (pace next)
-      (sleep (- next (current-seconds))))
+    (define (show str)
+      @w (terminal-string str))
     
     (mutex-lock! upload-mutex)
     (cond ;; no data
           ((eof-object? data)
-           ;(terminal-string ".")
+           (show ".")
            (set-app-limited upload-state (+ (get-delivered upload-state) (get-inflight upload-state)))
-           (pace next)
            (mutex-unlock! upload-mutex)
-           (loop (+ n 1) (pop-upload self) (+ next .0001)))
+           (let ((data (pop-upload self +inf.0)))
+             (loop (+ n 1) data (current-seconds))))
           ;; data
           (else
            (let ((size (u8vector-length data)))
              (cond ;; exceeding congestion window
                    ((> (+ (get-inflight upload-state) size) (get-cwnd upload-congestion))
-                    ;(terminal-string "$")
-                    (pace next)
-                    (mutex-unlock! upload-mutex)
-                    (loop (+ n 1) data (+ next .0001)))
+                    (let ((now (current-seconds)))
+                      (cond ;; send pulse
+                            ((>= now (+ (get-last-sent-time upload-state) .1))
+                             (show "@")
+                             (wait next-delivery-time)
+                             (send-media-pulse self now)
+                             (mutex-unlock! upload-mutex)
+                             (loop (+ n 1) data (+ next-delivery-time .0001)))
+                            ;; do nothing
+                            (else
+                             (show "$")
+                             (wait next-delivery-time)
+                             (mutex-unlock! upload-mutex)
+                             (loop (+ n 1) data (+ next-delivery-time .0001))))))
                    ;; send packet
                    (else
-                    ;(terminal-string "^")
-                    (upload-data self data)
-                    (pace next)
+                    (show "^")
+                    (wait next-delivery-time)
+                    (send-media-data self data)
                     (mutex-unlock! upload-mutex)
-                    (loop (+ n 1) (pop-upload self) (+ next (wait size)))))))))
+                    (loop (+ n 1) (pop-upload self 0) (+ next-delivery-time (pace size)))))))))
   
   
   (method package (upload-info self)
     (and (> (get-sent upload-state) 0)
          (let ((average-rtt (get-average (get-movingRTT upload-state)))
+               (min-rtt (get-minrtt upload-congestion))
                (btlbw (get-btlbw upload-congestion))
+               (inflight (get-inflight upload-state))
+               (cwnd (get-cwnd upload-congestion))
                (pacing-rate (get-pacing-rate upload-congestion))
                (delivery-rate (get-delivery-rate upload-rate))
                (delivery-average (get-delivery-average upload-rate))
@@ -667,13 +715,15 @@
            (and average-rtt
                 upload-rate
                 upload-drop
-                (format "RTT: {r precision: 3}s, btlbw: {r precision: 3}, Pacing: {r precision: 1}Mbps, Upload: {r precision: 1}Mbps, Delivery: {r precision: 1}Mbps, Drop: {r precision: 1}%, Delayed: {a}, Limited: {a}"
+                (format "RTT: {r precision: 3}s, MinRTT: {r precision: 3}s, Inflight: {a}Bytes, BtlBW: {r precision: 3}Mbps, CWND: {r precision: 3}Bytes, Rate: {r precision: 3}Mbps, BBR: {r precision: 3}Mbps, Other: {r precision: 3}Mbps, Delayed: {a}, Limited: {a}"
                         average-rtt
+                        min-rtt
+                        inflight
                         (bytes->mbps btlbw)
+                        cwnd
                         (bytes->mbps pacing-rate)
-                        (bytes->mbps upload-rate)
-                        (bytes->mbps delivery-rate)
-                        upload-drop
+                        (bytes->mbps (get-average upload-bbr-rate))
+                        (bytes->mbps (get-average upload-other-rate))
                         delayed
                         (if limited? "Yes" "No"))))))
   
