@@ -121,23 +121,17 @@
   (slot statistics                 initialize #f  getter generate)
   (slot upload-mutex               initialize #f  getter generate)
   (slot upload-state               initialize #f  getter generate)
-  (slot upload-rate                initialize #f  getter generate)
-  (slot upload-congestion          initialize #f  getter generate)
+  (slot upload-socket              initialize #f  getter generate)
   (slot upload-queue               initialize #f  getter generate)
   (slot upload-task                initialize #f  getter generate)
+  (slot upload-burst?              initialize #f  getter generate)
   (slot upload-done?               initialize #f  getter generate)
-  (slot ca-mutex                   initialize #f  getter generate)
-  (slot ca-state                   initialize #f  getter generate)
-  (slot ca-socket                  initialize #f  getter generate)
-  (slot ca-queue                   initialize #f  getter generate)
-  (slot ca-task                    initialize #f  getter generate)
-  (slot ca-burst?                  initialize #f  getter generate)
-  (slot ca-done?                   initialize #f  getter generate)
-  (slot ca-skbuff-info             initialize #f  getter generate)
-  (slot ca-skbcb-info              initialize #f  getter generate)
-  (slot ca-rate-info               initialize #f  getter generate)
-  (slot ca-bbr                     initialize #f  getter generate)
-  (slot ca-bbr-info                initialize #f  getter generate)
+  (slot upload-info?               initialize #f  getter generate)
+  (slot upload-skbuff-info         initialize #f  getter generate)
+  (slot upload-skbcb-info          initialize #f  getter generate)
+  (slot upload-rate-info           initialize #f  getter generate)
+  (slot upload-bbr-info            initialize #f  getter generate)
+  (slot upload-bbrinfo-info        initialize #f  getter generate)
   (slot invalid-packets            initialize 0   getter generate)
   (slot resending-nacks            initialize '() getter generate)
   (slot last-send-state            initialize #f  getter generate)
@@ -197,25 +191,18 @@
       (set! server-port #f)
       (set! monitor (new UDP-Monitor))
       (set! statistics (new UDP-Statistics))
-      (set! upload-mutex (make-mutex 'connection))
-      (set! upload-state (new UDP-Connection-State))
-      (set! upload-rate (new UDP-Rate-Sample))
-      (set! upload-congestion (new UDP-Congestion))
-      (init upload-congestion upload-state udp-datagram-max)
+      (set! upload-mutex (make-mutex 'upload))
+      (set! upload-state (new Upload-State))
+      (set! upload-socket (new_tcpsock))
+      (tcp_init upload-socket udp-datagram-max (current-monotonic-nanoseconds) (current-monotonic-frequency))
+      (congestion_init upload-socket)
       (set! upload-queue (new Priorities-Queue 2))
       (set! upload-done? #f)
-      (set! ca-mutex (make-mutex 'ca))
-      (set! ca-state (new CA-State))
-      (set! ca-socket (new_tcpsock))
-      (tcp_init ca-socket udp-datagram-max (current-monotonic-nanoseconds) (current-monotonic-frequency))
-      (congestion_init ca-socket)
-      (set! ca-queue (new Priorities-Queue 2))
-      (set! ca-done? #f)
-      (set! ca-skbuff-info (new_skbuff))
-      (set! ca-skbcb-info (new_skbcb))
-      (set! ca-rate-info (new_ratesample))
-      (set! ca-bbr (socket->bbr ca-socket))
-      (set! ca-bbr-info (new_bbrinfo))
+      (set! upload-skbuff-info (new_skbuff))
+      (set! upload-skbcb-info (new_skbcb))
+      (set! upload-rate-info (new_ratesample))
+      (set! upload-bbr-info (socket->bbr upload-socket))
+      (set! upload-bbrinfo-info (new_bbrinfo))
       (bbr-updated)
       (set! simulator #f)
       (when record-events?
@@ -274,16 +261,18 @@
     (thread-join! (get-thread receive-task))
     (set! udp-port #f)
     (set! receive-task #f)
-    (free_tcpsock ca-socket)
-    (set! ca-socket #f)
-    (free_skbuff ca-skbuff-info)
-    (set! ca-skbuff-info #f)
-    (free_skbcb ca-skbcb-info)
-    (set! ca-skbcb-info #f)
-    (free_ratesample ca-rate-info)
-    (set! ca-rate-info #f)
-    (free_bbrinfo ca-bbr-info)
-    (set! ca-bbr-info #f))
+    (free_tcpsock upload-socket)
+    (set! upload-socket #f)
+    (free_skbuff upload-skbuff-info)
+    (set! upload-skbuff-info #f)
+    (free_skbcb upload-skbcb-info)
+    (set! upload-skbcb-info #f)
+    (free_ratesample upload-rate-info)
+    (set! upload-rate-info #f)
+    (free_bbr upload-bbr-info)
+    (set! upload-bbr-info #f)
+    (free_bbrinfo upload-bbrinfo-info)
+    (set! upload-bbrinfo-info #f))
   
   
   (method (start self)
@@ -292,9 +281,6 @@
         (set! upload-done? #f)
         (set! upload-task (new Task 'upload (~ run-upload self) priority: upload-priority))
         (start-task upload-task)
-        (set! ca-done? #f)
-        (set! ca-task (new Task 'ca (~ run-ca self) priority: ca-priority))
-        (start-task ca-task)
         (set! state-task (new Task 'state (~ run-state self) priority: state-priority))
         (start-task state-task)
         (set! heartbeat-task (new Task 'heartbeat (~ run-heartbeat self) priority: heartbeat-priority))
@@ -314,10 +300,6 @@
       (push upload-queue (eof-object) 0)
       (thread-join! (get-thread upload-task))
       (set! upload-task #f)
-      (set! ca-done? #t)
-      (push ca-queue (eof-object) 0)
-      (thread-join! (get-thread ca-task))
-      (set! ca-task #f)
       (stop-task state-task)
       (set! state-task #f)
       (stop-task heartbeat-task)
@@ -519,9 +501,7 @@
                     (let ((priority (if (= kind udp-audio)
                                         0
                                       1)))
-                      @upload
-                      (push-upload self data priority)
-                      (push-ca self data priority)))))
+                      (push-upload self data priority)))))
               
               (define (advance-frame!)
                 (let ((frame (next-frame-sequence! channel)))
@@ -640,10 +620,6 @@
     (if (testing?)
         (update upload-bbr-rate (u8vector-length data))
       (update upload-other-rate (u8vector-length data)))
-    @w
-    (unless (testing?)
-      (with-record header
-        (terminal-string (->string (read-header-kind data)))))
     (if simulator
         (send simulator data #f)
       (send-server self data))
@@ -671,29 +647,55 @@
     (pop upload-queue timeout))
   
   
-  (hub get-queue)
+  (method protected (toggle-upload-burst self)
+    (set! upload-burst? (not upload-burst?)))
+  
+  
+  (method (effective-upload-empty? self)
+    (if upload-burst?
+        #f
+      (empty? upload-queue)))
+  
+  
   (method (trim-upload self)
     ;; trim video
-    @w
-    (let ((size (get-size (get-queue upload-queue 1))))
-      (when (> size 0)
-        (terminal-string (format " {a} " size))))
+    @wait
     (trim-priority upload-queue 1 #f))
   
   
   (method (send-upload-data self data)
     (with-record media
       (let ((sent (current-seconds))
-            (sequence (next-media-order! self))
-            (size (u8vector-length data)))
+            (sequence (next-media-order! self)))
         (write-media-order data sequence)
         (with-write-mutex self
           (lambda ()
             (parameterize ((testing? #t))
             (send-data self data))))
-        (let ((packet-state (packet-sent upload-state sent sequence size)))
-          (packet-sent upload-rate upload-state packet-state)
-          (packet-sent upload-congestion)))))
+        (let ((skb (packet-sent upload-state sent sequence)))
+          (tcp_skb_sent upload-socket skb (effective-upload-empty? self) sequence 1 (current-monotonic-nanoseconds))
+          (tcp_rate_skb_sent upload-socket skb))
+        (bbr-updated))))
+  
+  
+  (method (send-upload-burst self)
+    (with-record media-burst
+      (let ((sent (current-seconds))
+            (sequence (next-media-order! self)))
+        (with-write-mutex self
+          (lambda ()
+            (let ((size (calculate-media-burst-size)))
+              (let ((data (make-u8vector (+ size udp-code-size))))
+                (write-header-kind data udp-media-burst)
+                (write-header-sender data client-no)
+                (write-media-burst-order data sequence)
+                (write-udp-code data)
+                (parameterize ((testing? #t))
+                  (send-data self data))))))
+        (let ((skb (packet-sent upload-state sent sequence)))
+          (tcp_skb_sent upload-socket skb (effective-upload-empty? self) sequence 1 (current-monotonic-nanoseconds))
+          (tcp_rate_skb_sent upload-socket skb))
+        (bbr-updated))))
   
   
   (method (send-upload-pulse self sent)
@@ -709,25 +711,30 @@
                 (write-udp-code data)
                 (parameterize ((testing? #t))
                 (send-data self data)))))))
-      (pulse-sent upload-state sent)))
+      (pulse-sent upload-state sent)
+      (bbr-updated)))
   
   
   (method (receive-upload-ack self data)
     (mutex-lock! upload-mutex)
     (with-record media-ack
       (let ((sequence (read-media-ack-order data)))
-        (let ((packet-state (ack-received upload-state sequence)))
-          (when packet-state
-            (ack-received upload-rate upload-state packet-state)
-            (ack-received upload-congestion upload-rate packet-state)
+        (let ((skb (ack-received upload-state upload-socket sequence)))
+          (when skb
+            (when upload-info?
+              (skbuff_get_info skb upload-skbuff-info)
+              (skbcb_get_info skb upload-skbcb-info))
+            (tcp_ack upload-socket skb (effective-upload-empty? self) (current-monotonic-nanoseconds) (and upload-info? upload-rate-info))
+            (free_skbuff skb)
             (record-event udp-id-rate-sample
                           -1.
                           -1.
                           -1.
                           (fixnum->flonum sequence)
-                          (bytes->mbps (get-delivery-rate upload-rate))
+                          (bytes->mbps (tcp_pacing_rate upload-socket))
                           -1.
                           -1.)))))
+    (bbr-updated)
     (mutex-unlock! upload-mutex))
   
   
@@ -747,7 +754,7 @@
       (sleep (- next-delivery-time (current-seconds))))
     
     (define (pace size)
-      (/ size (get-pacing-rate upload-congestion)))
+      (/ (cast <fl> size) (tcp_pacing_rate upload-socket)))
     
     (define (show str)
       @w (terminal-string str))
@@ -755,16 +762,22 @@
     (mutex-lock! upload-mutex)
     (cond ;; no data
           ((eof-object? data)
-           (show ".")
-           (set-app-limited upload-state (+ (get-delivered upload-state) (get-inflight upload-state)))
-           (mutex-unlock! upload-mutex)
-           (let ((data (pop-upload self +inf.0)))
-             (loop data (current-seconds))))
+           (cond (upload-burst?
+                  (show ">")
+                  (wait next-delivery-time)
+                  (send-upload-burst self)
+                  (mutex-unlock! upload-mutex)
+                  (loop (pop-upload self 0) (+ next-delivery-time (pace (+ (calculate-media-burst-size) udp-code-size)))))
+                 (else
+                  (show ".")
+                  (mutex-unlock! upload-mutex)
+                  (let ((data (pop-upload self +inf.0)))
+                    (loop data (current-seconds))))))
           ;; data
           (else
            (let ((size (u8vector-length data)))
              (cond ;; exceeding congestion window
-                   ((> (+ (get-inflight upload-state) size) (get-cwnd upload-congestion))
+                   ((> (+ (tcp_packets_in_flight upload-socket) 1) (tcp_snd_cwnd upload-socket))
                     (let ((now (current-seconds)))
                       (cond ;; send pulse
                             ((>= now (+ (get-last-sent-time upload-state) .1))
@@ -789,6 +802,8 @@
   
   
   (method package (upload-info self)
+    #f
+    @convert
     (and (> (get-sent upload-state) 0)
          (let ((average-rtt (get-average (get-movingRTT upload-state)))
                (min-rtt (get-minrtt upload-congestion))
@@ -816,177 +831,6 @@
                         (bytes->mbps (get-average upload-other-rate))
                         delayed
                         (if limited? "Yes" "No"))))))
-  
-  
-  ;;;
-  ;;;; CA
-  ;;;
-  
-  
-  (method (push-ca self data priority)
-    (push ca-queue data priority))
-  
-  
-  (method (pop-ca self timeout)
-    (pop ca-queue timeout))
-  
-  
-  (method protected (toggle-ca-burst self)
-    (set! ca-burst? (not ca-burst?)))
-  
-  
-  (method (effective-ca-empty? self)
-    (if ca-burst?
-        #f
-      (empty? ca-queue)))
-  
-  
-  (hub get-queue)
-  (method (trim-ca self)
-    ;; trim video
-    @w
-    (let ((size (get-size (get-queue ca-queue 1))))
-      (when (> size 0)
-        (terminal-string (format " {a} " size))))
-    @wait
-    (trim-priority ca-queue 1 #f))
-  
-  
-  (method (send-ca-data self data)
-    (with-record media
-      (let ((sent (current-seconds))
-            (sequence (next-media-order! self)))
-        (write-media-order data sequence)
-        (with-write-mutex self
-          (lambda ()
-            (parameterize ((testing? #t))
-            (send-data self data))))
-        (let ((skb (packet-sent ca-state sent sequence)))
-          (tcp_skb_sent ca-socket skb (effective-ca-empty? self) sequence 1 (current-monotonic-nanoseconds))
-          (tcp_rate_skb_sent ca-socket skb))
-        (bbr-updated))))
-  
-  
-  (method (send-ca-burst self)
-    (with-record media-burst
-      (let ((sent (current-seconds))
-            (sequence (next-media-order! self)))
-        (with-write-mutex self
-          (lambda ()
-            (let ((size (calculate-media-burst-size)))
-              (let ((data (make-u8vector (+ size udp-code-size))))
-                (write-header-kind data udp-media-burst)
-                (write-header-sender data client-no)
-                (write-media-burst-order data sequence)
-                (write-udp-code data)
-                (parameterize ((testing? #t))
-                  (send-data self data))))))
-        (let ((skb (packet-sent ca-state sent sequence)))
-          (tcp_skb_sent ca-socket skb (effective-ca-empty? self) sequence 1 (current-monotonic-nanoseconds))
-          (tcp_rate_skb_sent ca-socket skb))
-        (bbr-updated))))
-  
-  
-  (method (send-ca-pulse self sent)
-    (let ((sequence (next-media-order! self)))
-      (with-write-mutex self
-        (lambda ()
-          (with-record media-pulse
-            (let ((size (calculate-media-pulse-size)))
-              (let ((data (make-u8vector (+ size udp-code-size))))
-                (write-header-kind data udp-media-pulse)
-                (write-header-sender data client-no)
-                (write-media-pulse-order data sequence)
-                (write-udp-code data)
-                (parameterize ((testing? #t))
-                (send-data self data)))))))
-      (pulse-sent ca-state sent)
-      (bbr-updated)))
-  
-  
-  (method (receive-ca-ack self data)
-    (mutex-lock! ca-mutex)
-    (with-record media-ack
-      (let ((sequence (read-media-ack-order data)))
-        (let ((skb (ack-received ca-state ca-socket sequence)))
-          (when skb
-            (skbuff_get_info skb ca-skbuff-info)
-            (skbcb_get_info skb ca-skbcb-info)
-            (tcp_ack ca-socket skb (effective-ca-empty? self) (current-monotonic-nanoseconds) ca-rate-info)
-            (free_skbuff skb)
-            (record-event udp-id-rate-sample
-                          -1.
-                          -1.
-                          -1.
-                          (fixnum->flonum sequence)
-                          (bytes->mbps (tcp_pacing_rate ca-socket))
-                          -1.
-                          -1.)))))
-    (bbr-updated)
-    (mutex-unlock! ca-mutex))
-  
-  
-  (method (run-ca self task)
-    (declare (proper-tail-calls))
-    (with-task task
-      (lambda (exit)
-        (let (loop (data (pop-ca self 0)) (next-delivery-time (current-seconds)))
-          (if ca-done?
-              (continuation-return exit #f)
-            (wake-ca self data next-delivery-time loop))))))
-  
-  
-  (method (wake-ca self data next-delivery-time loop)
-    (declare (proper-tail-calls))
-    (define (wait next-delivery-time)
-      (sleep (- next-delivery-time (current-seconds))))
-    
-    (define (pace size)
-      (/ (cast <fl> size) (tcp_pacing_rate ca-socket)))
-    
-    (define (show str)
-      @w (terminal-string str))
-    
-    (mutex-lock! ca-mutex)
-    (cond ;; no data
-          ((eof-object? data)
-           (cond (ca-burst?
-                  (show ">")
-                  (wait next-delivery-time)
-                  (send-ca-burst self)
-                  (mutex-unlock! ca-mutex)
-                  (loop (pop-ca self 0) (+ next-delivery-time (pace (+ (calculate-media-burst-size) udp-code-size)))))
-                 (else
-                  (show ".")
-                  (mutex-unlock! ca-mutex)
-                  (let ((data (pop-ca self +inf.0)))
-                    (loop data (current-seconds))))))
-          ;; data
-          (else
-           (let ((size (u8vector-length data)))
-             (cond ;; exceeding congestion window
-                   ((> (+ (tcp_packets_in_flight ca-socket) 1) (tcp_snd_cwnd ca-socket))
-                    (let ((now (current-seconds)))
-                      (cond ;; send pulse
-                            ((>= now (+ (get-last-sent-time ca-state) .1))
-                             (show "@")
-                             (wait next-delivery-time)
-                             (send-ca-pulse self now)
-                             (mutex-unlock! ca-mutex)
-                             (loop data (+ next-delivery-time .0001)))
-                            ;; do nothing
-                            (else
-                             (show "$")
-                             (wait next-delivery-time)
-                             (mutex-unlock! ca-mutex)
-                             (loop data (+ next-delivery-time .0001))))))
-                   ;; send packet
-                   (else
-                    (show "^")
-                    (wait next-delivery-time)
-                    (send-ca-data self data)
-                    (mutex-unlock! ca-mutex)
-                    (loop (pop-ca self 0) (+ next-delivery-time (pace size)))))))))
   
   
   ;;;
@@ -1163,9 +1007,7 @@
             ((udp-audio udp-video)
              (receive-medias self kind data))
             ((udp-media-ack)
-             @upload
-             (receive-upload-ack self data)
-             (receive-ca-ack self data))
+             (receive-upload-ack self data))
             ((udp-state)
              (receive-state self data))
             ((udp-reset)
