@@ -45,7 +45,6 @@
         (world.support)
         (world.syntax (phase syntax))
         (world.task)
-        (world.throttle)
         (world.time)
         (world.udp)
         (world.video))
@@ -104,12 +103,10 @@
   (slot state-task                 initialize #f  getter generate)
   (slot heartbeat-task             initialize #f  getter generate)
   (slot heartbeat-sequence         initialize 0   getter generate)
-  (slot noack-ring                 initialize #f  getter generate)
-  (slot noack-task                 initialize #f  getter generate)
-  (slot noack-time                 initialize #f  getter generate)
   (slot started?                   initialize #f  getter generate)
   (slot monitor                    initialize #f  getter generate)
   (slot statistics                 initialize #f  getter generate)
+  (slot throttle-multiplier        initialize 1.  getter generate)
   (slot upload-mutex               initialize #f  getter generate)
   (slot upload-state               initialize #f  getter generate)
   (slot upload-socket              initialize #f  getter generate)
@@ -129,7 +126,6 @@
   (slot invalid-packets            initialize 0   getter generate)
   (slot resending-nacks            initialize '() getter generate)
   (slot last-send-state            initialize #f  getter generate)
-  (slot throttle                   initialize #f  getter generate)
   (slot profile-ack-callback       initialize #f  accessors generate)
   (slot profile-media-ack-callback initialize #f  accessors generate)
   (slot profile-pulse-sequence     initialize #f  getter generate)
@@ -150,7 +146,6 @@
     (set! write-mutex (make-mutex 'write))
     (set! receive-streams (make-table))
     (set! receive-channels (make-table))
-    (set! throttle (new UDP-Throttle))
     (register-snapshot-callback (~ snapshot-receive-streams self)))
   
   
@@ -274,11 +269,7 @@
         (set! state-task (new Task 'state (~ run-state self) priority: state-priority))
         (start-task state-task)
         (set! heartbeat-task (new Task 'heartbeat (~ run-heartbeat self) priority: heartbeat-priority))
-        (start-task heartbeat-task)
-        (set! noack-ring (new Time-Ring 1))
-        (set! noack-task (new Task 'noack (~ run-noack self) priority: noack-priority))
-        (start-task noack-task)
-        (schedule-noack self))
+        (start-task heartbeat-task))
       (set! started? #t)))
   
   
@@ -292,10 +283,6 @@
       (set! state-task #f)
       (stop-task heartbeat-task)
       (set! heartbeat-task #f)
-      (terminate noack-ring)
-      (thread-join! (get-thread noack-task))
-      (set! noack-ring #f)
-      (set! noack-task #f)
       (set! started? #f)))
   
   
@@ -336,6 +323,19 @@
   
   (method protected (increase-received self data)
     (increase-received monitor data))
+  
+  
+  ;;;
+  ;;;; Throttle
+  ;;;
+  
+  
+  (method protected (reset-throttle-multiplier self)
+    (set! throttle-multiplier 1.))
+  
+  
+  (method public (effective-rate self min-rate rate)
+    (+ min-rate (* throttle-multiplier (- rate min-rate))))
   
   
   ;;;
@@ -909,23 +909,6 @@
   
   
   ;;;
-  ;;;; Noack
-  ;;;
-  
-  
-  (method (run-noack self task)
-    (declare (proper-tail-calls))
-    (with-task task
-      (lambda (exit)
-        (let (loop)
-          (let ((proc (wait noack-ring)))
-            (if (not proc)
-                (continuation-return exit #f)
-              (proc)
-              (loop)))))))
-  
-  
-  ;;;
   ;;;; Receive
   ;;;
   
@@ -1009,9 +992,8 @@
         (let ((ack-sent (read-ack-sent data))
               (server-bytes-sent (read-ack-bytes-sent data))
               (server-bytes-received (read-ack-bytes-received data))
-              (server-missed-media-packets (read-ack-missed-media-packets data))
               (round-trip (- now heartbeat-sent)))
-          (update statistics now monitor round-trip heartbeat-sequence heartbeat-bytes-sent server-bytes-sent server-bytes-received server-missed-media-packets)
+          (update statistics now monitor round-trip heartbeat-sequence heartbeat-bytes-sent server-bytes-sent server-bytes-received)
           (when record-events?
             (record-event udp-id-receive-ack
                           -1.
@@ -1032,26 +1014,7 @@
                               (fixnum->flonum heartbeat-sequence)
                               -1.
                               last-upload-rate
-                              last-download-rate)))))
-        ;; throttle
-        (received-ack throttle heartbeat-sent heartbeat-sequence statistics
-          (lambda (adjustment reason)
-            (delay-throttle-upload self adjustment reason))
-          (lambda (profile)
-            (delay-event
-              (lambda ()
-                (set-download-profile profile)
-                (download-profile-update)
-                (when profile-changed-hook
-                  (profile-changed-hook profile))))))
-        (schedule-noack self))))
-  
-  
-  (method (noack-receive self)
-    (noack-received throttle statistics
-      (lambda (adjustment reason)
-        (delay-throttle-upload self adjustment reason)))
-    (schedule-noack self))
+                              last-download-rate))))))))
   
   
   (method (delay-throttle-upload self adjustment reason)
@@ -1070,16 +1033,6 @@
                               reason
                               -1.
                               -1.))))))))
-  
-  
-  (method (schedule-noack self)
-    (let ((time (+ (current-seconds) noack-delay)))
-      (when (or (not noack-time)
-                (> time noack-time))
-        (set! noack-time time)
-        (empty noack-ring)
-        (insert noack-ring noack-time (lambda ()
-                                        (noack-receive self))))))
   
   
   (method (receive-nack self data)
@@ -1202,10 +1155,9 @@
                 (pulse-bytes-sent (read-profile-ack-pulse-bytes-sent data))
                 (latency (read-profile-ack-latency data))
                 (server-bytes-sent (read-profile-ack-bytes-sent data))
-                (server-bytes-received (read-profile-ack-bytes-received data))
-                (server-missed-media-packets 0)) ;; todo
+                (server-bytes-received (read-profile-ack-bytes-received data)))
             (let ((round-trip (- now pulse-sent)))
-              (update profile-statistics now profile-monitor round-trip pulse-sequence pulse-bytes-sent server-bytes-sent server-bytes-received server-missed-media-packets)
+              (update profile-statistics now profile-monitor round-trip pulse-sequence pulse-bytes-sent server-bytes-sent server-bytes-received)
               (parameterize ((simulation-evolution profile-evolution))
                 ;; hack to plot latency
                 (when record-events?
