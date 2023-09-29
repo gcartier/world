@@ -90,6 +90,13 @@
     (set! average -1.))
   
   
+  (method protected (reset self)
+    (set! start #f)
+    (set! total #f)
+    (set! rate 0.)
+    (set! average -1.))
+  
+  
   (method protected (update self size)
     (let ((now (current-seconds)))
       (when (not start)
@@ -133,6 +140,8 @@
   (slot upload-queue               initialize #f  getter generate)
   (slot upload-queue-rate          initialize #f  getter generate)
   (slot upload-send-rate           initialize #f  getter generate)
+  (slot upload-ack-mutex           initialize #f  getter generate)
+  (slot upload-ack-condvar         initialize #f  getter generate)
   (slot upload-task                initialize #f  getter generate)
   (slot upload-burst?              initialize #f  getter generate)
   (slot upload-done?               initialize #f  getter generate)
@@ -201,6 +210,8 @@
       (set! upload-queue (new Priorities-Queue 3))
       (set! upload-queue-rate (new Transfer-Rate))
       (set! upload-send-rate (new Transfer-Rate))
+      (set! upload-ack-mutex (make-mutex 'ack))
+      (set! upload-ack-condvar (make-condition-variable 'ack))
       (set! upload-done? #f)
       (set! upload-skbuff-info (new_skbuff 0))
       (set! upload-skbcb-info (new_skbcb))
@@ -213,9 +224,6 @@
          (together.bbr:draw-bbr #f 0 0)
          (together.bbr:set-upload-info #f #f #f #f #f #f #f #f #f #f #f #f))
         (else))
-      (tcp_init upload-socket udp-datagram-max (current-monotonic-nanoseconds) (current-monotonic-frequency))
-      (bbr_init upload-socket)
-      (bbr-updated self)
       (set! simulator #f)
       (when record-events?
         (record-event udp-id-connecting
@@ -290,6 +298,13 @@
   (method (start self)
     (unless started?
       (unless (simulation?)
+        (reset upload-state)
+        (reset upload-queue #f)
+        (reset upload-queue-rate)
+        (reset upload-send-rate)
+        (tcp_init upload-socket udp-mss (current-monotonic-nanoseconds) (current-monotonic-frequency))
+        (bbr_init upload-socket)
+        (bbr-updated self)
         (set! upload-done? #f)
         (set! upload-task (new Task 'upload (~ run-upload self) priority: upload-priority))
         (start-task upload-task)
@@ -304,8 +319,11 @@
     (when started?
       (set! upload-done? #t)
       (push upload-queue (eof-object) 0)
+      (condition-variable-signal! upload-ack-condvar)
       (thread-join! (get-thread upload-task))
       (set! upload-task #f)
+      (reset upload-state)
+      (reset upload-queue #f)
       (stop-task state-task)
       (set! state-task #f)
       (stop-task heartbeat-task)
@@ -644,8 +662,9 @@
   
   
   (method (push-upload self data priority)
-    (push upload-queue data priority)
-    (update upload-queue-rate (u8vector-length data)))
+    (unless upload-done?
+      (push upload-queue data priority)
+      (update upload-queue-rate (u8vector-length data))))
   
   
   (method (pop-upload self timeout)
@@ -735,6 +754,7 @@
                 (skbuff_get_info skb upload-skbuff-info)
                 (skbcb_get_info skb upload-skbcb-info))
               (tcp_ack upload-socket skb lost (get-round-trip-rate statistics) (effective-upload-empty? self) (current-monotonic-nanoseconds) (and upload-info? upload-rate-info))
+              (condition-variable-signal! upload-ack-condvar)
               (free_skbuff skb)
               (record-event udp-id-rate-sample
                             -1.
@@ -794,13 +814,17 @@
                            (wait next-delivery-time)
                            (send-upload-pulse self now)
                            (mutex-unlock! upload-mutex)
-                           (loop data (+ next-delivery-time .0001)))
+                           (mutex-lock! upload-ack-mutex)
+                           (mutex-unlock! upload-ack-mutex upload-ack-condvar +inf.0)
+                           (loop data next-delivery-time))
                           ;; do nothing
                           (else
                            (show "$")
                            (wait next-delivery-time)
                            (mutex-unlock! upload-mutex)
-                           (loop data (+ next-delivery-time .0001))))))
+                           (mutex-lock! upload-ack-mutex)
+                           (mutex-unlock! upload-ack-mutex upload-ack-condvar +inf.0)
+                           (loop data next-delivery-time)))))
                  ;; send packet
                  (else
                   (let ((size (u8vector-length data)))
