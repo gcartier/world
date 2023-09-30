@@ -207,7 +207,7 @@
       (set! upload-mutex (make-mutex 'upload))
       (set! upload-state (new Upload-State))
       (set! upload-socket (new_tcpsock))
-      (set! upload-queue (new Priorities-Queue 3))
+      (set! upload-queue (new Upload-Queue))
       (set! upload-queue-rate (new Transfer-Rate))
       (set! upload-send-rate (new Transfer-Rate))
       (set! upload-ack-mutex (make-mutex 'ack))
@@ -299,7 +299,7 @@
     (unless started?
       (unless (simulation?)
         (reset upload-state)
-        (reset upload-queue #f)
+        (reset upload-queue)
         (reset upload-queue-rate)
         (reset upload-send-rate)
         (tcp_init upload-socket udp-mss (current-monotonic-nanoseconds) (current-monotonic-frequency))
@@ -323,7 +323,7 @@
       (thread-join! (get-thread upload-task))
       (set! upload-task #f)
       (reset upload-state)
-      (reset upload-queue #f)
+      (reset upload-queue)
       (stop-task state-task)
       (set! state-task #f)
       (stop-task heartbeat-task)
@@ -667,6 +667,12 @@
       (update upload-queue-rate (u8vector-length data))))
   
   
+  (method (push-time-upload self data priority)
+    (unless upload-done?
+      (push-time upload-queue data priority)
+      (update upload-queue-rate (u8vector-length data))))
+  
+  
   (method (pop-upload self timeout)
     (pop upload-queue timeout))
   
@@ -683,7 +689,7 @@
   
   (method (trim-upload self)
     ;; trim all but audio
-    (trim upload-queue 1 #f))
+    (trim upload-queue 1))
 
   
   (method (bbr-updated self)
@@ -1138,7 +1144,7 @@
                   (if data
                       (with-record media
                         (increase-media-resent data)
-                        (push-upload self data 2)
+                        (push-time-upload self data 2)
                         (when record-events?
                           (let ((frame (read-media-frame data)))
                             (record-event udp-id-resend-packet
@@ -1337,6 +1343,224 @@
                   (write-header-sender data client-no)
                   (write-udp-code data)
                   (send-data self data))))))))))
+
+
+;;;
+;;;; Upload Ring
+;;;
+
+
+(class Upload-Ring extends Object
+  
+  
+  (slot priority <fx>     getter generate)
+  (slot count    <fx>)
+  (slot expire)
+  (slot times    <f64vector>)
+  (slot content  <vector>)
+  (slot head     <fx>)
+  (slot tail     <fx>)
+  (slot size     <fx>     getter generate)
+  
+  
+  (method override (initialize self prio cnt exp)
+    (set! priority prio)
+    (set! count cnt)
+    (set! expire exp)
+    (set! times (make-f64vector (if exp cnt 0) +nan.0))
+    (set! content (make-vector cnt))
+    (set! head 0)
+    (set! tail 0)
+    (set! size 0))
+  
+  
+  (method override (print self output readably)
+    (print-unreadable self output
+      (lambda (output)
+        (format output "{a}" size))))
+  
+  
+  (method public (empty? self)
+    (= head tail))
+  
+  
+  (method public (reset self)
+    (prog1 size
+      (f64vector-fill! times +nan.0)
+      (vector-fill! content #f)
+      (set! head 0)
+      (set! tail 0)
+      (set! size 0)))
+  
+  
+  (method public (push self obj)
+    (let ((new-size (+ size 1)))
+      (when (> new-size count)
+        (let ((new-count (if (= count 0) 8 (fxround (* count GOLDEN-RATIO)))))
+          (let ((new-content (make-vector new-count)))
+            (loop (for n from 0 below size)
+                  (vector-set! new-content n (vector-ref content (modulo (+ head n) count))))
+            (set! count new-count)
+            (set! content new-content)
+            (set! head 0)
+            (set! tail size))))
+      (vector-set! content tail obj)
+      (set! tail (modulo (+ tail 1) count))
+      (set! size new-size)))
+  
+  
+  (method public (push-time self obj)
+    (declare (proper-tail-calls))
+    (let ((time (current-seconds)))
+      ;; trim
+      (when (> size 0)
+        (let ((cut (- time expire)))
+          (let (loop)
+            (let ((earliest-time (f64vector-ref times head)))
+              (when (<= earliest-time cut)
+                (f64vector-set! times head +nan.0)
+                (vector-set! content head #f)
+                (set! head (modulo (+ head 1) count))
+                (decrease! size)
+                (when (> size 0)
+                  (loop)))))))
+      ;; push
+      (let ((new-size (+ size 1)))
+        (when (> new-size count)
+          (let ((new-count (if (= count 0) 8 (fxround (* count GOLDEN-RATIO)))))
+            (let ((new-times (make-f64vector new-count +nan.0))
+                  (new-content (make-vector new-count #f)))
+              (loop (for n from 0 below size)
+                    (let ((offset (modulo (+ head n) count)))
+                      (f64vector-set! new-times n (f64vector-ref times offset))
+                      (vector-set! new-content n (vector-ref content offset))))
+              (set! count new-count)
+              (set! times new-times)
+              (set! content new-content)
+              (set! head 0)
+              (set! tail size))))
+        (f64vector-set! times tail time)
+        (vector-set! content tail obj)
+        (set! tail (modulo (+ tail 1) count))
+        (set! size new-size))))
+  
+  
+  (method public (pop self)
+    (if (<= size 0)
+        (error "Ring is empty")
+      (prog1 (vector-ref content head)
+        (vector-set! content head #f)
+        (set! head (modulo (+ head 1) count))
+        (decrease! size))))
+  
+  
+  (method public (pop-time self)
+    (if (<= size 0)
+        (error "Ring is empty")
+      (prog1 (vector-ref content head)
+        (f64vector-set! times head +nan.0)
+        (vector-set! content head #f)
+        (set! head (modulo (+ head 1) count))
+        (decrease! size)))))
+
+
+;;;
+;;;; Upload Queue
+;;;
+
+
+(class Upload-Queue extends Object
+  
+  
+  (slot count     <fx>)
+  (slot rings     <vector>)
+  (slot mutex              initialize (make-mutex))
+  (slot condition-variable initialize (make-condition-variable))
+  
+  
+  (method override (initialize self)
+    (nextmethod self)
+    (set! count 3)
+    (set! rings (vector (new Upload-Ring 0 0 1.)
+                        (new Upload-Ring 1 0 #f)
+                        (new Upload-Ring 2 0 1.))))
+  
+  
+  (method inline (get-ring self priority <fx>) <Upload-Ring>
+    (element rings priority))
+  
+  
+  (method (top-ring self) <Upload-Ring+>
+    (declare (proper-tail-calls))
+    (let (iter (priority 0))
+      (if (< priority count)
+          (let ((ring (get-ring self priority)))
+            (if (not (empty? ring))
+                ring
+              (iter (+ priority 1))))
+        #f)))
+  
+  
+  (method public (size self)
+    (mutex-lock! mutex)
+    (prog1 (let ((size 0))
+             (loop (for ring <Upload-Ring> in-vector rings)
+                   (increase! size (get-size ring)))
+             size)
+      (mutex-unlock! mutex)))
+  
+  
+  (method public (sizes self)
+    (loop (for p from 0 below count)
+          (collect (get-size (get-ring self p)))))
+  
+  
+  (method public (empty? self)
+    (mutex-lock! mutex)
+    (prog1 (not (top-ring self))
+      (mutex-unlock! mutex)))
+  
+  
+  (method public (reset self)
+    (mutex-lock! mutex)
+    (loop (for ring <Upload-Ring> in-vector rings)
+          (reset ring))
+    (mutex-unlock! mutex))
+  
+  
+  (method public (trim self priority)
+    (mutex-lock! mutex)
+    (let ((ring (get-ring self priority)))
+      (prog1 (reset ring)
+        (mutex-unlock! mutex))))
+  
+  
+  (method public (push self obj priority <fx>)
+    (mutex-lock! mutex)
+    (push (get-ring self priority) obj)
+    (mutex-unlock! mutex)
+    (condition-variable-signal! condition-variable))
+  
+  
+  (method public (push-time self obj priority <fx>)
+    (mutex-lock! mutex)
+    (push-time (get-ring self priority) obj)
+    (mutex-unlock! mutex)
+    (condition-variable-signal! condition-variable))
+  
+  
+  (method public (pop self timeout)
+    (declare (proper-tail-calls))
+    (let (iter)
+      (mutex-lock! mutex)
+      (let ((ring (top-ring self)))
+        (cond (ring
+               (prog1 (pop ring)
+                 (mutex-unlock! mutex)))
+              ((mutex-unlock! mutex condition-variable timeout)
+               (iter))
+              (else
+               (eof-object)))))))
 
 
 ;;;
