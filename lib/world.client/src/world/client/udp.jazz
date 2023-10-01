@@ -318,7 +318,7 @@
   (method (stop self)
     (when started?
       (set! upload-done? #t)
-      (push upload-queue (eof-object) 0)
+      (push-done upload-queue)
       (condition-variable-signal! upload-ack-condvar)
       (thread-join! (get-thread upload-task))
       (set! upload-task #f)
@@ -474,11 +474,13 @@
   (method package (register-send-channel self priority stream-no channel-no media-kind source-kind level resolution framerate bitrate codec caps metadata send-state)
     (let ((stream (find-send-stream self stream-no)))
       (let ((channel (new UDP-Send-Channel priority stream channel-no media-kind source-kind level resolution framerate bitrate codec caps metadata send-state)))
+        (register-channel upload-queue channel (if (= media-kind udp-audio) 1. #f))
         (table-set! send-channels channel-no channel)
         channel)))
   
   
   (method package (close-send-channel self channel)
+    (unregister-channel upload-queue channel)
     (let ((channel-no (get-no channel)))
       (close channel)
       (close-channel-output self channel)
@@ -532,13 +534,12 @@
             (let ((kind (get-media-kind channel)))
               (define (send)
                 (when (and (= kind udp-video) (frame-keyframe? flags))
-                  (trim-upload self))
+                  (trim-upload self channel))
                 (send-media channel client-no buffer dts pts duration flags
                   (lambda (data)
-                    (let ((priority (if (= kind udp-audio)
-                                        0
-                                      1)))
-                      (push-upload self data priority)))))
+                    (if (= kind udp-audio)
+                        (push-time-upload self channel data)
+                      (push-upload self channel data)))))
               
               (define (advance-frame!)
                 (next-frame-sequence! channel))
@@ -661,15 +662,21 @@
   ;;;
   
   
-  (method (push-upload self data priority)
+  (method (push-upload self channel data)
     (unless upload-done?
-      (push upload-queue data priority)
+      (push upload-queue channel data)
       (update upload-queue-rate (u8vector-length data))))
   
   
-  (method (push-time-upload self data priority)
+  (method (push-time-upload self channel data)
     (unless upload-done?
-      (push-time upload-queue data priority)
+      (push-time upload-queue channel data)
+      (update upload-queue-rate (u8vector-length data))))
+  
+  
+  (method (push-missing-upload self data)
+    (unless upload-done?
+      (push-missing upload-queue data)
       (update upload-queue-rate (u8vector-length data))))
   
   
@@ -687,9 +694,8 @@
       (empty? upload-queue)))
   
   
-  (method (trim-upload self)
-    ;; trim all but audio
-    (trim upload-queue 1))
+  (method (trim-upload self channel)
+    (trim upload-queue channel))
 
   
   (method (bbr-updated self)
@@ -1145,7 +1151,7 @@
                   (if data
                       (with-record media
                         (increase-media-resent data)
-                        (push-time-upload self data 2)
+                        (push-missing-upload self data)
                         (when record-events?
                           (let ((frame (read-media-frame data)))
                             (record-event udp-id-resend-packet
@@ -1472,31 +1478,76 @@
   
   
   (slot count     <fx>)
+  (slot channels  <list>)
   (slot rings     <vector>)
+  (slot missing-ring)
   (slot mutex              initialize (make-mutex))
   (slot condition-variable initialize (make-condition-variable))
   
   
   (method override (initialize self)
     (nextmethod self)
-    (set! count 3)
-    (set! rings (vector (new Upload-Ring 0 1.)
-                        (new Upload-Ring 0 #f)
-                        (new Upload-Ring 0 1.))))
+    (set! count 1)
+    (set! channels '())
+    (set! missing-ring (new Upload-Ring 0 1.))
+    (set! rings (vector missing-ring)))
   
   
-  (method inline (get-ring self priority <fx>) <Upload-Ring>
-    (element rings priority))
+  (method protected (register-channel self channel expire)
+    (mutex-lock! mutex)
+    (let ((ring (new Upload-Ring 0 expire)))
+      (increase! count)
+      (set! channels (cons channel channels))
+      (set-upload-ring channel ring)
+      (sort-channels self)
+      (update-rings self))
+    (mutex-unlock! mutex))
+  
+  
+  (method protected (unregister-channel self channel)
+    (mutex-lock! mutex)
+    (decrease! count)
+    (set! channels (remove! channel channels))
+    (set-upload-ring channel #f)
+    (sort-channels self)
+    (update-rings self)
+    (mutex-unlock! mutex))
+  
+  
+  (method (sort-channels self)
+    (define (determine-level channel)
+      (if (= (get-media-kind channel) udp-audio)
+          -1
+        (or (get-level channel) 0)))
+    
+    (set! channels (sort (lambda (x y)
+                           (let ((px (get-priority x))
+                                 (py (get-priority y))
+                                 (lx (determine-level x))
+                                 (ly (determine-level y)))
+                             (or (< px py)
+                                 (and (= px py)
+                                      (< lx ly)))))
+                         channels)))
+  
+  
+  (method (update-rings self)
+    (set! rings (make-vector count))
+    (let ((last (- count 1)))
+      (loop (for n from 0 below last)
+            (for channel in channels)
+            (vector-set! rings n (get-upload-ring channel)))
+      (vector-set! rings last missing-ring)))
   
   
   (method (top-ring self) <Upload-Ring+>
     (declare (proper-tail-calls))
-    (let (iter (priority 0))
-      (if (< priority count)
-          (let ((ring (get-ring self priority)))
+    (let (iter (n 0))
+      (if (< n count)
+          (let ((ring (vector-ref rings n)))
             (if (not (empty? ring))
                 ring
-              (iter (+ priority 1))))
+              (iter (+ n 1))))
         #f)))
   
   
@@ -1510,8 +1561,8 @@
   
   
   (method public (sizes self)
-    (loop (for p from 0 below count)
-          (collect (get-size (get-ring self p)))))
+    (loop (for n from 0 below count)
+          (collect (get-size (vector-ref rings n)))))
   
   
   (method public (empty? self)
@@ -1527,25 +1578,36 @@
     (mutex-unlock! mutex))
   
   
-  (method public (trim self priority)
+  (method public (trim self channel)
     (mutex-lock! mutex)
-    (let ((ring (get-ring self priority)))
+    (let ((ring (get-upload-ring channel)))
       (prog1 (reset ring)
         (mutex-unlock! mutex))))
   
   
-  (method public (push self obj priority <fx>)
+  (method public (push self channel obj)
     (mutex-lock! mutex)
-    (push (get-ring self priority) obj)
+    (push (get-upload-ring channel) obj)
     (mutex-unlock! mutex)
     (condition-variable-signal! condition-variable))
   
   
-  (method public (push-time self obj priority <fx>)
+  (method public (push-time self channel obj)
     (mutex-lock! mutex)
-    (push-time (get-ring self priority) obj)
+    (push-time (get-upload-ring channel) obj)
     (mutex-unlock! mutex)
     (condition-variable-signal! condition-variable))
+  
+  
+  (method public (push-missing self obj)
+    (mutex-lock! mutex)
+    (push-time missing-ring obj)
+    (mutex-unlock! mutex)
+    (condition-variable-signal! condition-variable))
+  
+  
+  (method public (push-done self)
+    (push-missing self (eof-object)))
   
   
   (method public (pop self timeout)
