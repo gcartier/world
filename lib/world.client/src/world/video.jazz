@@ -922,6 +922,21 @@
 
 
 ;;;
+;;;; Video-Consumer
+;;;
+
+
+(class Video-Consumer extends Stream-Frame-Consumer
+  
+  
+  (slot bitrate-modifier initialize 1. accessors generate)
+  
+  
+  (method public (effective-rate self min-rate rate)
+    (+ min-rate (* bitrate-modifier (- rate min-rate)))))
+
+
+;;;
 ;;;; Video-Src
 ;;;
 
@@ -938,6 +953,10 @@
   
   (method (stop-listeners self)
     (for-each stop-listener sinks))
+  
+  
+  (method protected virtual (throttle-bitrate self consumer modifier)
+    )
   
   
   (method public virtual abstract (task-priority self)
@@ -1245,29 +1264,25 @@
   
   
   (method package (determine-bitrate self)
-    (let ((udp (current-udp)))
-      (let ((bitrate 0.))
-        (for-each (lambda (consumer)
-                    (when (and (is? consumer Camera-Video-Consumer)
-                               (get-processing? consumer))
-                      (let ((profile (get-profile consumer)))
-                        (increase! bitrate (effective-rate udp (get-min-bitrate profile) (get-bitrate profile))))))
-                  sinks)
-        bitrate)))
-  
-  
-  (method override (throttle-bitrate self)
-    (let ((udp (current-udp)))
+    (let ((bitrate 0.))
       (for-each (lambda (consumer)
-                  (when (is? consumer Camera-Video-Consumer)
+                  (when (and (is? consumer Camera-Video-Consumer)
+                             (get-processing? consumer))
                     (let ((profile (get-profile consumer)))
-                      (let ((name (get-name profile))
-                            (min-bitrate (get-min-bitrate profile))
-                            (bitrate (get-bitrate profile)))
-                        (let ((encname (tie "enc{name}")))
-                          (with-unref ((enc (gst_bin_get_by_name pipeline encname)))
-                            (g_object_set_uint enc "bitrate" (fxround (effective-rate udp min-bitrate bitrate)))))))))
-                sinks)))
+                      (increase! bitrate (effective-rate consumer (get-min-bitrate profile) (get-bitrate profile))))))
+                sinks)
+      bitrate))
+  
+  
+  (method override (throttle-bitrate self consumer modifier)
+    (set-bitrate-modifier consumer modifier)
+    (let ((profile (get-profile consumer)))
+      (let ((name (get-name profile))
+            (min-bitrate (get-min-bitrate profile))
+            (bitrate (get-bitrate profile)))
+        (let ((encname (tie "enc{name}")))
+          (with-unref ((enc (gst_bin_get_by_name pipeline encname)))
+            (g_object_set_uint enc "bitrate" (fxround (effective-rate consumer min-bitrate bitrate))))))))
   
   
   @not-used
@@ -1301,8 +1316,7 @@
   
   (method override (setup-element self)
     (nextmethod self)
-    (let ((udp (current-udp))
-          (max-resolution resolution)
+    (let ((max-resolution resolution)
           (max-framerate selfrate))
       (receive (camera-name camera-identifier camera-resolution camera-framerate) (effective-camera-information selfrate)
         (let ((camera-width (get-width camera-resolution))
@@ -1363,7 +1377,7 @@
                                                        (let ((width (get-width resolution))
                                                              (height (get-height resolution))
                                                              (scale? (nu/=? resolution max-resolution))
-                                                             (effective-bitrate (fxround (effective-rate udp min-bitrate bitrate))))
+                                                             (effective-bitrate (fxround (effective-rate consumer min-bitrate bitrate))))
                                                          (list
                                                            "tee^."
                                                            (tie "queue name=queue{name}")
@@ -1504,7 +1518,7 @@
   (method public virtual abstract (set-probe self value)))
 
 
-(class Camera-Video-Consumer extends Stream-Frame-Consumer implements Camera-Video-Consumable
+(class Camera-Video-Consumer extends Video-Consumer implements Camera-Video-Consumable
   
   
   (slot channel-no getter generate)
@@ -1719,46 +1733,46 @@
       (wait-caps-string/resolution appsink)))
   
   
-  (method override (throttle-bitrate self)
-    (let ((udp (current-udp)))
-      (with-unref ((enc (gst_bin_get_by_name pipeline "enc")))
-        (g_object_set_uint enc "bitrate" (fxround (effective-rate udp min-bitrate bitrate))))))
+  (method override (throttle-bitrate self consumer modifier)
+    (set-bitrate-modifier consumer modifier)
+    (with-unref ((enc (gst_bin_get_by_name pipeline "enc")))
+      (g_object_set_uint enc "bitrate" (fxround (effective-rate consumer min-bitrate bitrate)))))
   
   
   (method override (setup-element self)
     (nextmethod self)
-    (let ((udp (current-udp)))
-      (let ((width (get-width resolution))
-            (height (get-height resolution))
-            (listener (open-stream-listener "screen")))
-        (let ((pipeline (gst-pipeline (cond-expand
-                                        (mac "avfvideosrc capture-screen=true capture-screen-cursor=true capture-screen-mouse-clicks=true name=src")
-                                        (windows "dx9screencapsrc name=src")
-                                        (else "v4l2src name=src"))
-                                      (tie "videorate max-rate={framerate}")
-                                      ;; first step just on mac
-                                      (cond-expand
-                                        (mac (tie "video/x-raw, format=BGRA"))
-                                        (else #f))
-                                      "videoconvert"
-                                      (and (eq? codec 'h264)
-                                           (let ((key-int-max (and screen-share-keyframes (fxround (* (cast <fl> framerate) screen-share-keyframes))))
-                                                 (bitrate (fxround (effective-rate udp min-bitrate bitrate)))
-                                                 (tune "zerolatency")
-                                                 (speed-preset "superfast"))
-                                             (gst-element "x264enc"
-                                                          key-int-max: key-int-max
-                                                          bitrate: bitrate
-                                                          tune: tune
-                                                          speed-preset: speed-preset
-                                                          name: "enc")))
-                                      "appsink name=sink")))
-          (gst_object_set_name pipeline "video.screen")
-          (with-unref ((appsink (gst_bin_get_by_name pipeline "sink")))
-            (gst_app_sink_connect_signals appsink listener)
-            (gst_element_set_state pipeline GST_STATE_READY)
-            (set! self.pipeline pipeline)
-            (setup-consumer (find-consumer self #f) listener appsink (* width height 4)))))))
+    (let ((width (get-width resolution))
+          (height (get-height resolution))
+          (listener (open-stream-listener "screen"))
+          (consumer (find-consumer self #f)))
+      (let ((pipeline (gst-pipeline (cond-expand
+                                      (mac "avfvideosrc capture-screen=true capture-screen-cursor=true capture-screen-mouse-clicks=true name=src")
+                                      (windows "dx9screencapsrc name=src")
+                                      (else "v4l2src name=src"))
+                                    (tie "videorate max-rate={framerate}")
+                                    ;; first step just on mac
+                                    (cond-expand
+                                      (mac (tie "video/x-raw, format=BGRA"))
+                                      (else #f))
+                                    "videoconvert"
+                                    (and (eq? codec 'h264)
+                                         (let ((key-int-max (and screen-share-keyframes (fxround (* (cast <fl> framerate) screen-share-keyframes))))
+                                               (bitrate (fxround (effective-rate consumer min-bitrate bitrate)))
+                                               (tune "zerolatency")
+                                               (speed-preset "superfast"))
+                                           (gst-element "x264enc"
+                                                        key-int-max: key-int-max
+                                                        bitrate: bitrate
+                                                        tune: tune
+                                                        speed-preset: speed-preset
+                                                        name: "enc")))
+                                    "appsink name=sink")))
+        (gst_object_set_name pipeline "video.screen")
+        (with-unref ((appsink (gst_bin_get_by_name pipeline "sink")))
+          (gst_app_sink_connect_signals appsink listener)
+          (gst_element_set_state pipeline GST_STATE_READY)
+          (set! self.pipeline pipeline)
+          (setup-consumer consumer listener appsink (* width height 4))))))
   
   
   (method override (task-priority self)
@@ -1798,7 +1812,7 @@
 ;;;
 
 
-(class Screen-Video-Consumer extends Stream-Frame-Consumer
+(class Screen-Video-Consumer extends Video-Consumer
   
   
   (slot channel-no getter generate)
@@ -1853,41 +1867,41 @@
       (wait-caps-string/resolution appsink)))
   
   
-  (method override (throttle-bitrate self)
-    (let ((udp (current-udp)))
-      (with-unref ((enc (gst_bin_get_by_name pipeline "enc")))
-        (g_object_set_uint enc "bitrate" (fxround (effective-rate udp min-bitrate bitrate))))))
+  (method override (throttle-bitrate self consumer modifier)
+    (set-bitrate-modifier consumer modifier)
+    (with-unref ((enc (gst_bin_get_by_name pipeline "enc")))
+      (g_object_set_uint enc "bitrate" (fxround (effective-rate consumer min-bitrate bitrate)))))
   
   
   (method override (setup-element self)
     (nextmethod self)
-    (let ((udp (current-udp)))
-      (let ((width (get-width resolution))
-            (height (get-height resolution))
-            (listener (open-stream-listener "window")))
-        (let ((pipeline (gst-pipeline "appsrc name=src"
-                                      "videoflip method=vertical-flip"
-                                      "videoconvert"
-                                      (and (eq? codec 'h264)
-                                           (let ((key-int-max (and window-share-keyframes (fxround (* (cast <fl> framerate) window-share-keyframes))))
-                                                 (bitrate (fxround (effective-rate udp min-bitrate bitrate)))
-                                                 (tune "zerolatency")
-                                                 (speed-preset "superfast"))
-                                             (gst-element "x264enc"
-                                                          key-int-max: key-int-max
-                                                          bitrate: bitrate
-                                                          tune: tune
-                                                          speed-preset: speed-preset
-                                                          name: "enc")))
-                                      "appsink sync=false name=sink")))
-          (gst_object_set_name pipeline "video.window")
-          (with-unref ((appsrc (gst_bin_get_by_name pipeline "src"))
-                       (appsink (gst_bin_get_by_name pipeline "sink")))
-            (gst_app_sink_connect_signals appsink listener)
-            (gst-setup-video-source appsrc "video/x-raw" "BGRA" width height framerate)
-            (gst_element_set_state pipeline GST_STATE_READY)
-            (set! self.pipeline pipeline)
-            (setup-consumer (find-consumer self #f) listener appsink (* width height 4)))))))
+    (let ((width (get-width resolution))
+          (height (get-height resolution))
+          (listener (open-stream-listener "window"))
+          (consumer (find-consumer self #f)))
+      (let ((pipeline (gst-pipeline "appsrc name=src"
+                                    "videoflip method=vertical-flip"
+                                    "videoconvert"
+                                    (and (eq? codec 'h264)
+                                         (let ((key-int-max (and window-share-keyframes (fxround (* (cast <fl> framerate) window-share-keyframes))))
+                                               (bitrate (fxround (effective-rate consumer min-bitrate bitrate)))
+                                               (tune "zerolatency")
+                                               (speed-preset "superfast"))
+                                           (gst-element "x264enc"
+                                                        key-int-max: key-int-max
+                                                        bitrate: bitrate
+                                                        tune: tune
+                                                        speed-preset: speed-preset
+                                                        name: "enc")))
+                                    "appsink sync=false name=sink")))
+        (gst_object_set_name pipeline "video.window")
+        (with-unref ((appsrc (gst_bin_get_by_name pipeline "src"))
+                     (appsink (gst_bin_get_by_name pipeline "sink")))
+          (gst_app_sink_connect_signals appsink listener)
+          (gst-setup-video-source appsrc "video/x-raw" "BGRA" width height framerate)
+          (gst_element_set_state pipeline GST_STATE_READY)
+          (set! self.pipeline pipeline)
+          (setup-consumer consumer listener appsink (* width height 4))))))
   
   
   (method override (task-priority self)
@@ -1964,7 +1978,7 @@
 ;;;
 
 
-(class Window-Video-Consumer extends Stream-Frame-Consumer
+(class Window-Video-Consumer extends Video-Consumer
   
   
   (slot channel-no getter generate)
