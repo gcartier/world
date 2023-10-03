@@ -972,7 +972,6 @@
   (slot wait-keyframe?     getter generate)
   (slot upload-ring        accessors generate)
   (slot replay-ring        getter generate)
-  (slot release-task       getter generate)
   (slot audio-mirror-mutex getter generate)
   
   
@@ -989,12 +988,6 @@
     (set! self.upload-ring #f)
     (set! self.replay-ring (and record-media? (remember-ring media-kind source-kind level framerate)))
     (set! self.retain-ring (new UDP-Ring self no (get-origin stream) media-kind source-kind udp-retain-size max-size: udp-retain-max-size overflow-proc: (udp-ring-overflow 'retain udp-ring-kind-retain) retain-window: (effective-retain-window source-kind)))
-    (unless (simulation?)
-      (let ((task-name (if (= media-kind udp-audio)
-                           (list 'release-audio (determine-channel-name self))
-                         (list 'release-video (determine-channel-name self) level))))
-        (set! self.release-task (new Task task-name (~ run-release self) priority: release-priority)))
-      (start-task release-task))
     (when (= media-kind udp-audio)
       (set! audio-mirror-mutex (make-mutex 'audio-mirror))))
   
@@ -1003,8 +996,6 @@
     (when pipeline
       (release pipeline)
       (close pipeline))
-    (terminate retain-ring)
-    (thread-join! (get-thread release-task))
     (nextmethod self))
   
   
@@ -1166,49 +1157,7 @@
                               -1.
                               -1.
                               -1.
-                              -1.))))))))
-  
-  
-  (method protected (run-release self task)
-    (declare (proper-tail-calls))
-    (with-task task
-      (lambda (exit)
-        (let (loop)
-          (let ((packet (retain-wait retain-ring)))
-            (if (eq? packet 'terminate)
-                (continuation-return exit #f)
-              (site release
-                (release-media self packet))
-              (loop)))))))
-  
-  
-  (method protected (release-media self packet)
-    (when record-events?
-      (let ((data (get-data packet))
-            (origin (get-origin stream)))
-        (if (not data)
-            (let ((removed-sequence (get-sequence packet)))
-              (record-event udp-id-giveup-packet
-                            (fixnum->flonum no)
-                            (fixnum->flonum origin)
-                            (fixnum->flonum media-kind)
-                            (fixnum->flonum removed-sequence)
-                            -1.
-                            -1.
-                            -1.))
-          (when record-media?
-            (with-record media
-              (let ((sequence (read-media-sequence data))
-                    (frame (read-media-frame data))
-                    (dts (read-media-dts data)))
-                (record-event udp-id-release-packet
-                              (fixnum->flonum no)
-                              (fixnum->flonum origin)
-                              (fixnum->flonum media-kind)
-                              (fixnum->flonum sequence)
-                              (fixnum->flonum frame)
-                              -1.
-                              (timestamp->flonum dts))))))))))
+                              -1.)))))))))
 
 
 ;;;
@@ -1856,6 +1805,8 @@
           (insert/purge #f))
         
         (define (insert-highest packet)
+          (when retain-window
+            (retain-trim self local))
           (record-insert)
           (insert-before self tail packet)
           (set! last-sequence sequence)
@@ -2140,34 +2091,19 @@
   ;;;
   
   
-  (method public (retain-wait self)
+  (method (retain-trim self local)
     (declare (proper-tail-calls))
-    (let (loop-wait)
-      (if terminate?
-          'terminate
-        (mutex-lock! mutex)
-        (if (= count 0)
-            (begin
-              (mutex-unlock! mutex wait-condvar)
-              (loop-wait))
-          (let ((nowstamp (current-timestamp))
-                (earliest <UDP-Packet> (vector-ref packets head)))
-            (let ((release-time (determine-release-time self earliest)))
-              (if (>= nowstamp release-time)
-                  (prog1 earliest
-                    (vector-set! packets head #f)
-                    (set! head (modulo (+ head 1) size))
-                    (decrease! count)
-                    (increase! lowest)
-                    (check self)
-                    (mutex-unlock! mutex))
-                (mutex-unlock! mutex wait-condvar (timestamp->flonum (- release-time nowstamp)))
-                (loop-wait))))))))
-  
-  
-  (method (determine-release-time self packet <UDP-Packet>) <fx>
-    (let ((dts (get-dts packet)))
-      (+ (remote->local time-base dts) retain-window)))
+    (when (> count 0)
+      (let ((cut (- local (get-base time-base) (get-latency time-base) retain-window)))
+        (let (loop)
+          (let ((earliest <UDP-Packet> (vector-ref packets head)))
+            (when (<= (get-dts earliest) cut)
+              (vector-set! packets head #f)
+              (set! head (modulo (+ head 1) size))
+              (decrease! count)
+              (increase! lowest)
+              (when (> count 0)
+                (loop))))))))
   
   
   ;;;
