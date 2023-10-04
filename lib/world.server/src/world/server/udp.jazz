@@ -160,6 +160,12 @@
       (table-clear send-streams stream-no)))
   
   
+  (method protected (update-stream-receivers self stream)
+    (iterate-table (get-channels stream)
+      (lambda (no channel)
+        (update-receivers channel self))))
+  
+  
   ;;;
   ;;;; Channel
   ;;;
@@ -172,6 +178,7 @@
   (method package (register-server-channel self stream-no channel-no media-kind source-kind level resolution framerate bitrate codec caps metadata send-state server-sender?)
     (let ((stream (find-server-stream self stream-no)))
       (let ((channel (new UDP-Server-Channel stream channel-no media-kind source-kind level resolution framerate bitrate codec caps metadata send-state server-sender?)))
+        (update-receivers channel self)
         (table-set! server-channels channel-no channel)
         channel)))
   
@@ -678,26 +685,14 @@
   
   
   (method (broadcast-media self channel kind data)
-    (let ((server (current-server)))
-      (let ((stream (get-stream channel)))
-        (let ((members (get-members (get-recipient stream)))
-              (exclude-broadcast (get-exclude-broadcast stream))
-              (channel-level (get-level channel)))
-          (for-each (lambda (member)
-                      (let ((no (get-no member)))
-                        (let ((connection (no->connection self no)))
-                          (when connection
-                            (unless (eq? member exclude-broadcast)
-                              (let ((download-level (get-download-level connection)))
-                                (unless (and (= kind udp-video)
-                                             (not (stream-video-channel? self stream channel-level download-level)))
-                                  (if (waiting-keyframe? connection channel)
-                                      (with-record media
-                                        (when (frame-keyframe? (read-media-flags data))
-                                          (got-keyframe connection channel)
-                                          (send-data self connection data)))
-                                    (send-data self connection data)))))))))
-                    members)))))
+    (for-each (lambda (connection)
+                (if (waiting-keyframe? connection channel)
+                    (with-record media
+                      (when (frame-keyframe? (read-media-flags data))
+                        (got-keyframe connection channel)
+                        (send-data self connection data)))
+                  (send-data self connection data)))
+              (get-receivers channel)))
   
   
   (method protected (wait-keyframes self delegate connection)
@@ -1035,14 +1030,30 @@
   
   
   (slot server-sender? getter generate)
+  (slot receivers      getter generate)
   
   
   (method override (initialize self stream-no no media-kind source-kind level resolution framerate bitrate codec caps metadata send-state server-sender?)
     (nextmethod self stream-no no media-kind source-kind level resolution framerate bitrate codec caps metadata send-state)
     (set! self.server-sender? server-sender?)
+    (set! self.receivers '())
     (if server-sender?
         (set! self.retain-ring #f)
       (set! self.retain-ring (new UDP-Ring self no (get-origin stream) media-kind source-kind udp-retain-size max-size: udp-retain-max-size overflow-proc: (udp-ring-overflow 'retain udp-ring-kind-retain) retain-window: (effective-retain-window source-kind)))))
+  
+  
+  (method protected (update-receivers self udp)
+    (let ((members (get-members (get-recipient stream)))
+          (exclude-broadcast (get-exclude-broadcast stream)))
+      (set! receivers (collect (lambda (member)
+                                 (let ((no (get-no member)))
+                                   (let ((connection (no->connection udp no)))
+                                     (and connection
+                                          (neq? member exclude-broadcast)
+                                          (or (= media-kind udp-audio)
+                                              (stream-video-channel? udp stream level (get-download-level connection)))
+                                          connection))))
+                               members))))
   
   
   (method protected (retain-media self data)
