@@ -127,8 +127,8 @@
   ;;;
   
   
-  (method package (register-server-stream self sender name no origin source-kind video-level recipient exclude-register exclude-broadcast)
-    (let ((stream (new UDP-Server-Stream sender name no origin source-kind video-level recipient exclude-register exclude-broadcast)))
+  (method package (register-server-stream self sender name no origin source-kind video-levels recipient exclude-register exclude-broadcast)
+    (let ((stream (new UDP-Server-Stream sender name no origin source-kind video-levels recipient exclude-register exclude-broadcast)))
       (table-set! server-streams no stream)
       (when recipient
         (register-ordered-stream recipient stream))
@@ -161,9 +161,24 @@
   
   
   (method protected (update-stream-receivers self stream)
-    (iterate-table (get-channels stream)
-      (lambda (no channel)
-        (update-receivers channel self))))
+    (let ((stream-no (get-no stream))
+          (members (get-members (get-recipient stream)))
+          (exclude-broadcast (get-exclude-broadcast stream)))
+      (define (determine-receivers channel)
+        (let ((media-kind (get-media-kind channel))
+              (level (get-level channel)))
+          (collect (lambda (member)
+                     (let ((no (get-no member)))
+                       (let ((connection (no->connection self no)))
+                         (and (neq? member exclude-broadcast)
+                              (or (= media-kind udp-audio)
+                                  (eqv? (table-ref (get-download-levels connection) stream-no #f) level))
+                              connection))))
+                   members)))
+      
+      (iterate-table (get-channels stream)
+        (lambda (no channel)
+          (set-receivers channel (determine-receivers channel))))))
   
   
   ;;;
@@ -178,7 +193,6 @@
   (method package (register-server-channel self stream-no channel-no media-kind source-kind level resolution framerate bitrate codec caps metadata send-state server-sender?)
     (let ((stream (find-server-stream self stream-no)))
       (let ((channel (new UDP-Server-Channel stream channel-no media-kind source-kind level resolution framerate bitrate codec caps metadata send-state server-sender?)))
-        (update-receivers channel self)
         (table-set! server-channels channel-no channel)
         channel)))
   
@@ -312,8 +326,6 @@
       (let ((sender (read-header-sender data))
             (sent (read-connect-sent data))
             (graphic-level (read-connect-graphic-level data))
-            (upload-level (read-connect-upload-level data))
-            (download-level (read-connect-download-level data))
             (source-info (udp-source-socket-info udp-port)))
         (let ((source-host (socket-info-address source-info))
               (source-port (socket-info-port-number source-info)))
@@ -334,20 +346,16 @@
                 (begin
                   (send-connected existing-connection)
                   (when record-events?
-                    (let ((upload-level (get-upload-level existing-connection))
-                          (download-level (get-download-level existing-connection)))
-                      (record-event udp-id-connect
-                                    -1.
-                                    (fixnum->flonum sender)
-                                    -1.
-                                    reconnect-marker
-                                    (if upload-level (fixnum->flonum upload-level) -1.)
-                                    (if download-level (fixnum->flonum download-level) -1.)
-                                    -1.))))
-              (let ((graphic-level (and (/= graphic-level -1) graphic-level))
-                    (upload-level (and (/= upload-level -1) upload-level))
-                    (download-level (and (/= download-level -1) download-level)))
-                (let ((connection (new UDP-Connection source-host source-port graphic-level upload-level download-level)))
+                    (record-event udp-id-connect
+                                  -1.
+                                  (fixnum->flonum sender)
+                                  -1.
+                                  reconnect-marker
+                                  -1.
+                                  -1.
+                                  -1.)))
+              (let ((graphic-level (and (/= graphic-level -1) graphic-level)))
+                (let ((connection (new UDP-Connection source-host source-port graphic-level)))
                   (register-connection self sender connection)
                   (send-connected connection)
                   (when record-events?
@@ -356,8 +364,8 @@
                                   (fixnum->flonum sender)
                                   -1.
                                   -1.
-                                  (if upload-level (fixnum->flonum upload-level) -1.)
-                                  (if download-level (fixnum->flonum download-level) -1.)
+                                  -1.
+                                  -1.
                                   -1.))))))))))
   
   
@@ -397,40 +405,21 @@
         (let ((sim (new-simulator self)))
           (set-simulator connection sim)
           sim)))
-  
-  
-  (method package (stream-video-channel? self stream channel-level download-level)
-    (or (not (get-video-level stream))
-        (= channel-level (stream-video-level stream download-level))))
-  
-  
-  (method package (stream-to-connection? self channel connection)
-    (or (= (get-media-kind channel) udp-audio)
-        (let ((stream (get-stream channel))
-              (channel-level (get-level channel))
-              (download-level (get-download-level connection)))
-          (stream-video-channel? self stream channel-level download-level))))
-  
-  
-  (method package (stream-to-group? self channel group)
-    (some? (lambda (delegate)
-             (let ((no (get-no delegate)))
-               (let ((connection (no->connection self no)))
-                 (and connection
-                      (stream-to-connection? self channel connection)))))
-           (get-members group)))
    
   
-  (method package (update-streaming self group)
-    (for-each (lambda (server-stream)
-                (let ((stream (find-send-stream self (get-no server-stream))))
-                  (when stream
-                    (iterate-table (get-channels stream)
-                      (lambda (no channel)
-                        (let ((src (get-src (get-pipeline channel)))
-                              (stream? (stream-to-group? self channel group)))
-                          (set-stream? src stream?)))))))
-              (get-server-streams group)))
+  (method package (update-streaming self upload-changed)
+    (for-each (lambda (changed)
+                (bind (stream-no . upload-levels) changed
+                  (let ((stream (find-send-stream self stream-no)))
+                    (when stream
+                      (set-upload-levels stream upload-levels)
+                      (iterate-table (get-channels stream)
+                        (lambda (no channel)
+                          (let ((src (get-src (get-pipeline channel)))
+                                (stream? (or (= (get-media-kind channel) udp-audio)
+                                             (memv? (get-level channel) upload-levels))))
+                            (set-stream? src stream?))))))))
+              upload-changed))
   
   
   (method (receive-heartbeat self connection sender data)
@@ -861,10 +850,11 @@
   (slot monitor                                getter generate)
   (slot simulator               initialize #f  accessors generate)
   (slot graphic-level                          accessors generate)
-  (slot upload-level                           accessors generate)
-  (slot download-level                         accessors generate)
   (slot circle-mode                            accessors generate)
   (slot circle-focused                         accessors generate)
+  (slot download-needs                         accessors generate)
+  (slot download-levels                        accessors generate)
+  (slot upload-levels                          accessors generate)
   (slot waiting-for-keyframe                   accessors generate)
   (slot resending-nacks         initialize '() accessors generate)
   (slot profile-base-time       initialize #f  getter generate)
@@ -876,16 +866,17 @@
   (slot profile-evolution       initialize #f  getter generate)
   
   
-  (method override (initialize self host port graphic-level upload-level download-level)
+  (method override (initialize self host port graphic-level)
     (nextmethod self)
     (set! self.host host)
     (set! self.port port)
     (set! self.monitor (new UDP-Monitor))
     (set! self.graphic-level graphic-level)
-    (set! self.upload-level upload-level)
-    (set! self.download-level download-level)
     (set! self.circle-mode #f)
     (set! self.circle-focused #f)
+    (set! self.download-needs (make-table))
+    (set! self.download-levels (make-table))
+    (set! self.upload-levels (make-table))
     (set! self.waiting-for-keyframe (make-table test: eq?))
     (set! self.profile-time-base (new Time-Base)))
   
@@ -899,6 +890,14 @@
   (method protected (update-host/port self host port)
     (set! self.host host)
     (set! self.port port))
+  
+  
+  (method protected (leave-group-reset self)
+    (set! self.circle-mode #f)
+    (set! self.circle-focused #f)
+    (set! self.download-needs (make-table))
+    (set! self.download-levels (make-table))
+    (set! self.upload-levels (make-table)))
   
   
   (method protected (waiting-keyframe? self channel)
@@ -1022,8 +1021,8 @@
   (slot exclude-broadcast getter generate)
   
   
-  (method override (initialize self sender name no origin source-kind video-level recipient exclude-register exclude-broadcast)
-    (nextmethod self sender name no origin source-kind video-level)
+  (method override (initialize self sender name no origin source-kind video-levels recipient exclude-register exclude-broadcast)
+    (nextmethod self sender name no origin source-kind video-levels)
     (set! self.recipient recipient)
     (set! self.exclude-register exclude-register)
     (set! self.exclude-broadcast exclude-broadcast)))
@@ -1038,7 +1037,7 @@
   
   
   (slot server-sender? getter generate)
-  (slot receivers      getter generate)
+  (slot receivers      accessors generate)
   
   
   (method override (initialize self stream-no no media-kind source-kind level resolution framerate bitrate codec caps metadata send-state server-sender?)
@@ -1048,20 +1047,6 @@
     (if server-sender?
         (set! self.retain-ring #f)
       (set! self.retain-ring (new UDP-Ring self no (get-origin stream) media-kind source-kind udp-retain-size max-size: udp-retain-max-size overflow-proc: (udp-ring-overflow 'retain udp-ring-kind-retain) retain-window: (effective-retain-window source-kind)))))
-  
-  
-  (method protected (update-receivers self udp)
-    (let ((members (get-members (get-recipient stream)))
-          (exclude-broadcast (get-exclude-broadcast stream)))
-      (set! receivers (collect (lambda (member)
-                                 (let ((no (get-no member)))
-                                   (let ((connection (no->connection udp no)))
-                                     (and connection
-                                          (neq? member exclude-broadcast)
-                                          (or (= media-kind udp-audio)
-                                              (stream-video-channel? udp stream level (get-download-level connection)))
-                                          connection))))
-                               members))))
   
   
   (method protected (retain-media self data)
