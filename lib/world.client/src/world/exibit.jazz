@@ -18,6 +18,8 @@
         (jazz.stream)
         (world)
         (world.context)
+        (world.pane)
+        (world.profile)
         (world.stream)
         (world.streaming)
         (world.video))
@@ -40,6 +42,8 @@
   (let ((output (create-exibit-output profile caps process?)))
     (install-exibit-output output)
     (register-video-sink-consumer output consumer)
+    (when (not exibit-focus)
+      (set! exibit-focus output))
     output))
 
 
@@ -81,6 +85,11 @@
     (close-output video (get-id output) output)
     (unregister-video-sink-consumer output)
     (set-stream-state output 'off)))
+
+
+;;;
+;;;; Consumer
+;;;
 
 
 (interface Camera-Exibit-Consumer
@@ -194,8 +203,9 @@
   
   
   (method override (consume-frame self buffer dts pts duration flags)
-    (when output
-      (receive-video (current-video) output buffer dts pts duration flags #f)))
+    (let ((video (current-video)))
+      (when output
+        (receive-video video output buffer dts pts duration flags #f))))
   
   
   (method override (consume-eos self)
@@ -216,8 +226,25 @@
 ;;;
 
 
+(definition protected exibit-focus
+  #f)
+
+(definition protected (change-exibit-focus output)
+  (unless (eq? output exibit-focus)
+    (let ((actual exibit-focus))
+      (set! exibit-focus output)
+      (when actual
+        (exibit-invalidate actual))
+      (when exibit-focus
+        (exibit-invalidate exibit-focus)))))
+
+
 (definition protected exibit-pipeline
   #f)
+
+
+(definition public (exibit-on?)
+  (boolean exibit-pipeline))
 
 
 (definition public (exibit-on)
@@ -238,29 +265,113 @@
       (display-on/off world "Exibit" #f))))
 
 
+(hub show-interface)
+(definition (exibit-invalidate output)
+  (invalidate-texture (get-interface-pane output))
+  (show-interface (current-space) #t))
+
+
+(definition public (exibit-bitrate-modifier output)
+  (let ((consumer (registered-video-sink-consumer output)))
+    (get-bitrate-modifier consumer)))
+
+
+(definition public (exibit-bitrate output)
+  (let ((consumer (registered-video-sink-consumer output)))
+    (let ((profile (get-profile consumer)))
+      (let ((min-bitrate (get-min-bitrate profile))
+            (bitrate (get-bitrate profile)))
+        (effective-bitrate consumer min-bitrate bitrate)))))
+
+
+(definition public (exibit-mouse-down view)
+  (change-exibit-focus (get-output view)))
+
+
+(definition public (exibit-backspace)
+  (when exibit-focus
+    (let ((consumer (registered-video-sink-consumer exibit-focus)))
+      (let ((src (get-src consumer)))
+        (throttle-bitrate src consumer 1.)
+        (exibit-invalidate exibit-focus)))))
+
+
+(definition public (exibit-left)
+  (when exibit-focus
+    (let ((consumer (registered-video-sink-consumer exibit-focus)))
+      (let ((src (get-src consumer))
+            (modifier (get-bitrate-modifier consumer)))
+        (when (> modifier -.8)
+          (throttle-bitrate src consumer (- modifier .1)))
+        (exibit-invalidate exibit-focus)))))
+
+
+(definition public (exibit-right)
+  (when exibit-focus
+    (let ((consumer (registered-video-sink-consumer exibit-focus)))
+      (let ((src (get-src consumer))
+            (modifier (get-bitrate-modifier consumer)))
+        (throttle-bitrate src consumer (+ modifier .1))
+        (exibit-invalidate exibit-focus)))))
+
+
+(definition public (exibit-up)
+  )
+
+
+(definition public (exibit-down)
+  )
+
+
+(definition (exibit-profiles camera-profile)
+  (define (full (n #f))
+    (let ((name (if (not n) 'full (string->symbol (format "full{a}" n)))))
+      (new Graphic-Profile name 4 {Dimension 1920 1080} 30 30 2048 4096 'h264 #f)))
+  
+  (define (high (n #f))
+    (let ((name (if (not n) 'high (string->symbol (format "high{a}" n)))))
+      (new Graphic-Profile name 3 {Dimension 1280  720} 30 30 1024 2048 'h264 #f)))
+  
+  (define (standard (n #f))
+    (let ((name (if (not n) 'standard (string->symbol (format "standard{a}" n)))))
+      (new Graphic-Profile name 2 {Dimension  640  360} 24 24  512 1024 'h264 #f)))
+  
+  (define (medium (n #f))
+    (let ((name (if (not n) 'medium (string->symbol (format "medium{a}" n)))))
+      (new Graphic-Profile name 1 {Dimension  416  234} 18 18  256  512 'h264 #f)))
+  
+  (define (low (n #f))
+    (let ((name (if (not n) 'low (string->symbol (format "low{a}" n)))))
+      (new Graphic-Profile name 0 {Dimension  256  144} 12 12  128  256 'h264 #f)))
+  
+  (list
+    (high) (standard) (medium) (low)))
+
+
 (definition public (make-camera-exibit)
   (let ((camera-profile (maximum-camera-profile)))
-    (let ((profiles (camera-profiles camera-profile)))
+    (let ((profiles (exibit-profiles camera-profile)))
       (let ((src (new Camera-Video-Src
                    resolution: (get-resolution camera-profile)
                    framerate: (get-framerate camera-profile)
                    selfrate: (get-selfrate camera-profile)))
-            @w (self-sinks (map (lambda (profile)
-                               (new Camera-Exibit-Self-Consumer
-                                 caps: 'self
-                                 profile: profile
-                                 processing?: #t))
-                             profiles))
+            @self (self-sinks (map (lambda (profile)
+                                     (new Camera-Exibit-Self-Consumer
+                                       caps: 'self
+                                       profile: profile
+                                       processing?: #t))
+                                   profiles))
             (sinks (map (lambda (profile)
                           (new Camera-Exibit-Video-Consumer
                             profile: profile
                             processing?: #t))
                         profiles)))
-        (pipeline `(,src @w ,@self-sinks ,@sinks))))))
+        (pipeline `(,src @self ,@self-sinks ,@sinks))))))
 
 
 (definition public (close-camera-exibit pipeline)
-  (close pipeline))
+  (close pipeline)
+  (change-exibit-focus #f))
 
 
 (definition public (play-camera-exibit pipeline)
