@@ -142,7 +142,6 @@
   (slot upload-ack-mutex           initialize #f  getter generate)
   (slot upload-ack-condvar         initialize #f  getter generate)
   (slot upload-task                initialize #f  getter generate)
-  (slot upload-burst?              initialize #f  getter generate)
   (slot upload-done?               initialize #f  getter generate)
   (slot upload-info?               initialize #f  accessors generate)
   (slot upload-skbuff-info         initialize #f  getter generate)
@@ -667,16 +666,6 @@
     (pop upload-queue timeout))
   
   
-  (method protected (toggle-upload-burst self)
-    (set! upload-burst? (not upload-burst?)))
-  
-  
-  (method (effective-upload-empty? self)
-    (if upload-burst?
-        #f
-      (empty? upload-queue)))
-  
-  
   (method (trim-upload self channel)
     (let ((trimmed (trim upload-queue channel)))
       (let ((consumer (get-consumer channel)))
@@ -702,7 +691,7 @@
             (send-data self data)
             (update upload-send-rate (u8vector-length data))))
         (let ((skb (packet-sent upload-state sent sequence data)))
-          (tcp_skb_sent upload-socket skb (effective-upload-empty? self) sequence 1 (current-monotonic-nanoseconds))
+          (tcp_skb_sent upload-socket skb (empty? upload-queue) sequence 1 (current-monotonic-nanoseconds))
           (tcp_rate_skb_sent upload-socket skb))
         (bbr-updated self))))
   
@@ -722,7 +711,7 @@
                 (send-data self data)
                 (update upload-send-rate (u8vector-length data))))
             (let ((skb (packet-sent upload-state sent sequence data)))
-              (tcp_skb_sent upload-socket skb (effective-upload-empty? self) sequence 1 (current-monotonic-nanoseconds))
+              (tcp_skb_sent upload-socket skb (empty? upload-queue) sequence 1 (current-monotonic-nanoseconds))
               (tcp_rate_skb_sent upload-socket skb))
             (bbr-updated self))))))
   
@@ -755,7 +744,7 @@
               (when upload-info?
                 (skbuff_get_info skb upload-skbuff-info)
                 (skbcb_get_info skb upload-skbcb-info))
-              (tcp_ack upload-socket skb lost (get-round-trip-rate statistics) (effective-upload-empty? self) (current-monotonic-nanoseconds) (and upload-info? upload-rate-info))
+              (tcp_ack upload-socket skb lost (get-round-trip-rate statistics) (empty? upload-queue) (current-monotonic-nanoseconds) (and upload-info? upload-rate-info))
               (condition-variable-signal! upload-ack-condvar)
               (free_skbuff skb)
               (record-event udp-id-rate-sample
@@ -794,17 +783,10 @@
     (mutex-lock! upload-mutex)
     (cond ;; no data
           ((eof-object? data)
-           (cond (upload-burst?
-                  (show ">")
-                  (wait next-delivery-time)
-                  (send-upload-burst self)
-                  (mutex-unlock! upload-mutex)
-                  (loop (pop-upload self 0) (+ next-delivery-time (pace (+ (calculate-media-burst-size) udp-code-size)))))
-                 (else
-                  (show ".")
-                  (mutex-unlock! upload-mutex)
-                  (let ((data (pop-upload self +inf.0)))
-                    (loop data (current-seconds))))))
+           (show ".")
+           (mutex-unlock! upload-mutex)
+           (let ((data (pop-upload self +inf.0)))
+             (loop data (current-seconds))))
           ;; data
           (else
            (cond ;; exceeding congestion window
