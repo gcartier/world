@@ -151,6 +151,8 @@
   (slot upload-bbr-info            initialize #f  getter generate)
   (slot upload-bbrinfo-info        initialize #f  getter generate)
   (slot upload-bbr-update          initialize 0   getter generate)
+  (slot throttle-task              initialize #f  getter generate)
+  (slot throttle-done?             initialize #f  getter generate)
   (slot invalid-packets            initialize 0   getter generate)
   (slot resending-nacks            initialize '() getter generate)
   (slot last-send-state            initialize #f  getter generate)
@@ -216,6 +218,7 @@
       (set! upload-rate-info (new_ratesample))
       (set! upload-bbr-info (socket->bbr upload-socket))
       (set! upload-bbrinfo-info (new_bbrinfo))
+      (set! throttle-done? #f)
       (cond-expand
         ((or devel stable)
          (together.bbr:set-upload-info upload-state upload-socket upload-queue upload-queue-rate upload-send-rate upload-skbuff-info upload-skbcb-info upload-rate-info upload-bbr-info upload-bbrinfo-info (lambda () upload-bbr-update) statistics)
@@ -306,6 +309,9 @@
         (set! upload-done? #f)
         (set! upload-task (new Task 'upload (~ run-upload self) priority: upload-priority))
         (start-task upload-task)
+        (set! throttle-done? #f)
+        (set! throttle-task (new Task 'throttle (~ run-throttle self) priority: throttle-priority))
+        (start-task throttle-task)
         (set! state-task (new Task 'state (~ run-state self) priority: state-priority))
         (start-task state-task)
         (set! heartbeat-task (new Task 'heartbeat (~ run-heartbeat self) priority: heartbeat-priority))
@@ -320,6 +326,9 @@
       (condition-variable-signal! upload-ack-condvar)
       (thread-join! (get-thread upload-task))
       (set! upload-task #f)
+      (set! throttle-done? #t)
+      (thread-join! (get-thread throttle-task))
+      (set! throttle-task #f)
       (reset upload-state)
       (reset upload-queue)
       (stop-task state-task)
@@ -816,6 +825,23 @@
                     (send-upload-data self data)
                     (mutex-unlock! upload-mutex)
                     (loop (pop-upload self 0) (+ next-delivery-time (pace size)))))))))
+  
+  
+  (method package (run-throttle self task)
+    (declare (proper-tail-calls))
+    (with-task task
+      (lambda (exit)
+        (let (loop)
+          (if throttle-done?
+              (continuation-return exit #f)
+            (wake-throttle self loop))))))
+  
+  
+  (method (wake-throttle self loop)
+    (declare (proper-tail-calls))
+    (throttle upload-queue)
+    (sleep 1)
+    (loop))
   
   
   (method package (upload-info self)
@@ -1316,7 +1342,9 @@
   (slot content <vector>)
   (slot head    <fx>)
   (slot tail    <fx>)
-  (slot size    <fx>     getter generate)
+  (slot size    <fx> getter generate)
+  (slot pushed  <fx> getter generate)
+  (slot popped  <fx> getter generate)
   
   
   (method override (initialize self cnt exp)
@@ -1326,7 +1354,9 @@
     (set! content (make-vector cnt))
     (set! head 0)
     (set! tail 0)
-    (set! size 0))
+    (set! size 0)
+    (set! pushed 0)
+    (set! popped 0))
   
   
   (method override (print self output readably)
@@ -1345,7 +1375,14 @@
       (vector-fill! content #f)
       (set! head 0)
       (set! tail 0)
-      (set! size 0)))
+      (set! size 0)
+      (set! pushed 0)
+      (set! popped 0)))
+  
+  
+  (method public (reset-pushed/popped self)
+    (set! pushed 0)
+    (set! popped 0))
   
   
   (method public (push self obj)
@@ -1361,7 +1398,8 @@
             (set! tail size))))
       (vector-set! content tail obj)
       (set! tail (modulo (+ tail 1) count))
-      (set! size new-size)))
+      (set! size new-size)
+      (increase! pushed)))
   
   
   (method public (push-time self obj)
@@ -1397,7 +1435,8 @@
         (f64vector-set! times tail time)
         (vector-set! content tail obj)
         (set! tail (modulo (+ tail 1) count))
-        (set! size new-size))))
+        (set! size new-size)
+        (increase! pushed))))
   
   
   (method public (pop self)
@@ -1406,7 +1445,8 @@
       (prog1 (vector-ref content head)
         (vector-set! content head #f)
         (set! head (modulo (+ head 1) count))
-        (decrease! size))))
+        (decrease! size)
+        (increase! popped))))
   
   
   (method public (pop-time self)
@@ -1416,7 +1456,8 @@
         (f64vector-set! times head +nan.0)
         (vector-set! content head #f)
         (set! head (modulo (+ head 1) count))
-        (decrease! size)))))
+        (decrease! size)
+        (increase! popped)))))
 
 
 ;;;
@@ -1530,15 +1571,28 @@
   
   (method public (trim self channel)
     (mutex-lock! mutex)
-    (case (get-upload-mode channel)
-      ((startup)
-       (trim-startup self channel))
-      (else
-       (trim-running self channel)))
+    (reset (get-upload-ring channel))
     (mutex-unlock! mutex))
   
   
-  (method (trim-startup self channel)
+  (method public (throttle self)
+    (mutex-lock! mutex)
+    (for-each (lambda (channel)
+                (when (= (get-media-kind channel) udp-video)
+                  (throttle-channel self channel)))
+              channels)
+    (mutex-unlock! mutex))
+  
+  
+  (method (throttle-channel self channel)
+    (case (get-upload-mode channel)
+      ((startup)
+       (throttle-startup self channel))
+      (else
+       (throttle-running self channel))))
+  
+  
+  (method (throttle-startup self channel)
     (let ((stream (get-stream channel)))
       (let ((elapse (- (current-seconds) (get-upload-startup channel))))
         (when (>= elapse 1.)
@@ -1547,14 +1601,13 @@
             (for-each (lambda (level)
                         (let ((channel (locate-video-level-channel stream level)))
                           (let ((ring (get-upload-ring channel)))
-                            (let ((trimmed (reset ring)))
-                              (let ((queued (get-upload-queued channel)))
-                                (let ((sent (- queued trimmed)))
-                                  (when (> queued 0)
-                                    (let ((survive-ratio (percentage sent queued)))
-                                      (set-upload-debug channel survive-ratio)
-                                      (when (>= survive-ratio 60.)
-                                        (set! survivors (cons level survivors)))))))))))
+                            (let ((pushed (get-pushed ring))
+                                  (popped (get-popped ring)))
+                              (when (> pushed 0)
+                                (let ((survive-ratio (percentage popped pushed)))
+                                  (set-upload-debug channel survive-ratio)
+                                  (when (>= survive-ratio 60.)
+                                    (set! survivors (cons level survivors)))))))))
                       levels)
             (if (null? survivors)
                 (update-levels self stream '(0) 'running)
@@ -1578,40 +1631,43 @@
                   'clear))))))))
   
   
-  (method (trim-running self channel)
+  (method (throttle-running self channel)
     (let ((stream (get-stream channel))
           (ring (get-upload-ring channel)))
-      (let ((trimmed (reset ring)))
-        (let ((consumer (get-consumer channel)))
-          (when consumer
-            (let ((modifier (get-bitrate-modifier consumer)))
-              (cond ;; trim
-                    ((> trimmed 0)
-                     (cond ;; lower bitrate
-                           ((>= modifier .1)
-                            (throttle-bitrate (get-src (get-pipeline channel)) consumer (- modifier .1))
-                            (when show-streaming?
-                              (debug-streaming self stream)))
-                           ;; maybe go down level
-                           (else
-                            (let ((level (get-level channel)))
-                              (when (> level 0)
-                                (match-highest self stream (- level 1)))))))
-                    ;; no trim
-                    ((= trimmed 0)
-                     (cond ;; raise bitrate
-                           ((<= modifier .9)
-                            (throttle-bitrate (get-src (get-pipeline channel)) consumer (+ modifier .1))
-                            (when show-streaming?
-                              (debug-streaming self stream)))
-                           ;; maybe go up level
-                           @incorrect
-                           (else
-                            (let ((level (get-level channel))
-                                  (needs (get-upload-needs stream)))
-                              (let ((highest-need (last needs)))
-                                (when (< level highest-need)
-                                  (match-highest self stream (+ level 1)))))))))))))))
+      (let ((consumer (get-consumer channel)))
+        (when consumer
+          (let ((pushed (get-pushed ring))
+                (popped (get-popped ring)))
+            (when (> pushed 0)
+              (let ((trimmed (percentage (- pushed popped) pushed))
+                    (modifier (get-bitrate-modifier consumer)))
+                (cond ;; trim
+                      ((> trimmed 10.)
+                       (cond ;; lower bitrate
+                             ((>= modifier .1)
+                              (throttle-bitrate (get-src (get-pipeline channel)) consumer (- modifier .1))
+                              (when show-streaming?
+                                (debug-streaming self stream)))
+                             ;; maybe go down level
+                             (else
+                              (let ((level (get-level channel)))
+                                (when (> level 0)
+                                  (match-highest self stream (- level 1)))))))
+                      ;; no trim
+                      ((= trimmed 0)
+                       (cond ;; raise bitrate
+                             ((<= modifier .9)
+                              (throttle-bitrate (get-src (get-pipeline channel)) consumer (+ modifier .1))
+                              (when show-streaming?
+                                (debug-streaming self stream)))
+                             ;; maybe go up level
+                             @incorrect
+                             (else
+                              (let ((level (get-level channel))
+                                    (needs (get-upload-needs stream)))
+                                (let ((highest-need (last needs)))
+                                  (when (< level highest-need)
+                                    (match-highest self stream (+ level 1))))))))))))))))
   
   
   (method public (update-needs self stream upload-needs)
@@ -1635,7 +1691,7 @@
                           (bind (level . caps) spec
                             (let ((channel (locate-video-level-channel stream level)))
                               (set-upload-startup channel now)
-                              (set-upload-queued channel 0))))
+                              (reset-pushed/popped (get-upload-ring channel)))))
                         specs))
             (set-upload-levels stream levels)
             (when show-streaming?
@@ -1678,8 +1734,6 @@
   (method public (push self channel data)
     (mutex-lock! mutex)
     (push (get-upload-ring channel) data)
-    (when (eq? (get-upload-mode channel) 'startup)
-      (set-upload-queued channel (+ (get-upload-queued channel) 1)))
     (mutex-unlock! mutex)
     (condition-variable-signal! condition-variable))
   
