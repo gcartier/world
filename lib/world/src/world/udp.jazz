@@ -629,6 +629,10 @@
       stream))
   
   
+  (method public (count-send-streams self)
+    (table-length send-streams))
+  
+  
   (method public (find-send-stream self stream-no)
     (table-ref send-streams stream-no #f))
   
@@ -692,17 +696,32 @@
     (increase! next-stream-no)))
 
 
+(definition public (find-video-level target items (key: key #f))
+  (declare (proper-tail-calls))
+  (let (loop (previous-item #f) (scan items))
+    (if (null? scan)
+        previous-item
+      (let ((item (car scan)))
+        (let ((level (apply-key key item)))
+          (cond ((= level target)
+                 item)
+                ((> level target)
+                 (or previous-item item))
+                (else
+                 (loop item (cdr scan)))))))))
+
+
 (class UDP-Stream extends Object
   
   
-  (slot sender         getter generate)
-  (slot name           getter generate)
-  (slot no             getter generate)
-  (slot origin         getter generate)
-  (slot source-kind    getter generate)
-  (slot video-levels   getter generate)
-  (slot channels       getter generate)
-  (slot level-channels getter generate)
+  (slot sender       getter generate)
+  (slot name         getter generate)
+  (slot no           getter generate)
+  (slot origin       getter generate)
+  (slot source-kind  getter generate)
+  (slot video-levels getter generate)
+  (slot channels     getter generate)
+  (slot video-output accessors generate)
   
   
   (method override (initialize self sender name no origin source-kind video-levels)
@@ -714,7 +733,7 @@
     (set! self.source-kind source-kind)
     (set! self.video-levels video-levels)
     (set! self.channels (make-table test: eqv?))
-    (set! self.level-channels (make-vector 5 #f)))
+    (set! self.video-output #f))
   
   
   (method override (print self output readably)
@@ -724,10 +743,7 @@
   
   
   (method protected (add-child self channel)
-    (table-set! channels (get-no channel) channel)
-    (let ((level (get-level channel)))
-      (when level
-        (vector-set! level-channels level channel))))
+    (table-set! channels (get-no channel) channel))
   
   
   (method protected (play self)
@@ -762,16 +778,20 @@
       highest-channel))
   
   
+  (method protected (locate-video-level-channel self level)
+    (search-table channels
+      (lambda (no channel)
+        (and (= (get-media-kind channel) udp-video)
+             (= (get-level channel) level)
+             channel))))
+  
+  
   (method protected (locate-video-output-channel self)
     (search-table channels
       (lambda (no channel)
         (and (= (get-media-kind channel) udp-video)
              (get-output channel)
              channel))))
-  
-  
-  (method protected (find-level self level)
-    (vector-ref level-channels level))
   
   
   (method public (effective-name self)
@@ -788,9 +808,12 @@
 (class UDP-Send-Stream extends UDP-Stream
   
   
-  (slot location     initialize #f accessors generate)
-  (slot upload-needs initialize #f accessors generate)
-  (slot action-proc  initialize #f accessors generate)
+  (slot location      initialize #f accessors generate)
+  (slot upload-needs  initialize '() accessors generate)
+  (slot upload-levels initialize '() accessors generate)
+  (slot upload-specs  initialize '() accessors generate)
+  (slot upload-debug  initialize '() accessors generate)
+  (slot action-proc   initialize #f accessors generate)
   
   
   (method protected (locate-video-channel self)
@@ -804,7 +827,7 @@
     (search-table channels
       (lambda (no channel)
         (and (= (get-media-kind channel) udp-video)
-             (= (get-level channel) level)
+             (eqv? (get-level channel) level)
              channel))))
   
   
@@ -861,7 +884,6 @@
   (slot send-state   accessors generate)
   (slot output       accessors generate)
   (slot recorder     accessors generate)
-  (slot placeholder? accessors generate)
   
   
   (method override (initialize self stream no media-kind source-kind level resolution framerate bitrate codec caps metadata send-state)
@@ -880,7 +902,6 @@
     (set! self.send-state send-state)
     (set! self.output #f)
     (set! self.recorder #f)
-    (set! self.placeholder? #f)
     (add-child stream self))
   
   
@@ -974,6 +995,10 @@
   (slot frame-sequence     accessors generate)
   (slot last-reset         getter generate)
   (slot wait-keyframe?     getter generate)
+  (slot upload-mode        accessors generate)
+  (slot upload-startup     accessors generate)
+  (slot upload-queued      accessors generate)
+  (slot upload-debug       accessors generate)
   (slot upload-ring        accessors generate)
   (slot replay-ring        getter generate)
   (slot audio-mirror-mutex getter generate)
@@ -990,6 +1015,10 @@
     (set! self.frame-sequence 0)
     (set! self.last-reset #f)
     (set! self.wait-keyframe? (= media-kind udp-video))
+    (set! self.upload-mode #f)
+    (set! self.upload-startup #f)
+    (set! self.upload-queued #f)
+    (set! self.upload-debug #f)
     (set! self.upload-ring #f)
     (set! self.replay-ring (and record-media? (remember-ring media-kind source-kind level framerate)))
     (set! self.retain-ring (new UDP-Ring self no (get-origin stream) media-kind source-kind udp-retain-size max-size: udp-retain-max-size overflow-proc: (udp-ring-overflow 'retain udp-ring-kind-retain) retain-window: (effective-retain-window source-kind)))
@@ -1028,6 +1057,15 @@
   (method protected (require-consumer-caps self)
     (and (get-processing? consumer)
          (require-consumer-caps (get-src pipeline) consumer)))
+  
+  
+  (method protected (cache-consumer-caps self)
+    (if caps
+        (values caps resolution)
+      (receive (caps resolution) (require-consumer-caps self)
+        (set! self.caps caps)
+        (set! self.resolution resolution)
+        (values caps resolution))))
   
   
   (method (on? self)

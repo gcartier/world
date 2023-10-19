@@ -501,7 +501,6 @@
                             (server-join client delegate-name))))))
                   (get-members group)))
       (set-members group (cons delegate (get-members group)))
-      ;; (tell 'update 'join-group)
       (update-group-streaming self group)
       (wait-keyframes udp-server delegate (delegate->connection self delegate))))
   
@@ -543,7 +542,7 @@
               (count (length ordered-streams))
               (stream-nos (map get-no ordered-streams)))
           (let ((heart (and (eq? shape 'heart) (get-no (car stream-nos)))))
-            (define (determine-needs connection)
+            (define (update-download connection)
               (let ((level (get-graphic-level connection))
                     (mode (get-circle-mode connection))
                     (focused (get-circle-focused connection))
@@ -554,24 +553,36 @@
                                 (memq? shape '(round flow)))
                            (eq? mode 'gallery))
                        (let ((tiled-level (tiled-level level)))
-                         (for-each (lambda (stream-no)
-                                     (table-set! needs stream-no tiled-level))
-                                   stream-nos)))
+                         (for-each (lambda (stream)
+                                     (let ((stream-no (get-no stream))
+                                           (video-levels (get-video-levels stream)))
+                                       (when (not-null? video-levels)
+                                         (let ((level tiled-level))
+                                           (table-set! needs stream-no (find-video-level level video-levels))))))
+                                   ordered-streams)))
                       ;; focus
                       ((eq? mode 'focus)
-                       (for-each (lambda (stream-no)
-                                   (table-set! needs stream-no (if (eqv? stream-no focused)
-                                                                   (min (+ level 1) max-graphic-level)
-                                                                 widget-graphic-level)))
-                                 stream-nos))
+                       (for-each (lambda (stream)
+                                   (let ((stream-no (get-no stream))
+                                         (video-levels (get-video-levels stream)))
+                                     (when (not-null? video-levels)
+                                       (let ((level (if (eqv? stream-no focused)
+                                                        (min (+ level 1) max-graphic-level)
+                                                      widget-graphic-level)))
+                                         (table-set! needs stream-no (find-video-level level video-levels))))))
+                                 ordered-streams))
                       ;; heart
                       (else
                        (let ((tiled-level (tiled-level level)))
-                         (for-each (lambda (stream-no)
-                                     (table-set! needs stream-no (if (eqv? stream-no heart)
-                                                                     level
-                                                                   tiled-level)))
-                                   stream-nos))))))
+                         (for-each (lambda (stream)
+                                     (let ((stream-no (get-no stream))
+                                           (video-levels (get-video-levels stream)))
+                                       (when (not-null? video-levels)
+                                         (let ((level (if (eqv? stream-no heart)
+                                                          level
+                                                        tiled-level)))
+                                           (table-set! needs stream-no (find-video-level level video-levels))))))
+                                   ordered-streams))))))
             
             (define (tiled-level level)
               (cond ((<= count 2)
@@ -585,90 +596,102 @@
                     (else
                      min-graphic-level)))
             
-            (define (find-download-level level video-levels)
-              (declare (proper-tail-calls))
-              (let (loop (previous-level #f) (scan video-levels))
-                (if (null? scan)
-                    previous-level
-                  (let ((video-level (car scan)))
-                    (if (> video-level level)
-                        (or previous-level video-level)
-                      (loop video-level (cdr scan)))))))
+            (define (update-upload no upload-needs)
+              (let ((upload-changed '()))
+                (for-each (lambda (stream)
+                            (when (= (get-origin stream) no)
+                              (let ((stream-no (get-no stream))
+                                    (upload '()))
+                                (for-each (lambda (member)
+                                            (let ((download-no (get-no member)))
+                                              (when (/= download-no no)
+                                                (let ((connection (no->connection udp-server download-no)))
+                                                  (let ((need (table-ref (get-download-needs connection) stream-no #f)))
+                                                    (when need
+                                                      (unless (memv? need upload)
+                                                        (set! upload (cons need upload)))))))))
+                                          members)
+                                (let ((upload (sort < upload)))
+                                  (unless (equal? upload (table-ref upload-needs stream-no #f))
+                                    (table-set! upload-needs stream-no upload)
+                                    (set! upload-changed (cons (cons stream-no upload) upload-changed)))))))
+                          ordered-streams)
+                upload-changed))
             
             ;; download
             (for-each (lambda (member)
                         (let ((no (get-no member)))
                           (let ((connection (no->connection udp-server no)))
-                            (determine-needs connection))))
+                            (update-download connection))))
                       members)
-            ;; upload
-            (let ((download-changed (make-table)))
-              (define (determine-upload no max-upload upload-needs)
-                (let ((upload-changed '()))
-                  (for-each (lambda (stream)
-                              (when (= (get-origin stream) no)
-                                (let ((stream-no (get-no stream))
-                                      (video-levels (get-video-levels stream))
-                                      (upload '()))
-                                  (for-each (lambda (member)
-                                              (let ((download-no (get-no member)))
-                                                (when (/= download-no no)
-                                                  (let ((connection (no->connection udp-server download-no)))
-                                                    (let ((need (table-ref (get-download-needs connection) stream-no #f)))
-                                                      (let ((level (find-download-level (min need max-upload) video-levels)))
-                                                        (unless (eqv? (table-ref (get-download-levels connection) stream-no #f) level)
-                                                          (table-set! (get-download-levels connection) stream-no level)
-                                                          (table-set! download-changed download-no (cons (cons stream-no level) (table-ref download-changed download-no '()))))
-                                                        (unless (memv? level upload)
-                                                          (set! upload (cons level upload)))))))))
-                                            members)
-                                  (let ((upload (sort < upload)))
-                                    (unless (equal? upload (table-ref upload-needs stream-no #f))
-                                      (table-set! upload-needs stream-no upload)
-                                      (set! upload-changed (cons (cons stream-no upload) upload-changed)))))))
-                            ordered-streams)
-                  upload-changed))
-              
-              ;; server
-              (let ((no server-no)
-                    (max-upload max-graphic-level)
-                    (upload-needs (get-server-needs group)))
-                (let ((upload-changed (determine-upload no max-upload upload-needs)))
+            ;; server upload
+            (let ((no server-no))
+              (let ((upload-needs (get-needs (no->upload udp-server no))))
+                (let ((upload-changed (update-upload no upload-needs)))
                   (when (not-null? upload-changed)
-                    ;; execute after the stream is registered
-                    (delay-event
-                      (lambda ()
-                        (with-task-mutex
-                          (lambda ()
-                            (update-streaming udp-server upload-changed))))))))
-              ;; clients
-              (for-each (lambda (member)
-                          (let ((no (get-no member)))
-                            (let ((connection (no->connection udp-server no)))
-                              (let ((max-upload (get-graphic-level connection))
-                                    (upload-needs (get-upload-needs connection))
-                                    (upload-count (count-if (lambda (stream) (= (get-origin stream) no)) ordered-streams)))
-                                (let ((effective-max-upload (if (<= upload-count 1) (min (+ max-upload 1) max-graphic-level) max-upload)))
-                                  (let ((upload-changed (determine-upload no effective-max-upload upload-needs)))
-                                    (when (not-null? upload-changed)
-                                      (unless (is? member Mobile-Delegate)
-                                        (let ((client (get-client member)))
-                                          (calling-client self member
-                                            (lambda ()
-                                              (upload-update client upload-changed))))))))))))
-                        members)
-              (iterate-table download-changed
-                (lambda (no changed)
-                  (let ((connection (no->connection udp-server no))
-                        (member (find members no key: get-no return: 'item)))
-                    (let ((client (get-client member)))
-                      (calling-client self member
-                        (lambda ()
-                          (download-update client changed))))))))
-            ;; streams
-            (for-each (lambda (stream)
-                        (update-stream-receivers udp-server stream))
-                      ordered-streams))))))
+                    (update-streaming udp-server upload-changed)))))
+            ;; clients upload
+            (for-each (lambda (member)
+                        (let ((no (get-no member)))
+                          (let ((upload-needs (get-needs (no->upload udp-server no))))
+                            (let ((upload-changed (update-upload no upload-needs)))
+                              (when (not-null? upload-changed)
+                                (unless (is? member Mobile-Delegate)
+                                  (let ((client (get-client member)))
+                                    (calling-client self member
+                                      (lambda ()
+                                        (upload-update client upload-changed))))))))))
+                      members)
+            ;; download
+            (update-group-download self group))))))
+  
+  
+  (method package (update-group-download self group (stream-target #f))
+    (let ((members (get-members group))
+          (ordered-streams (get-ordered-streams group)))
+      (for-each (lambda (stream)
+                  (let ((stream-no (get-no stream))
+                        (origin (get-origin stream)))
+                    (when (or (not stream-target)
+                              (= stream-no stream-target))
+                      (let ((upload-specs (get-specs (no->upload udp-server origin))))
+                        ;; download
+                        (for-each (lambda (member)
+                                    (let ((no (get-no member)))
+                                      (when (/= no origin)
+                                        (let ((connection (no->connection udp-server no))
+                                              (client (get-client member)))
+                                          (let ((need (table-ref (get-download-needs connection) stream-no #f)))
+                                            (when need
+                                              (let ((upload-specs (table-ref upload-specs stream-no #f)))
+                                                (when upload-specs
+                                                  (let ((download-spec (find-video-level need upload-specs key: car)))
+                                                    (unless (equal? (table-ref (get-download-specs connection) stream-no #f) download-spec)
+                                                      (table-set! (get-download-specs connection) stream-no download-spec)
+                                                      (calling-client self member
+                                                        (lambda ()
+                                                          (download-update client stream-no download-spec)))))))))))))
+                                  members)
+                        ;; receivers
+                        (update-stream-receivers udp-server stream)))))
+                ordered-streams)))
+  
+  
+  (method package (client-change-upload-specs self client stream-no upload-specs)
+    (let ((delegate (find-delegate self client)))
+      ;; together robust
+      (if (not delegate)
+          (format "Delegate not found")
+        (let ((origin (get-no delegate))
+              (upload (no->upload udp-server (get-no delegate))))
+          (if (not upload)
+              (format "Upload not found")
+            (unless (equal? (table-ref (get-specs upload) stream-no #f) upload-specs)
+              (table-set! (get-specs upload) stream-no upload-specs)
+              (let ((group (get-group delegate)))
+                (when group
+                  (update-group-download self group))))
+            #f)))))
   
   
   ;;;
@@ -1503,7 +1526,6 @@
             (set-graphic-level connection graphic-level)
             (let ((group (get-group delegate)))
               (when group
-                ;; (tell 'update 'client-change-graphic-level)
                 (update-group-streaming self group)))
             #f)))))
   
@@ -1521,7 +1543,6 @@
             (set-circle-focused connection focused)
             (let ((group (get-group delegate)))
               (when group
-                ;; (tell 'update 'client-change-mode/focused)
                 (update-group-streaming self group)))
             #f)))))
   
@@ -1566,8 +1587,6 @@
                                   (lambda ()
                                     (stream-add client group-no group-require-microphone? group-require-camera? sender name no origin source-kind video-levels extended-channels))))))))
                       members)
-            ;; (tell 'update 'server-register-stream)
-            (update-group-streaming self recipient)
             (cons stream server-channels))))))
   
   
@@ -1603,13 +1622,15 @@
                         (unless (eq? delegate exclude-register)
                           (when (eq? (get-state delegate) 'started)
                             (unless (is? delegate Mobile-Delegate)
+                              (let ((no (get-no delegate)))
+                                (let ((connection (no->connection udp-server no)))
+                                  (unregister-stream-reset connection stream-no)))
                               (let ((client (get-client delegate)))
                                 (calling-client self delegate
                                   (lambda ()
                                     (stream-remove client stream-no))))))))
                       members)
             (close-server-stream udp-server stream)
-            ;; (tell 'update 'server-unregister-stream)
             (update-group-streaming self recipient))))))
   
   
@@ -1895,7 +1916,6 @@
       (if (not group)
           (format "{a}{? {a}~} doesn't exist anymore" (group-domain-name self circle-name) circle-name)
         (set-shape group shape)
-        ;; (tell 'update 'delegate-change-circle-shape)
         (update-group-streaming self group)
         (broadcast-circle-change-shape self delegate group shape)
         #f)))
@@ -1914,7 +1934,6 @@
       (if (not group)
           (format "{a}{? {a}~} doesn't exist anymore" (group-domain-name self circle-name) circle-name)
         (let ((order (reorder-ordered-streams group order)))
-          ;; (tell 'update 'delegate-change-circle-order)
           (update-group-streaming self group)
           (broadcast-circle-change-order self delegate group order)
           #f))))
@@ -3958,9 +3977,10 @@
             (set-location send-stream location)
             (for-each (lambda (server-channel creator)
                         (let ((create (get-create creator)))
-                          (create stream-no (get-no server-channel))))
+                          (create send-stream (get-no server-channel))))
                       server-channels
                       creators)
+            (update-group-streaming self group)
             (values stream send-stream))))))
   
   
@@ -4067,16 +4087,17 @@
           (close reader)
           (new Channel-Creator
             (list media-kind source-kind level resolution framerate bitrate codec caps metadata send-state)
-            (lambda (stream-no channel-no)
-              (let ((channel (register-send-channel udp-server upload-stream-priority stream-no channel-no media-kind source-kind level resolution framerate bitrate codec caps metadata send-state)))
-                (let ((src (new File-Stream-Audio-Src
-                             location
-                             loop?: stream-loop?))
-                      (sink (new Stream-Frame-Consumer
-                              consumer: (lambda (buffer dts pts duration flags)
-                                          (send-server-media self channel-no buffer dts pts duration flags)))))
-                  (let ((pipeline (pipeline (list src sink))))
-                    (set-pipeline channel pipeline))))))))))
+            (lambda (stream channel-no)
+              (let ((stream-no (get-no stream)))
+                (let ((channel (register-send-channel udp-server upload-stream-priority stream-no channel-no media-kind source-kind level resolution framerate bitrate codec caps metadata send-state)))
+                  (let ((src (new File-Stream-Audio-Src
+                               location
+                               loop?: stream-loop?))
+                        (sink (new Stream-Frame-Consumer
+                                consumer: (lambda (buffer dts pts duration flags)
+                                            (send-server-media self channel-no buffer dts pts duration flags)))))
+                    (let ((pipeline (pipeline (list src sink))))
+                      (set-pipeline channel pipeline)))))))))))
   
   
   (method (make-server-video-channels self location group)
@@ -4097,18 +4118,19 @@
                      (close reader)
                      (new Channel-Creator
                        (list media-kind source-kind level resolution framerate bitrate codec caps metadata send-state)
-                       (lambda (stream-no channel-no)
-                         (let ((channel (register-send-channel udp-server upload-stream-priority stream-no channel-no media-kind source-kind level resolution framerate bitrate codec caps metadata send-state)))
-                           (let ((src (new File-Stream-Video-Src
-                                        profile
-                                        location
-                                        stream?: (= media-kind udp-audio)
-                                        loop?: stream-loop?))
-                                 (sink (new Stream-Frame-Consumer
-                                         consumer: (lambda (buffer dts pts duration flags)
-                                                     (send-server-media self channel-no buffer dts pts duration flags)))))
-                             (let ((pipeline (pipeline (list src sink))))
-                               (set-pipeline channel pipeline)))))))))))
+                       (lambda (stream channel-no)
+                         (let ((stream-no (get-no stream)))
+                           (let ((channel (register-send-channel udp-server upload-stream-priority stream-no channel-no media-kind source-kind level resolution framerate bitrate codec caps metadata send-state)))
+                             (let ((src (new File-Stream-Video-Src
+                                          profile
+                                          location
+                                          stream?: (= media-kind udp-audio)
+                                          loop?: stream-loop?))
+                                   (sink (new Stream-Frame-Consumer
+                                           consumer: (lambda (buffer dts pts duration flags)
+                                                       (send-server-media self channel-no buffer dts pts duration flags)))))
+                               (let ((pipeline (pipeline (list src sink))))
+                                 (set-pipeline channel pipeline))))))))))))
            existing-profiles)))
   
   
@@ -4128,15 +4150,16 @@
             (close reader)
             (new Channel-Creator
               (list media-kind source-kind level resolution framerate bitrate codec caps metadata send-state)
-              (lambda (stream-no channel-no)
-                (let ((channel (register-send-channel udp-server upload-stream-priority stream-no channel-no media-kind source-kind level resolution framerate bitrate codec caps metadata send-state)))
-                  (let ((src (new File-Stream-Image-Src
-                               location))
-                        (sink (new Stream-Frame-Consumer
-                                consumer: (lambda (buffer dts pts duration flags)
-                                            (send-server-media self channel-no buffer dts pts duration flags)))))
-                    (let ((pipeline (pipeline (list src sink))))
-                      (set-pipeline channel pipeline)))))))))))
+              (lambda (stream channel-no)
+                (let ((stream-no (get-no stream)))
+                  (let ((channel (register-send-channel udp-server upload-stream-priority stream-no channel-no media-kind source-kind level resolution framerate bitrate codec caps metadata send-state)))
+                    (let ((src (new File-Stream-Image-Src
+                                 location))
+                          (sink (new Stream-Frame-Consumer
+                                  consumer: (lambda (buffer dts pts duration flags)
+                                              (send-server-media self channel-no buffer dts pts duration flags)))))
+                      (let ((pipeline (pipeline (list src sink))))
+                        (set-pipeline channel pipeline))))))))))))
   
   
   (method package (send-server-media self channel-no buffer dts pts duration flags)

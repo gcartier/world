@@ -48,6 +48,7 @@
   
   (slot udp-port               initialize #f  getter generate)
   (slot udp-stopping?          initialize #f  getter generate)
+  (slot no-uploads             initialize #f  getter generate)
   (slot no-connections         initialize #f  getter generate)
   ;; mutex was not needed before server streaming...
   (slot server-mutex           initialize #f  getter generate)
@@ -73,6 +74,8 @@
                                  local-port-number: service)))
       (setup-udp-port-buffers udp-port)
       (set! udp-stopping? #f)
+      (set! no-uploads (make-table))
+      (register-upload self server-no (new UDP-Upload))
       (set! no-connections (make-table))
       (set! server-mutex (make-mutex 'server))
       (set! server-channels (make-table))
@@ -103,6 +106,23 @@
                                    (get-source-kind stream)))
                            server-streams)))
       (add-snapshot-property 'live.udp-server info)))
+  
+  
+  ;;;
+  ;;;; Upload
+  ;;;
+  
+  
+  (method (register-upload self no upload)
+    (table-set! no-uploads no upload))
+  
+  
+  (method (unregister-upload self no)
+    (table-clear no-uploads no))
+  
+  
+  (method protected (no->upload self no)
+    (table-ref no-uploads no #f))
   
   
   ;;;
@@ -172,7 +192,9 @@
                        (let ((connection (no->connection self no)))
                          (and (neq? member exclude-broadcast)
                               (or (= media-kind udp-audio)
-                                  (eqv? (table-ref (get-download-levels connection) stream-no #f) level))
+                                  (let ((download-spec (table-ref (get-download-specs connection) stream-no #f)))
+                                    (and download-spec
+                                         (= (car download-spec) level))))
                               connection))))
                    members)))
       
@@ -355,7 +377,9 @@
                                   -1.
                                   -1.)))
               (let ((graphic-level (and (/= graphic-level -1) graphic-level)))
-                (let ((connection (new UDP-Connection source-host source-port graphic-level)))
+                (let ((upload (new UDP-Upload))
+                      (connection (new UDP-Connection source-host source-port graphic-level)))
+                  (register-upload self sender upload)
                   (register-connection self sender connection)
                   (send-connected connection)
                   (when record-events?
@@ -381,6 +405,7 @@
                           -1.
                           -1.
                           -1.))
+        (unregister-upload self no)
         (unregister-connection self no)
         (when record-events?
           (record-event udp-id-deconnect
@@ -408,18 +433,23 @@
    
   
   (method package (update-streaming self upload-changed)
-    (for-each (lambda (changed)
-                (bind (stream-no . upload-needs) changed
-                  (let ((stream (find-send-stream self stream-no)))
-                    (when stream
-                      (set-upload-needs stream upload-needs)
-                      (iterate-table (get-channels stream)
-                        (lambda (no channel)
-                          (let ((src (get-src (get-pipeline channel)))
-                                (stream? (or (= (get-media-kind channel) udp-audio)
-                                             (memv? (get-level channel) upload-needs))))
-                            (set-stream? src stream?))))))))
-              upload-changed))
+    (let ((server-specs (get-specs (no->upload self server-no))))
+      (for-each (lambda (changed)
+                  (bind (stream-no . upload-needs) changed
+                    (let ((stream (find-send-stream self stream-no)))
+                      (when stream
+                        (set-upload-needs stream upload-needs)
+                        (let ((specs (new-queue)))
+                          (iterate-table (get-channels stream)
+                            (lambda (no channel)
+                              (let ((src (get-src (get-pipeline channel)))
+                                    (stream? (or (= (get-media-kind channel) udp-audio)
+                                                 (memv? (get-level channel) upload-needs))))
+                                (set-stream? src stream?)
+                                (when (and stream? (= (get-media-kind channel) udp-video))
+                                  (enqueue specs (cons (get-level channel) (get-caps channel)))))))
+                          (table-set! server-specs stream-no (sort < (queue-list specs) key: car)))))))
+                upload-changed)))
   
   
   (method (receive-heartbeat self connection sender data)
@@ -838,6 +868,34 @@
 
 
 ;;;
+;;;; UDP Upload
+;;;
+
+
+(class UDP-Upload extends Object
+  
+  
+  (slot needs getter generate)
+  (slot specs getter generate)
+  
+  
+  (method override (initialize self)
+    (nextmethod self)
+    (set! self.needs (make-table))
+    (set! self.specs (make-table)))
+  
+  
+  (method protected (unregister-stream-reset self stream-no)
+    (table-clear needs stream-no)
+    (table-clear specs stream-no))
+  
+  
+  (method protected (leave-group-reset self)
+    (set! needs (make-table))
+    (set! specs (make-table))))
+
+
+;;;
 ;;;; UDP Connection
 ;;;
 
@@ -852,9 +910,8 @@
   (slot graphic-level                          accessors generate)
   (slot circle-mode                            accessors generate)
   (slot circle-focused                         accessors generate)
-  (slot download-needs                         accessors generate)
-  (slot download-levels                        accessors generate)
-  (slot upload-needs                           accessors generate)
+  (slot download-needs                         getter generate)
+  (slot download-specs                         getter generate)
   (slot waiting-for-keyframe                   accessors generate)
   (slot resending-nacks         initialize '() accessors generate)
   (slot profile-base-time       initialize #f  getter generate)
@@ -875,8 +932,7 @@
     (set! self.circle-mode #f)
     (set! self.circle-focused #f)
     (set! self.download-needs (make-table))
-    (set! self.download-levels (make-table))
-    (set! self.upload-needs (make-table))
+    (set! self.download-specs (make-table))
     (set! self.waiting-for-keyframe (make-table test: eq?))
     (set! self.profile-time-base (new Time-Base)))
   
@@ -892,12 +948,16 @@
     (set! self.port port))
   
   
+  (method protected (unregister-stream-reset self stream-no)
+    (table-clear download-needs stream-no)
+    (table-clear download-specs stream-no))
+  
+  
   (method protected (leave-group-reset self)
-    (set! self.circle-mode #f)
-    (set! self.circle-focused #f)
-    (set! self.download-needs (make-table))
-    (set! self.download-levels (make-table))
-    (set! self.upload-needs (make-table)))
+    (set! circle-mode #f)
+    (set! circle-focused #f)
+    (set! download-needs (make-table))
+    (set! download-specs (make-table)))
   
   
   (method protected (waiting-keyframe? self channel)
