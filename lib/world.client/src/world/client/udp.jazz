@@ -1457,21 +1457,27 @@
 ;;;
 
 
+(definition debug-logic?
+  (world-setting 'world.debug-logic? #f))
+
+
 (class Upload-Queue extends Object
   
   
-  (slot count     <fx>)
-  (slot channels  <list>   getter generate)
-  (slot rings     <vector>)
+  (slot count         <fx>)
+  (slot channels      <list>   getter generate)
+  (slot video-streams          getter generate)
+  (slot rings         <vector>)
   (slot missing-ring)
-  (slot mutex              initialize (make-mutex))
-  (slot condition-variable initialize (make-condition-variable))
+  (slot mutex                  initialize (make-mutex))
+  (slot condition-variable     initialize (make-condition-variable))
   
   
   (method override (initialize self)
     (nextmethod self)
     (set! count 1)
     (set! channels '())
+    (set! video-streams #f)
     (set! missing-ring (new Upload-Ring 0 1.))
     (set! rings (vector missing-ring)))
   
@@ -1481,6 +1487,8 @@
     (let ((ring (new Upload-Ring 0 expire)))
       (increase! count)
       (set! channels (cons channel channels))
+      (set! video-streams #f)
+      (set-upload-mode channel #f)
       (set-upload-ring channel ring)
       (sort-channels self)
       (update-rings self))
@@ -1491,6 +1499,8 @@
     (mutex-lock! mutex)
     (decrease! count)
     (set! channels (remove! channel channels))
+    (set! video-streams #f)
+    (set-upload-mode channel #f)
     (set-upload-ring channel #f)
     (sort-channels self)
     (update-rings self)
@@ -1512,6 +1522,19 @@
                                  (and (= px py)
                                       (< lx ly)))))
                          channels)))
+  
+  
+  (method (cache-video-streams self)
+    (or video-streams
+        (let ((lst '()))
+          (for-each (lambda (channel)
+                      (when (= (get-media-kind channel) udp-video)
+                        (let ((stream (get-stream channel)))
+                          (unless (memq? stream lst)
+                            (set! lst (append! lst (list stream)))))))
+                    channels)
+          (set! video-streams lst)
+          lst)))
   
   
   (method (update-rings self)
@@ -1564,175 +1587,264 @@
   (method public (trim self channel)
     (mutex-lock! mutex)
     (reset (get-upload-ring channel))
+    (when (eq? (get-upload-mode channel) 'waiting)
+      (debug-section self 'trim)
+      (change-mode self channel 'running))
     (mutex-unlock! mutex))
+  
+  
+  (method (debug-logic self color rest)
+    (when debug-logic?
+      (if (not color)
+          (apply tell rest)
+        (let ((first? #t))
+          (for-each (lambda (obj)
+                      (when (not first?)
+                        (format :terminal " "))
+                      (if first?
+                          (format :terminal "\033[{a}m{a}\033[39;49m" color obj)
+                        (if (symbol? obj)
+                            (format :terminal "\033[35m{a}\033[39;49m" obj)
+                          (format :terminal "{a}" obj)))
+                      (set! first? #f))
+                    rest))
+        (format :terminal "{%}"))))
+    
+  
+  (method (debug-section self . rest)
+    (debug-logic self 36 rest))
+  
+  
+  (method (debug-to-server self . rest)
+    (debug-logic self 31 (cons '>>>>>>>>>> rest)))
+  
+  
+  (method (debug-from-server self . rest)
+    (debug-logic self 32 (cons '<<<<<<<<<< rest)))
+  
+  
+  (method (debug-action self . rest)
+    (when debug-logic?
+      (format :terminal "  {l}{%}" rest)))
+
+  
+  (method (uploading? self stream)
+    (let ((uploading? #f))
+      (iterate-video-channels stream
+        (lambda (level channel)
+          (when (get-upload-mode channel)
+            (set! uploading? #t))))
+      uploading?))
+  
+  
+  (method (waiting? self stream)
+    (let ((waiting? #f))
+      (iterate-video-channels stream
+        (lambda (level channel)
+          (when (eq? (get-upload-mode channel) 'waiting)
+            (set! waiting? #t))))
+      waiting?))
+  
+  
+  (method (change-mode self channel mode)
+    (set-upload-mode channel mode)
+    (debug-action self (get-level channel) '-> mode))
   
   
   (method public (throttle self)
     (mutex-lock! mutex)
-    (for-each (lambda (channel)
-                (when (= (get-media-kind channel) udp-video)
-                  (throttle-channel self channel)))
-              channels)
+    (let ((streams (cache-video-streams self)))
+      (when (not-null? streams)
+        (for-each (lambda (stream)
+                    (if (not (uploading? self stream))
+                        (startup-mode self stream)
+                      (iterate-video-channels stream
+                        (lambda (level channel)
+                          (throttle-channel self channel)
+                          (reset-pushed/popped (get-upload-ring channel))))
+                      (match-needs self stream)))
+                  streams)
+        (when debug-logic?
+          (tell)
+          (tell))
+        (when debug-upload?
+          (invalidate-outputs (current-video)))))
     (mutex-unlock! mutex))
   
   
   (method (throttle-channel self channel)
     (case (get-upload-mode channel)
-      ((startup)
-       (throttle-startup self channel))
+      ((trial)
+       (throttle-trial self channel))
       (else
-       (throttle-running self channel))))
+       (throttle-bitrate self channel))))
   
   
-  (method (throttle-startup self channel)
-    (let ((stream (get-stream channel)))
-      (let ((elapse (- (current-seconds) (get-upload-startup channel))))
-        (when (>= elapse 1.)
-          (let ((levels (get-upload-levels stream))
-                (survivors '()))
-            (for-each (lambda (level)
-                        (let ((channel (locate-video-level-channel stream level)))
-                          (let ((ring (get-upload-ring channel)))
-                            (let ((pushed (get-pushed ring))
-                                  (popped (get-popped ring)))
-                              (when (> pushed 0)
-                                (let ((survive-ratio (percentage popped pushed)))
-                                  (set-upload-debug channel survive-ratio)
-                                  (when (>= survive-ratio 60.)
-                                    (set! survivors (cons level survivors)))))))))
-                      levels)
-            (if (null? survivors)
-                (update-levels self stream '(0) 'running)
-              (let ((needs (get-upload-needs stream)))
-                (let ((survivors (sort < survivors)))
-                  (let ((highest-survivor (last survivors)))
-                    (match-highest self stream highest-survivor)))))
-            (when show-streaming?
-              (debug-streaming self stream levels)
-              (thread-start!
-                (new-thread
-                  (lambda ()
-                    (sleep 5.)
-                    (mutex-lock! mutex)
-                    (for-each (lambda (level)
-                                (let ((channel (locate-video-level-channel stream level)))
-                                  (set-upload-debug channel #f)))
-                              levels)
-                    (debug-streaming self stream levels)
-                    (mutex-unlock! mutex))
-                  'clear))))))))
+  (method (throttle-trial self channel)
+    (debug-section self 'throttle-trial (get-level channel))
+    (let ((ring (get-upload-ring channel)))
+      (let ((pushed <fl> (get-pushed ring))
+            (popped <fl> (get-popped ring)))
+        (if (= pushed 0)
+            (debug-action self 'nothing 'pushed)
+          (let ((survived (/ popped pushed)))
+            (cond ((>= survived .6)
+                   (change-mode self channel 'waiting))
+                  (else
+                   (change-mode self channel #f))))))))
   
   
-  (method (throttle-running self channel)
+  (method (throttle-bitrate self channel)
     (let ((stream (get-stream channel))
           (ring (get-upload-ring channel)))
       (let ((consumer (get-consumer channel)))
         (when consumer
-          (let ((pushed (get-pushed ring))
-                (popped (get-popped ring)))
+          (let ((pushed <fl> (get-pushed ring))
+                (popped <fl> (get-popped ring)))
             (when (> pushed 0)
-              (let ((trimmed (percentage (- pushed popped) pushed))
+              (let ((trimmed (/ (- pushed popped) pushed))
                     (modifier (get-bitrate-modifier consumer)))
-                (cond ;; trim
-                      ((> trimmed 10.)
-                       (cond ;; lower bitrate
-                             ((>= modifier .1)
-                              (throttle-bitrate (get-src (get-pipeline channel)) consumer (- modifier .1))
-                              (when show-streaming?
-                                (debug-streaming self stream)))
-                             ;; maybe go down level
-                             (else
-                              (let ((level (get-level channel)))
-                                (when (> level 0)
-                                  (match-highest self stream (- level 1)))))))
-                      ;; no trim
-                      ((= trimmed 0)
-                       (cond ;; raise bitrate
-                             ((<= modifier .9)
-                              (throttle-bitrate (get-src (get-pipeline channel)) consumer (+ modifier .1))
-                              (when show-streaming?
-                                (debug-streaming self stream)))
-                             ;; maybe go up level
-                             @incorrect
-                             (else
-                              (let ((level (get-level channel))
-                                    (needs (get-upload-needs stream)))
-                                (let ((highest-need (last needs)))
-                                  (when (< level highest-need)
-                                    (match-highest self stream (+ level 1))))))))))))))))
-  
-  
-  (method public (update-needs self stream upload-needs)
-    (mutex-lock! mutex)
-    (set-upload-needs stream upload-needs)
-    (if (null? (get-upload-specs stream))
-        (startup-mode self stream)
-      (match-needs self stream))
-    (mutex-unlock! mutex))
+                (cond ;; lower bitrate
+                      ((and (> trimmed .1)
+                            (>= modifier .1))
+                       (debug-section self 'throttle-bitrate (get-level channel))
+                       (change-bitrate (get-src (get-pipeline channel)) consumer (- modifier .1)))
+                      ;; raise bitrate
+                      ((and (= trimmed 0.)
+                            (<= modifier .9))
+                       (debug-section self 'throttle-bitrate (get-level channel))
+                       (change-bitrate (get-src (get-pipeline channel)) consumer (+ modifier .1)))))))))))
   
   
   (method (startup-mode self stream)
     (let ((needs (get-upload-needs stream)))
+      (debug-section self 'startup-mode 'needs needs)
       (if (null? needs)
-          (update-levels self stream '() 'closing)
-        (let ((highest-need (last needs)))
-          (let ((levels (interval 0 highest-need)))
-            (let ((specs (update-specs (current-client) stream levels 'startup))
-                  (now (current-seconds)))
-              (for-each (lambda (spec)
-                          (bind (level . caps) spec
-                            (let ((channel (locate-video-level-channel stream level)))
-                              (set-upload-startup channel now)
-                              (reset-pushed/popped (get-upload-ring channel)))))
-                        specs))
-            (set-upload-levels stream levels)
-            (when show-streaming?
-              (debug-streaming self stream levels)))))))
+          (update-levels self stream '() '())
+        (let ((highest-need (last needs))
+              (lowest-level (car (get-video-levels stream))))
+          (if (> lowest-level highest-need)
+              (let ((lowest-channel (locate-video-level-channel stream lowest-level)))
+                (change-mode self lowest-channel 'waiting)
+                (let ((levels (list lowest-level)))
+                  (update-levels self stream levels levels)))
+            (let ((levels (collect-video-levels stream (lambda (level) (<= level highest-need)))))
+              (for-each (lambda (level)
+                          (let ((channel (locate-video-level-channel stream level)))
+                            (change-mode self channel 'trial)))
+                        levels)
+              (update-levels self stream '() levels)))))))
+  
+  
+  (method (close-unneeded self stream spec-levels)
+    (debug-section self 'close-unneeded 'spec-levels spec-levels)
+    (iterate-video-channels stream
+      (lambda (level channel)
+        (when (and (get-upload-mode channel)
+                   (not (memv? level spec-levels)))
+          (change-mode self channel 'closing)))))
+  
+  
+  (method (cleanup-closing self stream)
+    (unless (waiting? self stream)
+      (debug-section self 'cleanup-closing)
+      (iterate-video-channels stream
+        (lambda (level channel)
+          (when (eq? (get-upload-mode channel) 'closing)
+            (change-mode self channel #f))))))
+  
+  
+  (method (satisfy-needs self stream needs)
+    (debug-section self 'satisfy-needs 'needs needs)
+    (let ((spec-levels (new-queue)))
+      (for-each (lambda (need)
+                  (let ((channel (locate-video-level-channel stream need)))
+                    (let ((mode (get-upload-mode channel)))
+                      (if mode
+                          (enqueue spec-levels need)
+                        (let ((higher-channel (locate-higher-upload-channel stream need)))
+                          (if higher-channel
+                              (begin
+                                (change-mode self channel 'waiting)
+                                (enqueue spec-levels need))
+                            (let ((lower-channel (locate-lower-upload-channel stream need)))
+                              (assert lower-channel)
+                              (enqueue spec-levels (get-level lower-channel)))))))))
+                needs)
+      (remove-duplicates (queue-list spec-levels))))
   
   
   (method (match-needs self stream)
-    (let ((specs (get-upload-specs stream)))
-      (let ((highest-spec (car (last specs))))
-        (match-highest self stream highest-spec))))
-  
-  
-  (method (match-highest self stream highest-level)
     (let ((needs (get-upload-needs stream)))
-      (let ((levels (sort < (remove-duplicates (map (lambda (need) (min need highest-level)) needs)))))
-        (update-levels self stream levels 'running))))
+      (debug-section self 'match-needs 'needs needs)
+      (if (null? needs)
+          (update-levels self stream '() '())
+        (if (not (uploading? self stream))
+            (let ((lowest-channel (locate-lowest-video-channel stream)))
+              (change-mode self lowest-channel 'waiting)
+              (let ((levels (list (get-level lowest-channel))))
+                (update-levels self stream levels levels)))
+          (let ((spec-levels (satisfy-needs self stream needs)))
+            (close-unneeded self stream spec-levels)
+            (cleanup-closing self stream)
+            (improve-levels self stream spec-levels needs)
+            (let ((levels (collect-upload-levels stream)))
+              (update-levels self stream spec-levels levels)))))))
   
   
-  (method (update-levels self stream levels mode)
+  (method (improve-levels self stream spec-levels needs)
+    (debug-section self 'improve-levels 'spec-levels spec-levels 'needs needs)
+    (let ((highest-level (last spec-levels)))
+      (let ((highest-channel (locate-video-level-channel stream highest-level)))
+        (let ((consumer (get-consumer highest-channel)))
+          (when consumer
+            (let ((bitrate-modifier (get-bitrate-modifier consumer)))
+              (cond ((= bitrate-modifier 0.)
+                     (let ((lower-channel (locate-lower-level-channel stream highest-level)))
+                       (when lower-channel
+                         (change-mode self highest-channel 'closing)
+                         (change-mode self lower-channel 'waiting))))
+                    ((= bitrate-modifier 1.)
+                     (let ((highest-need (last needs)))
+                       (when (> highest-need highest-level)
+                         (let ((higher-channel (locate-higher-level-channel stream highest-level)))
+                           (change-mode self higher-channel 'trial))))))))))))
+  
+  
+  (method (update-levels self stream spec-levels levels)
     (let ((client (current-client)))
-      (let ((stream-no (get-no stream)))
-        (let ((upload-specs (update-specs client stream levels mode)))
-          (unless (equal? (get-upload-specs stream) upload-specs)
-            (set-upload-levels stream (map car upload-specs))
-            (set-upload-specs stream upload-specs)
-            (change-upload-specs client stream-no upload-specs)
-            (when show-streaming?
-              (debug-streaming self stream)))))))
+      (let ((stream-no (get-no stream))
+            (upload-specs (update-specs client stream spec-levels levels)))
+        (debug-section self 'update-levels 'spec-levels spec-levels 'levels levels)
+        (unless (equal? (get-upload-specs stream) upload-specs)
+          (debug-to-server self (map car upload-specs))
+          (set-upload-specs stream upload-specs)
+          (change-upload-specs client stream-no upload-specs)))))
   
   
-  (method (debug-streaming self stream (levels #f))
-    (let ((levels (or levels (get-upload-levels stream))))
-      (let ((new-channels (collect (lambda (level) (locate-video-level-channel stream level)) levels))
-            (actual-channels (get-upload-debug stream)))
-        (let ((channels (union key: get-level new-channels actual-channels)))
-          (set-upload-debug stream channels))))
-    (invalidate-outputs (current-video)))
+  (method public (update-needs self stream upload-needs)
+    (mutex-lock! mutex)
+    (debug-from-server self upload-needs)
+    (set-upload-needs stream upload-needs)
+    (mutex-unlock! mutex))
   
   
   (method public (push self channel data)
     (mutex-lock! mutex)
-    (push (get-upload-ring channel) data)
+    ;; quicky until closing channels is mutex protected
+    (let ((ring (get-upload-ring channel)))
+      (when ring
+        (push ring data)))
     (mutex-unlock! mutex)
     (condition-variable-signal! condition-variable))
   
   
   (method public (push-time self channel data)
     (mutex-lock! mutex)
-    (push-time (get-upload-ring channel) data)
+    ;; quicky until closing channels is mutex protected
+    (let ((ring (get-upload-ring channel)))
+      (when ring
+        (push-time ring data)))
     (mutex-unlock! mutex)
     (condition-variable-signal! condition-variable))
   

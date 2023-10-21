@@ -1751,6 +1751,19 @@
         graphic-level)))
   
   
+  (method package (user-update self source-kind upload-needs)
+    (with-task-mutex
+      (lambda ()
+        (let ((streams (table-values (get-send-streams udp-client))))
+          (let ((stream (find-if (lambda (stream) (eq? (get-source-kind stream) source-kind)) streams)))
+            (assert stream
+              (let ((video-levels (get-video-levels stream)))
+                (for-each (lambda (need)
+                            (assert (memv? need video-levels)))
+                          upload-needs))
+              (update-needs (get-upload-queue udp-client) stream upload-needs)))))))
+  
+  
   (method package (upload-update self upload-changed)
     (for-each (lambda (changed)
                 (bind (stream-no . upload-needs) changed
@@ -1760,19 +1773,19 @@
               upload-changed))
   
   
-  (method package (update-specs self stream levels mode)
+  (method package (update-specs self stream spec-levels levels)
     (case (get-source-kind stream)
       ((live)
-       (update-camera-specs self stream levels mode))
+       (update-camera-specs self stream spec-levels levels))
       ((window)
-       (update-window-specs self stream levels mode))
+       (update-window-specs self stream spec-levels levels))
       ((screen)
-       (update-screen-specs self stream levels mode))
+       (update-screen-specs self stream spec-levels levels))
       ((stream)
-       (update-stream-specs self stream levels mode))))
+       (update-stream-specs self stream spec-levels levels))))
   
   
-  (method (update-camera-specs self stream levels mode)
+  (method (update-camera-specs self stream spec-levels levels)
     (let ((video (current-video)))
       (let ((specs (new-queue)))
         (when camera-channel
@@ -1780,7 +1793,7 @@
                 (camera-pipeline (get-pipeline camera-channel)))
             ;; self
             (let ((elements (get-elements camera-pipeline))
-                  (self-level (if (not-null? levels) (last levels) (min (+ (active-graphic-level) 1) max-graphic-level))))
+                  (self-level (if (not-null? spec-levels) (last spec-levels) (min (+ (active-graphic-level) 1) max-graphic-level))))
               (define (find-actual-consumer)
                 (find-if (lambda (element)
                            (and (is? element Camera-Self-Consumer)
@@ -1844,34 +1857,30 @@
                                 (receive (caps resolution) (cache-consumer-caps channel)
                                   (set-caps channel caps))
                                 (set-bitrate-modifier element 1.))))
-                          (if (not processing?)
-                              (set-upload-mode channel #f)
-                            (set-upload-mode channel mode)
+                          (when (and processing? (memv? level spec-levels))
                             (enqueue specs (cons level (get-caps channel)))))))))))))
         (sort < (queue-list specs) key: car))))
   
   
-  (method (update-window-specs self stream levels mode)
+  (method (update-window-specs self stream spec-levels levels)
     (let ((channel (locate-window-channel stream)))
       (receive (caps resolution) (require-caps channel)
-        (set-upload-mode channel mode)
         (set-send-state channel 'on)
         (set-caps channel caps)
         (set-resolution channel resolution)
         (list (cons (get-level channel) caps)))))
   
   
-  (method (update-screen-specs self stream levels mode)
+  (method (update-screen-specs self stream spec-levels levels)
     (let ((channel (locate-screen-channel stream)))
       (receive (caps resolution) (require-caps channel)
-        (set-upload-mode channel mode)
         (set-send-state channel 'on)
         (set-caps channel caps)
         (set-resolution channel resolution)
         (list (cons (get-level channel) caps)))))
   
   
-  (method (update-stream-specs self stream levels mode)
+  (method (update-stream-specs self stream spec-levels levels)
     (let ((video (current-video)))
       (let ((specs (new-queue)))
         (let ((self-output (get-video-output stream)))
@@ -1879,25 +1888,22 @@
             (let ((self-level (get-level self-channel))
                   (self-output (get-output self-channel)))
               (iterate-video-channels stream
-                (lambda (no channel)
+                (lambda (channel-level channel)
                   (let ((src (get-src (get-pipeline channel))))
-                    (let ((channel-level (get-level channel)))
-                      (let ((sending? (memv? channel-level levels)))
-                        (let ((stream? (or (eqv? channel-level self-level) sending?)))
-                          (set-sending? channel sending?)
-                          (set-stream? src stream?)
-                          (when (and self-channel
-                                     (neq? channel self-channel)
-                                     (= channel-level self-level))
-                            (let ((new-output (replace-output video self-output channel sync-audio?: #t)))
-                              (play-video new-output)
-                              (set-video-output stream new-output)
-                              (set-output channel new-output)
-                              (set-output self-channel #f)))
-                          (if (not sending?)
-                              (set-upload-mode channel #f)
-                            (set-upload-mode channel mode)
-                            (enqueue specs (cons channel-level (get-caps channel)))))))))))))
+                    (let ((sending? (memv? channel-level levels)))
+                      (let ((stream? (or (eqv? channel-level self-level) sending?)))
+                        (set-sending? channel sending?)
+                        (set-stream? src stream?)
+                        (when (and self-channel
+                                   (neq? channel self-channel)
+                                   (= channel-level self-level))
+                          (let ((new-output (replace-output video self-output channel sync-audio?: #t)))
+                            (play-video new-output)
+                            (set-video-output stream new-output)
+                            (set-output channel new-output)
+                            (set-output self-channel #f)))
+                        (when (and sending? (memv? channel-level spec-levels))
+                          (enqueue specs (cons channel-level (get-caps channel))))))))))))
         (sort < (queue-list specs) key: car))))
   
   
