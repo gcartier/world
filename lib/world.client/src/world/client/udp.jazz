@@ -685,6 +685,13 @@
   
   
   (method (send-upload-data self data)
+    (with-record header
+      (if (= (read-header-kind data) udp-media-burst)
+          (send-upload-burst self data)
+        (send-upload-media self data))))
+  
+  
+  (method (send-upload-media self data)
     (with-record media
       (let ((sent (current-seconds))
             (sequence (next-media-order!)))
@@ -699,24 +706,19 @@
         (bbr-updated self))))
   
   
-  (method (send-upload-burst self)
+  (method (send-upload-burst self data)
     (with-record media-burst
       (let ((sent (current-seconds))
-            (sequence (next-media-order! self)))
-        (let ((size (calculate-media-burst-size)))
-          (let ((data (make-u8vector (+ size udp-code-size))))
-            (with-write-mutex self
-              (lambda ()
-                (write-header-kind data udp-media-burst)
-                (write-header-sender data client-no)
-                (write-media-burst-order data sequence)
-                (write-udp-code data)
-                (send-data self data)
-                (update upload-send-rate (u8vector-length data))))
-            (let ((skb (packet-sent upload-state sent sequence data)))
-              (tcp_skb_sent upload-socket skb (empty? upload-queue) sequence 1 (current-monotonic-nanoseconds))
-              (tcp_rate_skb_sent upload-socket skb))
-            (bbr-updated self))))))
+            (sequence (next-media-order!)))
+        (write-media-burst-order data sequence)
+        (with-write-mutex self
+          (lambda ()
+            (send-data self data)
+            (update upload-send-rate (u8vector-length data))))
+        (let ((skb (packet-sent upload-state sent sequence data)))
+          (tcp_skb_sent upload-socket skb (empty? upload-queue) sequence 1 (current-monotonic-nanoseconds))
+          (tcp_rate_skb_sent upload-socket skb))
+        (bbr-updated self))))
   
   
   (method (send-upload-pulse self sent)
@@ -1469,17 +1471,23 @@
   (slot video-streams          getter generate)
   (slot rings         <vector>)
   (slot missing-ring)
-  (slot mutex                  initialize (make-mutex))
+  (slot trial-ring)
+  (slot trial-amount)
+  (slot trial-bitrate)
+  (slot mutex                  initialize (make-mutex 'upload))
   (slot condition-variable     initialize (make-condition-variable))
   
   
   (method override (initialize self)
     (nextmethod self)
-    (set! count 1)
+    (set! count 2)
     (set! channels '())
     (set! video-streams #f)
     (set! missing-ring (new Upload-Ring 0 1.))
-    (set! rings (vector missing-ring)))
+    (set! trial-ring (new Upload-Ring 0 #f))
+    (set! trial-amount 0)
+    (set! trial-bitrate 0)
+    (set! rings (vector missing-ring trial-ring)))
   
   
   (method protected (register-channel self channel expire)
@@ -1543,7 +1551,8 @@
       (loop (for n from 0 below last)
             (for channel in channels)
             (vector-set! rings n (get-upload-ring channel)))
-      (vector-set! rings last missing-ring)))
+      (vector-set! rings (- last 1) missing-ring)
+      (vector-set! rings last trial-ring)))
   
   
   (method (top-ring self) <Upload-Ring+>
@@ -1661,6 +1670,8 @@
     (mutex-lock! mutex)
     (let ((streams (cache-video-streams self)))
       (when (not-null? streams)
+        (when (> trial-amount 0)
+          (determine-trial-bitrate self))
         (let ((first? #t))
           (for-each (lambda (stream)
                       (if first?
@@ -1676,6 +1687,8 @@
                             (reset-pushed/popped (get-upload-ring channel))))
                         (match-needs self stream)))
                     streams))
+        (when (> trial-amount 0)
+          (push-trial-amount self))
         (when debug-logic?
           (tell)
           (tell))
@@ -1692,41 +1705,41 @@
        (throttle-bitrate self channel))))
   
   
-  (method (last-second-bitrate-sent-ratio self channel)
-    (let ((ring (get-upload-ring channel)))
-      (let ((pushed <fl> (get-pushed ring))
-            (popped <fl> (get-popped ring)))
-        (if (= pushed 0.)
-            #f
-          (let ((sent-ratio (/ popped pushed)))
-            ;; assumes that min-bitrate is half of max-bitrate
-            (if (<= sent-ratio .5)
-                0.
-              (* (- sent-ratio .5) 2.)))))))
-  
-  
   (method (throttle-trial self channel)
     (let ((level (get-level channel))
-          (survived (last-second-bitrate-sent-ratio self channel)))
-      (if (not survived)
-          (debug-section self 'throttle-trial 'nothing 'pushed)
-        (cond ((>= survived .6)
-               (debug-section self 'throttle-trial level 'survived survived)
+          (survived (stop-trial self channel)))
+      (let ((survived? (>= survived .6)))
+        (debug-section self 'throttle-trial level (if survived? 'survived 'failed) survived)
+        (cond (survived?
                (let ((consumer (get-consumer channel)))
                  (when consumer
                    (change-bitrate (get-src (get-pipeline channel)) consumer survived)))
                (change-mode self channel 'waiting))
               (else
-               (debug-section self 'throttle-trial level 'failed survived)
                (change-mode self channel #f))))))
   
   
   (method (throttle-bitrate self channel)
+    (define (last-second-bitrate-sent-ratio)
+      (let ((ring (get-upload-ring channel)))
+        (let ((pushed <fl> (get-pushed ring))
+              (popped <fl> (get-popped ring)))
+          (if (= pushed 0.)
+              #f
+            (let ((sent-ratio (if ;; this can happen in normal behavior
+                                    (> popped pushed)
+                                  1.
+                                (/ popped pushed))))
+              ;; assumes that min-bitrate is half of max-bitrate
+              (if (<= sent-ratio .5)
+                  0.
+                (* (- sent-ratio .5) 2.)))))))
+    
     (let ((consumer (get-consumer channel)))
       (when consumer
         (let ((stream (get-stream channel))
               (level (get-level channel))
-              (sent (last-second-bitrate-sent-ratio self channel)))
+              (sent (last-second-bitrate-sent-ratio)))
           (when sent
             (let ((trimmed (- 1. sent))
                   (modifier (get-bitrate-modifier consumer)))
@@ -1750,20 +1763,52 @@
     (let ((needs (get-upload-needs stream)))
       (debug-section self 'startup-mode 'needs needs)
       (if (null? needs)
-          (update-levels self stream '() '())
+          (update-levels self stream '())
         (let ((highest-need (last needs))
               (lowest-level (car (get-video-levels stream))))
           (if (> lowest-level highest-need)
               (let ((lowest-channel (locate-video-level-channel stream lowest-level)))
                 (change-mode self lowest-channel 'waiting)
-                (let ((levels (list lowest-level)))
-                  (update-levels self stream levels levels)))
+                (update-levels self stream (list lowest-level)))
             (let ((levels (collect-video-levels stream (lambda (level) (<= level highest-need)))))
               (for-each (lambda (level)
                           (let ((channel (locate-video-level-channel stream level)))
-                            (change-mode self channel 'trial)))
+                            (start-trial self channel)))
                         levels)
-              (update-levels self stream '() levels)))))))
+              (update-levels self stream '())))))))
+  
+  
+  (method (start-trial self channel)
+    (change-mode self channel 'trial)
+    (increase! trial-amount (get-bitrate channel)))
+  
+  
+  (method (push-trial-amount self)
+    (let ((count (fxceiling (/ (/ (* trial-amount 1024) 8.) 1404.))))
+      (loop (repeat count)
+            (let ((size (calculate-media-burst-size)))
+              (let ((data (make-u8vector (+ size udp-code-size))))
+                (with-record media-burst
+                  (write-header-kind data udp-media-burst)
+                  (write-header-sender data client-no)
+                  (write-udp-code data))
+                (push trial-ring data)))))
+    (condition-variable-signal! condition-variable))
+  
+  
+  (method (determine-trial-bitrate self)
+    (set! trial-amount 0)
+    (set! trial-bitrate (* (/ (* (get-popped trial-ring) 1404) 1024.) 8.))
+    (reset trial-ring))
+  
+  
+  (method (stop-trial self channel)
+    (let ((profile (level->graphic-profile (get-level channel))))
+      (let ((min (get-min-bitrate profile))
+            (max (get-bitrate profile)))
+        (cond ((< trial-bitrate min) 0.)
+              ((> trial-bitrate max) 1.)
+              (else (/ (- trial-bitrate min) (- max min)))))))
   
   
   (method (close-unneeded self stream spec-levels)
@@ -1808,18 +1853,16 @@
     (let ((needs (get-upload-needs stream)))
       (debug-section self 'match-needs 'needs needs)
       (if (null? needs)
-          (update-levels self stream '() '())
+          (update-levels self stream '())
         (if (not (uploading? self stream))
             (let ((lowest-channel (locate-lowest-video-channel stream)))
               (change-mode self lowest-channel 'waiting)
-              (let ((levels (list (get-level lowest-channel))))
-                (update-levels self stream levels levels)))
+              (update-levels self stream (list (get-level lowest-channel))))
           (let ((spec-levels (satisfy-needs self stream needs)))
             (close-unneeded self stream spec-levels)
             (cleanup-closing self stream)
             (improve-levels self stream spec-levels needs)
-            (let ((levels (collect-upload-levels stream)))
-              (update-levels self stream spec-levels levels)))))))
+            (update-levels self stream spec-levels))))))
   
   
   (method (improve-levels self stream spec-levels needs)
@@ -1840,14 +1883,14 @@
                      (let ((highest-need (last needs)))
                        (when (> highest-need highest-level)
                          (let ((higher-channel (locate-higher-level-channel stream highest-level)))
-                           (change-mode self higher-channel 'trial))))))))))))
+                           (start-trial self higher-channel))))))))))))
   
   
-  (method (update-levels self stream spec-levels levels)
+  (method (update-levels self stream spec-levels)
     (let ((client (current-client)))
       (let ((stream-no (get-no stream))
-            (upload-specs (update-specs client stream spec-levels levels)))
-        (debug-section self 'update-levels 'spec-levels spec-levels 'levels levels)
+            (upload-specs (update-specs client stream spec-levels)))
+        (debug-section self 'update-levels 'spec-levels spec-levels)
         (unless (equal? (get-upload-specs stream) upload-specs)
           (debug-to-server self (map car upload-specs))
           (set-upload-specs stream upload-specs)
