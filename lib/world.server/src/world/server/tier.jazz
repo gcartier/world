@@ -137,6 +137,7 @@
   (slot zones           initialize '()                       getter generate)
   (slot zones-available initialize '()                       getter generate)
   (slot groups          initialize '()                       getter generate)
+  (slot ghost-groups    initialize '()                       getter generate)
   (slot circles-index   initialize (make-table test: equal?) getter generate)
   (slot hits            initialize 0                         getter generate)
   (slot aliveness-task  initialize #f                        getter generate)
@@ -174,16 +175,42 @@
       (setup-local-process)))
   
   
+  (method (spawn/cleanup-processor self world-asset-entries zone (delegate #f))
+    (define (collect-zone-ghost-groups)
+      (collect-if (lambda (group)
+                    (equal? (get-zone group) zone))
+                  ghost-groups))
+    
+    (let ((processor (spawn-processor (effective-host configuration)
+                                      (effective-service configuration)
+                                      world-asset-entries
+                                      zone
+                                      delegate)))
+      (if (string? processor)
+          processor
+        (let ((zone-ghost-groups (collect-zone-ghost-groups)))
+          (when (not-null? zone-ghost-groups)
+            (let ((remote-processor (get-remote-proxy processor)))
+              (for-each (lambda (ghost-group)
+                          (let ((stone (get-stone ghost-group)))
+                            (when stone
+                              (calling-processor self processor
+                                (lambda ()
+                                  (delete-circle-stone remote-processor stone)))))
+                          (set! ghost-groups (remove! ghost-group ghost-groups))
+                          (delete-circle self (get-name ghost-group)))
+                        zone-ghost-groups))))
+        processor)))
+  
+  
   (method (delay-spawn-processors self)
     (delay-event
       (lambda ()
         (with-task-mutex
           (lambda ()
-            (let ((host (effective-host configuration))
-                  (service (effective-service configuration))
-                  (world-asset-entries (~ collect-world-asset-entries self)))
-              (spawn-processor host service world-asset-entries 'start)
-              (spawn-processor host service world-asset-entries '(zone "World"))))))))
+            (let ((world-asset-entries (~ collect-world-asset-entries self)))
+              (spawn/cleanup-processor self world-asset-entries 'start)
+              (spawn/cleanup-processor self world-asset-entries '(zone "World"))))))))
   
   
   (method override (enter self)
@@ -831,7 +858,7 @@
             (character-script (get-script delegate))
             (character-role (get-role delegate))
             (character-admin? (get-admin? delegate)))
-        (let ((processor (spawn-processor (effective-host configuration) (effective-service configuration) (~ collect-world-asset-entries self) zone)))
+        (let ((processor (spawn/cleanup-processor self (~ collect-world-asset-entries self) zone)))
           (if (string? processor)
               processor
             (let ((remote-processor (get-remote-proxy processor)))
@@ -1407,7 +1434,7 @@
                       (calling-client self delegate
                         (lambda ()
                           (zone-loaded client zone error-string)))))))))
-          (set! spawn-result (spawn-processor (effective-host configuration) (effective-service configuration) (~ collect-world-asset-entries self) zone delegate))))))
+          (set! spawn-result (spawn/cleanup-processor self (~ collect-world-asset-entries self) zone delegate))))))
   
   
   (method package (client-change-zone self client zone)
@@ -1978,7 +2005,10 @@
                     (link (get-link client-circle))
                     (description (get-description client-circle)))
                 (let ((group (new Server-Group circle-name owner created persistent? invite-only? require-microphone? require-camera? zone stone shape zoom? link description)))
-                  (set! groups (cons group groups))))))))))
+                  (if persistent?
+                      (set! groups (cons group groups))
+                    ;; group survived because of server crash and needs cleanup
+                    (set! ghost-groups (cons group ghost-groups)))))))))))
   
   
   (method (circles-directory self)
@@ -2215,7 +2245,7 @@
             (character-role (get-role delegate))
             (character-admin? (get-admin? delegate)))
         ;; spawn
-        (let ((processor (spawn-processor (effective-host configuration) (effective-service configuration) (~ collect-world-asset-entries self) zone delegate)))
+        (let ((processor (spawn/cleanup-processor self (~ collect-world-asset-entries self) zone delegate)))
           (if (string? processor)
               processor
             ;; exit
