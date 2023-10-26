@@ -1647,8 +1647,41 @@
   
   
   (method public (throttle self)
+    (receive (bitrate-changes levels-changes) (throttle-logic self)
+      (when (not-null? bitrate-changes)
+        (for-each (lambda (change)
+                    (bind (channel . bitrate-modifier) change
+                      (with-task-mutex
+                        (lambda ()
+                          (let ((consumer (get-consumer channel)))
+                            (when consumer
+                              (tell 'bitrate (get-level channel) bitrate-modifier)
+                              (change-bitrate (get-src (get-pipeline channel)) consumer bitrate-modifier)))))))
+                  bitrate-changes))
+      (when (not-null? levels-changes)
+        (let ((client (current-client)))
+          (for-each (lambda (change)
+                      (bind (stream . spec-levels) change
+                        (with-task-mutex
+                          (lambda ()
+                            (tell 'update spec-levels)
+                            (let ((stream-no (get-no stream))
+                                  (upload-specs (update-specs client stream spec-levels)))
+                              (debug-section self 'update-levels 'spec-levels spec-levels)
+                              (unless (equal? (get-upload-specs stream) upload-specs)
+                                (debug-to-server self (map car upload-specs))
+                                (set-upload-specs stream upload-specs)
+                                (change-upload-specs client stream-no upload-specs)))))))
+                    levels-changes))))
+    (when debug-upload?
+      (invalidate-outputs (current-video))))
+  
+  
+  (method (throttle-logic self)
     (mutex-lock! mutex)
-    (let ((streams (cache-video-streams self)))
+    (let ((streams (cache-video-streams self))
+          (bitrate-changes (new-queue))
+          (levels-changes (new-queue)))
       (when (not-null? streams)
         (when (> trial-amount 0)
           (determine-trial-bitrate self))
@@ -1659,47 +1692,52 @@
                         (when debug-logic?
                           (tell)))
                       (debug-stream self stream)
-                      (if (not (uploading? self stream))
-                          (startup-mode self stream)
-                        (iterate-video-channels stream
-                          (lambda (level channel)
-                            (throttle-channel self channel)
-                            (reset-pushed/popped (get-upload-ring channel))))
-                        (match-needs self stream)))
+                      (let ((spec-levels (throttle-stream self stream bitrate-changes)))
+                        (when spec-levels
+                          (enqueue levels-changes (cons stream spec-levels)))))
                     streams))
         (when (> trial-amount 0)
           (push-trial-amount self))
         (when debug-logic?
           (tell)
-          (tell))
-        (when debug-upload?
-          (invalidate-outputs (current-video)))))
-    (mutex-unlock! mutex))
+          (tell)))
+      (let ((bitrate-changes (queue-list bitrate-changes))
+            (levels-changes (queue-list levels-changes)))
+        (mutex-unlock! mutex)
+        (values bitrate-changes levels-changes))))
   
   
-  (method (throttle-channel self channel)
+  (method (throttle-stream self stream bitrate-changes)
+    (if (not (uploading? self stream))
+        (startup-mode self stream)
+      (iterate-video-channels stream
+        (lambda (level channel)
+          (throttle-channel self channel bitrate-changes)
+          (reset-pushed/popped (get-upload-ring channel))))
+      (match-needs self stream)))
+  
+  
+  (method (throttle-channel self channel bitrate-changes)
     (case (get-upload-mode channel)
       ((trial)
-       (throttle-trial self channel))
+       (throttle-trial self channel bitrate-changes))
       (else
-       (throttle-bitrate self channel))))
+       (throttle-bitrate self channel bitrate-changes))))
   
   
-  (method (throttle-trial self channel)
+  (method (throttle-trial self channel bitrate-changes)
     (let ((level (get-level channel))
           (survived (stop-trial self channel)))
       (let ((survived? (>= survived .6)))
         (debug-section self 'throttle-trial level (if survived? 'survived 'failed) survived)
         (cond (survived?
-               (let ((consumer (get-consumer channel)))
-                 (when consumer
-                   (change-bitrate (get-src (get-pipeline channel)) consumer survived)))
+               (enqueue bitrate-changes (cons channel survived))
                (change-mode self channel 'waiting))
               (else
                (change-mode self channel #f))))))
   
   
-  (method (throttle-bitrate self channel)
+  (method (throttle-bitrate self channel bitrate-changes)
     (define (last-second-bitrate-sent-ratio)
       (let ((ring (get-upload-ring channel)))
         (let ((pushed <fl> (get-pushed ring))
@@ -1730,13 +1768,13 @@
                          (let ((decrease (+ .1 (/ excess 3.))))
                            (let ((new-modifier (max 0. (- modifier decrease))))
                              (debug-section self 'throttle-bitrate level new-modifier)
-                             (change-bitrate (get-src (get-pipeline channel)) consumer new-modifier))))))
+                             (enqueue bitrate-changes (cons channel new-modifier)))))))
                     ;; raise bitrate
                     ((= trimmed 0.)
                      (unless (>= modifier 1.)
                        (let ((new-modifier (min (+ modifier .1) 1.)))
                          (debug-section self 'throttle-bitrate level new-modifier)
-                         (change-bitrate (get-src (get-pipeline channel)) consumer new-modifier)))))))))))
+                         (enqueue bitrate-changes (cons channel new-modifier))))))))))))
   
   
   (method (startup-mode self stream)
@@ -1795,22 +1833,20 @@
               (else (/ (- trial-bitrate min) (- max min)))))))
   
   
-  (method (close-unneeded self stream spec-levels)
-    (debug-section self 'close-unneeded 'spec-levels spec-levels)
-    (iterate-video-channels stream
-      (lambda (level channel)
-        (when (and (get-upload-mode channel)
-                   (not (memv? level spec-levels)))
-          (change-mode self channel 'closing)))))
-  
-  
-  (method (cleanup-closing self stream)
-    (unless (waiting? self stream)
-      (debug-section self 'cleanup-closing)
-      (iterate-video-channels stream
-        (lambda (level channel)
-          (when (eq? (get-upload-mode channel) 'closing)
-            (change-mode self channel #f))))))
+  (method (match-needs self stream)
+    (let ((needs (get-upload-needs stream)))
+      (debug-section self 'match-needs 'needs needs)
+      (if (null? needs)
+          (update-levels self stream '())
+        (if (not (uploading? self stream))
+            (let ((lowest-channel (locate-lowest-video-channel stream)))
+              (change-mode self lowest-channel 'waiting)
+              (update-levels self stream (list (get-level lowest-channel))))
+          (let ((spec-levels (satisfy-needs self stream needs)))
+            (close-unneeded self stream spec-levels)
+            (cleanup-closing self stream)
+            (improve-levels self stream spec-levels needs)
+            (update-levels self stream spec-levels))))))
   
   
   (method (satisfy-needs self stream needs)
@@ -1833,20 +1869,22 @@
       (remove-duplicates (queue-list spec-levels))))
   
   
-  (method (match-needs self stream)
-    (let ((needs (get-upload-needs stream)))
-      (debug-section self 'match-needs 'needs needs)
-      (if (null? needs)
-          (update-levels self stream '())
-        (if (not (uploading? self stream))
-            (let ((lowest-channel (locate-lowest-video-channel stream)))
-              (change-mode self lowest-channel 'waiting)
-              (update-levels self stream (list (get-level lowest-channel))))
-          (let ((spec-levels (satisfy-needs self stream needs)))
-            (close-unneeded self stream spec-levels)
-            (cleanup-closing self stream)
-            (improve-levels self stream spec-levels needs)
-            (update-levels self stream spec-levels))))))
+  (method (close-unneeded self stream spec-levels)
+    (debug-section self 'close-unneeded 'spec-levels spec-levels)
+    (iterate-video-channels stream
+      (lambda (level channel)
+        (when (and (get-upload-mode channel)
+                   (not (memv? level spec-levels)))
+          (change-mode self channel 'closing)))))
+  
+  
+  (method (cleanup-closing self stream)
+    (unless (waiting? self stream)
+      (debug-section self 'cleanup-closing)
+      (iterate-video-channels stream
+        (lambda (level channel)
+          (when (eq? (get-upload-mode channel) 'closing)
+            (change-mode self channel #f))))))
   
   
   (method (improve-levels self stream spec-levels needs)
@@ -1871,16 +1909,10 @@
   
   
   (method (update-levels self stream spec-levels)
-    (unless (equal? spec-levels (get-upload-levels stream))
+    (if (equal? spec-levels (get-upload-levels stream))
+        #f
       (set-upload-levels stream spec-levels)
-      (let ((client (current-client)))
-        (let ((stream-no (get-no stream))
-              (upload-specs (update-specs client stream spec-levels)))
-          (debug-section self 'update-levels 'spec-levels spec-levels)
-          (unless (equal? (get-upload-specs stream) upload-specs)
-            (debug-to-server self (map car upload-specs))
-            (set-upload-specs stream upload-specs)
-            (change-upload-specs client stream-no upload-specs))))))
+      spec-levels))
   
   
   (method public (update-needs self stream upload-needs)
