@@ -1641,6 +1641,12 @@
       waiting?))
   
   
+  ;; #f
+  ;; trial
+  ;; running
+  ;; waiting
+  ;; closing
+  ;; resurrect
   (method (change-mode self channel mode)
     (set-upload-mode channel mode)
     (debug-action self (get-level channel) '-> mode))
@@ -1660,13 +1666,13 @@
       (when (not-null? levels-changes)
         (let ((client (current-client)))
           (for-each (lambda (change)
-                      (bind (stream . spec-levels) change
+                      (bind (stream spec-levels closing-levels) change
                         (with-task-mutex
                           (lambda ()
                             (let ((stream-no (get-no stream))
-                                  (upload-specs (update-specs client stream spec-levels)))
+                                  (upload-specs (update-specs client stream spec-levels closing-levels)))
                               (debug-to-server self (map car upload-specs))
-                              (change-upload-specs client stream-no upload-specs))))))
+                              (change-upload-specs client stream-no upload-specs closing-levels))))))
                     levels-changes))))
     (when debug-logic?
       (tell)
@@ -1690,9 +1696,10 @@
                         (when debug-logic?
                           (tell)))
                       (debug-stream self stream)
-                      (let ((spec-levels (throttle-stream self stream bitrate-changes)))
-                        (when spec-levels
-                          (enqueue levels-changes (cons stream spec-levels)))))
+                      (let ((levels-info (throttle-stream self stream bitrate-changes)))
+                        (when levels-info
+                          (receive (spec-levels closing-levels) levels-info
+                            (enqueue levels-changes (list stream spec-levels closing-levels))))))
                     streams))
         (when (> trial-amount 0)
           (push-trial-amount self)))
@@ -1835,30 +1842,39 @@
           (update-levels self stream '())
         (if (not (uploading? self stream))
             (let ((lowest-channel (locate-lowest-video-channel stream)))
-              (change-mode self lowest-channel 'waiting)
-              (update-levels self stream (list (get-level lowest-channel))))
+              (let ((lowest-level (get-level lowest-channel)))
+                (change-mode self lowest-channel 'waiting)
+                (update-levels self stream (list lowest-level))))
           (let ((spec-levels (satisfy-needs self stream needs)))
             (close-unneeded self stream spec-levels)
-            (cleanup-closing self stream)
             (improve-levels self stream spec-levels needs)
             (update-levels self stream spec-levels))))))
   
   
+  ;; this method satisfies needs using channels that do not need to go in trial
   (method (satisfy-needs self stream needs)
     (debug-section self 'satisfy-needs 'needs needs)
     (let ((spec-levels (new-queue)))
       (for-each (lambda (need)
-                  (let ((channel (locate-video-level-channel stream need)))
-                    (let ((mode (get-upload-mode channel)))
+                  (let ((need-channel (locate-video-level-channel stream need)))
+                    ;; if we are already uploading then use this channel
+                    (let ((mode (get-upload-mode need-channel)))
                       (if mode
-                          (enqueue spec-levels need)
+                          (begin
+                            (when (eq? mode 'closing)
+                              (change-mode self need-channel 'resurrect))
+                            (enqueue spec-levels need))
                         (let ((higher-channel (locate-higher-upload-channel stream need)))
+                          ;; if we are already uploading a higher channel then we have enough bandwidth
                           (if higher-channel
                               (begin
-                                (change-mode self channel 'waiting)
+                                (change-mode self need-channel 'waiting)
                                 (enqueue spec-levels need))
+                            ;; else we use highest lower uploading channel
                             (let ((lower-channel (locate-lower-upload-channel stream need)))
                               (assert lower-channel)
+                              (when (eq? (get-upload-mode lower-channel) 'closing)
+                                (change-mode self lower-channel 'resurrect))
                               (enqueue spec-levels (get-level lower-channel)))))))))
                 needs)
       (remove-duplicates (queue-list spec-levels))))
@@ -1872,16 +1888,8 @@
                    (not (memv? level spec-levels)))
           (change-mode self channel 'closing)))))
   
-  
-  (method (cleanup-closing self stream)
-    (unless (waiting? self stream)
-      (debug-section self 'cleanup-closing)
-      (iterate-video-channels stream
-        (lambda (level channel)
-          (when (eq? (get-upload-mode channel) 'closing)
-            (change-mode self channel #f))))))
-  
-  
+
+  ;; because of how satisfy-needs works we only need to improve the highest level
   (method (improve-levels self stream spec-levels needs)
     (debug-section self 'improve-levels 'spec-levels spec-levels 'needs needs)
     (let ((highest-level (last spec-levels)))
@@ -1889,13 +1897,15 @@
         (let ((consumer (get-consumer highest-channel)))
           (when consumer
             (let ((bitrate-modifier (get-bitrate-modifier consumer)))
-              (cond ((= bitrate-modifier 0.)
+              (cond ;; go down
+                    ((= bitrate-modifier 0.)
                      (let ((lower-channel (locate-lower-level-channel stream highest-level)))
                        (when lower-channel
                          (unless (eq? (get-upload-mode highest-channel) #f)
                            (change-mode self highest-channel 'closing))
                          (unless (eq? (get-upload-mode lower-channel) 'running)
                            (change-mode self lower-channel 'waiting)))))
+                    ;; go up
                     ((= bitrate-modifier 1.)
                      (let ((highest-need (last needs)))
                        (when (> highest-need highest-level)
@@ -1904,10 +1914,31 @@
   
   
   (method (update-levels self stream spec-levels)
-    (if (equal? spec-levels (get-upload-levels stream))
-        #f
-      (set-upload-levels stream spec-levels)
-      spec-levels))
+    (let ((closing-levels (cleanup-closing self stream)))
+      (if (and (equal? spec-levels (get-upload-levels stream))
+               (equal? closing-levels (get-upload-closing stream)))
+          #f
+        (set-upload-levels stream spec-levels)
+        (set-upload-closing stream closing-levels)
+        (values spec-levels closing-levels))))
+  
+  
+  (method (cleanup-closing self stream)
+    (let ((waiting? (waiting? self stream))
+          (closing-levels (new-queue)))
+      (debug-section self 'cleanup-closing)
+      (iterate-video-channels stream
+        (lambda (level channel)
+          (case (get-upload-mode channel)
+            ((closing)
+             (if waiting?
+                 (enqueue closing-levels (get-level channel))
+               (change-mode self channel #f)))
+            ((resurrect)
+             (if waiting?
+                 (enqueue closing-levels (get-level channel))
+               (change-mode self channel 'running))))))
+      (queue-list closing-levels)))
   
   
   (method public (update-needs self stream upload-needs)
