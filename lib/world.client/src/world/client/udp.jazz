@@ -1476,7 +1476,7 @@
       (increase! count)
       (set! channels (cons channel channels))
       (set! video-streams #f)
-      (set-upload-mode channel #f)
+      (set-upload-state channel #f)
       (set-upload-ring channel ring)
       (sort-channels self)
       (update-rings self))
@@ -1488,7 +1488,7 @@
     (decrease! count)
     (set! channels (remove! channel channels))
     (set! video-streams #f)
-    (set-upload-mode channel #f)
+    (set-upload-state channel #f)
     (set-upload-ring channel #f)
     (sort-channels self)
     (update-rings self)
@@ -1576,9 +1576,9 @@
   (method public (trim self channel)
     (mutex-lock! mutex)
     (reset (get-upload-ring channel))
-    (when (eq? (get-upload-mode channel) 'waiting)
+    (when (eq? (get-upload-state channel) 'waiting)
       (debug-section self 'trim)
-      (change-mode self channel 'running))
+      (change-state self channel 'running))
     (mutex-unlock! mutex))
   
   
@@ -1627,7 +1627,7 @@
     (let ((uploading? #f))
       (iterate-video-channels stream
         (lambda (level channel)
-          (when (get-upload-mode channel)
+          (when (get-upload-state channel)
             (set! uploading? #t))))
       uploading?))
   
@@ -1636,7 +1636,7 @@
     (let ((waiting? #f))
       (iterate-video-channels stream
         (lambda (level channel)
-          (when (eq? (get-upload-mode channel) 'waiting)
+          (when (eq? (get-upload-state channel) 'waiting)
             (set! waiting? #t))))
       waiting?))
   
@@ -1647,9 +1647,9 @@
   ;; waiting
   ;; closing
   ;; resurrect
-  (method (change-mode self channel mode)
-    (set-upload-mode channel mode)
-    (debug-action self (get-level channel) '-> mode))
+  (method (change-state self channel state)
+    (set-upload-state channel state)
+    (debug-action self (get-level channel) '-> state))
   
   
   (method public (throttle self)
@@ -1722,7 +1722,7 @@
   
   
   (method (throttle-channel self channel bitrate-changes)
-    (case (get-upload-mode channel)
+    (case (get-upload-state channel)
       ((trial)
        (throttle-trial self channel bitrate-changes))
       (else
@@ -1736,9 +1736,9 @@
         (debug-section self 'throttle-trial level (if survived? 'survived 'failed) survived)
         (cond (survived?
                (enqueue bitrate-changes (cons (get-no channel) survived))
-               (change-mode self channel 'waiting))
+               (change-state self channel 'waiting))
               (else
-               (change-mode self channel #f))))))
+               (change-state self channel #f))))))
   
   
   (method (throttle-bitrate self channel bitrate-changes)
@@ -1788,13 +1788,13 @@
         (if (eq? (get-source-kind stream) 'image)
             (let ((highest-level (last (get-video-levels stream))))
               (let ((highest-channel (locate-video-level-channel stream highest-level)))
-                (change-mode self highest-channel 'running)
+                (change-state self highest-channel 'running)
                 (update-levels self stream (list highest-level))))
           (let ((highest-need (last needs))
                 (lowest-level (car (get-video-levels stream))))
             (if (> lowest-level highest-need)
                 (let ((lowest-channel (locate-video-level-channel stream lowest-level)))
-                  (change-mode self lowest-channel 'waiting)
+                  (change-state self lowest-channel 'waiting)
                   (update-levels self stream (list lowest-level)))
               (let ((levels (collect-video-levels stream (lambda (level) (<= level highest-need)))))
                 (for-each (lambda (level)
@@ -1805,7 +1805,7 @@
   
   
   (method (start-trial self channel)
-    (change-mode self channel 'trial)
+    (change-state self channel 'trial)
     (increase! trial-amount (get-bitrate channel)))
   
   
@@ -1847,7 +1847,7 @@
             ((not (uploading? self stream))
              (let ((lowest-channel (locate-lowest-video-channel stream)))
                (let ((lowest-level (get-level lowest-channel)))
-                 (change-mode self lowest-channel 'waiting)
+                 (change-state self lowest-channel 'waiting)
                  (update-levels self stream (list lowest-level)))))
             ;; satisfy needs
             (else
@@ -1864,23 +1864,23 @@
       (for-each (lambda (need)
                   (let ((need-channel (locate-video-level-channel stream need)))
                     ;; if we are already uploading then use this channel
-                    (let ((mode (get-upload-mode need-channel)))
-                      (if mode
+                    (let ((state (get-upload-state need-channel)))
+                      (if state
                           (begin
-                            (when (eq? mode 'closing)
-                              (change-mode self need-channel 'resurrect))
+                            (when (eq? state 'closing)
+                              (change-state self need-channel 'resurrect))
                             (enqueue spec-levels need))
                         (let ((higher-channel (locate-higher-upload-channel stream need)))
                           ;; if we are already uploading a higher channel then we have enough bandwidth
                           (if higher-channel
                               (begin
-                                (change-mode self need-channel 'waiting)
+                                (change-state self need-channel 'waiting)
                                 (enqueue spec-levels need))
                             ;; else we use highest lower uploading channel
                             (let ((lower-channel (locate-lower-upload-channel stream need)))
                               (assert lower-channel)
-                              (when (eq? (get-upload-mode lower-channel) 'closing)
-                                (change-mode self lower-channel 'resurrect))
+                              (when (eq? (get-upload-state lower-channel) 'closing)
+                                (change-state self lower-channel 'resurrect))
                               (enqueue spec-levels (get-level lower-channel)))))))))
                 needs)
       (remove-duplicates (queue-list spec-levels))))
@@ -1890,9 +1890,9 @@
     (debug-section self 'close-unneeded 'spec-levels spec-levels)
     (iterate-video-channels stream
       (lambda (level channel)
-        (when (and (get-upload-mode channel)
+        (when (and (get-upload-state channel)
                    (not (memv? level spec-levels)))
-          (change-mode self channel 'closing)))))
+          (change-state self channel 'closing)))))
   
 
   ;; because of how satisfy-needs works we only need to improve the highest level
@@ -1906,10 +1906,10 @@
                   ((= bitrate-modifier 0.)
                    (let ((lower-channel (locate-lower-level-channel stream highest-level)))
                      (when lower-channel
-                       (unless (eq? (get-upload-mode highest-channel) #f)
-                         (change-mode self highest-channel 'closing))
-                       (unless (eq? (get-upload-mode lower-channel) 'running)
-                         (change-mode self lower-channel 'waiting)))))
+                       (unless (eq? (get-upload-state highest-channel) #f)
+                         (change-state self highest-channel 'closing))
+                       (unless (eq? (get-upload-state lower-channel) 'running)
+                         (change-state self lower-channel 'waiting)))))
                   ;; go up
                   ((= bitrate-modifier 1.)
                    (let ((highest-need (last needs)))
@@ -1934,15 +1934,15 @@
       (debug-section self 'cleanup-closing)
       (iterate-video-channels stream
         (lambda (level channel)
-          (case (get-upload-mode channel)
+          (case (get-upload-state channel)
             ((closing)
              (if waiting?
                  (enqueue closing-levels (get-level channel))
-               (change-mode self channel #f)))
+               (change-state self channel #f)))
             ((resurrect)
              (if waiting?
                  (enqueue closing-levels (get-level channel))
-               (change-mode self channel 'running))))))
+               (change-state self channel 'running))))))
       (queue-list closing-levels)))
   
   
