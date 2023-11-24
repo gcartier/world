@@ -141,6 +141,8 @@
   (slot ghost-groups    initialize '()                       getter generate)
   (slot circles-index   initialize (make-table test: equal?) getter generate)
   (slot hits            initialize 0                         getter generate)
+  (slot urgency-server  initialize #f                        getter generate)
+  (slot urgency-thread  initialize #f                        getter generate)
   (slot aliveness-task  initialize #f                        getter generate)
   (slot udp-server      initialize #f                        getter generate)
   
@@ -166,6 +168,7 @@
   
   (method override (startup self)
     (nextmethod self)
+    (start-urgency-server self)
     (start-aliveness-task self)
     (start-mobile-server (new-directory directory "certificates") (~ mobile-connect self) (~ mobile-serve self))
     (start-udp-server self)
@@ -229,6 +232,7 @@
     (stop-mobile-server)
     (stop-udp-server self)
     (stop-aliveness-task self)
+    (stop-urgency-server self)
     (detach-clients self))
   
   
@@ -971,6 +975,8 @@
       (set-state delegate 'deconnected)
       ;; closing remote
       (closing-remote-proxy-safe client)
+      ;; urgency
+      (close-urgency self delegate)
       ;; broadcast
       (when broadcast-exited?
         (broadcast-exited self delegate))
@@ -2548,6 +2554,16 @@
        (let ((file (logger-file)))
          (and (exists? file)
               (load-lines file))))
+      ((crash)
+       (bind (who) arguments
+         (let ((delegate (search-for-delegate self who)))
+           (if (string? delegate)
+               delegate
+             (let ((port (get-urgency-port delegate)))
+               (if (not port)
+                   (format "Unable to find urgency port")
+                 (urgency-crash self port)
+                 #f))))))
       ((date)
        (date->string (system-date) "~Y-~m-~d_~H-~M-~S"))
       ((disconnected)
@@ -3415,6 +3431,79 @@
                   (when (get-admin? delegate)
                     (deliver-message self delegate sender kind message)))
                 delegates)))
+  
+  
+  ;;;
+  ;;;; Urgency
+  ;;;
+  
+  
+  (method (start-urgency-server self)
+    (let ((host (effective-host configuration))
+          (service (+ (effective-service configuration) urgency-service-offset)))
+      (let ((server (open-tcp-server (list server-address: host port-number: service keep-alive: #t))))
+        (let ((thread
+                (new-thread
+                  (lambda ()
+                    (declare (proper-tail-calls))
+                    (let (loop)
+                      (let ((port (read server)))
+                        (accept-urgency self port))
+                      (loop)))
+                  'urgency)))
+        (thread-base-priority-set! thread urgency-priority)
+        (thread-start! thread)
+        (set! urgency-server server)
+        (set! urgency-thread thread)))))
+  
+  
+  (method (with-urgency self prefix thunk)
+    (catch-exception-filter
+      (lambda (exc)
+        #t)
+      (lambda (exc)
+        (problem "{a}: {a}" prefix (exception-reason exc)))
+      thunk))
+  
+  
+  (method (accept-urgency self port)
+    (with-urgency self "Accept urgency"
+      (lambda ()
+        (receive (code version) (read-transmission-header port)
+          (validate-code urgency-code code)
+          (validate-version urgency-version version)
+          (let ((no (read port)))
+            (let ((delegate (find-if (lambda (delegate)
+                                       (= (get-no delegate) no))
+                                     delegates)))
+              (when delegate
+                (set-urgency-port delegate port))))))))
+  
+  
+  (method (close-urgency self delegate)
+    (with-urgency self "Close urgency"
+      (lambda ()
+        (let ((port (get-urgency-port delegate)))
+          (when port
+            (close-port port)
+            (set-urgency-port delegate #f))))))
+  
+  
+  (method (urgency-crash self port)
+    (with-urgency self "Urgency crash"
+      (lambda ()
+        (write 'crash port)
+        (newline port)
+        (force-output port))))
+  
+  
+  (method (stop-urgency-server self)
+    (when urgency-thread
+      (exit-thread urgency-thread)
+      (thread-join! urgency-thread)
+      (close-port urgency-server)
+      (set! urgency-server #f)
+      (set! urgency-thread #f)))
   
   
   ;;;
