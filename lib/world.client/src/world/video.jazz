@@ -142,8 +142,10 @@
   (world-setting 'world.video-layout 'sidebar @currently-buggy-when-we-cycle 'overhead))
 
 (definition (change-video-layout layout)
-  (set! video-layout layout)
-  (set-setting options-settings 'world.video-layout layout))
+  (when (neq? layout video-layout)
+    (set! video-layout layout)
+    (update-self-output (current-video))
+    (set-setting options-settings 'world.video-layout layout)))
 
 
 (definition public video-mode
@@ -341,6 +343,7 @@
   (slot outputs         getter generate)
   (slot ordered-outputs getter generate)
   (slot focused-output  getter generate)
+  (slot self-level      accessors generate)
   (slot self-output     accessors generate)
   (slot self-consumer   accessors generate)
   (slot render-hook     accessors generate)
@@ -351,6 +354,7 @@
     (set! self.outputs (make-table test: equal?))
     (set! self.ordered-outputs '())
     (set! self.focused-output #f)
+    (set! self.self-level #f)
     (set! self.self-output #f)
     (set! self.self-consumer #f)
     (set! self.render-hook #f))
@@ -652,7 +656,7 @@
        (gallery-layout self))))
   
   
-  (method protected (update-layouts self)
+  (method (update-layout self)
     (case video-layout
       ((overhead)
        (overhead-layout self))
@@ -664,6 +668,11 @@
        (circle-layout self))
       ((focus)
        (focus-layout self))))
+  
+  
+  (method protected (update-layouts self)
+    (update-self-output self)
+    (update-layout self))
   
   
   (method (stop-renders self)
@@ -783,7 +792,83 @@
     (let ((count (length ordered-outputs)))
       (for-each (lambda (output)
                   (update-interface-matrix output count))
-                ordered-outputs))))
+                ordered-outputs)))
+  
+  
+  ;;;
+  ;;;; Self
+  ;;;
+
+
+  (method protected (determine-self-level self new?)
+    (let ((level (active-graphic-level)))
+      (if (eq? video-layout 'focus)
+          (focused-level level)
+        (let ((count (+ (length ordered-outputs) (if new? 1 0))))
+          (tiled-level level count)))))
+  
+  
+  (method protected (update-self-output self)
+    (let ((client (current-client)))
+      (let ((camera-stream (get-live-stream client))
+            (camera-channel (get-camera-channel client)))
+        (when camera-channel
+          (let ((camera-pipeline (get-pipeline camera-channel)))
+            (let ((elements (get-elements camera-pipeline))
+                  (new-level (determine-self-level self #f)))
+              (define (find-actual-consumer)
+                (find-if (lambda (element)
+                           (and (is? element Camera-Self-Consumer)
+                                (get-processing? element)))
+                         elements))
+              
+              (define (find-new-consumer)
+                (find-if (lambda (element)
+                           (and (is? element Camera-Self-Consumer)
+                                (= (get-level (get-profile element)) new-level)))
+                         elements))
+              
+              (define (update-probe consumer processing?)
+                (let ((profile (get-profile consumer))
+                      (probe (get-probe consumer)))
+                  (let ((name (get-name profile))
+                        (selfrate (get-selfrate profile)))
+                    (let ((rate (if processing? selfrate 0)))
+                      (gst_rate_probe_set_rate probe rate)))))
+              
+              (define (with-self-priority thunk)
+                (let ((thread (current-thread)))
+                  (let ((preserved-priority (thread-base-priority thread)))
+                    (thread-base-priority-set! thread self-priority)
+                    (thunk)
+                    (thread-base-priority-set! thread preserved-priority))))
+              
+              (when (or (not self-level) (/= new-level self-level))
+                (let ((actual-consumer (find-actual-consumer))
+                      (new-consumer (find-new-consumer)))
+                  (when (neq? new-consumer actual-consumer)
+                    (with-self-priority
+                      (lambda ()
+                        (when on?
+                          (update-probe new-consumer #t))
+                        (let ((rank (and self-output (find-output-rank self self-output))))
+                          (let ((new-output (create-self-output new-consumer)))
+                            (set-video-output camera-stream new-output)
+                            (set-output new-consumer new-output)
+                            (when on?
+                              ;; display one new buffer before stopping the
+                              ;; actual consumer in order to remove flicker
+                              ;; note that the current thread needs to be higher
+                              ;; priority than the camera task else this will hang
+                              (gst_app_sink_process_one_buffer new-consumer)
+                              (update-probe actual-consumer #f))
+                            (set-processing? actual-consumer #f)
+                            (when self-output
+                              (close-self-output self-consumer))
+                            (set-processing? new-consumer #t)
+                            (install-self-output new-consumer rank: rank)
+                            (set! self-level new-level)
+                            (update-layout self)))))))))))))))
 
 
 ;;;
@@ -1496,6 +1581,7 @@
   (method protected (install-self-output self (rank: rank #f))
     (let ((video (current-video)))
       (install-output video (get-id output) output rank: rank)
+      (set-self-level video (get-level profile))
       (set-self-output video output)
       (set-self-consumer video self)))
   
@@ -1525,11 +1611,12 @@
             process?: #f)))))
   
   
-  (method protected (close-self-output self (layout?: layout? #t))
+  (method protected (close-self-output self)
     (let ((video (current-video)))
       (when output
-        (close-output video (get-id output) output layout?: layout?)
+        (close-output video (get-id output) output layout?: #f)
         (set-stream-state output 'off)
+        (set-self-level video #f)
         (set-self-output video #f)
         (set-self-consumer video #f)
         (set! output #f))))
