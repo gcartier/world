@@ -1,0 +1,88 @@
+;;;===============
+;;;  WorldScheme
+;;;===============
+;;;
+;;;; BBR State
+;;;
+;;;  The Initial Developer of the Original Code is Guillaume Cartier.
+;;;  Portions created by the Initial Developer are Copyright (C) 2012-2018
+;;;  the Initial Developer. All Rights Reserved.
+;;;
+;;;  Contributor(s):
+;;;    Barbara Samson
+
+
+(module world.bbr.state jazz
+
+
+(import (world.bbr))
+
+
+;; closest to a 1432 divisor near 50
+(definition protected udp-mss <fx>
+  53)
+
+
+;;;
+;;;; State
+;;;
+
+
+(class BBR-State extends Object
+  
+  
+  (slot inflight-buffers   getter generate)
+  (slot delivered-last-seq getter generate)
+  (slot last-sent-time     getter generate)
+  
+  
+  (method override (initialize self)
+    (nextmethod self)
+    (set! inflight-buffers (make-table test: equal?))
+    (set! delivered-last-seq -1)
+    (set! last-sent-time 0))
+  
+  
+  (method protected (reset self)
+    (set! inflight-buffers (make-table test: equal?))
+    (set! delivered-last-seq -1)
+    (set! last-sent-time 0))
+  
+  
+  (method protected (packet-sent self sent-time sequence data)
+    (let ((segs (max 1 (fxround/ (u8vector-length data) udp-mss))))
+      (let ((skb (new_skbuff segs)))
+        (table-set! inflight-buffers sequence skb)
+        (set! last-sent-time sent-time)
+        skb)))
+  
+  
+  (method protected (pulse-sent self sent-time)
+    (set! last-sent-time sent-time))
+  
+  
+  (method protected (ack-received self socket sequence srtt queue-empty? timer)
+    (if (<= sequence delivered-last-seq)
+        #f
+      (let ((lost 0))
+        (loop (for seq from (+ delivered-last-seq 1) below sequence)
+              (update-lost self socket seq srtt queue-empty? timer)
+              @disable-bbr-loss-handling-for-now
+              (increase! lost))
+        (set! delivered-last-seq sequence)
+        (let ((skb (table-ref inflight-buffers sequence #f)))
+          ;; pulses are not put in the inflight table
+          (if (not skb)
+              #f
+            (table-clear inflight-buffers sequence)
+            (values skb lost))))))
+  
+  
+  (method protected (update-lost self socket seq srtt queue-empty? timer)
+    (let ((skb (table-ref inflight-buffers seq #f)))
+      (when skb
+        (table-clear inflight-buffers seq)
+        (tcp_ack socket skb 0 srtt queue-empty? timer #f)
+        @disable-bbr-loss-handling-for-now
+        (tcp_skb_lost socket skb)
+        (free_skbuff skb))))))
