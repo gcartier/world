@@ -907,16 +907,17 @@
     (declare (proper-tail-calls))
     (with-task task
       (lambda (exit)
-        (let (loop (data (pop-upload self 0)) (next-delivery-time (current-monotonic)))
-          (if upload-done?
-              (continuation-return exit #f)
-            (wake-upload self data next-delivery-time loop))))))
+        (let ((now (current-monotonic)))
+          (let (loop (data (pop-upload self 0)) (local-delivery-time now) (next-delivery-time now))
+            (if upload-done?
+                (continuation-return exit #f)
+              (wake-upload self data local-delivery-time next-delivery-time loop)))))))
   
   
-  (method (wake-upload self data next-delivery-time loop)
+  (method (wake-upload self data local-delivery-time next-delivery-time loop)
     (declare (proper-tail-calls))
-    (define (wait next-delivery-time)
-      (sleep (- next-delivery-time (current-monotonic))))
+    (define (wait local-delivery-time)
+      (sleep (- local-delivery-time (current-monotonic))))
     
     (define (pace size)
       (/ (cast <fl> size) (or upload-user-rate (tcp_pacing_rate upload-socket))))
@@ -929,8 +930,9 @@
           ((eof-object? data)
            (show ".")
            (mutex-unlock! upload-mutex)
-           (let ((data (pop-upload self +inf.0)))
-             (loop data (current-monotonic))))
+           (let ((data (pop-upload self +inf.0))
+                 (now (current-monotonic)))
+             (loop data now now)))
           ;; data
           (else
            (cond ;; exceeding congestion window
@@ -940,35 +942,34 @@
                     (cond ;; send pulse
                           ((>= now (+ (get-last-sent-time bbr-state) .1))
                            (show "@")
-                           (wait next-delivery-time)
+                           (wait local-delivery-time)
                            (send-upload-pulse self now)
                            (mutex-unlock! upload-mutex)
                            (mutex-lock! upload-ack-mutex)
                            (mutex-unlock! upload-ack-mutex upload-ack-condvar .1)
-                           (loop data next-delivery-time))
+                           (loop data local-delivery-time next-delivery-time))
                           ;; do nothing
                           (else
                            (show "$")
-                           (wait next-delivery-time)
+                           (wait local-delivery-time)
                            (mutex-unlock! upload-mutex)
                            (mutex-lock! upload-ack-mutex)
                            (mutex-unlock! upload-ack-mutex upload-ack-condvar .1)
-                           (loop data next-delivery-time)))))
+                           (loop data local-delivery-time next-delivery-time)))))
                  ;; send media
                  (else
                   (tcp_set_is_cwnd_limited upload-socket #f)
                   (let ((size (u8vector-length data)))
                     (show "^")
-                    (wait next-delivery-time)
+                    (wait local-delivery-time)
                     (send-upload-media self data)
-                    (let ((now (current-monotonic)))
-                      (let ((pace (pace size)))
-                        (let ((next (+ next-delivery-time pace))
-                              ;; never send faster locally than pace / 2
-                              (smallest-next (+ now (/ pace 2.))))
-                          (let ((next-delivery-time (max next smallest-next)))
-                            (mutex-unlock! upload-mutex)
-                            (loop (pop-upload self 0) next-delivery-time)))))))))))
+                    (let ((pace (pace size)))
+                      (let ((next (+ next-delivery-time pace))
+                            ;; never send faster locally than pace / 2
+                            (smallest-local (+ (current-monotonic) (/ pace 2.))))
+                        (let ((local-delivery-time (max next smallest-local)))
+                          (mutex-unlock! upload-mutex)
+                          (loop (pop-upload self 0) local-delivery-time next))))))))))
   
   
   (proclaim (not warn optimizations))
