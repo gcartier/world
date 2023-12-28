@@ -772,7 +772,7 @@
     (increase! upload-bbr-update))
   
   
-  (method (send-upload-media self data)
+  (method (send-upload-media self data was-empty?)
     (with-record media-ackable
       (let ((sent (current-monotonic))
             (order (next-media-order!)))
@@ -782,9 +782,8 @@
             (send-data self data)
             (update upload-send-rate (u8vector-length data))))
         (receive (skb segs) (packet-sent bbr-state sent order data)
-          (let ((empty? (empty? upload-queue))
-                (timer (current-monotonic-jiffies)))
-            (tcp_skb_sent upload-socket skb empty? order timer)
+          (let ((timer (current-monotonic-jiffies)))
+            (tcp_skb_sent upload-socket skb was-empty? order timer)
             (when record-bbr?
               (record-event udp-id-bbr-sent
                             -1.
@@ -792,7 +791,7 @@
                             -1.
                             (fixnum->flonum segs)
                             (fixnum->flonum order)
-                            (if empty? 1. 0.)
+                            (if was-empty? 1. 0.)
                             (timestamp->flonum timer)))))
         (when record-events?
           (with-record media
@@ -815,7 +814,7 @@
         (bbr-updated self))))
   
   
-  (method (send-upload-pulse self sent)
+  (method (send-upload-pulse self sent was-empty?)
     (let ((order (next-media-order!)))
       (let ((data (with-write-mutex self
                     (lambda ()
@@ -830,9 +829,8 @@
                             (update upload-send-rate (u8vector-length data))
                             data)))))))
         (receive (skb segs) (packet-sent bbr-state sent order data)
-          (let ((empty? (empty? upload-queue))
-                (timer (current-monotonic-jiffies)))
-            (tcp_skb_sent upload-socket skb empty? order timer)
+          (let ((timer (current-monotonic-jiffies)))
+            (tcp_skb_sent upload-socket skb was-empty? order timer)
             (when record-bbr?
               (record-event udp-id-bbr-pulsed
                             -1.
@@ -840,7 +838,7 @@
                             -1.
                             (fixnum->flonum segs)
                             (fixnum->flonum order)
-                            (if empty? 1. 0.)
+                            (if was-empty? 1. 0.)
                             (timestamp->flonum timer)))))
         (record-event udp-id-bbr-pulse
                       -1.
@@ -911,13 +909,13 @@
     (with-task task
       (lambda (exit)
         (let ((now (current-monotonic)))
-          (let (loop (data (pop-upload self 0)) (local-delivery-time now) (next-delivery-time now))
+          (let (loop (data (pop-upload self 0)) (was-empty? #f) (local-delivery-time now) (next-delivery-time now))
             (if upload-done?
                 (continuation-return exit #f)
-              (wake-upload self data local-delivery-time next-delivery-time loop)))))))
+              (wake-upload self data was-empty? local-delivery-time next-delivery-time loop)))))))
   
   
-  (method (wake-upload self data local-delivery-time next-delivery-time loop)
+  (method (wake-upload self data was-empty? local-delivery-time next-delivery-time loop)
     (declare (proper-tail-calls))
     (define (wait local-delivery-time)
       (sleep (- local-delivery-time (current-monotonic))))
@@ -935,7 +933,7 @@
            (mutex-unlock! upload-mutex)
            (let ((data (pop-upload self +inf.0))
                  (now (current-monotonic)))
-             (loop data now now)))
+             (loop data #t now now)))
           ;; data
           (else
            (cond ;; exceeding congestion window
@@ -947,11 +945,11 @@
                           ((>= now (+ (get-last-sent-time bbr-state) .1))
                            (show "@")
                            (wait local-delivery-time)
-                           (send-upload-pulse self now)
+                           (send-upload-pulse self now was-empty?)
                            (mutex-unlock! upload-mutex)
                            (mutex-lock! upload-ack-mutex)
                            (mutex-unlock! upload-ack-mutex upload-ack-condvar .1)
-                           (loop data local-delivery-time next-delivery-time))
+                           (loop data was-empty? local-delivery-time next-delivery-time))
                           ;; do nothing
                           (else
                            (show "$")
@@ -959,7 +957,7 @@
                            (mutex-unlock! upload-mutex)
                            (mutex-lock! upload-ack-mutex)
                            (mutex-unlock! upload-ack-mutex upload-ack-condvar .1)
-                           (loop data local-delivery-time next-delivery-time)))))
+                           (loop data was-empty? local-delivery-time next-delivery-time)))))
                  ;; send media
                  (else
                   (tcp_set_is_cwnd_limited upload-socket #f)
@@ -968,14 +966,14 @@
                   (let ((size (u8vector-length data)))
                     (show "^")
                     (wait local-delivery-time)
-                    (send-upload-media self data)
+                    (send-upload-media self data was-empty?)
                     (let ((pace (pace size)))
                       (let ((next (+ next-delivery-time pace))
                             ;; never send faster locally than pace / 2
                             (smallest-local (+ (current-monotonic) (/ pace 2.))))
                         (let ((local-delivery-time (max next smallest-local)))
                           (mutex-unlock! upload-mutex)
-                          (loop (pop-upload self 0) local-delivery-time next))))))))))
+                          (loop (pop-upload self 0) #f local-delivery-time next))))))))))
   
   
   (proclaim (not warn optimizations))
