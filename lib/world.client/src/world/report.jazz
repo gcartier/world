@@ -16,6 +16,7 @@
 
 (import (jazz.io)
         (jazz.pack)
+        (jazz.snapshot)
         (world)
         (world.context))
 
@@ -23,19 +24,26 @@
 (definition reports-directory
   {Directory Settings "work" "reports"})
 
-(definition reports-remote
-  (cond-expand
-    (devel  "http://logs.togethersphere.com/devel/reports")
-    (trial  "http://logs.togethersphere.com/trial/reports")
-    (test   "http://logs.togethersphere.com/test/reports")
-    (triage "http://logs.togethersphere.com/triage/reports")
-    (stable "http://logs.togethersphere.com/stable/reports")
-    (stage  "http://logs.togethersphere.com/stage/reports")
-    (prod   "http://logs.togethersphere.com/prod/reports")))
-
+(definition reports-bucket
+  "reports")
 
 (definition send-directory
   {Directory Settings "work" "send"})
+
+
+(definition snapshots-bucket
+  "crashes")
+
+
+(definition remote
+  (cond-expand
+    (devel  "http://logs.togethersphere.com/devel")
+    (trial  "http://logs.togethersphere.com/trial")
+    (test   "http://logs.togethersphere.com/test")
+    (triage "http://logs.togethersphere.com/triage")
+    (stable "http://logs.togethersphere.com/stable")
+    (stage  "http://logs.togethersphere.com/stage")
+    (prod   "http://logs.togethersphere.com/prod")))
 
 
 (definition public (send-reports (feedback?: feedback? #t))
@@ -54,20 +62,20 @@
       (for-each (lambda (report)
                   (when feedback?
                     (working-progress world (format "Sending logs ({a} of {a})" (+ rank 1) total) #f))
-                  (send-report report)
+                  (send-file report reports-bucket)
                   (increase! rank))
                 unsent))
     
-    (define (send-report report)
-      (let ((report (normalize-file report)))
+    (define (send-file file bucket)
+      (let ((file (normalize-file file)))
         (let ((port (open-process
                       (list
                         path: curl
-                        arguments: (list "--silent" "-T" (parse report) "-H" "Content-Type: text/plain" (string-append reports-remote "/" (get-name report)))
+                        arguments: (list "--silent" "-T" (parse file) "-H" "Content-Type: text/plain" (string-append remote "/" bucket "/" (get-name file)))
                         show-console: #f))))
           (let ((status (process-status port)))
             (when (= status 0)
-              (delete report))))))
+              (delete file))))))
     
     (define (send-dirs dirs rank total)
       (for-each (lambda (dir)
@@ -82,7 +90,18 @@
       (let ((report (new-file send-directory (add-extension (get-name dir) "report"))))
         (pack-directory dir report)
         (delete dir)
-        (send-report report)))
+        (send-file report reports-bucket)))
+    
+    (define (send-snapshots snapshots rank total)
+      (for-each (lambda (snapshot)
+                  (when feedback?
+                    (working-progress world (format "Sending logs ({a} of {a})" (+ rank 1) total) #f))
+                  (send-snapshot snapshot)
+                  (increase! rank))
+                snapshots))
+    
+    (define (send-snapshot snapshot)
+      (send-file snapshot snapshots-bucket))
     
     (define (collect-unsent)
       (let ((queue (new-queue)))
@@ -110,12 +129,27 @@
             recursive?: #f))
         (queue-list queue)))
     
+    (define (collect-snapshots)
+      (let ((queue (new-queue))
+            (snapshots-dir (snapshots-directory)))
+        (when (exists? snapshots-dir)
+          (iterate-directory snapshots-dir
+            (lambda (file)
+              (when (extension=? (get-extension file) "snapshot")
+                (enqueue queue file)))
+            files?: #t
+            directories?: #f
+            recursive?: #f))
+        (queue-list queue)))
+    
     (let ((unsent (collect-unsent))
-          (dirs (collect-dirs)))
-      (let ((total (+ (length unsent) (length dirs))))
+          (dirs (collect-dirs))
+          (snapshots (collect-snapshots)))
+      (let ((total (+ (length unsent) (length dirs) (length snapshots))))
         (define (send-all)
           (send-unsent unsent 0 total)
-          (send-dirs dirs (length unsent) total))
+          (send-dirs dirs (length unsent) total)
+          (send-snapshots snapshots (+ (length unsent) (length dirs)) total))
         
         (when (> total 0)
           (if (not feedback?)
