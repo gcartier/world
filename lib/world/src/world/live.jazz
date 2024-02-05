@@ -339,10 +339,11 @@
   (slot working-step            <fx>                initialize 0               getter generate)
   (slot working-message         <object>            initialize #f              getter generate)
   (slot working-percentage      <object>            initialize #f              getter generate)
-  (slot working-result          <object>            initialize #f              getter generate)
   (slot working-sheet           <object>            initialize #f              getter generate)
-  (slot working-background      <object>            initialize #f              accessors generate)
+  (slot working-background      <object>            initialize #f              getter generate)
+  (slot working-task            <object>            initialize #f              getter generate)
   (slot working-mutex           <object>            initialize #f              getter generate)
+  (slot working-done?           <bool>              initialize #f              getter generate)
   (slot compass-sheet           <object>            initialize #f              getter generate)
   (slot compass-visible?        <bool>              initialize #f              accessors generate)
   (slot map-sheet               <object>            initialize #f              getter generate)
@@ -440,7 +441,10 @@
     (set! models-mutex (make-mutex 'models))
     (set! paintings (make-table test: equal?))
     (set! paintings-mutex (make-mutex 'paintings))
-    (set! working-mutex (make-mutex 'working))
+    (when (window?)
+      (set! working-task (new Task 'working (~ run-working self) exit: (~ exit-working self) priority: working-priority))
+      (set! working-mutex (make-mutex 'working))
+      (working-lock! self))
     (update-world-up self ambient-gravity)
     (prepare-sounds self)
     (setup-history)
@@ -825,6 +829,7 @@
   
   (method override (destroy self)
     (when (window?)
+      (stop-working self)
       (with-reentrant-render-mutex
         (lambda ()
           (cond-expand
@@ -873,7 +878,8 @@
     (set! axes? (world-setting 'world.axes? #f))
     (set! axes-graduation? (world-setting 'world.axes-graduation? #f))
     (when (window?)
-      (setup-interface self)))
+      (setup-interface self)
+      (start-working self)))
   
   
   (method package (setup-interface self)
@@ -2321,23 +2327,6 @@
     (render-visualizer))
   
   
-  (method package (render-working self)
-    (with-render-mutex
-      (lambda ()
-        ;; pre
-        (when multisampling?
-          (preprocess-multisampled self))
-        ;; clear
-        (glClear (bitwise-ior GL_COLOR_BUFFER_BIT GL_DEPTH_BUFFER_BIT))
-        (let ((interface (current-interface)))
-          (render-texture interface working-background)
-          (draw-working self))
-        ;; post
-        (when multisampling?
-          (postprocess-multisampled self))
-        (gl-check-error))))
-  
-  
   (method protected virtual (render-outputs self)
     (let ((video (current-video)))
       (render-outputs video)))
@@ -2619,9 +2608,7 @@
         (when status
           (draw-status self))
         (when action
-          (draw-action self))
-        (when working?
-          (draw-working self)))))
+          (draw-action self)))))
   
   
   (method (explore-interface self)
@@ -6253,6 +6240,61 @@
   ;;;
   ;;;; Working
   ;;;
+  
+  
+  (method (start-working self)
+    (start-task working-task))
+  
+  
+  (method (stop-working self)
+    (stop-task working-task))
+  
+  
+  (method package (run-working self task <Task>)
+    (declare (proper-tail-calls))
+    (let ((window (current-window)))
+      (with-task task
+        (lambda (exit)
+          (let (iter)
+            (working-lock! self)
+            (if working-done?
+                (continuation-return exit #f)
+              (render-working self)
+              (render-sync window)
+              (working-unlock! self)
+              (sleep .05)
+              (set! working-step (modulo (+ working-step 1) 20))
+              (iter)))))))
+  
+  
+  (method package (exit-working self task <Task>)
+    (set! working-done? #t)
+    (working-unlock! self))
+  
+  
+  (method package (render-working self)
+    (with-render-mutex
+      (lambda ()
+        ;; pre
+        (when multisampling?
+          (preprocess-multisampled self))
+        ;; clear
+        (glClear (bitwise-ior GL_COLOR_BUFFER_BIT GL_DEPTH_BUFFER_BIT))
+        (let ((interface (current-interface)))
+          (render-texture interface working-background)
+          (draw-working self))
+        ;; post
+        (when multisampling?
+          (postprocess-multisampled self))
+        (gl-check-error))))
+  
+  
+  (method (working-lock! self)
+    (mutex-lock! working-mutex #f #f))
+  
+  
+  (method (working-unlock! self)
+    (mutex-unlock! working-mutex))
 
 
   (method package (working-wait self message delay thunk)
@@ -6265,79 +6307,23 @@
   
   (method package (working self thunk (color: color #f))
     (assert (task-mutex-owner?))
-    ;; quick solution
-    (if (render-mutex-owner?)
-        (begin
-          ;; (terminal '***WARNING*** 'working 'called 'from 'render (execution-stack))
-          (thunk))
-      (set! working? #t)
-      (set! working-color color)
-      (set! working-message #f)
-      (set! working-percentage #f)
-      (set! working-result #f)
-      (let ((thread
-              (new-thread
-                (lambda ()
-                  (unwind-protect
-                      (set! working-result (thunk))
-                    (set! working? #f)))
-                'work)))
-        (thread-base-priority-set! thread work-feedback-priority)
-        (thread-start! thread))
-      (working-loop self)
-      working-result))
-  
-  
-  (method package (task-working self thunk (color: color #f))
-    (assert (task-mutex-owner?))
+    (assert (not working?))
     (set! working? #t)
     (set! working-color color)
     (set! working-message #f)
     (set! working-percentage #f)
-    (set! working-background (capture-window-to-texture))
-    (let ((thread
-            (new-thread
-              (lambda ()
-                (feedback-loop self))
-              'feedback)))
-      (thread-base-priority-set! thread work-feedback-priority)
-      (thread-start! thread))
+    (set! working-background (render-window-to-texture))
+    (working-unlock! self)
     (prog1 (thunk)
-      (mutex-lock! working-mutex)
-      (set! working-background #f)
+      (working-lock! self)
       (set! working? #f)
-      (mutex-unlock! working-mutex)))
+      (close working-background)
+      (set! working-background #f)))
   
   
   (method package (working-progress self message percentage)
     (set! working-message message)
     (set! working-percentage percentage))
-  
-  
-  (method (working-loop self)
-    (declare (proper-tail-calls))
-    (let ((window (current-window)))
-      (let (loop)
-        (sleep .05)
-        (set! working-step (modulo (+ working-step 1) 20))
-        (when working?
-          (render-now window)
-          (loop)))))
-  
-  
-  (method (feedback-loop self)
-    (declare (proper-tail-calls))
-    (let ((window (current-window)))
-      (let (loop)
-        (sleep .05)
-        (set! working-step (modulo (+ working-step 1) 20))
-        (mutex-lock! working-mutex)
-        (if (not working?)
-            (mutex-unlock! working-mutex)
-          (render-working self)
-          (render-sync window)
-          (mutex-unlock! working-mutex)
-          (loop)))))
   
   
   (method (layout-working self)
