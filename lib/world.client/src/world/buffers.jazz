@@ -14,102 +14,176 @@
 (module world.buffers jazz
 
 
-(import (jazz.opengl.glew)
+(import (jazz.math)
+        (jazz.opengl.glew)
         (jazz.screen)
         (world.foreign)
+        (world.profile)
         (world.settings))
 
 
 (proclaim (warn optimizations))
 
 
-;; This value is large because alpha to coverage transparency produces
-;; visible dithering when alpha is not a multiple of 1/multisampling and
-;; so with 8 we get all the multiples of .125 for smooth transparency
-(definition default-multisampling
-  (cond-expand
-    ;; quick hack around what is probably a vmware bug
-    (unix 0)
-    (else 8)))
-
-
 ;;;
-;;;; Render-Target
+;;;; Framebuffer
 ;;;
 
 
-(class Render-Target extends Object
+(class Framebuffer extends Object
   
   
-  (slot color-buffer <int+> initialize #f getter generate)
-  (slot depth-buffer <int+> initialize #f getter generate)
-  (slot frame-buffer <int+> initialize #f getter generate)
-  (slot width        <int>  initialize #f getter generate)
-  (slot height       <int>  initialize #f getter generate)
+  (slot mutex                              getter generate)
+  (slot inhibit?      <bool> initialize #f getter generate)
+  (slot width         <int>  initialize #f getter generate)
+  (slot height        <int>  initialize #f getter generate)
+  (slot multisampling <int+> initialize #f getter generate)
+  (slot framebuffer   <int+> initialize #f getter generate)
+  (slot color-buffer  <int+> initialize #f getter generate)
+  (slot depth-buffer  <int+> initialize #f getter generate)
+  (slot color-texture <int+> initialize #f getter generate)
+  (slot depth-texture <int+> initialize #f getter generate)
   
   
-  (method override (initialize self width height)
+  (method override (initialize self width height (multisampling #f))
     (nextmethod self)
-    (initialize-buffers self width height))
+    (set! mutex (make-mutex 'framebuffer))
+    (receive (width height) (effective-width/height self width height)
+      (initialize-buffers self width height multisampling)))
   
   
-  (method (initialize-buffers self width height)
-    (let ((scale-factor (main-screen-scale-factor)))
-      (set! self.width (* scale-factor width))
-      (set! self.height (* scale-factor height)))
-    (initialize-multisampled self)
+  (method protected virtual (effective-width/height self width height)
+    (values width height))
+  
+  
+  (method protected virtual (initialize-buffers self width height multisampling)
+    (set! self.width width)
+    (set! self.height height)
+    (set! self.multisampling
+          ;; be robust if some multisampling 1 left in .options
+          (if (eqv? multisampling 1) 2 multisampling))
     (initialize-framebuffer self))
   
   
-  ;; Initialize using multisample extension
-  (method protected (initialize-multisampled self)
-    (let ((multisampling (world-setting 'world.multisampling (if arc-en-ciel? 1 default-multisampling))))
-      ;; color
-      (set! color-buffer (glGenRenderbuffers*))
-      (glBindRenderbuffer GL_RENDERBUFFER color-buffer)
-      (glRenderbufferStorageMultisample GL_RENDERBUFFER multisampling GL_RGBA width height)
-      (glBindRenderbuffer GL_RENDERBUFFER 0)
-      ;; depth
-      (set! depth-buffer (glGenRenderbuffers*))
-      (glBindRenderbuffer GL_RENDERBUFFER depth-buffer)
-      (glRenderbufferStorageMultisample GL_RENDERBUFFER multisampling GL_DEPTH_COMPONENT32 width height)
-      (glBindRenderbuffer GL_RENDERBUFFER 0)))
-  
-  
-  ;; Bind the color and depth buffer in a single framebuffer object
   (method protected (initialize-framebuffer self)
-    ;; frame
-    (set! frame-buffer (glGenFramebuffers*))
-    (glBindFramebuffer GL_FRAMEBUFFER frame-buffer)
+    (set! framebuffer (glGenFramebuffers*)))
+  
+  
+  (method override (destroy self)
+    (free-resources self)
+    (nextmethod self))
+  
+  
+  (method protected (add-color-buffer self)
+    (set! color-buffer (glGenRenderbuffers*))
+    (glBindRenderbuffer GL_RENDERBUFFER color-buffer)
+    (if (not multisampling)
+        (glRenderbufferStorage GL_RENDERBUFFER GL_RGBA width height)
+      (glRenderbufferStorageMultisample GL_RENDERBUFFER multisampling GL_RGBA width height))
+    (glBindRenderbuffer GL_RENDERBUFFER 0)
+    (glBindFramebuffer GL_FRAMEBUFFER framebuffer)
     (glFramebufferRenderbuffer GL_FRAMEBUFFER GL_COLOR_ATTACHMENT0 GL_RENDERBUFFER color-buffer)
+    (glBindFramebuffer GL_FRAMEBUFFER 0))
+  
+  
+  (method protected (add-depth-buffer self)
+    (set! depth-buffer (glGenRenderbuffers*))
+    (glBindRenderbuffer GL_RENDERBUFFER depth-buffer)
+    (if (not multisampling)
+        (glRenderbufferStorage GL_RENDERBUFFER GL_DEPTH_COMPONENT32 width height)
+      (glRenderbufferStorageMultisample GL_RENDERBUFFER multisampling GL_DEPTH_COMPONENT32 width height))
+    (glBindRenderbuffer GL_RENDERBUFFER 0)
+    (glBindFramebuffer GL_FRAMEBUFFER framebuffer)
     (glFramebufferRenderbuffer GL_FRAMEBUFFER GL_DEPTH_ATTACHMENT GL_RENDERBUFFER depth-buffer)
     (glBindFramebuffer GL_FRAMEBUFFER 0))
   
   
-  ;;; Set the render target for rendering
-  (method public (activate self)
-    (when frame-buffer
-      (glBindFramebuffer GL_FRAMEBUFFER frame-buffer)))
+  (method protected (add-color-texture self)
+    (let ((target (if multisampling GL_TEXTURE_2D_MULTISAMPLE GL_TEXTURE_2D)))
+      (glBindFramebuffer GL_FRAMEBUFFER framebuffer)
+      (set! color-texture (gl-generate-texture))
+      (glBindTexture target color-texture)
+      (if multisampling
+          (glTexImage2DMultisample target multisampling GL_RGBA width height #t)
+        (glTexParameteri target GL_TEXTURE_MIN_FILTER GL_LINEAR)
+        (glTexParameteri target GL_TEXTURE_MAG_FILTER GL_LINEAR)
+        (glTexImage2D target 0 GL_RGBA width height 0 GL_BGRA GL_UNSIGNED_BYTE #f))
+      (glFramebufferTexture2D GL_FRAMEBUFFER GL_COLOR_ATTACHMENT0 target color-texture 0)
+      (check-framebuffer self)
+      (glBindFramebuffer GL_FRAMEBUFFER 0)))
   
   
-  ;; Set the render target back to opengl's native buffer
-  (method public (deactivate self)
+  (method protected (add-depth-texture self)
+    (let ((target (if multisampling GL_TEXTURE_2D_MULTISAMPLE GL_TEXTURE_2D)))
+      (glBindFramebuffer GL_FRAMEBUFFER framebuffer)
+      (set! depth-texture (gl-generate-texture))
+      (glBindTexture GL_TEXTURE_2D depth-texture)
+      (if multisampling
+          (glTexImage2DMultisample target multisampling GL_DEPTH_COMPONENT width height #t)
+        (glTexParameteri GL_TEXTURE_2D GL_TEXTURE_MIN_FILTER GL_LINEAR)
+        (glTexParameteri GL_TEXTURE_2D GL_TEXTURE_MAG_FILTER GL_LINEAR)
+        (glTexImage2D GL_TEXTURE_2D 0 GL_DEPTH_COMPONENT32 width height 0 GL_DEPTH_COMPONENT GL_FLOAT #f))
+      (glFramebufferTexture2D GL_FRAMEBUFFER GL_DEPTH_ATTACHMENT GL_TEXTURE_2D depth-texture 0)
+      (check-framebuffer self)
+      (glBindFramebuffer GL_FRAMEBUFFER 0)))
+  
+  
+  (method protected (check-framebuffer self)
+    (glBindFramebuffer GL_FRAMEBUFFER framebuffer)
+    (let ((status (glCheckFramebufferStatus GL_FRAMEBUFFER)))
+      (glBindFramebuffer GL_FRAMEBUFFER 0)
+      (when (/= status GL_FRAMEBUFFER_COMPLETE)
+        (let ()
+          (define (try value msg)
+            (if (/= status value)
+                #f
+              msg))
+          
+          (error "Framebuffer: {a}"
+                 (or (try GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT_EXT "INCOMPLETE_ATTACHMENT")
+                     (try GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT_EXT "INCOMPLETE_MISSING_ATTACHMENT")
+                     (try GL_FRAMEBUFFER_INCOMPLETE_DIMENSIONS_EXT "INCOMPLETE_DIMENSIONS")
+                     (try GL_FRAMEBUFFER_INCOMPLETE_FORMATS_EXT "INCOMPLETE_FORMATS")
+                     (try GL_FRAMEBUFFER_INCOMPLETE_DRAW_BUFFER_EXT "INCOMPLETE_DRAW_BUFFER")
+                     (try GL_FRAMEBUFFER_INCOMPLETE_READ_BUFFER_EXT "INCOMPLETE_READ_BUFFER")
+                     (try GL_FRAMEBUFFER_UNSUPPORTED_EXT "UNSUPPORTED")
+                     (try GL_FRAMEBUFFER_INCOMPLETE_MULTISAMPLE_EXT "INCOMPLETE_MULTISAMPLE")
+                     status))))))
+  
+  
+  (method public (bind-framebuffer self)
+    (glBindFramebuffer GL_FRAMEBUFFER framebuffer))
+  
+  
+  (method public (unbind-framebuffer self)
     (glBindFramebuffer GL_FRAMEBUFFER 0))
+    
   
-  
-  (method public (blit self destination)
-    (glBindFramebuffer GL_READ_FRAMEBUFFER frame-buffer)
-    (glBindFramebuffer GL_DRAW_FRAMEBUFFER destination)
-    (glBlitFramebuffer 0 0 width height 0 0 width height GL_COLOR_BUFFER_BIT GL_NEAREST)
-    (glBindFramebuffer GL_READ_FRAMEBUFFER 0))
+  (method public (render-settings self)
+    (mutex-lock! mutex)
+    (prog1 (values width height multisampling)
+      (mutex-unlock! mutex)))
   
   
   (method public (resize self width height)
-    (free-resources self)
-    ;; make sure dimension never becomes 0
-    (let ((width (max 1 width))
-          (height (max 1 height)))
-      (initialize-buffers self width height)))
+    (mutex-lock! mutex)
+    (receive (width height) (effective-width/height self width height)
+      (unless (and (= width self.width)
+                   (= height self.height))
+        (if (or (= width 0)
+                (= height 0))
+            (set! inhibit? #t)
+          (set! inhibit? #f)
+          (free-resources self)
+          (initialize-buffers self width height multisampling))))
+    (mutex-unlock! mutex))
+  
+  
+  (method public (blit self destination)
+    (glBindFramebuffer GL_READ_FRAMEBUFFER framebuffer)
+    (glBindFramebuffer GL_DRAW_FRAMEBUFFER destination)
+    (glBlitFramebuffer 0 0 width height 0 0 width height GL_COLOR_BUFFER_BIT GL_NEAREST)
+    (glBindFramebuffer GL_READ_FRAMEBUFFER 0))
   
   
   (method public (free-resources self)
@@ -117,8 +191,34 @@
       (glDeleteRenderbuffers* color-buffer))
     (when depth-buffer
       (glDeleteRenderbuffers* depth-buffer))
-    (when frame-buffer
-      (glDeleteFramebuffers* frame-buffer))
+    (when color-texture
+      (gl-delete-texture color-texture))
+    (when depth-texture
+      (gl-delete-texture depth-texture))
+    (when framebuffer
+      (glDeleteFramebuffers* framebuffer))
     (set! color-buffer #f)
     (set! depth-buffer #f)
-    (set! frame-buffer #f))))
+    (set! color-texture #f)
+    (set! depth-texture #f)
+    (set! framebuffer #f)))
+
+
+;;;
+;;;; Multisampled-Framebuffer
+;;;
+
+
+(class Multisampled-Framebuffer extends Framebuffer
+  
+  
+  (method override (effective-width/height self width height)
+    (let ((scale-factor (main-screen-scale-factor)))
+      (values (scale->device width scale-factor)
+              (scale->device height scale-factor))))
+  
+  
+  (method override (initialize-buffers self width height multisampling)
+    (nextmethod self width height multisampling)
+    (add-color-buffer self)
+    (add-depth-buffer self))))
