@@ -2,7 +2,7 @@
 ;;;  WorldScheme
 ;;;===============
 ;;;
-;;;; World Procedural Content
+;;;; Procedural Zones
 ;;;
 ;;;  The Initial Developer of the Original Code is Guillaume Cartier.
 ;;;  Portions created by the Initial Developer are Copyright (C) 2012-2018
@@ -14,975 +14,252 @@
 (module world.procedural jazz
 
 
-(import (jazz.component)
-        (jazz.foreign)
-        (jazz.geometry)
-        (jazz.optimize (phase syntax))
-        (jazz.platform)
-        (jazz.syntax (phase syntax))
+(import (jazz.opengl.render)
+        (gaea.geometry)
         (world)
-        (world.biome)
-        (world.chunk)
-        (world.foreign)
-        (world.foreign.noise)
-        (world.generation.block)
-        (world.generation.building)
-        (world.layer)
-        (world.region)
-        (world.section)
-        (world.syntax (phase syntax)))
-
-
-(proclaim (not check bounds zero)
-          (warn optimizations))
+        (world.context)
+        (world.face)
+        (world.generator)
+        (world.index)
+        (world.sector)
+        (world.settings)
+        (world.texture)
+        (world.triangle)
+        (world.zone))
 
 
 ;;;
-;;;; Random
+;;;; Procedural Zones
 ;;;
 
 
-;; PUT CODE HERE TO TEST UNTIL WE HAVE LINKING
+(proclaim (warn optimizations))
 
 
-(c-include "<stdlib.h>")
-
-
-(c-declare world.foreign
-  #/C/
-    ___S64 multiplier = 0x5DEECE66D;
-    ___S64 addend = 0xB;
-    ___S64 mask = ((___S64) 1 << 48) - 1;
-    ___S64 seedUniquifier = 8682522807148012;
+;; Ideally, this would use a PRNG which we can seed with a given value.
+;; That way the map can be persisted using just the seed and a list of changes.
+(class Procedural-Zone extends Zone
+  
+  
+  (property detail-level <fl> initialize 15. accessors generate)
+  (property clamp-height <fl> initialize 65. accessors generate)
+  
+  
+  (method override (setup-generator self)
+    (set! generator (new Perlin-Generator detail-level: detail-level clamp-height: clamp-height)))
+  
+  
+  (method override (zone-editable? self)
+    (world-setting 'world.procedural-editable? #f))
+  
+  
+  (method override (zone-destructible? self)
+    (zone-editable? self))
+  
+  
+  (method override (generate-visual self sector <Sector>)
+    (let ((index (get-index sector)))
+      (let ((x (index-x index))
+            (y (index-y index))
+            (z (index-z index)))
+        (when (= y 0)
+          (let ((from-x (* x sector-size))
+                (width sector-size)
+                (from-z (* z sector-size))
+                (depth sector-size))
+            (generate-procedural self sector from-x width from-z depth 'visual)))))
+    (set-visual-uptodate? sector #t)
+    (decrease-sectors-generating self 1))
+  
+  
+  (method override (generate-physical self area revision-update?)
+    (let ((index (get-index area)))
+      (let ((x (index-x index))
+            (y (index-y index))
+            (z (index-z index)))
+        (when (= y 0)
+          (let ((from-x (* x sector-size))
+                (width sector-size)
+                (from-z (* z sector-size))
+                (depth sector-size))
+            (generate-procedural self area from-x width from-z depth 'physical))))))
+  
+  
+  ;; gambit30 quicky to pass sector and area
+  (method (generate-procedural self sector/area from-x <fx> width <fx> from-z <fx> depth <fx> what)
+    (let ((world (current-world))
+          (x-count (+ width 1))
+          (z-count (+ depth 1)))
+      (define (generator-heightmap)
+        (let ((heightmap <f32vector> (make-f32vector (* x-count z-count))))
+          (loop (for x from 0 below x-count)
+                (loop (for z from 0 below z-count)
+                      (f32vector-set! heightmap (+ (* x z-count) z)
+                        ;; max and min are quick hacks until perlin generator is fixed
+                        (max 0. (min 10. (/ (noise2 generator (cast <fl> (+ from-x x)) (cast <fl> (+ from-z z))) 5.))))))
+          heightmap))
+      
+      (generate-heightmap-old self sector/area (generator-heightmap) from-x width from-z depth what)))
+  
+  
+  ;;;
+  ;;;; Heightmap
+  ;;;
+  
+  
+  ;; gambit30 quicky to pass sector and area
+  (method (generate-heightmap-old self sector/area heightmap <f32vector> from-x <fx> width <fx> from-z <fx> depth <fx> what)
+    (define (generate-done sector)
+      (set-visual-uptodate? sector #t)
+      (set-visual-revision sector (get-revision generator))
+      (set-visual-generating? sector #f)
+      (decrease-sectors-generating self 1))
     
-    void setSeed(___S64* rand, ___S64 seed)
-    {
-        seed = ((seed) ^ multiplier) & mask;
-        *rand = seed;
-    }
-
-    ___S32 next(___S64* rand, ___S32 bits)
-    {
-        ___S64 oldseed, nextseed;
-        oldseed = *rand;
-        nextseed = (oldseed * multiplier + addend) & mask;
-        *rand = nextseed;
-        return (___S32)((___U64) nextseed >> (48 - bits));
-    }
-    
-    ___S32 randomInt(___S64* rand, ___S32 n)
-    {
-        if ((n & -n) == n)
-            return (___S32)((n * (___S64)next(rand, 31)) >> 31);
-        else
-        {
-            ___S32 bits, val;
-            do {
-                bits = next(rand, 31);
-                val = bits % n;
-            } while (bits - val + (n-1) < 0);
-            
-            return val;
-        }
-    }
-//#)
-
-
-(defoptimize inline (_initRandom rand <s64vector> seed <s64vector>) <void>
-  (c-inline
-  #/C/
-    *rand = 0;
-    setSeed(rand, *seed);
-//#))
-
-
-(definition (_newRandom seed) <s64vector>
-  (let ((rand (make-s64vector 1))
-        (seed (s64vector seed)))
-    (optimize
-      (_initRandom rand seed)
-      ;; quicky
-      0)
-    rand))
-
-
-(defoptimize inline (_getSeed rand <s64vector>) <s64>
-  (c-inline
-  #/C/
-    return *rand;
-//#))
-
-
-(defoptimize inline (_setSeed rand <s64vector> seed <s64>) <void>
-  (c-inline
-  #/C/
-    setSeed(rand, seed);
-//#))
-
-
-(defoptimize inline (_setSeedAux rand <s64vector> p <fx> q <fx> j <s64> k <s64> seed <s64>) <void>
-  (c-inline
-  #/C/
-    ___S64 j1 = (___S64)p * j;
-    ___S64 k1 = (___S64)q * k;
-    setSeed(rand, j1 ^ k1 ^ seed);
-//#))
-
-
-(defoptimize inline (_randomLong rand <s64vector>) <s64>
-  (c-inline
-  #/C/
-    return ((___S64)(next(rand, 32)) << 32) + next(rand, 32);
-//#))
-
-
-(defoptimize inline (_randomInt rand <s64vector> n <fx>) <fx>
-  (c-inline
-  #/C/
-    return randomInt(rand, n);
-//#))
-
-
-(definition public (_randomIntBetween rand min <fx> max <fx>) <fx>
-  (+ min (_randomInt rand (+ (- max min) 1))))
-
-
-(definition public (_randomBool rand) <bool>
-  (= (_randomInt rand 2) 1))
-
-
-(defoptimize inline (_randomFloat rand <s64vector>) <fl>
-  (c-inline
-  #/C/
-    return next(rand, 24) / ((float)((___S64) 1 << 24));
-//#))
-
-
-;;;
-;;;; Generation
-;;;
-
-
-(c-declare world.foreign
-  #/C/
-    ___S64 worldSeed;
-    ___S64 chunkSeed;
-    
-    void initChunkSeed(___S64 arg1, ___S64 arg2)
-    {
-        chunkSeed = worldSeed;
-        chunkSeed *= chunkSeed * 6364136223846793005 + 1442695040888963407;
-        chunkSeed += arg1;
-        chunkSeed *= chunkSeed * 6364136223846793005 + 1442695040888963407;
-        chunkSeed += arg2;
-        chunkSeed *= chunkSeed * 6364136223846793005 + 1442695040888963407;
-        chunkSeed += arg1;
-        chunkSeed *= chunkSeed * 6364136223846793005 + 1442695040888963407;
-        chunkSeed += arg2;
-    }
-    
-    ___S32 nextInt(___S32 n)
-    {
-        ___S32 i = (___S32)((chunkSeed >> 24) % (___S64) n);
-    
-        if (i < 0)
-        {
-            i += n;
-        }
-    
-        chunkSeed *= chunkSeed * 6364136223846793005 + 1442695040888963407;
-        chunkSeed += worldSeed;
-        
-        return i;
-    }
-//#)
-
-
-(defoptimize inline (_worldSeed) <s64>
-  (c-inline
-  #/C/
-    return worldSeed;
-//#))
-
-
-(c-external (_initWorldSeed int64) void
-  #/C/
-    worldSeed = ___arg1;
-//#)
-
-
-(c-external (_initChunkSeed int64 int64) void
-  #/C/
-    initChunkSeed(___arg1, ___arg2);
-//#)
-
-
-(c-external (_nextInt int32) int32 <fx>
-  #/C/
-    ___return(nextInt(___arg1));
-//#)
-
-
-;;;
-;;;; Optimize
-;;;
-
-
-;; for optimize tests
-(c-declare world.procedural #/C/
-#define ___BODYREF(x, y) ___CAST(___SCMOBJ*, ___BODY(x))[y]
-#define ___S32BODYREF(x, y) ___CAST(___S32*, ___BODY(x))[y]
-#define ___S32BODYSET(x, y, z) ___CAST(___S32*, ___BODY(x))[y] = (z)
-#define ___F64BODYREF(x, y) ___CAST(___F64*, ___BODY(x))[y]
-#define ___F64BODYSET(x, y, z) ___CAST(___F64*, ___BODY(x))[y] = (z)
-
-inline int even(int x)
-{
-    return (x % 2) == 0;
-}
-
-inline int odd(int x)
-{
-    return (x % 2) != 0;
-}
-
-inline int floor_divide(int n, int d)
-{
-    return floor((double) n / (double) d);
-}
-//#)
-
-
-;; ADD CORRECT BOOLEAN SUPPORT FOR generate-skylight
-
-
-;; TO THINK IS IT OK TO TOUCH EVEN WHEN REFING?????
-(defoptimize inline (shaping-section-no-touch shapings <vector> j <fx>) <World-Section>
-  (let ((y (quotient/ j 16)))
-    (let ((section <World-Section> (vector-ref shapings y)))
-      section)))
-
-(defoptimize inline (shaping-section shapings <vector> j <fx>) <World-Section>
-  (let ((y (quotient/ j 16)))
-    (let ((section <World-Section> (vector-ref shapings y)))
-      (set-touched section 1)
-      section)))
-
-
-(defoptimize inline (local-index i <fx> j <fx> k <fx>) <fx>
-  (+ (* j 256) (* k 16) i))
-
-
-(defoptimize inline (u4vector-set! field <u8vector> index <fx> value <fx>) <void>
-  (let ((offset (quotient index 2)))
-    (let ((byte (u8vector-ref field offset)))
-      (u8vector-set! field offset
-        (if (even? index)
-            (bitwise-ior value (bitwise-and byte #xF0))
-          (bitwise-ior (bitwise-and byte #x0F) (arithmetic-shift-left value 4)))))))
-
-
-;; QUICK HACK AROUND DUPLICATION THAT NEEDS LINKING LOGIC
-(defoptimize inline (chunk-blocks section <World-Section>) <u8vector>
-  (get-blocks section))
-
-
-;; QUICK HACK AROUND DUPLICATION THAT NEEDS LINKING LOGIC
-(defoptimize inline (shaping-blocks-no-touch shapings <vector> j <fx>) <u8vector>
-  (chunk-blocks (shaping-section-no-touch shapings j)))
-
-(defoptimize inline (shaping-blocks shapings <vector> j <fx>) <u8vector>
-  (chunk-blocks (shaping-section shapings j)))
-
-
-(defoptimize inline (block-ref shapings <vector> i <fx> j <fx> k <fx>) <fx>
-  (u8vector-ref (shaping-blocks-no-touch shapings j) (local-index i (modulo j 16) k)))
-
-
-(defoptimize inline (block-set! shapings <vector> i <fx> j <fx> k <fx> block-id <fx>) <void>
-  (u8vector-set! (shaping-blocks shapings j) (local-index i (modulo j 16) k) block-id))
-
-
-(defoptimize inline (data-set! shapings <vector> i <fx> j <fx> k <fx> data-id <fx>) <void>
-  (u4vector-set! (get-data (shaping-section shapings j)) (local-index i (modulo j 16) k) data-id))
-
-
-(defoptimize inline (skylight-set! shapings <vector> i <fx> j <fx> k <fx> value <fx>) <void>
-  (u4vector-set! (get-skylight (shaping-section shapings j)) (local-index i (modulo j 16) k) value))
-
-
-;; TEMP COPIED
-;; QUICK HACK AROUND DUPLICATION THAT NEEDS LINKING LOGIC
-(defoptimize inline (get-block-variants) <fx>
-  block-variants)
-
-(defoptimize inline (decode-fxid id <fx>) <fx>
-  (quotient/ id (get-block-variants)))
-
-(defoptimize inline (decode-variant-id id <fx>) <fx>
-  (- (modulo id (get-block-variants)) 1))
-
-
-(defoptimize inline (blockstate-set! shapings <vector> i <fx> j <fx> k <fx> id <fx>) <void>
-  (let ((block-id (decode-fxid id))
-        (data-id (decode-variant-id id)))
-    (block-set! shapings i j k block-id)
-    (when (> data-id 0)
-      (data-set! shapings i j k data-id))))
-
-
-;;;
-;;;; Generator
-;;;
-
-
-(class Generator extends Component
-  
-  
-  (property revision <fx> initialize 0 accessors generate)
-  
-  
-  (method package virtual (empty? self)
-    #f)
-  
-  
-  (method package virtual (free self)
-    )
-  
-  
-  (method protected (increase-revision self)
-    (increase! revision))
-  
-  
-  (method package virtual (noise2 self x <fl> y <fl>) <fl>
-    )
-  
-  
-  (method package virtual (shape self chunk <World-Chunk> shapings)
-    )
-  
-  
-  (method protected virtual (generate-variations self chunk-x chunk-z region-x region-z)
-    )
-  
-  
-  (defoptimize (touched-top-y shapings <vector>) <fx>
-    (continuation-capture
-      (lambda (return)
-        (for (y 15 (>= y 0) (decrease! y))
-             (let ((section <World-Section> (vector-ref shapings y)))
-               (when (= (get-touched section) 1)
-                 (continuation-return return (* y 16)))))
-        -1)))
-  
-  
-  (method (generate-heightmap self chunk <World-Chunk> shapings <vector>)
-    (site heightmap
-      (optimize
-        (let ((heightmap (get-heightmap chunk))
-              (top-y (touched-top-y shapings)))
-          (for (x 0 (< x 16) (increase! x))
-               (for (z 0 (< z 16) (increase! z))
-                    (continuation-capture
-                      (lambda (break)
-                        (let ((y (+ top-y 15)))
-                          (for ()
-                               (if (= (block-ref shapings x y z) 0)
-                                   (decrease! y)
-                                 (vector-set! heightmap (+ x (* z 16)) (+ y 1))
-                                 (continuation-return break))))))))))))
-  
-  
-  ;; to think correctly
-  (definition (touched-top-y2 shapings <vector>) <fx>
-    (continuation-capture
-      (lambda (return)
-        (for (y 15 (>= y 0) (decrease! y))
-             (let ((section <World-Section> (vector-ref shapings y)))
-               (when (get-chunk section)
-                 (continuation-return return (* y 16)))))
-        -1)))
-
-
-  (method package (generate-skylight self chunk <World-Chunk> shapings <vector>)
-    (site skylight
-      (let ((top-y (touched-top-y2 shapings)))
-        (unless (= top-y -1)
-          (optimize
-            (let ((heightmap (get-heightmap chunk)))
-              (for (x 0 (< x 16) (increase! x))
-                   (for (z 0 (< z 16) (increase! z))
-                        (let ((heightmap-set? #f))
-                          (continuation-capture
-                            (lambda (break)
-                              (let ((y (+ top-y 15)) (light 15))
-                                (for ()
-                                     (let ((opacity (get-opacity (cast <Block> (vector-ref blockids (* (block-ref shapings x y z) block-variants)))))
-                                           @optimize (opacity (get-opacity (id->block (block-ref shapings x y z)))))
-                                       (unless heightmap-set?
-                                         (when (/= opacity 0)
-                                           (vector-set! heightmap (+ x (* z 16)) (+ y 1))
-                                           (set! heightmap-set? #t)))
-                                       (when (and (= opacity 0) (/= light 15))
-                                         (set! opacity 1))
-                                       (decrease! light opacity)
-                                       (when (> light 0)
-                                         (skylight-set! shapings x y z light))
-                                       (if (or (<= y 0) (<= light 0))
-                                           (continuation-return break)
-                                         (decrease! y))))))))))))))))
-  
-  
-  (method package virtual (populate self chunk front corner right)
-    ))
-
-
-;;;
-;;;; Empty
-;;;
-
-
-(class Empty-Generator extends Generator
-  
-  
-  (method override (empty? self)
-    #t))
-
-
-;;;
-;;;; Flat
-;;;
-
-
-(class Flat-Generator extends Generator
-  
-  
-  (method override (shape self chunk <World-Chunk> shapings)
-    (loop (for i from 0 below 16)
-          (loop (for k from 0 below 16)
-                (block-set! shapings i 0 k Bedrock)
-                (block-set! shapings i 1 k Dirt)
-                (block-set! shapings i 2 k Dirt)
-                (block-set! shapings i 3 k Grass)))
-    (generate-heightmap self chunk shapings)))
-
-
-;;;
-;;;; World
-;;;
-
-
-(defoptimize coordinate-scale <fl>
-  684.412) ;; 684.412
-
-
-(defoptimize height-scale <fl>
-  684.412) ;; 684.412
-
-
-(defoptimize depth-noise-scale-x <fl>
-  200.) ;; 200.
-
-(defoptimize depth-noise-scale-z <fl>
-  200.) ;; 200.
-
-
-(defoptimize main-noise-scale-x <fl>
-  80.) ;; 80.
-
-(defoptimize main-noise-scale-y <fl>
-  160.) ;; 160.
-
-(defoptimize main-noise-scale-z <fl>
-  80.) ;; 80.
-
-
-(defoptimize base-size <fl>
-  8.5) ;; 8.5
-
-
-(defoptimize lower-limit-scale <fl>
-  512.) ;; 512.
-
-(defoptimize upper-limit-scale <fl>
-  512.) ;; 512.
-
-
-(defoptimize default-base-height <fl>
-  .125) ;; .125
-
-(defoptimize default-height-variation <fl>
-  .05) ;; .05
-
-
-(defoptimize stretch-y <fl>
-  12.) ;; 12.
-
-
-(defoptimize biome-depth-weight <fl>
-  1.) ;; 1.
-
-(defoptimize biome-depth-offset <fl>
-  0.) ;; 0.
-
-(defoptimize biome-scale-weight <fl>
-  1.) ;; 1.
-
-(defoptimize biome-scale-offset <fl>
-  0.) ;; 0.
-
-
-(definition rand-seed
-  42)
-
-(definition rand
-  (newRandom rand-seed))
-
-
-(definition _rand <s64vector>
-  (_newRandom rand-seed))
-
-
-(defoptimize inline (clamp a <fl> b <fl> w <fl>) <fl>
-  (cond ((< w 0.) a)
-        ((> w 1.) b)
-        (else (+ a (* (- b a) w)))))
-
-
-(defoptimize inline (smooth x <fl>) <fl>
-  (* x x x (+ (* x (- (* x 6.) 15.)) 10.)))
-
-
-(defoptimize grad-x <f64vector>
-  #f64(1. -1. 1. -1. 1. -1. 1. -1. 0. 0. 0. 0. 1. 0. -1. 0.))
-
-(defoptimize grad-y <f64vector>
-  #f64(1. 1. -1. -1. 0. 0. 0. 0. 1. -1. 1. -1. 1. -1. 1. -1.))
-
-(defoptimize grad-z <f64vector>
-  #f64(0. 0. 0. 0. 1. 1. -1. -1. 1. 1. -1. -1. 0. 1. 0. -1.))
-
-(defoptimize inline (grad index <fx> x <fl> y <fl> z <fl>) <fl>
-  (let ((i (bitwise-and index #b1111)))
-    (+ (* (f64vector-ref grad-x i) x) (* (f64vector-ref grad-y i) y) (* (f64vector-ref grad-z i) z))))
-
-(defoptimize inline (grad-2d index <fx> x <fl> z <fl>) <fl>
-  (let ((i (bitwise-and index #b1111)))
-    (+ (* (f64vector-ref grad-x i) x) (* (f64vector-ref grad-z i) z))))
-
-
-(defoptimize inline (lerp a <fl> b <fl> w <fl>) <fl>
-  (+ a (* w (- b a))))
-
-
-(class Perlin-Attributes extends Object
-  
-  
-  (slot permutations <s32vector> initialize (make-s32vector 512) getter generate)
-  (slot x-coord      <fl>        initialize 0.                   getter generate)
-  (slot y-coord      <fl>        initialize 0.                   getter generate)
-  (slot z-coord      <fl>        initialize 0.                   getter generate)
-  
-  
-  (method override (initialize self)
-    (setSeed rand rand-seed)
-    (set! x-coord (* (randomFloat rand) 256.))
-    (set! y-coord (* (randomFloat rand) 256.))
-    (set! z-coord (* (randomFloat rand) 256.))
-    (loop (for i from 0 below 256)
-          (s32vector-set! permutations i i))
-    (loop (for j from 0 below 256)
-          (let ((rnd (randomIntBetween rand j 255))
-                (temp (s32vector-ref permutations j)))
-            (s32vector-set! permutations j (s32vector-ref permutations rnd))
-            (s32vector-set! permutations rnd temp)
-            (s32vector-set! permutations (+ j 256) (s32vector-ref permutations j))))))
-
-
-(class World-Generator extends Generator
-  
-  
-  (slot biome-weights     <f64vector> initialize (make-f64vector 25 0.) getter generate)
-  (slot main-attributes               initialize (make-vector 8  (new Perlin-Attributes)) getter generate)
-  (slot min-attributes                initialize (make-vector 16 (new Perlin-Attributes)) getter generate)
-  (slot max-attributes                initialize (make-vector 16 (new Perlin-Attributes)) getter generate)
-  (slot depth-attributes              initialize (make-vector 16 (new Perlin-Attributes)) getter generate)
-  
-  
-  (method override (prepare self rest)
-    (nextmethod self rest)
-    (for (i -2 (< i 3) (increase! i))
-         (for (j -2 (< j 3) (increase! j))
-              (f64vector-set! biome-weights (+ i 2 (* (+ j 2) 5)) (/ 10. (sqrt (+ (* (cast <fl> i) (cast <fl> i)) (* (cast <fl> j) (cast <fl> j)) .2)))))))
-  
-  
-  (method override (shape self chunk <World-Chunk> shapings)
-    (let ((region <World-Region> (get-region chunk)))
-      (setSeed rand rand-seed)
-      (generate-blocks self shapings (generate-variations self (get-x region) (get-z region) (get-x chunk) (get-z chunk)))
-      (replace-biome-blocks self chunk shapings)
-      (generate-caverns self chunk shapings)
-      (generate-heightmap self chunk shapings)))
-  
-  
-  (method override (generate-variations self region-x <fx> region-z <fx> chunk-x <fx> chunk-z <fx>) <f64vector>
-    (site variations
-      (let ((chunk-offset-x (* (+ (cast <fl> chunk-x) (* 32. (cast <fl> region-x))) 4.))
-            (chunk-offset-z (* (+ (cast <fl> chunk-z) (* 32. (cast <fl> region-z))) 4.)))
-        (let ((depth-region (generate-perlin-noise self depth-attributes chunk-offset-x 10. chunk-offset-z 5 1 5 depth-noise-scale-x 1. depth-noise-scale-z))
-              (main-noise (generate-perlin-noise self main-attributes chunk-offset-x 0. chunk-offset-z 5 33 5 (/ coordinate-scale main-noise-scale-x) (/ height-scale main-noise-scale-y) (/ coordinate-scale main-noise-scale-z)))
-              (min-limit-region (generate-perlin-noise self min-attributes chunk-offset-x 0. chunk-offset-z 5 33 5 coordinate-scale height-scale coordinate-scale))
-              (max-limit-region (generate-perlin-noise self max-attributes chunk-offset-x 0. chunk-offset-z 5 33 5 coordinate-scale height-scale coordinate-scale))
-              (variations (make-f64vector 825 0.))
-              (biomes (generate-variations-biomes region-x region-z chunk-x chunk-z))
-              (variations-index 0)
-              (depth-index 0))
-          (optimize
-            (for (x 0 (< x 5) (increase! x))
-                 (for (z 0 (< z 5) (increase! z))
-                      (let ((total-height-var <fl> 0.)
-                            (total-height <fl> 0.)
-                            (total-weight <fl> 0.)
-                            (biome (cast <Biome> (vector-ref biome-ids @optimize id->biome (s32vector-ref biomes (+ x 2 (* (+ z 2) 10)))))))
-                        (for (biome-x -2 (<= biome-x 2) (increase! biome-x))
-                             (for (biome-z -2 (<= biome-z 2) (increase! biome-z))
-                                  (let ((biome1 (cast <Biome> (vector-ref biome-ids @optimize id->biome (s32vector-ref biomes (+ x biome-x 2 (* (+ z biome-z 2) 10)))))))
-                                    (let ((base-height <fl> (+ biome-depth-offset (* (get-base biome1) biome-depth-weight)))
-                                          (height-variation <fl> (+ biome-scale-offset (* (get-variation biome1) biome-scale-weight))))
-                                      (let ((weight <fl> (/ (f64vector-ref biome-weights (+ biome-x 2 (* (+ biome-z 2) 5))) (+ base-height 2.))))
-                                        (when (> (get-base biome1) (get-base biome))
-                                          (divide! weight 2.))
-                                        (increase! total-height-var (* height-variation weight))
-                                        (increase! total-height (* base-height weight))
-                                        (increase! total-weight weight))))))
-                        (set! total-height-var (+ (* (/ total-height-var total-weight) .9) .1))
-                        (set! total-height (/ (- (* (/ total-height total-weight) 4.) 1) 8.))
-                        (let ((depth-factor <fl> (/ (f64vector-ref depth-region depth-index) 8000.)))
-                          (if (< depth-factor 0.)
-                              (set! depth-factor (- (* depth-factor -0.9) 2.))
-                            (set! depth-factor (- (* depth-factor 3.) 2.)))
-                          (if (< depth-factor 0.)
-                              (if (< depth-factor -2.)
-                                  (set! depth-factor (/ -5. 14.))
-                                (divide! depth-factor 5.6))
-                            (if (> depth-factor 1.)
-                                (set! depth-factor 1.)
-                              (divide! depth-factor 8.)))
-                          (increase! depth-index)
-                          (set! total-height (* (+ total-height (* depth-factor .2)) (/ base-size 8.)))
-                          (let ((height-factor <fl> (+ base-size (* total-height 4.))))
-                            (for (y 0 (< y 33) (increase! y))
-                                 (let ((min-height <fl> (* (- y height-factor) (/ stretch-y 2. total-height-var))))
-                                   (when (< min-height 0.)
-                                     (multiply! min-height 4.))
-                                   (let ((min-limit <fl> (/ (f64vector-ref min-limit-region variations-index) lower-limit-scale))
-                                         (max-limit <fl> (/ (f64vector-ref max-limit-region variations-index) upper-limit-scale))
-                                         (main-height <fl> (/ (+ (/ (f64vector-ref main-noise variations-index) 10.) 1.) 2.)))
-                                     (let ((normalized-height <fl> (- (clamp min-limit max-limit main-height) min-height)))
-                                       (when (> y 29)
-                                         (let ((d6 (/ (- (cast <fl> y) 29.) 3.)))
-                                           (set! normalized-height (+ (* normalized-height (- 1. d6)) (* -10. d6)))))
-                                       (f64vector-set! variations variations-index normalized-height)
-                                       (increase! variations-index)))))))))))
-          variations))))
-  
-  
-  (definition sea-level <fx>
-    63)
-
-  
-  (method (generate-blocks self shapings <vector> variations <f64vector>)
-    (site blocks
-      (optimize
-        (for (i 0 (< i 4) (increase! i))
-             (let ((j (* i 5))
-                   (k (* (+ i 1) 5)))
-               (for (l 0 (< l 4) (increase! l))
-                    (let ((i1 (* (+ j l) 33))
-                          (j1 (* (+ j l 1) 33))
-                          (k1 (* (+ k l) 33))
-                          (l1 (* (+ k l 1) 33)))
-                      (for (i2 0 (< i2 32) (increase! i2))
-                           (let ((d1 (f64vector-ref variations (+ i1 i2)))
-                                 (d2 (f64vector-ref variations (+ j1 i2)))
-                                 (d3 (f64vector-ref variations (+ k1 i2)))
-                                 (d4 (f64vector-ref variations (+ l1 i2))))
-                             (let ((d5 (/ (- (f64vector-ref variations (+ i1 i2 1)) d1) 8.))
-                                   (d6 (/ (- (f64vector-ref variations (+ j1 i2 1)) d2) 8.))
-                                   (d7 (/ (- (f64vector-ref variations (+ k1 i2 1)) d3) 8.))
-                                   (d8 (/ (- (f64vector-ref variations (+ l1 i2 1)) d4) 8.)))
-                               (for (j2 0 (< j2 8) (increase! j2))
-                                    (let ((d9 d1)
-                                          (d10 d2)
-                                          (y (+ j2 (* i2 8))))
-                                      (let ((d11 (/ (- d3 d1) 4.))
-                                            (d12 (/ (- d4 d2) 4.)))
-                                        (for (k2 0 (< k2 4) (increase! k2))
-                                             (let ((d13 (/ (- d10 d9) 4.))
-                                                   (x (+ k2 (* i 4))))
-                                               (let ((lvt-45-1 d9))
-                                                 (for (l2 0 (< l2 4) (increase! l2))
-                                                      (let ((z (+ l2 (* l 4))))
-                                                        (if (<= y (_randomInt _rand 5))
-                                                            (block-set! shapings x y z 7)
-                                                          (if (> lvt-45-1 0.)
-                                                              (block-set! shapings x y z 1)
-                                                            (when (< y sea-level)
-                                                              (block-set! shapings x y z 9)))))
-                                                      (set! lvt-45-1 (+ lvt-45-1 d13)))
-                                                 (set! d9 (+ d9 d11))
-                                                 (set! d10 (+ d10 d12)))))
-                                        (set! d1 (+ d1 d5))
-                                        (set! d2 (+ d2 d6))
-                                        (set! d3 (+ d3 d7))
-                                        (set! d4 (+ d4 d8)))))))))))))))
-
-
-  (method (replace-biome-blocks self chunk <World-Chunk> shapings <vector>)
-    (site replace
-      (let ((biomes (get-biomes chunk)))
-        (loop (for x from 0 below 16)
-              (loop (for z from 0 below 16)
-                    (let ((biome <Biome> (id->biome (u8vector-ref biomes (+ x (* z 16))))))
-                      (replace-blocks biome x z _rand shapings)))))))
-  
-  
-  (definition _tunnel-rand <s64vector>
-    (_newRandom rand-seed))
-  
-  
-  (defoptimize (add-tunnel shapings <vector> _tunnel-rand <s64vector> _rand <s64vector> range <fx> PI <fl> seed <s64> chunkX <fx> chunkZ <fx> rx <fl> ry <fl> rz <fl> p_180702_12_ <fl> p_180702_13_ <fl> p_180702_14_ <fl> p_180702_15_ <fx> p_180702_16_ <fx> p_180702_17_ <fl>) <void>
-    (continuation-capture
-      (lambda (return)
-        (let ((Air 0)
-              (Water 8)
-              (StationaryWater 9)
-              (d0 (+ (* (cast <fl> chunkX) 16.) 8.))
-              (d1 (+ (* (cast <fl> chunkZ) 16.) 8.))
-              (f0 0.)
-              (f1 0.))
-          (let ((random _tunnel-rand @wait-is-this-really-necessary (newRandom seed)))
-            ;; quick try
-            (_setSeed random seed)
-            (when (<= p_180702_16_ 0)
-              (let ((i (- (* range 16) 16)))
-                (set! p_180702_16_ (- i (_randomInt random (/ i 4))))))
-            (let ((flag2 #f))
-              (when (= p_180702_15_ -1)
-                (set! p_180702_15_ (quotient/ p_180702_16_ 2))
-                (set! flag2 #t))
-              (let ((j (+ (_randomInt random (quotient/ p_180702_16_ 2)) (quotient/ p_180702_16_ 4)))
-                    (flag (= (_randomInt random 6) 0)))
-                (continuation-capture
-                  (lambda (continue)
-                    (for (p_180702_15_quicky p_180702_15_ (< p_180702_15_quicky p_180702_16_) (increase! p_180702_15_quicky))
-                         (let ((d2 (+ 1.5 (* (sin
-                                               (/ (* (cast <fl> p_180702_15_quicky) PI)
-                                                  (cast <fl> p_180702_16_)))
-                                             p_180702_12_))))
-                           (let ((d3 (* d2 p_180702_17_))
-                                 (f2 (cos p_180702_14_))
-                                 (f3 (sin p_180702_14_)))
-                             (set! rx (+ rx (* (cos p_180702_13_) f2)))
-                             (set! ry (+ ry f3))
-                             (set! rz (+ rz (* (sin p_180702_13_) f2)))
-                             (if flag
-                                 (set! p_180702_14_ (* p_180702_14_ .92))
-                               (set! p_180702_14_ (* p_180702_14_ .7)))
-                             (set! p_180702_14_ (+ p_180702_14_ (* f1 .1)))
-                             (increase! p_180702_13_ (* f0 .1))
-                             (set! f1 (* f1 .9))
-                             (set! f0 (* f0 .75))
-                             (set! f1 (+ f1 (* (- (_randomFloat random) (_randomFloat random)) (_randomFloat random) 2.)))
-                             (set! f0 (+ f0 (* (- (_randomFloat random) (_randomFloat random)) (_randomFloat random) 4.)))
-                             (when (and (not flag2)
-                                        (= p_180702_15_quicky j)
-                                        (> p_180702_12_ 1.)
-                                        (> p_180702_16_ 0))
-                               (add-tunnel shapings _tunnel-rand _rand range PI (_randomLong random) chunkX chunkZ rx ry rz (+ (* (_randomFloat random) .5) .5) (- p_180702_13_ (/ PI 2.)) (/ p_180702_14_ 3.) p_180702_15_quicky p_180702_16_ 1.)
-                               (add-tunnel shapings _tunnel-rand _rand range PI (_randomLong random) chunkX chunkZ rx ry rz (+ (* (_randomFloat random) .5) .5) (+ p_180702_13_ (/ PI 2.)) (/ p_180702_14_ 3.) p_180702_15_quicky p_180702_16_ 1.)
-                               (continuation-return return))
-                             (when (or flag2 (/= (_randomInt random 4) 0))
-                               (let ((d4 (- rx d0))
-                                     (d5 (- rz d1))
-                                     (d6 (- (cast <fl> p_180702_16_) (cast <fl> p_180702_15_quicky)))
-                                     (d7 (+ p_180702_12_ 2. 16.)))
-                                 (when (> (- (+ (* d4 d4) (* d5 d5))
-                                             (* d6 d6))
-                                          (* d7 d7))
-                                   (continuation-return return))
-                                 (when (and (>= rx (- (- d0 16.) (* d2 2.)))
-                                            (>= rz (- (- d1 16.) (* d2 2.)))
-                                            (<= rx (+ d0 16. (* d2 2.)))
-                                            (<= rz (+ d1 16. (* d2 2.))))
-                                   (let ((k2 (- (- (fxfloor (- rx d2)) (* chunkX 16)) 1))
-                                         (k (+ (- (fxfloor (+ rx d2)) (* chunkX 16)) 1))
-                                         (l2 (- (fxfloor (- ry d3)) 1))
-                                         (l (+ (fxfloor (+ ry d3)) 1))
-                                         (i3 (- (- (fxfloor (- rz d2)) (* chunkZ 16)) 1))
-                                         (i1 (+ (- (fxfloor (+ rz d2)) (* chunkZ 16)) 1)))
-                                     (when (< k2 0) (set! k2 0))
-                                     (when (> k 16) (set! k 16))
-                                     (when (< l2 1) (set! l2 1))
-                                     (when (> l 248) (set! l 248))
-                                     (when (< i3 0) (set! i3 0))
-                                     (when (> i1 16) (set! i1 16))
-                                     (let ((flag3 #f))
-                                       (for (j1 k2 (and (not flag3) (< j1 k)) (increase! j1))
-                                            (for (k1 i3 (and (not flag3) (< k1 i1)) (increase! k1))
-                                                 (for (l1 (+ l 1) (and (not flag3) (>= l1 (- l2 1))) (decrease! l1))
-                                                      (when (and (>= l1 0) (< l1 256))
-                                                        (let ((block <fx> (block-ref shapings j1 l1 k1)))
-                                                          (when (or (= block Water)
-                                                                    (= block StationaryWater))
-                                                            (set! flag3 #t))
-                                                          (when (and (/= l1 (- l2 1))
-                                                                     (/= j1 k2)
-                                                                     (/= j1 (- k 1))
-                                                                     (/= k1 i3)
-                                                                     (/= k1 (- i1 1)))
-                                                            (set! l1 l2)))))))
-                                       (unless flag3
-                                         (for (j3 k2 (< j3 k) (increase! j3))
-                                              (let ((d10 (/ (- (+ (cast <fl> j3) (* (cast <fl> chunkX) 16.) .5) rx) d2)))
-                                                (for (i2 i3 (< i2 i1) (increase! i2))
-                                                     (let ((d8 (/ (- (+ (cast <fl> i2) (* (cast <fl> chunkZ) 16.) .5) rz) d2)))
-                                                       (when (< (+ (* d10 d10) (* d8 d8)) 1.)
-                                                         (for (j2 l (> j2 l2) (decrease! j2))
-                                                              (let ((d9 (/ (- (+ (- (cast <fl> j2) 1.) .5) ry) d3)))
-                                                                (when (and (> d9 -.7)
-                                                                           (< (+ (* d10 d10) (* d9 d9) (* d8 d8)) 1.))
-                                                                  (block-set! shapings j3 j2 i2 Air)))))))))
-                                         (when flag2
-                                           (continuation-return continue #f))))))))))))))))))))
-  
-  
-  (defoptimize (add-room shapings <vector> _tunnel-rand <s64vector> _rand <s64vector> range <fx> PI <fl> seed <s64> chunkX <fx> chunkZ <fx> rx <fl> ry <fl> rz <fl>) <void>
-    (add-tunnel shapings _tunnel-rand _rand range PI seed chunkX chunkZ rx ry rz (+ 1.0 (* (_randomFloat _rand) 6.0)) 0.0 0.0 -1 -1 0.5))
-  
-  
-  (defoptimize (recursive-generate shapings <vector> _tunnel-rand <s64vector> _rand <s64vector> range <fx> PI <fl> p <fx> q <fx> chunkX <fx> chunkZ <fx>) <void>
-    (let ((i (_randomInt _rand (+ (_randomInt _rand (+ (_randomInt _rand 15) 1)) 1))))
-      (when (/= (_randomInt _rand 7) 0)
-        (set! i 0))
-      (for (j 0 (< j i) (increase! j))
-           (let ((rx (cast <fl> (+ (* p 16) (_randomInt _rand 16))))
-                 (ry (cast <fl> (_randomInt _rand (+ (_randomInt _rand 120) 8))))
-                 (rz (cast <fl> (+ (* q 16) (_randomInt _rand 16))))
-                 (k 1))
-             (when (= (_randomInt _rand 4) 0)
-               (add-room shapings _tunnel-rand _rand range PI (_randomLong _rand) chunkX chunkZ rx ry rz)
-               (increase! k (_randomInt _rand 4)))
-             (for (l 0 (< l k) (increase! l))
-                  (let ((f0 (* (_randomFloat _rand) (* PI 2.)))
-                        (f1 (/ (* (- (_randomFloat _rand) .5) 2.) 8.))
-                        (f2 (+ (* (_randomFloat _rand) 2.) (_randomFloat _rand))))
-                    (when (= (_randomInt _rand 10) 0)
-                      (multiply! f2 (+ (* (_randomFloat _rand) (_randomFloat _rand) 3.) 1.)))
-                    (add-tunnel shapings _tunnel-rand _rand range PI (_randomLong _rand) chunkX chunkZ rx ry rz f2 f0 f1 0 0 1.)))))))
-  
-  
-  (method (generate-caverns self chunk <World-Chunk> shapings <vector>) <void>
-    (site caverns
-      (let ((x (get-x chunk))
-            (z (get-z chunk)))
-        (optimize
-          (let ((range 8))
-            (let ((i range)
-                  (worldSeed (_worldSeed)))
-              (_setSeed _rand worldSeed)
-              (let ((j (_randomLong _rand))
-                    (k (_randomLong _rand)))
-                (for (p (- x i) (<= p (+ x i)) (increase! p))
-                     (for (q (- z i) (<= q (+ z i)) (increase! q))
-                          (_setSeedAux _rand p q j k worldSeed)
-                          ;; passing _tunnel-rand _rand range and PI is a quicky that should be done correctly by optimize
-                          (recursive-generate shapings _tunnel-rand _rand range PI p q x z))))))))))
-  
-  
-  (method override (populate self chunk front corner right)
-    (site populate
-      ;; topleft of corner chunk is center of populate
-      (let ((biome (id->biome (u8vector-ref (get-biomes (vector-ref corner 32)) 0))))
-        (decorate-biome biome rand _rand chunk front corner right))))
-  
-  
-  (method (generate-perlin-noise self attributes <vector> x-offset <fl> y-offset <fl> z-offset <fl> x-size <fx> y-size <fx> z-size <fx> x-scale <fl> y-scale <fl> z-scale <fl>) <f64vector>
-    (let ((noise (make-f64vector (* x-size y-size z-size) 0.))
-          (octaves (vector-length attributes)))
-      (let (iter (i 0) (scaling 1.))
-        (if (< i octaves)
-            (let ((scaled-x-offset (* scaling x-offset x-scale))
-                  (scaled-y-offset (* scaling y-offset y-scale))
-                  (scaled-z-offset (* scaling z-offset z-scale)))
-              (generate-noise-octave self noise (vector-ref attributes i) (flmodulo scaled-x-offset 16777216.) scaled-y-offset (flmodulo scaled-z-offset 16777216.) x-size y-size z-size (* x-scale scaling) (* y-scale scaling) (* z-scale scaling) scaling)
-              (iter (+ i 1) (/ scaling 2.)))
-          noise))))
-  
-  
-  (method (generate-noise-octave self noise <f64vector> attributes <Perlin-Attributes> x-offset <fl> y-offset <fl> z-offset <fl> x-size <fx> y-size <fx> z-size <fx> x-scale <fl> y-scale <fl> z-scale <fl> scaling <fl>)
-    (optimize
-      (let ((permutations (get-permutations attributes))
-            (x-coord (get-x-coord attributes))
-            (y-coord (get-y-coord attributes))
-            (z-coord (get-z-coord attributes)))
-        (if (= y-size 1)
-            (let ((j 0)
-                  (i5 0)
-                  (j5 0)
-                  (k5 0)
-                  (d14 0.)
-                  (d15 0.)
-                  (d21 0.)
-                  (index 0))
-              (for (x 0 (< x x-size) (increase! x))
-                   (smooth/floor k2 d17 d18 (+ x-offset (* (cast <fl> x) x-scale) x-coord)
-                     (for (z 0 (< z z-size) (increase! z))
-                          (smooth/floor l6 d19 d20 (+ z-offset (* (cast <fl> z) z-scale) z-coord)
-                            (set! i5 (permute k2))
-                            (set! j5 (+ (permute i5) l6))
-                            (set! j (permute (+ k2 1)))
-                            (set! k5 (+ (permute j) l6))
-                            (set! d14 (lerp (grad-2d (permute j5) d17 d19) (grad-2d (permute k5) (- d17 1.) d19) d18))
-                            (set! d15 (lerp (grad-2d (permute (+ j5 1)) d17 (- d19 1.)) (grad-2d (permute (+ k5 1)) (- d17 1.) (- d19 1.)) d18))
-                            (set! d21 (lerp d14 d15 d20))
-                            (f64vector-set! noise index (+ (f64vector-ref noise index) (/ d21 scaling)))
-                            (set! index (+ index 1)))))))
-          (let ((k -1)
-                (l 0)
-                (i1 0)
-                (j1 0)
-                (k1 0)
-                (l1 0)
-                (i2 0)
-                (d1 0.)
-                (d2 0.)
-                (d3 0.)
-                (d4 0.)
-                (d11 0.)
-                (d12 0.)
-                (d13 0.)
-                (index 0))
-            (for (x 0 (< x x-size) (increase! x))
-                 (smooth/floor j3 d5 d6 (+ x-offset (* (cast <fl> x) x-scale) x-coord)
-                   (for (z 0 (< z z-size) (increase! z))
-                        (smooth/floor i4 d7 d8 (+ z-offset (* (cast <fl> z) z-scale) z-coord)
-                          (for (y 0 (< y y-size) (increase! y))
-                               (smooth/floor l4 d9 d10 (+ y-offset (* (cast <fl> y) y-scale) y-coord)
-                                 (when (or (= y 0) (/= l4 k))
-                                   (set! k l4)
-                                   (set! l (+ (permute j3) l4))
-                                   (set! i1 (+ (permute l) i4))
-                                   (set! j1 (+ (permute (+ l 1)) i4))
-                                   (set! k1 (+ (permute (+ j3 1)) l4))
-                                   (set! l1 (+ (permute k1) i4))
-                                   (set! i2 (+ (permute (+ k1 1)) i4))
-                                   (set! d1 (lerp (grad (permute i1) d5 d9 d7) (grad (permute l1) (- d5 1.) d9 d7) d6))
-                                   (set! d2 (lerp (grad (permute j1) d5 (- d9 1.) d7) (grad (permute i2) (- d5 1.) (- d9 1.) d7) d6))
-                                   (set! d3 (lerp (grad (permute (+ i1 1)) d5 d9 (- d7 1.)) (grad (permute (+ l1 1)) (- d5 1.) d9 (- d7 1.)) d6))
-                                   (set! d4 (lerp (grad (permute (+ j1 1)) d5 (- d9 1.) (- d7 1.)) (grad (permute (+ i2 1)) (- d5 1.) (- d9 1.) (- d7 1.)) d6)))
-                                 (set! d11 (lerp d1 d2 d10))
-                                 (set! d12 (lerp d3 d4 d10))
-                                 (set! d13 (lerp d11 d12 d8))
-                                 (f64vector-set! noise index (+ (f64vector-ref noise index) (/ d13 scaling)))
-                                 (set! index (+ index 1)))))))))))))))
+    (declare (proper-tail-calls))
+    (declare (optimize-dead-local-variables))
+    (declare (inline))
+    (declare (inlining-limit 1000))
+    (let ((world (current-world))
+          (x-count (+ width 1))
+          (z-count (+ depth 1))
+          (x-base (cast <fl> from-x))
+          (z-base (cast <fl> from-z)))
+      (let ((count (f32vector-length heightmap)))
+        (let ((vertices (make-vector count))
+              (normals (make-vector count)))
+          (define (get-vertex x <fx> z <fx>)
+            (vector-ref vertices (+ (* x z-count) z)))
+          
+          (define (normal-ref x <fx> z <fx>)
+            (vector-ref normals (+ (* x z-count) z)))
+          
+          ;; fill vertices
+          (loop (for x from 0 below x-count)
+                (loop (for z from 0 below z-count)
+                      (let ((index (+ (* x z-count) z)))
+                        (let ((height (f32vector-ref heightmap index)))
+                          (let ((x (cast <fl> (+ from-x x)))
+                                (y (cast <fl> height))
+                                (z (cast <fl> (+ from-z z))))
+                            (vector-set! vertices index (vertex (- x x-base) y (- z z-base)))
+                            (vector-set! normals index (vertex 0. 0. 0.)))))))
+          ;; add triangles
+          (let ((squares (make-vector (* width depth)))
+                (faces '())
+                (areas (make-table test: equal?))
+                (default-image (get-default-image world)))
+            (let ((material (get-material-opaque world))
+                  (uv (image-rect (get-block-atlas world) default-image)))
+              (let ((tl (uv-left uv))
+                    (tt (uv-top uv))
+                    (tr (uv-right uv))
+                    (tb (uv-bottom uv))
+                    (texture-depth (uv-depth uv)))
+                (define (safe-square x <fx> z <fx>)
+                  (and
+                    (>= x 0) (< x width)
+                    (>= z 0) (< z depth)
+                    (get-square x z)))
+                
+                (define (get-square x <fx> z <fx>)
+                  (vector-ref squares (+ (* x depth) z)))
+                
+                (define (set-square x <fx> z <fx> square)
+                  (vector-set! squares (+ (* x depth) z) square))
+                
+                (define (make-square t1 t2)
+                  (cons t1 t2))
+                
+                (define (square-t1 square) <Smooth-Triangle>
+                  (get-polygon (cast <Face> (car square))))
+                
+                (define (square-t2 square) <Smooth-Triangle>
+                  (get-polygon (cast <Face> (cdr square))))
+                
+                (define (add-face face)
+                  (set! faces (cons face faces))
+                  (when (eq? what 'physical)
+                    (let ((poly (get-polygon face)))
+                      (let ((center (get-center poly)))
+                        (let ((index (position-index sector/area center)))
+                          (table-add areas index poly))))))
+                
+                (define (add-triangle v1 v2 v3)
+                  (let ((normal (plane-normal v1 v2 v3)))
+                    (let ((face
+                            (if (> (vertex-x v1) (vertex-x v2))
+                                (make-face material
+                                           (f32vector tl tb tr tb tr tt)
+                                           texture-depth
+                                           (make-smooth-triangle self
+                                                                 v1 v2 v3
+                                                                 normal normal normal))
+                              (make-face material
+                                         (f32vector tr tt tl tt tl tb)
+                                         texture-depth
+                                         (make-smooth-triangle self
+                                                               v1 v2 v3
+                                                               normal normal normal)))))
+                      (add-face face)
+                      face)))
+                
+                ;; add triangles
+                (loop (for x from 0 below width)
+                      (loop (for z from 0 below depth)
+                            (let ((v1 (get-vertex x (+ z 1)))
+                                  (v2 (get-vertex (+ x 1) (+ z 1)))
+                                  (v3 (get-vertex (+ x 1) z))
+                                  (v4 (get-vertex x z)))
+                              (let ((triangle1 (add-triangle v1 v2 v3))
+                                    (triangle2 (add-triangle v3 v4 v1)))
+                                (set-square x z (make-square triangle1 triangle2))))))
+                ;; smooth normals
+                (loop (for x from 0 below x-count)
+                      (loop (for z from 0 below z-count)
+                            (let ((normal (normal-ref x z))
+                                  (tl (safe-square (- x 1) (- z 1)))
+                                  (tr (safe-square x (- z 1)))
+                                  (bl (safe-square (- x 1) z))
+                                  (br (safe-square x z)))
+                              (when tl
+                                (vertex-increase! normal (get-normal (square-t1 tl))))
+                              (when tr
+                                (vertex-increase! normal (get-normal (square-t1 tr)))
+                                (vertex-increase! normal (get-normal (square-t2 tr))))
+                              (when bl
+                                (vertex-increase! normal (get-normal (square-t1 bl)))
+                                (vertex-increase! normal (get-normal (square-t2 bl))))
+                              (when br
+                                (vertex-increase! normal (get-normal (square-t2 br))))
+                              (vertex-normalize! normal normal))))
+                ;; update normals
+                (loop (for x from 0 below width)
+                      (loop (for z from 0 below depth)
+                            (let ((square (get-square x z)))
+                              (set-n1 (square-t1 square) (normal-ref x (+ z 1)))
+                              (set-n2 (square-t1 square) (normal-ref (+ x 1) (+ z 1)))
+                              (set-n3 (square-t1 square) (normal-ref (+ x 1) z))
+                              (set-n1 (square-t2 square) (normal-ref (+ x 1) z))
+                              (set-n2 (square-t2 square) (normal-ref x z))
+                              (set-n3 (square-t2 square) (normal-ref x (+ z 1))))))
+                (case what
+                  ((physical)
+                   (let ((area sector/area))
+                     ;; PLANETS quick inefficient try
+                     (let ((matrix (make-translation-matrix (vertex x-base 0. z-base))))
+                       (table-iterate areas
+                         (lambda (index polygons)
+                           (add-polygons area #f index polygons matrix))))))
+                  ((visual)
+                   (let ((sector sector/area))
+                     (bind-values (vertices neighbors) (prepare-vertices/neighbors sector faces)
+                       (let ((lightmap (prepare-lightmap sector faces)))
+                         (with-render-mutex
+                           (lambda ()
+                             (free-material-mesh sector)
+                             (setup-material-mesh sector)
+                             (let ((mesh (get-material-mesh sector)))
+                               (fill-vertices/neighbors sector mesh #f vertices neighbors)
+                               (fill-lightmap sector mesh #f lightmap)
+                               (setup-array mesh))
+                             (generate-done sector/area)))))))))))))))))
