@@ -111,6 +111,8 @@
     (add 'scheme 'quote)
     (add 'scheme 'receive)
     (add 'scheme 'set!)
+    (add 'scheme 'server)
+    (add 'scheme 'client)
     
     ;; until all available functionaly
     (add 'jazz 'declare)
@@ -161,6 +163,18 @@
           effective-declaration)))))
 
 
+(define (jazz:expand-server walker resume declaration environment form-src)
+  (if (jazz:feature-satisfied? 'server)
+      (%%cons 'begin (%%cdr (jazz:source-code form-src)))
+    '(unspecified)))
+
+
+(define (jazz:expand-client walker resume declaration environment form-src)
+  (if (jazz:feature-satisfied? 'client)
+      (%%cons 'begin (%%cdr (jazz:source-code form-src)))
+    '(unspecified)))
+
+
 ;;;
 ;;;; Register
 ;;;
@@ -179,6 +193,8 @@
 (jazz:define-walker-special     %%lambda     scheme jazz:walk-lambda)
 (jazz:define-walker-special     %%let        scheme jazz:walk-let)
 (jazz:define-walker-special     %%do         scheme jazz:walk-do)
+(jazz:define-walker-syntax      server       scheme jazz:expand-server)
+(jazz:define-walker-syntax      client       scheme jazz:expand-client)
 
 (jazz:define-walker-special     declare      jazz jazz:walk-declare)
 
