@@ -57,6 +57,7 @@
 (jazz:define-method (jazz:jazz-walker-supports-selfdot? (jazz:Script-Walker walker))
   #f)
 
+#; ;; at the moment this breaks literals
 (jazz:define-method (jazz:jazz-walker-supports-composite? (jazz:Script-Walker walker))
   #f)
 
