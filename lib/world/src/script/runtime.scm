@@ -54,6 +54,7 @@
   (jazz:allocate-script-walker #f #f '() '() '() (jazz:new-queue) (jazz:new-queue) (%%make-table test: eq?) (%%make-table test: eq?) '()))
 
 
+#; ;; quicky for now get access to all jazz
 (jazz:define-method (jazz:jazz-walker-supports-selfdot? (jazz:Script-Walker walker))
   #f)
 
@@ -61,7 +62,7 @@
 (jazz:define-method (jazz:jazz-walker-supports-composite? (jazz:Script-Walker walker))
   #f)
 
-
+#; ;; quicky for now get access to all jazz
 (jazz:define-method (jazz:walker-declarations (jazz:Script-Walker walker))
   (let ((table (jazz:get-dialect-declarations (jazz:get-dialect 'script))))
     (define (add dialect symbol)
@@ -84,6 +85,7 @@
     (%%list table)))
 
 
+#; ;; quicky for now get access to all jazz
 (jazz:define-method (jazz:walker-bindings (jazz:Script-Walker walker))
   (let ((table (jazz:get-dialect-bindings (jazz:get-dialect 'script))))
     (define (add dialect symbol)
