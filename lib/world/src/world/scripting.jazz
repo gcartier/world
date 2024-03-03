@@ -379,12 +379,13 @@
 ;;;
 
 
-(definition public (%%near-player? actor distance)
-  (<= (vertex-distance (get-position actor) (get-position (current-me))) distance))
+(definition public (%%near-player? distance)
+  (let ((actor (%%current-actor)))
+    (<= (vertex-distance (get-position actor) (get-position (current-me))) distance)))
 
 
 (definition public (%%get-position element)
-  (get-position element))
+  (copy-vertex (get-position element)))
 
 
 (definition public (%%set-position element position)
@@ -766,103 +767,109 @@
 ;;;
 
 
-(definition public (%%path actor (motion: motion %%walk) (flying?: flying? #f) (warp?: warp? #f) (duration: duration #f))
+(definition public (%%path (flying?: flying? #f) (warp?: warp? #f) (duration: duration #f))
   (declare (proper-tail-calls))
   (let ((history (current-history))
         (start (current-monotonic)))
-    (let ((path-duration #f)
+    (let ((actor (%%current-actor))
+          (path-duration #f)
           (rotater #f)
           (warp-direction (and warp (random-upward-warp))))
-      (define (setup)
-        (with-lock
-          (lambda ()
-            (orient #t)
-            (reset))))
-      
-      (define (path)
-        (with-lock
-          (lambda ()
-            (cond ((< (random-real) (if flying? .2 .4))
-                   (set-motion actor 'idle))
-                  (else
-                   (orient)))
-            (reset))))
-      
-      (define (orient (first? #f))
-        (motion actor)
-        (set! rotater (%%rotater (copy-vertex (get-sight actor))
-                                 (let ((pos (get-position actor))
-                                       (leash (get-leash actor)))
-                                   (cond ((and leash (> (vertex-distance pos leash) 80.))
-                                          (vertex-normalize-safe (vertex- leash pos)))
-                                         (flying?
-                                          (if first?
-                                              (random-upward-fly)
-                                            (random-fly)))
-                                         (else
-                                          (random-horizon)))))))
-      
-      (define (rotate)
-        (when rotater
-          (let ((new-sight (rotater)))
-            (if new-sight
-                (if flying?
-                    (world.changes:lookat-fly-change actor new-sight)
-                  (world.changes:lookat-horizon-change actor new-sight))
-              (set! rotater #f)))))
-      
-      (define (reset)
-        (set! path-duration (random-between 2. 8.)))
-      
-      (define (move time elapse)
-        (with-lock
-          (lambda ()
-            (define (random-jump?)
-              (< (random-real) .005))
-            
-            (let ((gravity? #t)
-                  (response 'slide)
-                  (ignore-entities? #t)
-                  (ignore-players? #f)
-                  (ignore-me? #f))
-              (define (slice commands)
-                (let ((slice .04))
-                  (if (<= elapse slice)
-                      (tick-actor actor commands time elapse gravity? response ignore-entities?: ignore-entities? ignore-players?: ignore-players? ignore-me?: ignore-me? proportional-slide?: #f)
-                    (let (iter (from 0.) (to slice))
-                      (let ((info (tick-actor actor commands (- time (- elapse to)) (- to from) gravity? response ignore-entities?: ignore-entities? ignore-players?: ignore-players? ignore-me?: ignore-me? proportional-slide?: #f)))
-                        (if (>= to elapse)
-                            info
-                          (iter to (min elapse (+ to slice)))))))))
+      (let ((motion (let ((motion (get-motion actor))
+                          (sprint? (get-sprint? actor)))
+                      (cond ((eq? motion 'walk) %%walk)
+                            ((not sprint?) %%run)
+                            (else %%sprint)))))
+        (define (setup)
+          (with-lock
+            (lambda ()
+              (orient #t)
+              (reset))))
+        
+        (define (path)
+          (with-lock
+            (lambda ()
+              (cond ((< (random-real) (if flying? .2 .4))
+                     (set-motion actor 'idle))
+                    (else
+                     (orient)))
+              (reset))))
+        
+        (define (orient (first? #f))
+          (motion actor)
+          (set! rotater (%%rotater (copy-vertex (get-sight actor))
+                                   (let ((pos (get-position actor))
+                                         (leash (get-leash actor)))
+                                     (cond ((and leash (> (vertex-distance pos leash) 80.))
+                                            (vertex-normalize-safe (vertex- leash pos)))
+                                           (flying?
+                                            (if first?
+                                                (random-upward-fly)
+                                              (random-fly)))
+                                           (else
+                                            (random-horizon)))))))
+        
+        (define (rotate)
+          (when rotater
+            (let ((new-sight (rotater)))
+              (if new-sight
+                  (if flying?
+                      (world.changes:lookat-fly-change actor new-sight)
+                    (world.changes:lookat-horizon-change actor new-sight))
+                (set! rotater #f)))))
+        
+        (define (reset)
+          (set! path-duration (random-between 2. 8.)))
+        
+        (define (move time elapse)
+          (with-lock
+            (lambda ()
+              (define (random-jump?)
+                (< (random-real) .002))
               
-              (if warp?
-                  (begin
-                    (set-position actor (vertex+& (get-position actor) warp-direction))
-                    (follow-player (current-world)))
-                (let ((idle? (eq? (get-motion actor) 'idle)))
-                  (if (and (get-jump? actor) (not idle?))
-                      (begin
-                        (set-jump? actor #f)
-                        (slice move/jump-commands))
-                    (let ((commands (if idle? stay-commands move-commands)))
-                      (let ((info (slice commands)))
-                        (when (and info (or (not (get-jump-time actor)) (> time (+ (get-jump-time actor) (if #f @w aggro-target 1. 2.)))))
-                          (bind-values (center slide-collisions fall-collisions) info
-                            (when (or (not-null? slide-collisions) (random-jump?))
-                              (set-jump? actor #t)))))))))))))
-      
-      (setup)
-      (%%tick default-tick-period
-        (lambda (ignore-actor script time elapse iter)
-          (unless (get-paused? history)
-            (when (and path-duration (> path-duration 0.))
-              (decrease! path-duration elapse))
-            (move time elapse)
-            (rotate)
-            (when (<= path-duration 0.)
-              (path)))
-          (unless (and duration (>= (- (current-monotonic) start) duration))
-            (iter)))))))
+              (let ((gravity? #t)
+                    (response 'slide)
+                    (ignore-entities? #t)
+                    (ignore-players? #f)
+                    (ignore-me? #f))
+                (define (slice commands)
+                  (let ((slice .04))
+                    (if (<= elapse slice)
+                        (tick-actor actor commands time elapse gravity? response ignore-entities?: ignore-entities? ignore-players?: ignore-players? ignore-me?: ignore-me? proportional-slide?: #f)
+                      (let (iter (from 0.) (to slice))
+                        (let ((info (tick-actor actor commands (- time (- elapse to)) (- to from) gravity? response ignore-entities?: ignore-entities? ignore-players?: ignore-players? ignore-me?: ignore-me? proportional-slide?: #f)))
+                          (if (>= to elapse)
+                              info
+                            (iter to (min elapse (+ to slice)))))))))
+                
+                (if warp?
+                    (begin
+                      (set-position actor (vertex+& (get-position actor) warp-direction))
+                      (follow-player (current-world)))
+                  (let ((idle? (eq? (get-motion actor) 'idle)))
+                    (if (and (get-jump? actor) (not idle?))
+                        (begin
+                          (set-jump? actor #f)
+                          (slice move/jump-commands))
+                      (let ((commands (if idle? stay-commands move-commands)))
+                        (let ((info (slice commands)))
+                          (when (and info (or (not (get-jump-time actor)) (> time (+ (get-jump-time actor) (if #f @w aggro-target 1. 2.)))))
+                            (bind-values (center slide-collisions fall-collisions) info
+                              (when (or (not-null? slide-collisions) (random-jump?))
+                                (set-jump? actor #t)))))))))))))
+        
+        (setup)
+        (%%tick default-tick-period
+          (lambda (ignore-actor script time elapse iter)
+            (unless (get-paused? history)
+              (when (and path-duration (> path-duration 0.))
+                (decrease! path-duration elapse))
+              (move time elapse)
+              (rotate)
+              (when (<= path-duration 0.)
+                (path)))
+            (unless (and duration (>= (- (current-monotonic) start) duration))
+              (iter))))))))
 
 
 ;;;
@@ -870,9 +877,10 @@
 ;;;
 
 
-(definition public (%%bot actor)
+(definition public (%%bot)
   (declare (proper-tail-calls))
-  (let ((initial-duration 5.)
+  (let ((actor (%%current-actor))
+        (initial-duration 5.)
         (other-duration 10.))
     (define (walk duration)
       (with-lock
@@ -967,7 +975,7 @@
 
 (definition public (%%add-block location id)
   (let ((universe (current-universe)))
-    (apply-add-block universe (location->position location) id 0)))
+    (apply-add-block2 universe (location->position location) id 0)))
 
 
 (definition public (%%delete-block location)
