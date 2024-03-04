@@ -37,7 +37,6 @@
             (world.script.syntax (phase syntax))
             (world.scriptum))
     (%%define me (%%current-instance))
-    (%%define %%poll-script? #t)
     ,@body))
 
 
