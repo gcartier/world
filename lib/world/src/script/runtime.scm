@@ -32,8 +32,7 @@
 
 
 (jazz:define-method (jazz:dialect-wrap (jazz:Script-Dialect dialect) body)
-  `((declare (proper-tail-calls))
-    (import (script.syntax (phase syntax))
+  `((import (script.syntax (phase syntax))
             (world.script.syntax (phase syntax))
             (world.scriptum))
     (%%define me (%%current-instance))
