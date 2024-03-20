@@ -57,6 +57,7 @@
         (world.profiling)
         (world.report)
         (world.server)
+        (world.server.circle)
         (world.server.client)
         (world.server.group)
         (world.server.mobile)
@@ -133,9 +134,10 @@
   (slot instances       initialize (make-table test: equal?) getter generate)
   (slot zones           initialize '()                       getter generate)
   (slot zones-available initialize '()                       getter generate)
+  (slot circles         initialize '()                       getter generate)
+  (slot stored-circles  initialize (make-table test: equal?) getter generate)
+  (slot ghost-circles   initialize '()                       getter generate)
   (slot groups          initialize '()                       getter generate)
-  (slot ghost-groups    initialize '()                       getter generate)
-  (slot circles-index   initialize (make-table test: equal?) getter generate)
   (slot hits            initialize 0                         getter generate)
   (slot urgency-server  initialize #f                        getter generate)
   (slot urgency-thread  initialize #f                        getter generate)
@@ -173,10 +175,10 @@
   
   
   (method (spawn/cleanup-processor self sphere-asset-entries zone (delegate #f))
-    (define (collect-zone-ghost-groups)
-      (collect-if (lambda (group)
-                    (equal? (get-zone group) zone))
-                  ghost-groups))
+    (define (collect-zone-ghost-circles)
+      (collect-if (lambda (circle)
+                    (equal? (get-zone circle) zone))
+                  ghost-circles))
     
     (if (zone-available? self zone)
         (let ((processor (spawn-processor (effective-host configuration)
@@ -186,18 +188,18 @@
                                           delegate)))
           (if (string? processor)
               processor
-            (let ((zone-ghost-groups (collect-zone-ghost-groups)))
-              (when (not-null? zone-ghost-groups)
+            (let ((zone-ghost-circles (collect-zone-ghost-circles)))
+              (when (not-null? zone-ghost-circles)
                 (let ((remote-processor (get-remote-proxy processor)))
-                  (for-each (lambda (ghost-group)
-                              (let ((stone (get-stone ghost-group)))
+                  (for-each (lambda (ghost-circle)
+                              (let ((stone (get-stone ghost-circle)))
                                 (when stone
                                   (calling-processor self processor
                                     (lambda ()
                                       (delete-circle-stone remote-processor stone)))))
-                              (set! ghost-groups (remove! ghost-group ghost-groups))
-                              (delete-circle self (get-name ghost-group)))
-                            zone-ghost-groups))))
+                              (set! ghost-circles (remove! ghost-circle ghost-circles))
+                              (delete-stored-circle self (get-name ghost-circle)))
+                            zone-ghost-circles))))
             processor))
       (format "Zone is unavailable")))
   
@@ -437,72 +439,109 @@
   ;;;
   
   
-  (method (find-group self name/no)
-    (if (integer? name/no)
-        (find-if (lambda (group)
-                   (= (get-no group) name/no))
-                 groups)
-      (find-if (lambda (group)
-                 (equal? (get-name group) name/no))
-               groups)))
+  (method (find-circle self name)
+    (find-if (lambda (circle)
+               (ci=? (get-name circle) name))
+             circles))
   
   
-  (method (group-already-exists? self name/no)
+  (method (find-group self no)
+    (find-if (lambda (group)
+               (= (get-no group) no))
+             groups))
+  
+  
+  (method (circle-already-exists? self name)
     (define (standardize name)
       (trim-inner-whitespace (trim-whitespace name)))
     
-    (if (integer? name/no)
-        (find-group self name/no)
-      (let ((name (standardize name/no)))
-        (find-if (lambda (group)
-                   (let ((group-name (get-name group)))
-                     (and group-name
-                          (ci=? (standardize group-name) name))))
-                 groups))))
+    (let ((name (standardize name)))
+      (find-if (lambda (circle)
+                 (let ((circle-name (get-name circle)))
+                   (and circle-name
+                        (ci=? (standardize circle-name) name))))
+               circles)))
   
   
-  (method (create-group self delegate name persistent? require-microphone? require-camera? auto-create? stone zoom? link description)
-    (logger/activity self "Create group{? {a}~} ({a})" name (get-name delegate))
+  (method (group-already-exists? self no)
+    (find-group self no))
+  
+  
+  (method (create-circle self delegate name persistent? require-microphone? require-camera? auto-create? stone zoom? link description)
+    (logger/activity self "Create circle {a} ({a})" name (get-name delegate))
     (let ((owner (get-personal-key delegate))
           (created (date-truncate-nanosecond (current-date)))
           (invite-only? #f)
           (shape 'flow))
-      (let ((group (new Server-Group name owner created persistent? invite-only? require-microphone? require-camera? (if auto-create? 'start (get-zone delegate)) stone shape zoom? link description)))
-        (set! groups (cons group groups))
-        (when name
-          (save-circle self group))
-        group)))
+      (let ((circle (new Server-Circle name owner created persistent? invite-only? require-microphone? require-camera? (if auto-create? 'start (get-zone delegate)) stone shape zoom? link description)))
+        (set! circles (cons circle circles))
+        (set! groups (cons circle groups))
+        (save-circle self circle)
+        circle)))
+  
+  
+  (method (delete-circle self delegate circle)
+    (logger/activity self "Delete circle {a} ({a})" (get-name circle) (if delegate (get-name delegate) "Server"))
+    (set! circles (remove! circle circles))
+    (cleanup-disconnected-group circle)
+    (delete-stored-circle self (get-name circle)))
+  
+  
+  (method (maybe-delete-circle self delegate circle (delete-persistent? #f))
+    (if (or (and (get-persistent? circle) (not delete-persistent?))
+            (has-participants? circle)
+            (has-groups? circle))
+        (begin
+          (when (not (has-participants? circle))
+            (set-invite-only? circle #f))
+          #f)
+      (delete-circle self delegate circle)
+      (broadcast-circle-removed self circle)
+      (let ((stone (get-stone circle)))
+        ;; not sure we always have the stone
+        (when stone
+          (let ((processor (find-processor (get-zone circle))))
+            (when processor
+              (let ((remote-processor (get-remote-proxy processor)))
+                (calling-processor self processor
+                  (lambda ()
+                    (delete-circle-stone remote-processor stone))))))))
+      #t))
+  
+  
+  (method (join-circle self delegate circle)
+    (join-group self delegate circle)
+    (let ((delegate-name (get-name delegate)))
+      (logger/activity self "Join circle {a} ({a})" (get-name circle) (get-name delegate))
+      (add-participant circle delegate)))
+  
+  
+  (method (leave-circle self delegate circle)
+    (leave-group self delegate circle)
+    (let ((delegate-name (get-name delegate)))
+      (logger/activity self "Leave circle {a} ({a})" (get-name circle) delegate-name)
+      (remove-participant circle delegate)
+      (maybe-delete-circle self delegate circle)))
+
+  
+  (method (create-group self delegate disband?)
+    (logger/activity self "Create group ({a})" (get-name delegate))
+    (let ((group (new Server-Group #f disband?)))
+      (set! groups (cons group groups))
+      group))
   
   
   (method (delete-group self delegate group)
-    (logger/activity self "Delete group{? {a}~} ({a})" (get-name group) (if delegate (get-name delegate) "Server"))
+    (logger/activity self "Delete group ({a})" (if delegate (get-name delegate) "Server"))
     (set! groups (remove! group groups))
-    (cleanup-disconnected-group group)
-    (let ((name (get-name group)))
-      (when name
-        (delete-circle self name))))
+    (cleanup-disconnected-group group))
   
   
-  (method (maybe-delete-group self delegate group (delete-persistent? #f))
-    (if (or (and (get-persistent? group) (not delete-persistent?))
-            (has-members? self group)
-            (has-server-streams? self group))
-        (begin
-          (when (not (has-members? self group))
-            (set-invite-only? group #f))
-          #f)
+  (method (maybe-delete-group self delegate group)
+    (if (or (has-members? group)
+            (has-server-streams? group))
+        #f
       (delete-group self delegate group)
-      (when (get-name group)
-        (broadcast-circle-removed self group)
-        (let ((stone (get-stone group)))
-          ;; not sure we always have the stone
-          (when stone
-            (let ((processor (find-processor (get-zone group))))
-              (when processor
-                (let ((remote-processor (get-remote-proxy processor)))
-                  (calling-processor self processor
-                    (lambda ()
-                      (delete-circle-stone remote-processor stone)))))))))
       #t))
   
   
@@ -517,7 +556,7 @@
   
   
   (method (disband-group self delegate group)
-    (logger/activity self "Disband group{? {a}~} ({a})" (get-name group) (get-name delegate))
+    (logger/activity self "Disband group ({a})" (get-name delegate))
     (for-each (lambda (delegate)
                 (leave-group self delegate group)
                 (if (is? delegate Mobile-Delegate)
@@ -531,20 +570,12 @@
     (cleanup-disconnected-group group))
   
   
-  (method (has-members? self group)
-    (not-null? (get-members group)))
-  
-  
-  (method (has-server-streams? self group)
-    (not-null? (get-server-streams group)))
-  
-  
   (method (join-group self delegate group)
     (let ((delegate-name (get-name delegate))
-          (group-name (get-name group)))
-      (logger/activity self "Join group{? {a}~} ({a})" group-name (get-name delegate))
+          (circle? (is? group Server-Circle)))
       (set-group delegate group)
-      (unless group-name
+      (unless circle?
+        (logger/activity self "Join group ({a})" (get-name delegate))
         (for-each (lambda (delegate)
                     (if (is? delegate Mobile-Delegate)
                         (send-join self delegate delegate-name)
@@ -553,23 +584,24 @@
                           (lambda ()
                             (server-join client delegate-name))))))
                   (get-members group)))
-      (set-members group (cons delegate (get-members group)))
+      (add-member group delegate)
       (update-group-streaming self group)
       (wait-keyframes udp-server delegate (delegate->connection self delegate))))
   
   
   (method (leave-group self delegate group)
     (let ((delegate-name (get-name delegate))
-          (group-name (get-name group)))
-      (logger/activity self "Leave group{? {a}~} ({a})" group-name delegate-name)
+          (circle? (is? group Server-Circle)))
+      (unless circle?
+        (logger/activity self "Leave group ({a})" delegate-name))
       (unless (is? delegate Mobile-Delegate)
         (let ((connection (delegate->connection self delegate)))
           (done-keyframes udp-server delegate connection)
           (leave-group-reset connection)))
       (set-group delegate #f)
-      (set-members group (remove delegate (get-members group)))
+      (remove-member group delegate)
       (update-group-streaming self group)
-      (unless group-name
+      (unless circle?
         (for-each (lambda (delegate)
                     (if (is? delegate Mobile-Delegate)
                         (send-leave self delegate delegate-name)
@@ -578,9 +610,30 @@
                           (lambda ()
                             (server-leave client delegate-name))))))
                   (get-members group)))
-      (if (get-name group)
-          (maybe-delete-group self delegate group)
-        (maybe-disband-group self delegate group))))
+      (if (get-disband? group)
+          (maybe-disband-group self delegate group)
+        (maybe-delete-group self delegate group))))
+  
+  
+  (method (effective-require-microphone? self group)
+    (let ((circle (get-circle group)))
+      (if circle
+          (get-require-microphone? circle)
+        #t)))
+  
+  
+  (method (effective-require-camera? self group)
+    (let ((circle (get-circle group)))
+      (if circle
+          (get-require-camera? circle)
+        #f)))
+  
+  
+  (method (effective-shape self group)
+    (let ((circle (get-circle group)))
+      (if circle
+          (get-shape circle)
+        'flow)))
   
   
   (method (delegate->connection self delegate)
@@ -591,7 +644,7 @@
     (let ((members (get-members group))
           (ordered-streams (get-ordered-streams group)))
       (when (not-null? ordered-streams)
-        (let ((shape (get-shape group))
+        (let ((shape (effective-shape self group))
               (count (length ordered-streams))
               (stream-nos (map get-no ordered-streams)))
           (let ((heart (and (eq? shape 'heart) (car stream-nos))))
@@ -821,9 +874,9 @@
                                                         (or (get-name group)
                                                             (get-no group)))
                                                    (and group
-                                                        (get-require-microphone? group))
+                                                        (effective-require-microphone? self group))
                                                    (and group
-                                                        (get-require-camera? group)))))))
+                                                        (effective-require-camera? self group)))))))
                   (let ((delegate (cond (existing-delegate
                                           (reconnect-client self client existing-delegate client-uuid)
                                           existing-delegate)
@@ -932,12 +985,12 @@
   
   (method (delete-owner-zoom-circles self delegate)
     (let ((key (get-personal-key delegate)))
-      (for-each (lambda (group)
-                  (when (and (get-zoom? group)
-                             (not (get-persistent? group))
-                             (equal? (get-owner group) key))
-                    (maybe-delete-group self delegate group)))
-                groups)))
+      (for-each (lambda (circle)
+                  (when (and (get-zoom? circle)
+                             (not (get-persistent? circle))
+                             (equal? (get-owner circle) key))
+                    (maybe-delete-circle self delegate circle)))
+                circles)))
   
   
   (method package (client-deconnect self client)
@@ -1256,8 +1309,8 @@
                     (calling-client self recipient-delegate
                       (lambda ()
                         (server-invite client sender circle-name
-                          (and circle-name (get-require-microphone? (get-group delegate)))
-                          (and circle-name (get-require-camera? (get-group delegate)))))))
+                          (and circle-name (effective-require-microphone? self (get-group delegate)))
+                          (and circle-name (effective-require-camera? self (get-group delegate)))))))
                   (register-invite recipient-delegate sender)
                   #f))))))))
   
@@ -1284,7 +1337,7 @@
                                    (set-mode delegate 'participant))
                                  (join-group self delegate sender-group)
                                  sender-group)
-                             (let ((group (create-group self sender-delegate #f #f #f #f #f #f #f #f #f)))
+                             (let ((group (create-group self sender-delegate #t)))
                                (join-group self sender-delegate group)
                                (join-group self delegate group)
                                group))))
@@ -1379,23 +1432,6 @@
             (set-property designer identity 'status status))))))
   
   
-  (method package (client-leave self client)
-    ;; robust
-    (let ((delegate (find-delegate self client)))
-      (and delegate
-           (delegate-leave self delegate))))
-  
-  
-  (method (delegate-leave self delegate)
-    (let ((group (get-group delegate)))
-      (if (not group)
-          (format "You are not in a group")
-        (let ((members (get-members group)))
-          (leave-group self delegate group)
-          (broadcast-hierarchy self)
-          #f))))
-  
-  
   (method package (client-message self client kind recipient message)
     ;; robust
     (let ((delegate (find-delegate self client)))
@@ -1476,117 +1512,178 @@
     (changed-client-zone self client))
   
   
-  (method package (client-create-group self client name persistent? require-microphone? require-camera? broadcast-hierarchy? auto-create? stone zoom? link description)
+  (method package (client-create-circle self client name persistent? require-microphone? require-camera? broadcast-hierarchy? auto-create? stone zoom? link description mode)
     (let ((delegate (find-delegate self client)))
       ;; robust
       (if (not delegate)
           (format "Delegate not found")
-        (delegate-create-group self delegate name persistent? require-microphone? require-camera? broadcast-hierarchy? auto-create? stone zoom? link description))))
+        (let ((circle/err (delegate-create-circle self delegate name persistent? require-microphone? require-camera? broadcast-hierarchy? auto-create? stone zoom? link description mode)))
+          (if (string? circle/err)
+              circle/err
+            (client-join-circle self client name mode))))))
   
   
-  (method (delegate-create-group self delegate name persistent? require-microphone? require-camera? broadcast-hierarchy? auto-create? stone zoom? link description)
+  (method (delegate-create-circle self delegate name persistent? require-microphone? require-camera? broadcast-hierarchy? auto-create? stone zoom? link description mode)
     (if (and (not auto-create?) (get-group delegate))
         (format "You are already in a group")
-      (let ((existing-group (and name (group-already-exists? self name))))
-        (if existing-group
-            (format "{a}{? {a}~} already exists" (group-domain-name self name) name)
-          (let ((group (create-group self delegate name persistent? require-microphone? require-camera? auto-create? stone zoom? link description)))
-            (when name
-              (broadcast-circle-added self group))
+      (let ((existing-circle (and name (circle-already-exists? self name))))
+        (if existing-circle
+            (format "Circle {a} already exists" name)
+          (let ((circle (create-circle self delegate name persistent? require-microphone? require-camera? auto-create? stone zoom? link description)))
+            (broadcast-circle-added self circle)
             (when broadcast-hierarchy?
               (broadcast-hierarchy self))
-            (get-no group))))))
+            circle)))))
   
   
-  (method package (client-create-circle self client name persistent? require-microphone? require-camera? broadcast-hierarchy? auto-create? stone zoom? link description mode)
-    (let ((err (client-create-group self client name persistent? require-microphone? require-camera? broadcast-hierarchy? auto-create? stone zoom? link description)))
-      (if (string? err)
-          err
-        (client-join-group self client name mode))))
-  
-  
-  (method package (client-delete-group self client name/no)
+  (method package (client-delete-circle self client name)
     (let ((delegate (find-delegate self client)))
       ;; robust
       (if (not delegate)
           (format "Delegate not found")
-        (delegate-delete-group self delegate name/no))))
+        (delegate-delete-circle self delegate name))))
   
   
-  (method (delegate-delete-group self delegate name/no)
-    (let ((group (find-group self name/no))
-          (group-name (and (string? name/no) name/no)))
-      (if (not group)
-          (format "{a}{? {a}~} doesn't exist anymore" (group-domain-name self name/no) group-name)
-        (if (has-members? self group)
-            (format "{a}{? {a}~} still has members" (group-domain-name self name/no) group-name)
-          (if (has-server-streams? self group)
-              (format "{a}{? {a}~} still has streams" (group-domain-name self name/no) group-name)
-            (when (maybe-delete-group self delegate group #t)
+  (method (delegate-delete-circle self delegate name)
+    (let ((circle (find-circle self name)))
+      (if (not circle)
+          (format "Circle {a} doesn't exist anymore" name)
+        (if (has-members? circle)
+            (format "Circle {a} still has members" name)
+          (if (has-server-streams? circle)
+              (format "Circle {a} still has streams" name)
+            (when (maybe-delete-circle self delegate circle #t)
               (broadcast-hierarchy self))
             #f)))))
   
   
-  (method package (client-group-requirements self client name/no)
+  (method package (client-circle-requirements self client name)
     (let ((delegate (find-delegate self client)))
       ;; robust
       (if (not delegate)
           (format "Delegate not found")
         (if (get-group delegate)
             (format "You are already in a group")
-          (let ((group (find-group self name/no))
-                (group-name (and (string? name/no) name/no)))
-            (if (not group)
-                (format "{a}{? {a}~} doesn't exist anymore" (group-domain-name self name/no) group-name)
-              (if (get-invite-only? group)
-                  (format "Joining this {a} is by invite only" (downcase (group-domain-name self name/no)))
-                (group-requirements self group))))))))
+          (let ((circle (find-circle self name)))
+            (if (not circle)
+                (format "Circle {a} doesn't exist anymore" name)
+              (if (get-invite-only? circle)
+                  (format "Joining this circle is by invite only")
+                (circle-requirements self circle))))))))
   
   
-  (method package (client-join-group self client name/no mode)
+  (method package (client-join-circle self client name mode)
     (let ((delegate (find-delegate self client)))
       ;; robust
       (if (not delegate)
           (format "Delegate not found")
         (if (get-group delegate)
             (format "You are already in a group")
-          (let ((group (find-group self name/no))
-                (group-name (and (string? name/no) name/no)))
-            (if (not group)
-                (format "{a}{? {a}~} doesn't exist anymore" (group-domain-name self name/no) group-name)
-              (if (get-invite-only? group)
-                  (format "Joining this {a} is by invite only" (downcase (group-domain-name self name/no)))
-                (if (not (zone-available? self (get-zone group)))
+          (let ((circle (find-circle self name)))
+            (if (not circle)
+                (format "Circle {a} doesn't exist anymore" name)
+              (if (get-invite-only? circle)
+                  (format "Joining this circle is by invite only")
+                (if (not (zone-available? self (get-zone circle)))
                     (format "Zone is unavailable")
                   (when mode
                     (set-mode delegate mode))
-                  (join-group self delegate group)
+                  (join-circle self delegate circle)
                   (broadcast-hierarchy self)
-                  (group-information self group)))))))))
+                  (circle-information self circle)))))))))
   
   
-  (method package (client-rejoin-group self client name/no)
+  (method package (client-rejoin-circle self client name)
     (let ((delegate (find-delegate self client)))
       ;; robust
       (if (not delegate)
           (format "Delegate not found")
-        (let ((group (find-group self name/no))
-              (group-name (and (string? name/no) name/no)))
+        (let ((circle (find-circle self name)))
+          (if (not circle)
+              (format "Circle {a} doesn't exist anymore" name)
+            (circle-information self circle))))))
+  
+  
+  (method package (client-create-group self client)
+    (let ((delegate (find-delegate self client)))
+      ;; robust
+      (if (not delegate)
+          (format "Delegate not found")
+        (delegate-create-group self delegate))))
+  
+  
+  (method (delegate-create-group self delegate)
+    (if (get-group delegate)
+        (format "You are already in a group")
+      (let ((group (create-group self delegate #t)))
+        (get-no group))))
+  
+  
+  (method package (client-delete-group self client no)
+    (let ((delegate (find-delegate self client)))
+      ;; robust
+      (if (not delegate)
+          (format "Delegate not found")
+        (delegate-delete-group self delegate no))))
+  
+  
+  (method (delegate-delete-group self delegate no)
+    (let ((group (find-group self no)))
+      (if (not group)
+          (format "Group doesn't exist anymore")
+        (if (has-members? group)
+            (format "Group still has members")
+          (if (has-server-streams? group)
+              (format "Group still has streams")
+            (when (maybe-delete-group self delegate group)
+              (broadcast-hierarchy self))
+            #f)))))
+  
+  
+  (method package (client-join-group self client no mode)
+    (let ((delegate (find-delegate self client)))
+      ;; robust
+      (if (not delegate)
+          (format "Delegate not found")
+        (if (get-group delegate)
+            (format "You are already in a group")
+          (let ((group (find-group self no)))
+            (if (not group)
+                (format "Group doesn't exist anymore")
+              (when mode
+                (set-mode delegate mode))
+              (join-group self delegate group)
+              (broadcast-hierarchy self)
+              (group-information self group)))))))
+  
+  
+  (method package (client-rejoin-group self client no)
+    (let ((delegate (find-delegate self client)))
+      ;; robust
+      (if (not delegate)
+          (format "Delegate not found")
+        (let ((group (find-group self no)))
           (if (not group)
-              (format "{a}{? {a}~} doesn't exist anymore" (group-domain-name self name/no) group-name)
+              (format "Group doesn't exist anymore")
             (group-information self group))))))
   
   
-  (method package (client-leave-group self client name/no)
+  (method package (client-leave-group/circle self client)
     (let ((delegate (find-delegate self client)))
       ;; robust
       (if (not delegate)
           #f
-        (let ((group (find-group self name/no)))
-          (if (not group)
-              #f
-            (prog1 (leave-group self delegate group)
-              (broadcast-hierarchy self)))))))
+        (delegate-leave-group/circle self delegate))))
+  
+  
+  (method (delegate-leave-group/circle self delegate)
+    (let ((group (get-group delegate)))
+      (if (not group)
+          #f
+        (prog1 (if (is? group Server-Circle)
+                   (leave-circle self delegate group)
+                 (leave-group self delegate group))
+          (broadcast-hierarchy self)))))
   
   
   (method package (client-change-mode/focused self client mode focused)
@@ -1629,8 +1726,8 @@
                                     channels))
               (members (get-members recipient))
               (group-no (get-no recipient))
-              (group-require-microphone? (get-require-microphone? recipient))
-              (group-require-camera? (get-require-camera? recipient)))
+              (group-require-microphone? (effective-require-microphone? self recipient))
+              (group-require-camera? (effective-require-camera? self recipient)))
           (let ((extended-channels (map (lambda (descriptor server-channel)
                                           (cons (get-no server-channel) descriptor))
                                         channels
@@ -1826,20 +1923,28 @@
                     (action-channel client channel-no action arguments))))))))))
   
   
-  (method (group-requirements self group)
-    (list (get-require-microphone? group)
-          (get-require-camera? group)))
+  (method (circle-requirements self circle)
+    (list (get-require-microphone? circle)
+          (get-require-camera? circle)))
+  
+  
+  (method (circle-information self circle)
+    (cons (get-no circle)
+          (cons (get-require-microphone? circle)
+                (cons (get-require-camera? circle)
+                      (cons (get-duration circle)
+                            (cons (get-zone circle)
+                                  (cons (get-stone circle)
+                                        (cons (get-shape circle)
+                                              (group-streams self circle)))))))))
   
   
   (method (group-information self group)
     (cons (get-no group)
-          (cons (get-require-microphone? group)
-                (cons (get-require-camera? group)
-                      (cons (get-duration group)
-                            (cons (get-zone group)
-                                  (cons (get-stone group)
-                                        (cons (get-shape group)
-                                              (group-streams self group)))))))))
+          (cons (effective-require-microphone? self group)
+                (cons (effective-require-camera? self group)
+                      (cons (effective-shape self group)
+                            (group-streams self group))))))
   
   
   (method (group-streams self group)
@@ -1884,17 +1989,17 @@
   
   
   (method (delegate-circle-properties self delegate circle-name)
-    (let ((group (find-group self circle-name)))
-      (if (not group)
-          (format "{a}{? {a}~} doesn't exist anymore" (group-domain-name self circle-name) circle-name)
+    (let ((circle (find-circle self circle-name)))
+      (if (not circle)
+          (format "Circle {a} doesn't exist anymore" circle-name)
         (list
-          'shape (get-shape group)
-          'persistent? (get-persistent? group)
-          'invite-only? (get-invite-only? group)
-          'require-microphone? (get-require-microphone? group)
-          'require-camera? (get-require-camera? group)
-          'link (get-link group)
-          'description (get-description group)))))
+          'shape (get-shape circle)
+          'persistent? (get-persistent? circle)
+          'invite-only? (get-invite-only? circle)
+          'require-microphone? (get-require-microphone? circle)
+          'require-camera? (get-require-camera? circle)
+          'link (get-link circle)
+          'description (get-description circle)))))
   
   
   (method package (client-circle-property self client circle-name property)
@@ -1906,22 +2011,22 @@
   
   
   (method (delegate-circle-property self delegate circle-name property)
-    (let ((group (find-group self circle-name)))
-      (if (not group)
-          (format "{a}{? {a}~} doesn't exist anymore" (group-domain-name self circle-name) circle-name)
+    (let ((circle (find-circle self circle-name)))
+      (if (not circle)
+          (format "Circle {a} doesn't exist anymore" circle-name)
         (case property
           ((persistent?)
-           (get-persistent? group))
+           (get-persistent? circle))
           ((invite-only?)
-           (get-invite-only? group))
+           (get-invite-only? circle))
           ((require-microphone?)
-           (get-require-microphone? group))
+           (get-require-microphone? circle))
           ((require-camera?)
-           (get-require-camera? group))
+           (get-require-camera? circle))
           ((link)
-           (get-link group))
+           (get-link circle))
           ((description)
-           (get-description group))))))
+           (get-description circle))))))
   
   
   (method package (client-change-circle-property self client circle-name property value)
@@ -1933,28 +2038,28 @@
   
   
   (method (delegate-change-circle-property self delegate circle-name property value)
-    (let ((group (find-group self circle-name)))
-      (if (not group)
-          (format "{a}{? {a}~} doesn't exist anymore" (group-domain-name self circle-name) circle-name)
+    (let ((circle (find-circle self circle-name)))
+      (if (not circle)
+          (format "Circle {a} doesn't exist anymore" circle-name)
         (case property
           ((persistent?)
-           (set-persistent? group value)
-           (update-circle self group circle-name))
+           (set-persistent? circle value)
+           (update-stored-circle self circle circle-name))
           ((invite-only?)
-           (set-invite-only? group value)
-           (update-circle self group circle-name))
+           (set-invite-only? circle value)
+           (update-stored-circle self circle circle-name))
           ((require-microphone?)
-           (set-require-microphone? group value)
-           (update-circle self group circle-name))
+           (set-require-microphone? circle value)
+           (update-stored-circle self circle circle-name))
           ((require-camera?)
-           (set-require-camera? group value)
-           (update-circle self group circle-name))
+           (set-require-camera? circle value)
+           (update-stored-circle self circle circle-name))
           ((link)
-           (set-link group value)
-           (update-circle self group circle-name))
+           (set-link circle value)
+           (update-stored-circle self circle circle-name))
           ((description)
-           (set-description group value)
-           (update-circle self group circle-name)
+           (set-description circle value)
+           (update-stored-circle self circle circle-name)
            (broadcast-hierarchy self)))
         #f)))
   
@@ -1968,10 +2073,10 @@
   
   
   (method (delegate-circle-information self delegate circle-name)
-    (let ((group (find-group self circle-name)))
-      (if (not group)
-          (format "{a}{? {a}~} doesn't exist anymore" (group-domain-name self circle-name) circle-name)
-        (group-information self group))))
+    (let ((circle (find-circle self circle-name)))
+      (if (not circle)
+          (format "Circle {a} doesn't exist anymore" circle-name)
+        (circle-information self circle))))
   
   
   (method package (client-circle-shape self client circle-name)
@@ -1983,10 +2088,10 @@
   
   
   (method (delegate-circle-shape self delegate circle-name)
-    (let ((group (find-group self circle-name)))
-      (if (not group)
-          (format "{a}{? {a}~} doesn't exist anymore" (group-domain-name self circle-name) circle-name)
-        (get-shape group))))
+    (let ((circle (find-circle self circle-name)))
+      (if (not circle)
+          (format "Circle {a} doesn't exist anymore" circle-name)
+        (get-shape circle))))
   
   
   (method package (client-change-circle-shape self client circle-name shape)
@@ -1998,12 +2103,12 @@
   
   
   (method (delegate-change-circle-shape self delegate circle-name shape)
-    (let ((group (find-group self circle-name)))
-      (if (not group)
-          (format "{a}{? {a}~} doesn't exist anymore" (group-domain-name self circle-name) circle-name)
-        (set-shape group shape)
-        (update-group-streaming self group)
-        (broadcast-circle-change-shape self delegate group shape)
+    (let ((circle (find-circle self circle-name)))
+      (if (not circle)
+          (format "Circle {a} doesn't exist anymore" circle-name)
+        (set-shape circle shape)
+        (update-group-streaming self circle)
+        (broadcast-circle-change-shape self delegate circle shape)
         #f)))
   
   
@@ -2016,31 +2121,30 @@
   
   
   (method (delegate-change-circle-order self delegate circle-name order)
-    (let ((group (find-group self circle-name)))
-      (if (not group)
-          (format "{a}{? {a}~} doesn't exist anymore" (group-domain-name self circle-name) circle-name)
-        (let ((order (reorder-ordered-streams group order)))
-          (update-group-streaming self group)
-          (broadcast-circle-change-order self delegate group order)
+    (let ((circle (find-circle self circle-name)))
+      (if (not circle)
+          (format "Circle {a} doesn't exist anymore" circle-name)
+        (let ((order (reorder-ordered-streams circle order)))
+          (update-group-streaming self circle)
+          (broadcast-circle-change-order self delegate circle order)
           #f))))
   
   
   (method (collect-circles self zone)
-    (collect (lambda (group)
-               (let ((name (get-name group)))
-                 (and name
-                      (equal? (get-zone group) zone)
-                      (list name (get-stone group)))))
-             groups))
+    (collect (lambda (circle)
+               (let ((name (get-name circle)))
+                 (and (equal? (get-zone circle) zone)
+                      (list name (get-stone circle)))))
+             circles))
   
   
   (method (setup-circles self)
-    (load-circles-index self)
-    (iterate-table circles-index
+    (load-stored-circles self)
+    (iterate-table stored-circles
       (lambda (circle-name filename)
         (let ((file (persistent-circle-file self filename)))
           (when (exists? file)
-            (let ((client-circle (load-circle self file)))
+            (let ((client-circle (load-stored-circle self file)))
               (let ((owner (get-owner client-circle))
                     (created (get-created client-circle))
                     (persistent? (get-persistent? client-circle))
@@ -2053,84 +2157,86 @@
                     (zoom? (get-zoom? client-circle))
                     (link (get-link client-circle))
                     (description (get-description client-circle)))
-                (let ((group (new Server-Group circle-name owner created persistent? invite-only? require-microphone? require-camera? zone stone shape zoom? link description)))
+                (let ((circle (new Server-Circle circle-name owner created persistent? invite-only? require-microphone? require-camera? zone stone shape zoom? link description)))
                   (if persistent?
-                      (set! groups (cons group groups))
-                    ;; group survived because of server crash and needs cleanup
-                    (set! ghost-groups (cons group ghost-groups)))))))))))
+                      (begin
+                        (set! circles (cons circle circles))
+                        (set! groups (cons circle groups)))
+                    ;; circle survived because of server crash and needs cleanup
+                    (set! ghost-circles (cons circle ghost-circles)))))))))))
   
   
   (method (circles-directory self)
     (new-directory directory "circles"))
   
   
-  (method (circles-index-file self)
-    (new-file (circles-directory self) ".index"))
-  
-  
   (method (persistent-circle-file self filename)
     (new-file (circles-directory self) filename))
   
   
-  (method (load-circles-index self)
-    (let ((file (circles-index-file self)))
+  (method (stored-circles-index self)
+    (new-file (circles-directory self) ".index"))
+  
+  
+  (method (load-stored-circles self)
+    (let ((file (stored-circles-index self)))
       (when (exists? file)
-        (load-table circles-index file))))
+        (load-table stored-circles file))))
   
   
-  (method (save-circles-index self)
-    (let ((file (circles-index-file self)))
+  (method (save-stored-circles self)
+    (let ((file (stored-circles-index self)))
       (create-directories file)
-      (save-table circles-index file)))
+      (save-table stored-circles file)))
   
   
   (method (find-persistent-circle self circle-name)
-    (let ((filename (table-ref circles-index circle-name #f)))
+    (let ((filename (table-ref stored-circles circle-name #f)))
       (and filename
            (let ((file (persistent-circle-file self filename)))
              (and (exists? file)
                   file)))))
   
   
-  (method (update-circle self group circle-name)
+  (method (update-stored-circle self circle circle-name)
     (let ((file (find-persistent-circle self circle-name)))
       (when file
         (create-directories file)
-        (store-circle self file group))))
+        (store-circle self file circle))))
   
   
-  (method (delete-circle self circle-name)
+  (method (delete-stored-circle self circle-name)
     (let ((file (find-persistent-circle self circle-name)))
       (when file
         (delete file)))
-    (table-clear circles-index circle-name)
-    (save-circles-index self))
+    (table-clear stored-circles circle-name)
+    (save-stored-circles self))
   
   
-  (method (save-circle self group)
+  (method (save-circle self circle)
     (let ((dir (circles-directory self)))
       (create-directories dir)
-      (let ((circle-name (get-name group))
+      (let ((circle-name (get-name circle))
             (filename (add-extension (make-uuid) "circle")))
-        (table-set! circles-index circle-name filename)
+        (table-set! stored-circles circle-name filename)
         (let ((file (persistent-circle-file self filename)))
-          (store-circle self file group)))
-      (save-circles-index self)))
+          (store-circle self file circle)))
+      (save-stored-circles self)))
   
   
-  (method (store-circle self file group)
-    (let ((owner (get-owner group))
-          (created (get-created group))
-          (persistent? (get-persistent? group))
-          (invite-only? (get-invite-only? group))
-          (require-microphone? (get-require-microphone? group))
-          (require-camera? (get-require-camera? group))
-          (zone (get-zone group))
-          (stone (get-stone group))
-          (shape (get-shape group))
-          (zoom? (get-zoom? group))
-          (link (get-link group))
-          (description (get-description group)))
+  (method (store-circle self file circle)
+    (let ((owner (get-owner circle))
+          (created (get-created circle))
+          (persistent? (get-persistent? circle))
+          (invite-only? (get-invite-only? circle))
+          (require-microphone? (get-require-microphone? circle))
+          (require-camera? (get-require-camera? circle))
+          (zone (get-zone circle))
+          (stone (get-stone circle))
+          (shape (get-shape circle))
+          (zoom? (get-zoom? circle))
+          (link (get-link circle))
+          (description (get-description circle)))
       (call-with-output-file (path-settings file)
         (lambda (output)
           (format output ";;;========={%}")
@@ -2151,16 +2257,8 @@
           (format output "  (<Client-Circle> owner: {s} created: {s} persistent?: {s} invite-only?: {s} require-microphone?: {s} require-camera?: {s} zone: {s} stone: {s} shape: {s} zoom?: {s} link: {s} description: {s}))){%}" owner created persistent? invite-only? require-microphone? require-camera? zone stone shape zoom? link description)))))
   
   
-  (method (load-circle self file)
+  (method (load-stored-circle self file)
     (instantiate (read-form file)))
-  
-  
-  (method package (client-list-group-members self name/no)
-    (let ((group (find-group self name/no))
-          (group-name (and (string? name/no) name/no)))
-      (if (not group)
-          (format "{a}{? {a}~} doesn't exist anymore" (group-domain-name self name/no) group-name)
-        (map get-name (get-members group)))))
   
   
   (method package (client-list-hierarchy self)
@@ -2194,28 +2292,21 @@
                                                                                                            (and (eq? (get-state delegate) 'started)
                                                                                                                 (not (get-group delegate))))
                                                                                                          delegates)))))))))))))
-          (map (lambda (group)
-                 (cons (or (get-name group)
-                           (get-no group))
-                       (cons (get-owner group)
-                             (cons (get-persistent? group)
-                                   (cons (get-invite-only? group)
-                                         (cons (get-require-microphone? group)
-                                               (cons (get-require-camera? group)
-                                                     (cons (get-zone group)
-                                                           (cons (and (not sending-to-mobile?) (get-stone group))
-                                                                 (cons (get-zoom? group)
-                                                                       (cons (effective-link group sending-to-mobile?)
-                                                                             (cons (get-description group)
-                                                                                   (map member-info (get-members group))))))))))))))
-               groups)))
-  
-  
-  (method (group-domain-name self name)
-    (if (or (not name)
-            (integer? name))
-        (registered-domain-name 'group "Group")
-      (registered-domain-name 'circle "Circle")))
+          (map (lambda (circle)
+                 (cons (or (get-name circle)
+                           (get-no circle))
+                       (cons (get-owner circle)
+                             (cons (get-persistent? circle)
+                                   (cons (get-invite-only? circle)
+                                         (cons (get-require-microphone? circle)
+                                               (cons (get-require-camera? circle)
+                                                     (cons (get-zone circle)
+                                                           (cons (and (not sending-to-mobile?) (get-stone circle))
+                                                                 (cons (get-zoom? circle)
+                                                                       (cons (effective-link circle sending-to-mobile?)
+                                                                             (cons (get-description circle)
+                                                                                   (map member-info (get-members circle))))))))))))))
+               circles)))
   
   
   (method override (connected-players self)
@@ -3960,19 +4051,19 @@
   (method (mobile-leave self delegate)
     (with-mobile
       (lambda ()
-        (delegate-leave self delegate))))
+        (delegate-leave-group/circle self delegate))))
   
   
-  (method (mobile-create-group self delegate name persistent? broadcast-hierarchy? zoom? link description)
+  (method (mobile-create-circle self delegate name persistent? broadcast-hierarchy? zoom? link description)
     (with-mobile
       (lambda ()
-        (delegate-create-group self delegate name persistent? #f #f broadcast-hierarchy? #f #f zoom? link description))))
+        (delegate-create-circle self delegate name persistent? #f #f broadcast-hierarchy? #f #f zoom? link description 'participant))))
   
   
-  (method (mobile-delete-group self delegate name/no)
+  (method (mobile-delete-circle self delegate name)
     (with-mobile
       (lambda ()
-        (delegate-delete-group self delegate name/no))))
+        (delegate-delete-circle self delegate name))))
   
   
   (method (mobile-circle-property self delegate circle-name property)
@@ -4036,14 +4127,14 @@
                              (write-mobile self server port "result" command (mobile-decline self delegate sender))))
                           ((equal? command "leave")
                            (write-mobile self server port "result" command (mobile-leave self delegate)))
-                          ((equal? command "create-group")
+                          ((equal? command "create-circle")
                            (bind (name persistent? broadcast-hierarchy? zoom? link . rest) arguments
                              ;; patch around mobile bug
                              (bind-optionals ((description #f)) rest
-                               (write-mobile self server port "result" command (mobile-create-group self delegate name persistent? broadcast-hierarchy? zoom? link description)))))
-                          ((equal? command "delete-group")
-                           (bind (name/no) arguments
-                             (write-mobile self server port "result" command (mobile-delete-group self delegate name/no))))
+                               (write-mobile self server port "result" command (mobile-create-circle self delegate name persistent? broadcast-hierarchy? zoom? link description)))))
+                          ((equal? command "delete-circle")
+                           (bind (name) arguments
+                             (write-mobile self server port "result" command (mobile-delete-circle self delegate name))))
                           ((equal? command "circle-property")
                            (bind (circle-name property-string) arguments
                              (let ((property (mobile-string->circle-property self property-string)))
@@ -4296,7 +4387,7 @@
                           (video-on? #t))
                       (receive (stream send-stream) (make-server-stream self name 'stream video-levels video-on? channels group location: location)
                         (set-action-proc send-stream stream-controller-action)
-                        (set-server-streams group (cons stream (get-server-streams group)))
+                        (add-server-stream group stream)
                         (if delay-streaming?
                             (delay-stream send-stream)
                           (sleep stream-delay)
@@ -4312,7 +4403,7 @@
                             (video-on? (neq? stream-what 'audio)))
                         (receive (stream send-stream) (make-server-stream self name 'stream video-levels video-on? channels group location: location)
                           (set-action-proc send-stream stream-controller-action)
-                          (set-server-streams group (cons stream (get-server-streams group)))
+                          (add-server-stream group stream)
                           (if delay-streaming?
                               (delay-stream send-stream)
                             (sleep stream-delay)
@@ -4449,7 +4540,7 @@
     (let ((server-stream (find-server-stream udp-server (get-no stream))))
       (let ((group (get-recipient server-stream)))
         (close-send-stream udp-server stream)
-        (set-server-streams group (remove! server-stream (get-server-streams group)))
+        (remove-server-stream group server-stream)
         (maybe-delete-group self #f group))))
   
   
