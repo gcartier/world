@@ -39,7 +39,7 @@ struct osn_context {
 	int16_t *permGradIndex3D;
 };
 
-#define ARRAYSIZE(x) (sizeof((x)) / sizeof((x)[0]))
+#define ARRAYSIZE_(x) (sizeof((x)) / sizeof((x)[0]))
 
 /* 
  * Gradients for 2D. They approximate the directions to the
@@ -155,7 +155,7 @@ int open_simplex_noise_init_perm(struct osn_context *ctx, int16_t p[], int nelem
 		
 	for (i = 0; i < 256; i++) {
 		/* Since 3D has 24 gradients, simple bitmask won't work, so precompute modulo array. */
-		ctx->permGradIndex3D[i] = (int16_t)((ctx->perm[i] % (ARRAYSIZE(gradients3D) / 3)) * 3);
+		ctx->permGradIndex3D[i] = (int16_t)((ctx->perm[i] % (ARRAYSIZE_(gradients3D) / 3)) * 3);
 	}
 	return 0;
 }
@@ -200,7 +200,7 @@ int open_simplex_noise(int64_t seed, struct osn_context **ctx)
 		if (r < 0)
 			r += (i + 1);
 		perm[i] = source[r];
-		permGradIndex3D[i] = (short)((perm[i] % (ARRAYSIZE(gradients3D) / 3)) * 3);
+		permGradIndex3D[i] = (short)((perm[i] % (ARRAYSIZE_(gradients3D) / 3)) * 3);
 		source[r] = source[i];
 	}
 	return 0;
