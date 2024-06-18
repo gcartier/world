@@ -467,6 +467,54 @@
 
 
 ;;;
+;;;; Parcel
+;;;
+
+
+(definition parcel-pool
+  '())
+
+(definition parcel-mutex
+  (make-mutex 'parcel))
+
+
+(definition public parcel-size
+  still8-minimum)
+
+;; relies on udp-datagram-max < parcel-size
+(definition public (parcel? obj)
+  (= (u8vector-length obj) parcel-size))
+
+
+(definition protected parcels-live
+  0)
+
+(definition protected (parcels-allocated)
+  (+ parcels-live (length parcel-pool)))
+
+(definition protected (parcels-memory)
+  (* (+ 8 2048) (parcels-allocated)))
+
+
+(definition public (need-parcel)
+  (mutex-lock! parcel-mutex)
+  (increase! parcels-live)
+  (prog1 (if (null? parcel-pool)
+             (make-u8vector parcel-size)
+           (let ((parcel (car parcel-pool)))
+             (set! parcel-pool (cdr parcel-pool))
+             parcel))
+    (mutex-unlock! parcel-mutex)))
+
+
+(definition public (return-parcel parcel)
+  (mutex-lock! parcel-mutex)
+  (decrease! parcels-live)
+  (set! parcel-pool (cons parcel parcel-pool))
+  (mutex-unlock! parcel-mutex))
+
+
+;;;
 ;;;; Ring
 ;;;
 
@@ -518,11 +566,33 @@
     data))
 
 
+(definition protected (read-parcel port)
+  (let ((data (need-parcel)))
+    (udp-read-subu8vector data 0 parcel-size port)
+    (when record-read/write?
+      (with-record header
+        (let ((sender (read-header-sender data))
+              (kind (read-header-kind data)))
+          (record-event udp-id-read-data
+                        -1.
+                        (fixnum->flonum sender)
+                        (fixnum->flonum kind)
+                        -1.
+                        -1.
+                        -1.
+                        (fixnum->flonum (u8vector-length data))))))
+    data))
+
+
 (definition protected (write-data data port)
   ;; quick temporary hack to get back the safe behavior
   ;; of retrying-write until port being false is fixed
   (when port
-    (write data port)
+    ;; only media uses parcels
+    (if (parcel? data)
+        (let ((size (determine-media-size data)))
+          (udp-write-subu8vector data 0 size port))
+      (write data port))
     (when record-read/write?
       (with-record header
         (let ((sender (read-header-sender data))
@@ -1244,7 +1314,7 @@
                     (let ((sequence (next-data-sequence! self))
                           (content-size (min remain max-content-size)))
                       (let ((size (+ header-size content-size)))
-                        (let ((data (make-u8vector size)))
+                        (let ((data (need-parcel)))
                           (write-header-code data udp-code)
                           (write-header-kind data media-kind)
                           (write-header-sender data sender)
@@ -2082,7 +2152,7 @@
                                              (fixnum->flonum resent)
                                              -1.)))
                          (let ((packet (new UDP-Packet dts pts duration sequence frame part total flags data)))
-                           (vector-set! packets pos packet)
+                           (packet-set! self pos packet)
                            (when (= media-kind udp-audio)
                              (audio-added self packet))
                            (when record?
@@ -2124,10 +2194,10 @@
     (cond ((< count size)
            (cond ((= pos head)
                   (set! head (modulo (- head 1) size))
-                  (vector-set! packets head packet)
+                  (packet-set! self head packet)
                   (increase! count))
                  ((= pos tail)
-                  (vector-set! packets tail packet)
+                  (packet-set! self tail packet)
                   (set! tail (modulo (+ tail 1) size))
                   (increase! count))
                  (else
@@ -2135,24 +2205,34 @@
                            (>= pos head))
                       (begin
                         (subvector-shift! packets head pos -1)
-                        (vector-set! packets (- pos 1) packet)
+                        (packet-set! self (- pos 1) packet)
                         (set! head (modulo (- head 1) size))
                         (increase! count))
                     (subvector-shift! packets pos tail 1)
-                    (vector-set! packets pos packet)
+                    (packet-set! self pos packet)
                     (set! tail (modulo (+ tail 1) size))
                     (increase! count)))))
           (else
+           (terminal 'OVERFLOW)
            (when overflow-proc
              (let ((bumped-packet <UDP-Packet> (vector-ref packets tail)))
                (overflow-proc self packet bumped-packet)))
-           (vector-set! packets tail packet)
+           (packet-set! self tail packet)
            (set! tail (modulo (+ tail 1) size))
            (set! head tail)
            (increase! lowest)))
     ;; duration
     (when (= media-kind udp-audio)
       (audio-added self packet)))
+  
+  
+  (method protected (packet-set! self pos packet)
+    (let ((actual-packet (vector-ref packets pos)))
+      (when actual-packet
+        (let ((actual-data (get-data actual-packet)))
+          (when actual-data
+            (return-parcel actual-data)))))
+    (vector-set! packets pos packet))
   
   
   ;;;
@@ -2203,7 +2283,7 @@
                       (total (read-media-total data))
                       (flags (read-media-flags data)))
                   (let ((packet (new UDP-Packet dts pts duration sequence frame part total flags data)))
-                    (vector-set! packets pos packet))))))))))
+                    (packet-set! self pos packet))))))))))
   
   
   (method package (visualizer-frame-complete? self pos <fx>)
@@ -2245,7 +2325,7 @@
         (let (loop)
           (let ((earliest <UDP-Packet> (vector-ref packets head)))
             (when (<= (get-dts earliest) cut)
-              (vector-set! packets head #f)
+              (packet-set! self head #f)
               (set! head (modulo (+ head 1) size))
               (decrease! count)
               (increase! lowest)
@@ -2352,7 +2432,7 @@
           (when (= media-kind udp-audio)
             (let ((packet (vector-ref packets head)))
               (audio-removed self packet)))
-          (vector-set! packets head #f)
+          (packet-set! self head #f)
           (set! head (modulo (+ head 1) size))
           (decrease! count)
           (increase! lowest))
