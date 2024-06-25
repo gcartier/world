@@ -40,6 +40,7 @@
         (world.motion)
         (world.polygon)
         (world.queue)
+        (world.section)
         (world.settings)
         (world.sound)
         (world.spell)
@@ -163,6 +164,9 @@
   (slot dash-duration           <fl>         initialize 0.                 accessors generate)
   (slot jump?                   <bool>       initialize #f                 accessors generate)
   (slot jump-impulsion          <object>     initialize #f                 accessors generate)
+  (slot stable-position         <vertex>     initialize (make-nan-vertex)  getter generate)
+  (slot stable-revision         <fx>         initialize -1                 getter generate)
+  (slot stable-modified?        <bool>       initialize (unspecified)      getter generate)
   (slot animation-active        <object>     initialize #f                 accessors generate)
   (slot animation-speedup       <fl+>        initialize #f                 accessors generate)
   (slot animation-fall          <object>     initialize #f                 accessors generate)
@@ -509,669 +513,694 @@
   ;; (slot rotation           <fl>)           ;; rotation for the character model
   ;; (slot orientation        <object>)       ;; vertical or horizontal like for four-legged creatures
   ;; (slot dash               <fl>)           ;; temporary speed increase
+  ;; (slot stable-position    <vertex>)       ;; last stable position
+  ;; (slot stable-revision    <fx>)           ;; last stable chunk revision
+  ;; (slot stable-modified?   <bool>)         ;; last stable commands modified?
+  
+  (method package (update-stable self modified?)
+    (if modified?
+        (begin
+          (set! stable-modified? modified?)
+          #t)
+      (let ((area (center-area area-cube)))
+        (if (not area)
+            #t
+          (let ((section (get-section area)))
+            (if (not section)
+                #t
+              (let ((revision (get-revision (get-chunk section))))
+                (if (and (vertex-near? position stable-position)
+                         (= revision stable-revision)
+                         (eq? modified? stable-modified?))
+                    #f
+                  (vertex-copy! stable-position position)
+                  (set! stable-revision revision)
+                  (set! stable-modified? modified?)
+                  #t))))))))
   
   (method package (tick-actor self commands <Commands> time <fl> elapse <fl> gravity? collision-response (ignore-entities?: ignore-entities? (ignore-entities? self)) (ignore-players?: ignore-players? (ignore-players? self)) (ignore-me?: ignore-me? (ignore-me? self)) (proportional-slide?: proportional-slide? #t))
     (site tick-actor
-      (let ((world (current-world))
-            (zone (current-zone))
-            (me (current-me+))
-            (motion (current-motion+))
-            (camera (current-camera+))
-            (ambience (current-ambience+))
-            (seconds (current-seconds))
-            (model (cache-model self))
-            (center (transformed-center self))
-            (scaling (average-scaling self))
-            (backward? (get-move-backward? commands))
-            (sprint-forward? (get-sprint-forward? commands))
-            (sprint-backward? (get-sprint-backward? commands)))
-        (let ((gravity (or override-gravity (compute-gravity& world center)))
-              (area-cube (update-area-cube self))
-              (me? (eq? self me))
-              (playable? (playable? zone))
-              (swimable? (swimable? zone))
-              (sprint? (or sprint-forward? sprint-backward?))
-              (speed #f)
-              (animation-speedup #f)
-              (displacement (vertex& 0. 0. 0.))
-              (grace-slowdown .25)
-              (grace-move? #f)
-              (floor-level (floor-level world))
-              (motion-target? (and motion (eq? (motion-target motion) self)))
-              (old-lookat (lookat-copy& lookat))
-              (old-ground? ground?)
-              (animation #f)
-              (fly? (flying? self)))
-          (define (process-commands)
-            (when (and (get-modified? commands) (hook-commands world commands))
-              ;; move forward
-              (when (and (get-move-forward? commands) (not sprint?))
-                (when (allow-movement? self)
-                  (move move-forward)
-                  (animate (move-animation))))
-              ;; move backward
-              (when (and backward? (not sprint?))
-                (when (allow-movement? self)
-                  (move move-backward)
-                  (animate "WalkBackwards")))
-              ;; move left
-              (when (get-move-left? commands)
-                (when (allow-movement? self)
-                  (move move-left)
-                  (animate (if backward? "WalkBackwards" (move-animation)))))
-              ;; move right
-              (when (get-move-right? commands)
-                (when (allow-movement? self)
-                  (move move-right)
-                  (animate (if backward? "WalkBackwards" (move-animation)))))
-              ;; move up
-              (when (get-move-up? commands)
-                (move move-up))
-              ;; move down
-              (when (get-move-down? commands)
-                (move move-down))
-              ;; sprint forward
-              (when sprint-forward?
-                (move sprint-forward)
-                (animate "Run"))
-              ;; sprint backward
-              (when sprint-backward?
-                (move sprint-backward)
-                (animate "Run"))
-              ;; rotate left
-              (when (get-rotate-left? commands)
-                (rotate-left))
-              ;; rotate right
-              (when (get-rotate-right? commands)
-                (rotate-right))))
-          
-          (define (move proc)
-            (cond ((and swimable? water? (>= swim-timer 0.))
-                   (proc (* dash water-slowdown scaling) displacement))
-                  ((or ground? hover? ladder? fly?)
-                   (proc (* dash scaling) displacement))
-                  ((and jumping? jump-grace?)
-                   (proc (* dash grace-slowdown scaling) displacement)
-                   (set! grace-move? #t)
-                   (set! jump-grace? #f)))
-            (when (> dash-duration 0.)
-              (decrease! dash-duration elapse)
-              (when (<= dash-duration 0.)
-                (set! dash 1.)
-                (set! dash-duration 0.)
-                (update-parameter world 'dash))))
-          
-          (define (move-forward factor displacement)
-            (set! speed (* factor (vehicle-speed world self) move-slowdown))
-            (if rail-dir
-                (vertex-increase! displacement (vertex-scalar*& (vertex* (get-sight lookat) (car rail-dir)) speed))
-              (vertex-increase! displacement (vertex-scalar*& (get-sight lookat) speed))))
-          
-          (define (move-backward factor displacement)
-            (set! speed (* factor (vehicle-speed world self) move-slowdown))
-            (if rail-dir
-                (vertex-decrease! displacement (vertex-scalar*& (vertex* (get-sight lookat) (car rail-dir)) speed))
-              (vertex-decrease! displacement (vertex-scalar*& (get-sight lookat) speed))))
-          
-          (define (move-left factor displacement)
-            (set! speed (* factor (vehicle-speed world self) move-slowdown))
-            (vertex-decrease! displacement (vertex-scalar*& (get-right lookat) speed)))
-          
-          (define (move-right factor displacement)
-            (set! speed (* factor (vehicle-speed world self) move-slowdown))
-            (vertex-increase! displacement (vertex-scalar*& (get-right lookat) speed)))
-          
-          (define (move-up factor displacement)
-            (set! speed (* factor (vehicle-speed world self) move-slowdown (if (high-speed?) 2. 1.)))
-            (vertex-increase! displacement (vertex-scalar*& (get-up lookat) speed)))
-          
-          (define (move-down factor displacement)
-            (set! speed (* factor (vehicle-speed world self) move-slowdown (if (high-speed?) 2. 1.)))
-            (vertex-decrease! displacement (vertex-scalar*& (get-up lookat) speed)))
-          
-          (define (sprint-forward factor displacement)
-            (set! speed (if rail-dir
-                            (* factor (vehicle-speed world self))
-                          (* factor (vehicle-speed world self) sprint-speed)))
-            (if rail-dir
-                (vertex-increase! displacement (vertex-scalar*& (vertex* (get-sight lookat) (car rail-dir)) speed))
-              (vertex-increase! displacement (vertex-scalar*& (get-sight lookat) speed))))
-          
-          (define (sprint-backward factor displacement)
-            (set! speed (if rail-dir
-                            (* factor (vehicle-speed world self))
-                          (* factor (vehicle-speed world self) sprint-speed)))
-            (if rail-dir
-                (vertex-decrease! displacement (vertex-scalar*& (vertex* (get-sight lookat) (car rail-dir)) speed))
-              (vertex-decrease! displacement (vertex-scalar*& (get-sight lookat) speed))))
-          
-          (define (high-speed?)
-            (or (key-down? #\3)
-                (key-down? #\4)))
-          
-          (define player-rotation-speed <fl>
-            2.5)
-          
-          (define (rotate-left)
-            (rotate-actor (* player-rotation-speed elapse)))
-          
-          (define (rotate-right)
-            (rotate-actor (- (* player-rotation-speed elapse))))
-          
-          (define (rotate-actor angle)
-            ;; the me? is a quick patch
-            (if (and motion-target? me?)
-                (rotate-actor-horizontal motion self angle)
-              (rotate-horizontal self angle)))
-          
-          (define (animate name)
-            (set! animation name)
-            ;; arbitrary maximum so animation isn't crazy fast
-            (set! animation-speedup (and speed (min 2.5 (/ speed (* (model-ground-speed self) scaling animation-slowdown)))))
-            (animate/change time name speedup: animation-speedup))
-          
-          (define (animate/change time name (speedup: speedup #f))
-            (let ((old-animation animation-active))
-              (animate-model self time name speedup: speedup)
-              (world.changes:animate-change seconds self old-animation animation-active)))
-          
-          (define (move-animation)
-            (case self.motion
-              ((idle) "Idle")
-              ((walk) "Walk")
-              ((run) "Run")))
-          
-          (define (process-velocity)
-            (cond ((or ground? hover? ladder? fly? grace-move? (and swimable? water? (moving? commands)))
-                   (if rail-dir
-                       (vertex-copy! velocity (vertex-scalar*& displacement (/ 2.5 scaling)))
-                     (vertex-copy! velocity (vertex-scalar/& displacement scaling))))
-                  ((or (not jumping?)
-                       (> (- time jump-time) 1.))
-                   (let ((friction (get-friction self)))
-                     (when friction
-                       (let ((reduce <fl> (* friction elapse (if water? 4. 1.))))
-                         (if (< (vertex-norm& velocity) reduce)
-                             (vertex-zero! velocity)
-                           (vertex-decrease! velocity (vertex-scalar*& (vertex-normalize-safe& velocity) reduce)))))))))
-          
-          (define (process-gravity)
-            (let ((normalized-gravity (vertex-normalize& gravity)))
-              (if (or jump? (get-jump? commands))
-                  (when (and (not rail-dir) (or water-jump? (and jump-ready? (or sprint? water? (and (or ground? ladder?) (not jumping?))))))
-                    (unless (or water? water-jump?)
-                      (set! jumping? #t)
-                      (set! jump-ready? #f)
-                      (set! jump-grace? (and (allow-grace? self) (vertex-zero? velocity)))
-                      (set! jump-time time))
-                    (vertex-copy! fall-velocity (if water?
-                                                    (vertex-y-set! fall-velocity (min (+ (vertex-y fall-velocity) 0.02) 0.07))
-                                                  (vertex-scalar*& normalized-gravity (* (- (/ (or jump-impulsion (get-jump-impulsion world)) (if water-jump? 1.5 1.))) (cond (sprint? sprint-jump)
-                                                                                                                                                                              ((and swimable? water?) (if water-jump? 1. (/ 1. 4.)))
-                                                                                                                                                                              (else 1.))))))
-                    (when water-jump?
-                      (set! water-jump? #f))
-                    (set! jump? #f)
-                    (set! jump-impulsion #f)
-                    (animate/change time :context))
-                (unless water?
-                  (set! jump-ready? #t)))
-              (when (> swim-timer 0.)
-                (decrease! swim-timer elapse)
-                (when (<= swim-timer 0.)
-                  (set! swim-timer 0.)
-                  (set! jump-ready? #t)))
-              (when (and ground? (vertex-zero? fall-velocity))
-                (unless jump-ready?
-                  (set! jump-ready? #t))
-                (when water-jump?
-                  (set! water-jump? #f)))
-              (when (> (dot-product& fall-velocity normalized-gravity) (if water? 0.015 max-fall-speed))
-                (if water?
-                    (vertex-y-set! fall-velocity (* (vertex-y fall-velocity) 0.85))
-                  (vertex-copy! fall-velocity (vertex-scalar*& normalized-gravity max-fall-speed))))))
-          
-          (define (collide-actor)
-            (break-logic slide)
-            (when (get-debug-collisions?)
-              (reset-marks zone))
-            (let* ((radiuses (transformed-radiuses self))
-                   (pumps (and (not water?) (effective-pumps self)))
-                   (pumped-center (if pumps
-                                      (bind-values (pumped pumped-direction pumped-collisions) (collide&stop$ center (vertex+& center pumps) lookat radiuses area-cube: area-cube ignore-entities?: ignore-entities? ignore-players?: ignore-players? ignore-me?: ignore-me?)
-                                        (free-collisions$ pumped-collisions)
-                                        pumped)
-                                    center))
-                   (target-center (vertex+& pumped-center (vertex-scalar*& velocity elapse)))
-                   (collide$ (case collision-response ((stop) collide&stop$) ((slide) collide&slide$))))
-              ;; slide
-              (bind-values (new-center slide-direction slide-collisions) (collide$ pumped-center target-center lookat radiuses area-cube: area-cube include-back-facing?: #t ignore-entities?: ignore-entities? ignore-players?: ignore-players? ignore-me?: ignore-me? proportional-slide?: proportional-slide? debuggable-collisions?: #t)
-                (bind-values (new-slide-collisions slide-water?) (filter-water-collisions slide-collisions #t) ;; set water? with both slide and fall
-                  (when (and swimable? slide-water?)
-                    (bind-values (new-center-2 slide-direction-2 slide-collisions-2) (collide$ pumped-center target-center lookat radiuses area-cube: area-cube polygon-filter: (and swimable? liquid-filter) ignore-entities?: ignore-entities? ignore-players?: ignore-players? ignore-me?: ignore-me? debuggable-collisions?: #t)
-                      (vertex-copy! new-center new-center-2)
-                      (free-collisions$ slide-collisions)
-                      (set! slide-collisions slide-collisions-2)))
-                  (let ((new-center (if pumps
-                                        (bind-values (unpumped unpumped-direction unpumped-collisions) (collide&stop$ new-center (vertex-& new-center pumps) lookat radiuses area-cube: area-cube polygon-filter: (and swimable? liquid-filter) ignore-entities?: ignore-entities? ignore-players?: ignore-players? ignore-me?: ignore-me?)
-                                          (free-collisions$ unpumped-collisions)
-                                          unpumped)
-                                      new-center)))
-                    ;; kind of a quick hack so we dont slide farther than the player
-                    (when (and (not proportional-slide?) (not jumping?))
-                      (adjust-fast-slide! self center new-center))
-                    (break-action
-                      (when (in-logic?)
-                        (move-actor new-center #f)))
-                    (if (or (not gravity?) fly?)
-                        (values new-center slide-collisions '())
-                      (let ((adjusted-elapse (* elapse 50.)))
-                        (define (xz-position&)
-                          (vertex& (+ (fxceiling (get-x self)) .5) 0. (+ (fxceiling (get-z self)) .5)))
-                        
-                        ;; ladder
-                        (set! ladder? (some? (lambda (collision) (= (decode-id (get-data1 (get-polygon collision))) 65)) slide-collisions))
-                        (cond (ladder?
-                               (when (not ladder-center)
-                                 (set! ladder-center (make-vertex))
-                                 (for-each (lambda (collision)
-                                             (let ((polygon (get-polygon collision)))
-                                               (when (= (decode-id (get-data1 polygon)) 65)
-                                                 (let ((center (get-center polygon))
-                                                       (normal (get-normal polygon)))
-                                                   (vertex+! ladder-center center (vertex-scalar*& normal .45))
-                                                   (vertex-y-set! ladder-center 0.)
-                                                   (set! ladder-orientation (if (>= (abs (vertex-x normal)) .5) 'x 'z))))))
-                                           slide-collisions))
-                               (when (not ladder-shaft)
-                                 (set! ladder-shaft (make-vertex)))
-                               (vertex-copy! ladder-shaft (xz-position&)))
-                              (else
-                               (when ladder-shaft
-                                 (if (vertex=? (xz-position&) ladder-shaft)
-                                     (if (not-null? slide-collisions)
-                                         (set! ladder? #t)
-                                       ;; slow fall
-                                       (set! adjusted-elapse (/ adjusted-elapse 3.)))
-                                   (set! ladder-shaft #f)
-                                   (set! ladder-center #f)))))
-                        
-                        (break-logic fall)
-                        (break-action
-                          (when (get-debug-collisions?)
-                            (reset-marks zone)))
-                        (when (and swimable? water?)
-                          (set! adjusted-elapse (/ adjusted-elapse 1.5)))
-                        (vertex+! fall-velocity fall-velocity (vertex-scalar*& gravity adjusted-elapse))
-                        (cond (rail-dir
-                               (vertex! fall-velocity 0. -.20 0.))
-                              (ladder?
-                               (case ladder-orientation
-                                 ((x)
-                                  (vertex-x-set! fall-velocity 0.)
-                                  (vertex-y-set! fall-velocity .075)
-                                  (vertex-z-set! fall-velocity (/ (- (vertex-z ladder-center) (get-z self)) 5.)))
-                                 ((z)
-                                  (vertex-x-set! fall-velocity (/ (- (vertex-x ladder-center) (get-x self)) 5.))
-                                  (vertex-y-set! fall-velocity .075)
-                                  (vertex-z-set! fall-velocity 0.)))))
-                        (let ((target-fall (vertex+& new-center (vertex+& (vertex-scalar*& fall-velocity adjusted-elapse) (vertex-scalar*& gravity (* .5 adjusted-elapse adjusted-elapse))))))
-                          (if (vertex-near? target-fall new-center)
-                              #f
-                            ;; fall
-                            ;; megahack around many edge / point collision snags when jumping next to blocks (AM)
-                            (bind-values (new-fall fall-direction fall-collisions) (collide&stop$ new-center target-fall lookat radiuses area-cube: area-cube include-back-facing?: #t ignore-entities?: ignore-entities? ignore-players?: ignore-players? ignore-me?: ignore-me? debuggable-collisions?: #t megahack?: (and me? (or jumping? ladder? ladder-shaft)))
-                              (break-action
-                                (when (in-logic?)
-                                  (move-actor new-fall #f)))
-                              (let ((new-fall-collisions (if (not swimable?) fall-collisions (liquid? fall-collisions slide-water?))))
-                                (when swimable?
-                                  (if water-collision?
-                                      (begin
-                                        (unless shallow-water?
-                                          (set! shallow-water? #t)
-                                          (when (and ambience me?)
-                                            (change-ambience ambience error?: #f)))
-                                        (bind-values (new-fall-2 fall-direction other-fall-collisions) (collide&stop$ new-center target-fall lookat radiuses area-cube: area-cube polygon-filter: (and swimable? liquid-filter) ignore-entities?: ignore-entities? ignore-players?: ignore-players? ignore-me?: ignore-me? debuggable-collisions?: #t)
-                                          (vertex-copy! new-fall new-fall-2)
-                                          (free-collisions$ fall-collisions)
-                                          (set! fall-collisions other-fall-collisions)))
-                                    ;; going from shallow to water
-                                    (when (and water? shallow-water?)
-                                      (set! shallow-water? #f)
-                                      (when (and ambience me?)
-                                        (play-ambience ambience (find-asset world "ambience/warcraft/water/Underwater.ogg"))))))
-                                (vertex-copy! new-fall (or (manage-fall-collisions fall-collisions) new-fall))
-                                (values new-fall slide-collisions fall-collisions))))))))))))
-          
-          (define (manage-fall-collisions fall-collisions)
-            (manage-plates fall-collisions)
-            (manage-rails fall-collisions))
-          
-          (define (manage-plates fall-collisions)
-            (define (common-list-elements l1 l2)
-              (let ((common '()))
-                (for-each (lambda (element)
-                            (when (member? element l2)
-                              (set! common (cons element common))))
-                          l1)
-                common))
+      (when (update-stable self (get-modified? commands))
+        (let ((world (current-world))
+              (zone (current-zone))
+              (me (current-me+))
+              (motion (current-motion+))
+              (camera (current-camera+))
+              (ambience (current-ambience+))
+              (seconds (current-seconds))
+              (model (cache-model self))
+              (center (transformed-center self))
+              (scaling (average-scaling self))
+              (backward? (get-move-backward? commands))
+              (sprint-forward? (get-sprint-forward? commands))
+              (sprint-backward? (get-sprint-backward? commands)))
+          (let ((gravity (or override-gravity (compute-gravity& world center)))
+                (area-cube (update-area-cube self))
+                (me? (eq? self me))
+                (playable? (playable? zone))
+                (swimable? (swimable? zone))
+                (sprint? (or sprint-forward? sprint-backward?))
+                (speed #f)
+                (animation-speedup #f)
+                (displacement (vertex& 0. 0. 0.))
+                (grace-slowdown .25)
+                (grace-move? #f)
+                (floor-level (floor-level world))
+                (motion-target? (and motion (eq? (motion-target motion) self)))
+                (old-lookat (lookat-copy& lookat))
+                (old-ground? ground?)
+                (animation #f)
+                (fly? (flying? self)))
+            (define (process-commands)
+              (when (and (get-modified? commands) (hook-commands world commands))
+                ;; move forward
+                (when (and (get-move-forward? commands) (not sprint?))
+                  (when (allow-movement? self)
+                    (move move-forward)
+                    (animate (move-animation))))
+                ;; move backward
+                (when (and backward? (not sprint?))
+                  (when (allow-movement? self)
+                    (move move-backward)
+                    (animate "WalkBackwards")))
+                ;; move left
+                (when (get-move-left? commands)
+                  (when (allow-movement? self)
+                    (move move-left)
+                    (animate (if backward? "WalkBackwards" (move-animation)))))
+                ;; move right
+                (when (get-move-right? commands)
+                  (when (allow-movement? self)
+                    (move move-right)
+                    (animate (if backward? "WalkBackwards" (move-animation)))))
+                ;; move up
+                (when (get-move-up? commands)
+                  (move move-up))
+                ;; move down
+                (when (get-move-down? commands)
+                  (move move-down))
+                ;; sprint forward
+                (when sprint-forward?
+                  (move sprint-forward)
+                  (animate "Run"))
+                ;; sprint backward
+                (when sprint-backward?
+                  (move sprint-backward)
+                  (animate "Run"))
+                ;; rotate left
+                (when (get-rotate-left? commands)
+                  (rotate-left))
+                ;; rotate right
+                (when (get-rotate-right? commands)
+                  (rotate-right))))
             
-            (let ((new-pp '())
-                  (to-add '())
-                  (to-remove '()))
-              (for-each (lambda (coll)
-                          (when (memq? (decode-id (get-data1 (get-polygon coll))) '(70 72))
-                            (let ((poly (get-polygon coll)))
-                              (set! new-pp (cons (polygon-position poly) new-pp)))))
-                        fall-collisions)
-              (let ((common (intersection test: equal? new-pp plates)))
-                (set! to-add (list-copy new-pp))
-                (set! to-remove (list-copy plates))
-                (for-each (lambda (com)
-                            (set! to-add (remove com to-add test: equal?))
-                            (set! to-remove (remove com to-remove test: equal?)))
-                          common)
-                (plates-update (current-universe) to-add to-remove self)
-                (set! plates new-pp))))
-          
-          (define (manage-rails fall-collisions)
-            (let ((rail (find-if (lambda (coll) (and (memq? (decode-id (get-data1 (get-polygon coll))) '(27 28 66)) (get-polygon coll))) fall-collisions return: 'result))
-                  (pos #f))
-              (if rail
-                  (call-with-position zone (vertex& (get-data2 rail) (get-data3 rail) (get-data4 rail))
-                    (lambda (section block-id data-id i j k x y z with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!)
-                      (let ((data (if (memq? block-id '(27 28)) (bit-set data-id 3 #f) data-id)))
-                        (let ((curved? (> data 5)))
-                          (if (not curved?)
-                              (begin
-                                (let ((dir (if (memq? data '(0 4 5)) #f64(0. 0. 1.) #f64(1. 0. 0.)))) ;; N W
-                                  (let ((angle (vector-angle (get-sight lookat) dir))
-                                        (dist (vertex-norm& (vertex*& (vertex-& position (vertex& x y z)) (if (memq? data '(0 4 5)) #f64(1. 0. 0.) #f64(0. 0. 1.))))))
-                                    (if (and (or (< angle (degree->radian 10.)) (> angle (degree->radian 170.))) (< dist .2))
-                                        (unless rail-dir
-                                          (set! rail-dir (list dir)))
-                                      (set! rail-dir #f))))
-                                (set! last-turn #f))
-                            (let ((dir1 (if (memq? data '(6 7)) #f64(0. 0. 1.) #f64(0. 0. -1.)))
-                                  (dir2 (if (memq? data '(6 9)) #f64(1. 0. 0.) #f64(-1. 0. 0.))))
-                              (let ((curve (curve-angle (get-sight lookat) dir1 dir2)))
-                                (when rail-dir
-                                  (unless (and last-turn (vertex=? (vertex& x (- y .5) z) last-turn))
-                                    (set! pos (vertex x y z))
-                                    (set! last-turn (vertex x (- y .5) z))
-                                    (set! rail-dir (let ((dir (cdr rail-dir)))
-                                                     (if (null? dir)
-                                                         #f
-                                                       dir)))
-                                    (rotate-actor curve))))))))))
-                (set! rail-dir #f)
-                (set! last-turn #f))
-              pos))
-          
-          (define (curve-angle sight d1 d2)
-            (let ((a1 (vector-angle sight d1))
-                  (a2 (vector-angle sight d2))
-                  (main-dir (make-vertex))
-                  (curve (degree->radian 90.)))
-              (cond ((> a1 (degree->radian 170.))
-                     (vertex-copy! main-dir d1)
-                     (set! curve (* curve -1. (vertex-x d2) (vertex-z main-dir)))
-                     (unless last-turn
-                       (set! rail-dir (list (vertex-abs main-dir) d2))))
-                    ((> a2 (degree->radian 170.))
-                     (vertex-copy! main-dir d2)
-                     (set! curve (* curve (vertex-z d1) (vertex-x main-dir)))
-                     (unless last-turn
-                       (set! rail-dir (list (vertex-abs main-dir) d1))))
-                    (else
-                     (set! rail-dir #f)
-                     (set! last-turn #f)))
-              curve))
-          
-          (define (liquid? fall-collisions slide-water?)
-            (let ((new-collisions (make-queue$))
-                  (water-polygons (make-queue$))
-                  (lava-collision? #f))
-              (for-each (lambda (collision)
-                          (let ((poly (get-polygon collision)))
-                            (if (get-liquid-cube? (id->block (decode-id (get-data1 poly))))
+            (define (move proc)
+              (cond ((and swimable? water? (>= swim-timer 0.))
+                     (proc (* dash water-slowdown scaling) displacement))
+                    ((or ground? hover? ladder? fly?)
+                     (proc (* dash scaling) displacement))
+                    ((and jumping? jump-grace?)
+                     (proc (* dash grace-slowdown scaling) displacement)
+                     (set! grace-move? #t)
+                     (set! jump-grace? #f)))
+              (when (> dash-duration 0.)
+                (decrease! dash-duration elapse)
+                (when (<= dash-duration 0.)
+                  (set! dash 1.)
+                  (set! dash-duration 0.)
+                  (update-parameter world 'dash))))
+            
+            (define (move-forward factor displacement)
+              (set! speed (* factor (vehicle-speed world self) move-slowdown))
+              (if rail-dir
+                  (vertex-increase! displacement (vertex-scalar*& (vertex* (get-sight lookat) (car rail-dir)) speed))
+                (vertex-increase! displacement (vertex-scalar*& (get-sight lookat) speed))))
+            
+            (define (move-backward factor displacement)
+              (set! speed (* factor (vehicle-speed world self) move-slowdown))
+              (if rail-dir
+                  (vertex-decrease! displacement (vertex-scalar*& (vertex* (get-sight lookat) (car rail-dir)) speed))
+                (vertex-decrease! displacement (vertex-scalar*& (get-sight lookat) speed))))
+            
+            (define (move-left factor displacement)
+              (set! speed (* factor (vehicle-speed world self) move-slowdown))
+              (vertex-decrease! displacement (vertex-scalar*& (get-right lookat) speed)))
+            
+            (define (move-right factor displacement)
+              (set! speed (* factor (vehicle-speed world self) move-slowdown))
+              (vertex-increase! displacement (vertex-scalar*& (get-right lookat) speed)))
+            
+            (define (move-up factor displacement)
+              (set! speed (* factor (vehicle-speed world self) move-slowdown (if (high-speed?) 2. 1.)))
+              (vertex-increase! displacement (vertex-scalar*& (get-up lookat) speed)))
+            
+            (define (move-down factor displacement)
+              (set! speed (* factor (vehicle-speed world self) move-slowdown (if (high-speed?) 2. 1.)))
+              (vertex-decrease! displacement (vertex-scalar*& (get-up lookat) speed)))
+            
+            (define (sprint-forward factor displacement)
+              (set! speed (if rail-dir
+                              (* factor (vehicle-speed world self))
+                            (* factor (vehicle-speed world self) sprint-speed)))
+              (if rail-dir
+                  (vertex-increase! displacement (vertex-scalar*& (vertex* (get-sight lookat) (car rail-dir)) speed))
+                (vertex-increase! displacement (vertex-scalar*& (get-sight lookat) speed))))
+            
+            (define (sprint-backward factor displacement)
+              (set! speed (if rail-dir
+                              (* factor (vehicle-speed world self))
+                            (* factor (vehicle-speed world self) sprint-speed)))
+              (if rail-dir
+                  (vertex-decrease! displacement (vertex-scalar*& (vertex* (get-sight lookat) (car rail-dir)) speed))
+                (vertex-decrease! displacement (vertex-scalar*& (get-sight lookat) speed))))
+            
+            (define (high-speed?)
+              (or (key-down? #\3)
+                  (key-down? #\4)))
+            
+            (define player-rotation-speed <fl>
+              2.5)
+            
+            (define (rotate-left)
+              (rotate-actor (* player-rotation-speed elapse)))
+            
+            (define (rotate-right)
+              (rotate-actor (- (* player-rotation-speed elapse))))
+            
+            (define (rotate-actor angle)
+              ;; the me? is a quick patch
+              (if (and motion-target? me?)
+                  (rotate-actor-horizontal motion self angle)
+                (rotate-horizontal self angle)))
+            
+            (define (animate name)
+              (set! animation name)
+              ;; arbitrary maximum so animation isn't crazy fast
+              (set! animation-speedup (and speed (min 2.5 (/ speed (* (model-ground-speed self) scaling animation-slowdown)))))
+              (animate/change time name speedup: animation-speedup))
+            
+            (define (animate/change time name (speedup: speedup #f))
+              (let ((old-animation animation-active))
+                (animate-model self time name speedup: speedup)
+                (world.changes:animate-change seconds self old-animation animation-active)))
+            
+            (define (move-animation)
+              (case self.motion
+                ((idle) "Idle")
+                ((walk) "Walk")
+                ((run) "Run")))
+            
+            (define (process-velocity)
+              (cond ((or ground? hover? ladder? fly? grace-move? (and swimable? water? (moving? commands)))
+                     (if rail-dir
+                         (vertex-copy! velocity (vertex-scalar*& displacement (/ 2.5 scaling)))
+                       (vertex-copy! velocity (vertex-scalar/& displacement scaling))))
+                    ((or (not jumping?)
+                         (> (- time jump-time) 1.))
+                     (let ((friction (get-friction self)))
+                       (when friction
+                         (let ((reduce <fl> (* friction elapse (if water? 4. 1.))))
+                           (if (< (vertex-norm& velocity) reduce)
+                               (vertex-zero! velocity)
+                             (vertex-decrease! velocity (vertex-scalar*& (vertex-normalize-safe& velocity) reduce)))))))))
+            
+            (define (process-gravity)
+              (let ((normalized-gravity (vertex-normalize& gravity)))
+                (if (or jump? (get-jump? commands))
+                    (when (and (not rail-dir) (or water-jump? (and jump-ready? (or sprint? water? (and (or ground? ladder?) (not jumping?))))))
+                      (unless (or water? water-jump?)
+                        (set! jumping? #t)
+                        (set! jump-ready? #f)
+                        (set! jump-grace? (and (allow-grace? self) (vertex-zero? velocity)))
+                        (set! jump-time time))
+                      (vertex-copy! fall-velocity (if water?
+                                                      (vertex-y-set! fall-velocity (min (+ (vertex-y fall-velocity) 0.02) 0.07))
+                                                    (vertex-scalar*& normalized-gravity (* (- (/ (or jump-impulsion (get-jump-impulsion world)) (if water-jump? 1.5 1.))) (cond (sprint? sprint-jump)
+                                                                                                                                                                                ((and swimable? water?) (if water-jump? 1. (/ 1. 4.)))
+                                                                                                                                                                                (else 1.))))))
+                      (when water-jump?
+                        (set! water-jump? #f))
+                      (set! jump? #f)
+                      (set! jump-impulsion #f)
+                      (animate/change time :context))
+                  (unless water?
+                    (set! jump-ready? #t)))
+                (when (> swim-timer 0.)
+                  (decrease! swim-timer elapse)
+                  (when (<= swim-timer 0.)
+                    (set! swim-timer 0.)
+                    (set! jump-ready? #t)))
+                (when (and ground? (vertex-zero? fall-velocity))
+                  (unless jump-ready?
+                    (set! jump-ready? #t))
+                  (when water-jump?
+                    (set! water-jump? #f)))
+                (when (> (dot-product& fall-velocity normalized-gravity) (if water? 0.015 max-fall-speed))
+                  (if water?
+                      (vertex-y-set! fall-velocity (* (vertex-y fall-velocity) 0.85))
+                    (vertex-copy! fall-velocity (vertex-scalar*& normalized-gravity max-fall-speed))))))
+            
+            (define (collide-actor)
+              (break-logic slide)
+              (when (get-debug-collisions?)
+                (reset-marks zone))
+              (let* ((radiuses (transformed-radiuses self))
+                     (pumps (and (not water?) (effective-pumps self)))
+                     (pumped-center (if pumps
+                                        (bind-values (pumped pumped-direction pumped-collisions) (collide&stop$ center (vertex+& center pumps) lookat radiuses area-cube: area-cube ignore-entities?: ignore-entities? ignore-players?: ignore-players? ignore-me?: ignore-me?)
+                                          (free-collisions$ pumped-collisions)
+                                          pumped)
+                                      center))
+                     (target-center (vertex+& pumped-center (vertex-scalar*& velocity elapse)))
+                     (collide$ (case collision-response ((stop) collide&stop$) ((slide) collide&slide$))))
+                ;; slide
+                (bind-values (new-center slide-direction slide-collisions) (collide$ pumped-center target-center lookat radiuses area-cube: area-cube include-back-facing?: #t ignore-entities?: ignore-entities? ignore-players?: ignore-players? ignore-me?: ignore-me? proportional-slide?: proportional-slide? debuggable-collisions?: #t)
+                  (bind-values (new-slide-collisions slide-water?) (filter-water-collisions slide-collisions #t) ;; set water? with both slide and fall
+                    (when (and swimable? slide-water?)
+                      (bind-values (new-center-2 slide-direction-2 slide-collisions-2) (collide$ pumped-center target-center lookat radiuses area-cube: area-cube polygon-filter: (and swimable? liquid-filter) ignore-entities?: ignore-entities? ignore-players?: ignore-players? ignore-me?: ignore-me? debuggable-collisions?: #t)
+                        (vertex-copy! new-center new-center-2)
+                        (free-collisions$ slide-collisions)
+                        (set! slide-collisions slide-collisions-2)))
+                    (let ((new-center (if pumps
+                                          (bind-values (unpumped unpumped-direction unpumped-collisions) (collide&stop$ new-center (vertex-& new-center pumps) lookat radiuses area-cube: area-cube polygon-filter: (and swimable? liquid-filter) ignore-entities?: ignore-entities? ignore-players?: ignore-players? ignore-me?: ignore-me?)
+                                            (free-collisions$ unpumped-collisions)
+                                            unpumped)
+                                        new-center)))
+                      ;; kind of a quick hack so we dont slide farther than the player
+                      (when (and (not proportional-slide?) (not jumping?))
+                        (adjust-fast-slide! self center new-center))
+                      (break-action
+                        (when (in-logic?)
+                          (move-actor new-center #f)))
+                      (if (or (not gravity?) fly?)
+                          (values new-center slide-collisions '())
+                        (let ((adjusted-elapse (* elapse 50.)))
+                          (define (xz-position&)
+                            (vertex& (+ (fxceiling (get-x self)) .5) 0. (+ (fxceiling (get-z self)) .5)))
+                          
+                          ;; ladder
+                          (set! ladder? (some? (lambda (collision) (= (decode-id (get-data1 (get-polygon collision))) 65)) slide-collisions))
+                          (cond (ladder?
+                                 (when (not ladder-center)
+                                   (set! ladder-center (make-vertex))
+                                   (for-each (lambda (collision)
+                                               (let ((polygon (get-polygon collision)))
+                                                 (when (= (decode-id (get-data1 polygon)) 65)
+                                                   (let ((center (get-center polygon))
+                                                         (normal (get-normal polygon)))
+                                                     (vertex+! ladder-center center (vertex-scalar*& normal .45))
+                                                     (vertex-y-set! ladder-center 0.)
+                                                     (set! ladder-orientation (if (>= (abs (vertex-x normal)) .5) 'x 'z))))))
+                                             slide-collisions))
+                                 (when (not ladder-shaft)
+                                   (set! ladder-shaft (make-vertex)))
+                                 (vertex-copy! ladder-shaft (xz-position&)))
+                                (else
+                                 (when ladder-shaft
+                                   (if (vertex=? (xz-position&) ladder-shaft)
+                                       (if (not-null? slide-collisions)
+                                           (set! ladder? #t)
+                                         ;; slow fall
+                                         (set! adjusted-elapse (/ adjusted-elapse 3.)))
+                                     (set! ladder-shaft #f)
+                                     (set! ladder-center #f)))))
+                          
+                          (break-logic fall)
+                          (break-action
+                            (when (get-debug-collisions?)
+                              (reset-marks zone)))
+                          (when (and swimable? water?)
+                            (set! adjusted-elapse (/ adjusted-elapse 1.5)))
+                          (vertex+! fall-velocity fall-velocity (vertex-scalar*& gravity adjusted-elapse))
+                          (cond (rail-dir
+                                 (vertex! fall-velocity 0. -.20 0.))
+                                (ladder?
+                                 (case ladder-orientation
+                                   ((x)
+                                    (vertex-x-set! fall-velocity 0.)
+                                    (vertex-y-set! fall-velocity .075)
+                                    (vertex-z-set! fall-velocity (/ (- (vertex-z ladder-center) (get-z self)) 5.)))
+                                   ((z)
+                                    (vertex-x-set! fall-velocity (/ (- (vertex-x ladder-center) (get-x self)) 5.))
+                                    (vertex-y-set! fall-velocity .075)
+                                    (vertex-z-set! fall-velocity 0.)))))
+                          (let ((target-fall (vertex+& new-center (vertex+& (vertex-scalar*& fall-velocity adjusted-elapse) (vertex-scalar*& gravity (* .5 adjusted-elapse adjusted-elapse))))))
+                            (if (vertex-near? target-fall new-center)
+                                #f
+                              ;; fall
+                              ;; megahack around many edge / point collision snags when jumping next to blocks (AM)
+                              (bind-values (new-fall fall-direction fall-collisions) (collide&stop$ new-center target-fall lookat radiuses area-cube: area-cube include-back-facing?: #t ignore-entities?: ignore-entities? ignore-players?: ignore-players? ignore-me?: ignore-me? debuggable-collisions?: #t megahack?: (and me? (or jumping? ladder? ladder-shaft)))
+                                (break-action
+                                  (when (in-logic?)
+                                    (move-actor new-fall #f)))
+                                (let ((new-fall-collisions (if (not swimable?) fall-collisions (liquid? fall-collisions slide-water?))))
+                                  (when swimable?
+                                    (if water-collision?
+                                        (begin
+                                          (unless shallow-water?
+                                            (set! shallow-water? #t)
+                                            (when (and ambience me?)
+                                              (change-ambience ambience error?: #f)))
+                                          (bind-values (new-fall-2 fall-direction other-fall-collisions) (collide&stop$ new-center target-fall lookat radiuses area-cube: area-cube polygon-filter: (and swimable? liquid-filter) ignore-entities?: ignore-entities? ignore-players?: ignore-players? ignore-me?: ignore-me? debuggable-collisions?: #t)
+                                            (vertex-copy! new-fall new-fall-2)
+                                            (free-collisions$ fall-collisions)
+                                            (set! fall-collisions other-fall-collisions)))
+                                      ;; going from shallow to water
+                                      (when (and water? shallow-water?)
+                                        (set! shallow-water? #f)
+                                        (when (and ambience me?)
+                                          (play-ambience ambience (find-asset world "ambience/warcraft/water/Underwater.ogg"))))))
+                                  (vertex-copy! new-fall (or (manage-fall-collisions fall-collisions) new-fall))
+                                  (values new-fall slide-collisions fall-collisions))))))))))))
+            
+            (define (manage-fall-collisions fall-collisions)
+              (manage-plates fall-collisions)
+              (manage-rails fall-collisions))
+            
+            (define (manage-plates fall-collisions)
+              (define (common-list-elements l1 l2)
+                (let ((common '()))
+                  (for-each (lambda (element)
+                              (when (member? element l2)
+                                (set! common (cons element common))))
+                            l1)
+                  common))
+              
+              (let ((new-pp '())
+                    (to-add '())
+                    (to-remove '()))
+                (for-each (lambda (coll)
+                            (when (memq? (decode-id (get-data1 (get-polygon coll))) '(70 72))
+                              (let ((poly (get-polygon coll)))
+                                (set! new-pp (cons (polygon-position poly) new-pp)))))
+                          fall-collisions)
+                (let ((common (intersection test: equal? new-pp plates)))
+                  (set! to-add (list-copy new-pp))
+                  (set! to-remove (list-copy plates))
+                  (for-each (lambda (com)
+                              (set! to-add (remove com to-add test: equal?))
+                              (set! to-remove (remove com to-remove test: equal?)))
+                            common)
+                  (plates-update (current-universe) to-add to-remove self)
+                  (set! plates new-pp))))
+            
+            (define (manage-rails fall-collisions)
+              (let ((rail (find-if (lambda (coll) (and (memq? (decode-id (get-data1 (get-polygon coll))) '(27 28 66)) (get-polygon coll))) fall-collisions return: 'result))
+                    (pos #f))
+                (if rail
+                    (call-with-position zone (vertex& (get-data2 rail) (get-data3 rail) (get-data4 rail))
+                      (lambda (section block-id data-id i j k x y z with-field block-ref block-set! data-ref data-set! blocklight-ref blocklight-set! skylight-ref skylight-set!)
+                        (let ((data (if (memq? block-id '(27 28)) (bit-set data-id 3 #f) data-id)))
+                          (let ((curved? (> data 5)))
+                            (if (not curved?)
                                 (begin
-                                  (when (memq? (decode-id (get-data1 poly)) '(10 11))
-                                    (set! lava-collision? #t))
-                                  (enqueue water-polygons poly))
-                              (enqueue new-collisions collision))))
-                        fall-collisions)
-              (if (and (queue-empty? water-polygons) (not slide-water?))
-                  (begin
-                    (set! water-collision? #f)
-                    (when water?
-                      (unless (get-liquid-cube? (id->block (block-at-center self)))
-                        (exit-water self))))
-                (unless water?
-                  (when (> (abs (vertex-y fall-velocity)) 1.)
-                    (play-3d-sound "warcraft/water/EnterWaterSmallA" position))
-                  (enter-water self lava-collision? time)
-                  (set! grace-move? #f))
-                (unless water-collision?
-                  (set! water-collision? #t)))
-              (let ((lst (queue-list new-collisions)))
-                (free-queue$ new-collisions)
-                (free-queue$ water-polygons)
-                lst)))
-          
-          (define (liquid-filter poly)
-            (not (get-liquid-cube? (id->block (decode-id (get-data1 poly))))))
-          
-          (define (hit-action slide-collisions)
-            (define (find-actionable)
-              (continuation-capture
-                (lambda (found)
-                  (for-each (lambda (collision)
-                              (let ((poly (get-polygon collision)))
-                                (when (= (decode-id (get-data1 poly)) 90)
-                                  (continuation-return found poly))))
-                            slide-collisions)
-                  #f)))
+                                  (let ((dir (if (memq? data '(0 4 5)) #f64(0. 0. 1.) #f64(1. 0. 0.)))) ;; N W
+                                    (let ((angle (vector-angle (get-sight lookat) dir))
+                                          (dist (vertex-norm& (vertex*& (vertex-& position (vertex& x y z)) (if (memq? data '(0 4 5)) #f64(1. 0. 0.) #f64(0. 0. 1.))))))
+                                      (if (and (or (< angle (degree->radian 10.)) (> angle (degree->radian 170.))) (< dist .2))
+                                          (unless rail-dir
+                                            (set! rail-dir (list dir)))
+                                        (set! rail-dir #f))))
+                                  (set! last-turn #f))
+                              (let ((dir1 (if (memq? data '(6 7)) #f64(0. 0. 1.) #f64(0. 0. -1.)))
+                                    (dir2 (if (memq? data '(6 9)) #f64(1. 0. 0.) #f64(-1. 0. 0.))))
+                                (let ((curve (curve-angle (get-sight lookat) dir1 dir2)))
+                                  (when rail-dir
+                                    (unless (and last-turn (vertex=? (vertex& x (- y .5) z) last-turn))
+                                      (set! pos (vertex x y z))
+                                      (set! last-turn (vertex x (- y .5) z))
+                                      (set! rail-dir (let ((dir (cdr rail-dir)))
+                                                       (if (null? dir)
+                                                           #f
+                                                         dir)))
+                                      (rotate-actor curve))))))))))
+                  (set! rail-dir #f)
+                  (set! last-turn #f))
+                pos))
             
-            (let ((poly (find-actionable)))
-              (and poly
-                   (let ((id (decode-id (get-data1 poly)))
-                         (pos (polygon-position poly)))
-                     (cond ;; portal
-                           ((= id 90)
-                            (world.generation:invoke-block-action pos 'teleport))
-                           (else
-                            #f))))))
-          
-          (define (hit-collisions new-center slide-collisions fall-collisions)
-            (define (ground-update flag velocity)
-              (when (neq? ground? flag)
-                (set! ground? flag)
-                (if velocity
+            (define (curve-angle sight d1 d2)
+              (let ((a1 (vector-angle sight d1))
+                    (a2 (vector-angle sight d2))
+                    (main-dir (make-vertex))
+                    (curve (degree->radian 90.)))
+                (cond ((> a1 (degree->radian 170.))
+                       (vertex-copy! main-dir d1)
+                       (set! curve (* curve -1. (vertex-x d2) (vertex-z main-dir)))
+                       (unless last-turn
+                         (set! rail-dir (list (vertex-abs main-dir) d2))))
+                      ((> a2 (degree->radian 170.))
+                       (vertex-copy! main-dir d2)
+                       (set! curve (* curve (vertex-z d1) (vertex-x main-dir)))
+                       (unless last-turn
+                         (set! rail-dir (list (vertex-abs main-dir) d1))))
+                      (else
+                       (set! rail-dir #f)
+                       (set! last-turn #f)))
+                curve))
+            
+            (define (liquid? fall-collisions slide-water?)
+              (let ((new-collisions (make-queue$))
+                    (water-polygons (make-queue$))
+                    (lava-collision? #f))
+                (for-each (lambda (collision)
+                            (let ((poly (get-polygon collision)))
+                              (if (get-liquid-cube? (id->block (decode-id (get-data1 poly))))
+                                  (begin
+                                    (when (memq? (decode-id (get-data1 poly)) '(10 11))
+                                      (set! lava-collision? #t))
+                                    (enqueue water-polygons poly))
+                                (enqueue new-collisions collision))))
+                          fall-collisions)
+                (if (and (queue-empty? water-polygons) (not slide-water?))
                     (begin
-                      (set! override-gravity #f)
-                      (hit-ground self velocity))
-                  (leave-ground self))))
+                      (set! water-collision? #f)
+                      (when water?
+                        (unless (get-liquid-cube? (id->block (block-at-center self)))
+                          (exit-water self))))
+                  (unless water?
+                    (when (> (abs (vertex-y fall-velocity)) 1.)
+                      (play-3d-sound "warcraft/water/EnterWaterSmallA" position))
+                    (enter-water self lava-collision? time)
+                    (set! grace-move? #f))
+                  (unless water-collision?
+                    (set! water-collision? #t)))
+                (let ((lst (queue-list new-collisions)))
+                  (free-queue$ new-collisions)
+                  (free-queue$ water-polygons)
+                  lst)))
             
-            (hit self slide-collisions)
-            (let ((floor-level (and floor-level (+ floor-level (get-radius-y self))))
-                  (velocity (copy-vertex fall-velocity)))
-              (if (and floor-level (< (vertex-y new-center) floor-level) (not fly?))
-                  (begin
-                    (hit-floor self velocity)
-                    (vertex-y-set! new-center floor-level)
-                    (vertex! fall-velocity 0. 0. 0.)
-                    (set! jumping? #f)
-                    (ground-update #t velocity))
-                (let ((fall-collided? (not-null? fall-collisions))
-                      (water-only? (null? (filter-water-collisions fall-collisions #f))))
-                  (if (not fall-collided?)
-                      (ground-update #f #f)
-                    (vertex! fall-velocity 0. 0. 0.)
-                    (set! jumping? #f)
-                    (ground-update (not water-only?) velocity))))))
-          
-          (define (filter-water-collisions fall-collisions slide?)
-            (define (not-water? collision)
-              (liquid-filter (get-polygon collision)))
+            (define (liquid-filter poly)
+              (not (get-liquid-cube? (id->block (decode-id (get-data1 poly))))))
             
-            ;; optimize the by far most common case
-            (if (or (not swimable?) (every? not-water? fall-collisions))
-                (if slide?
-                    (values fall-collisions #f)
-                  fall-collisions)
-              (let ((new-collisions (collect-if not-water? fall-collisions)))
-                (if slide?
-                    (values new-collisions #t)
-                  new-collisions))))
-          
-          (define (foot-step fall-collisions)
-            (when (and me? (get-steps? model) (or ground? @not-really-nice ladder?) (and swimable? (or (not water?) shallow-water?)) morphing)
-              (let ((speed (vertex-norm& velocity)))
-                (when (> speed 0.)
-                  ;; two steps for each animation
-                  (let ((step-time (/ (effective-duration morphing) 2.)))
-                    (when (> (- time last-step) step-time)
-                      (set! last-step time)
-                      (let ((kind (cond @not-really-nice
-                                    (ladder?
-                                     'ladder)
-                                    ((and swimable? water? shallow-water?)
-                                     'water)
-                                    ((null? fall-collisions)
-                                     'stone)
-                                    (else
-                                     (let ((collision (car fall-collisions)))
-                                       (let ((id (decode-id (get-data1 (get-polygon collision)))))
-                                         (case id
-                                           ((2) 'grass)
-                                           ((5) 'wood)
-                                           ((12 13) 'dirt)
-                                           ((78 79 80) 'snow)
-                                           (else 'stone))))))))
-                        (let ((step (random-step kind)))
-                          (when step
-                            (play-ambient-sound step volume: .075))))))))))
-          
-          (define (move-actor new-center (calculate? #t))
-            (let ((movement (vertex- new-center center)))
-              (let ((new-position (vertex+& position movement))
-                    (old-position (vertex-copy& position))
-                    (old-velocity (vertex-copy& effective-velocity))
-                    (old-fall-velocity (vertex-copy& fall-velocity)))
-                (vertex+! effective-velocity velocity fall-velocity)
-                (when (and calculate? (moving? commands))
-                  (set! velocity-angle (abs (- 90. (radian->degree (vector-angle (vertex*& (vertex-& new-position old-position) (vertex& 1. 0. 1.)) (get-sight lookat)))))))
-                (set-position self new-position)
-                (vertex-copy! center new-center)
-                (unless (vertex-near? old-position new-position)
-                  (refresh-compass world))
-                (world.changes:move-change seconds self commands elapse old-position new-position old-velocity velocity old-fall-velocity fall-velocity old-ground? ground?)
-                movement)))
-          
-          (define (rotate-model movement)
-            (when me?
-              (let ((distance (/ (dot-product& (get-sight lookat) movement) (get-radius self))))
-                (define (set-x-rotation model name)
-                  (let ((model (child model name)))
-                    (vertex-x-set! (get-rotation model) rotation)
-                    (update-matrix model)))
-                
-                (when (/= distance 0.)
-                  (decrease! rotation distance)
-                  (when (and (eq? (get-name model) 'Orb) (not fly?))
-                    (set-x-rotation model 'body))
-                  (when (memq? (vehicle-name self) '(Wheels Hummer))
-                    (set-x-rotation (cache-model vehicle) 'wheel1)
-                    (set-x-rotation (cache-model vehicle) 'wheel2)
-                    (set-x-rotation (cache-model vehicle) 'wheel3)
-                    (set-x-rotation (cache-model vehicle) 'wheel4))))))
-          
-          (define (realign-actor slide-collisions fall-collisions)
-            (when (and gravity? (not fly?))
-              (update-world-up world gravity)
-              (case @until-horizontal-debugged orientation 'vertical
-                ((vertical)
-                 (realign-lookat self (gravity-up& gravity)))
-                ((horizontal)
-                 (when (or (not-null? slide-collisions)
-                           (not-null? fall-collisions))
-                   (let ()
-                     (define (average-normal)
-                       (let ((factor-sum 0.)
-                             (dir-sum (make-zero-vertex)))
-                         (define (process-collisions collisions)
-                           (for-each (lambda (collision)
-                                       (let ((plane (get-plane collision)))
-                                         (let ((origin (get-origin plane))
-                                               (normal (get-normal plane)))
-                                           (let ((dist (vertex-distance& origin center)))
-                                             (let ((factor (/ (+ 1. dist))))
-                                               (increase! factor-sum factor)
-                                               (vertex+! dir-sum dir-sum (vertex-scalar*& normal factor-sum)))))))
-                                     collisions))
-                         
-                         (process-collisions slide-collisions)
-                         (process-collisions fall-collisions)
-                         (vertex-scalar/& dir-sum factor-sum)))
-                     
-                     ;; this is clearly buggy and can create an up with y != 1 on a flat floor (AM)
-                     (remove-lookat-up-roll self (average-normal) lookat)))))))
-          
-          (define (realign-horizon)
-            (when (and gravity? (not fly?) motion-target? (is? motion Person-Motion) camera)
-              (let ((final-gravity (compute-gravity world center)))
-                (set-lookat camera (realign-lookat-horizon& (get-lookat camera) (get-up lookat) gravity final-gravity))
-                (camera-update camera))))
-          
-          (define (center-eye)
-            (when motion-target?
-              (without-roll self
-                (lambda ()
-                  (eye-center-player motion)))))
-          
-          (define (verify-death)
-            (when (and swimable? lava?)
-              (damage self 1. #f))
-            (when (and die-bottom (< (get-y self) die-bottom))
-              (damage self 100. #f)
-              ;; this death is client responsibility
-              (when (and (client?) (<= life 0.))
-                (world.changes:die-change self))))
-          
-          (process-commands)
-          (process-velocity)
-          (process-gravity)
-          (when (not animation)
-            (animate/change time :context))
-          (let ((collide-info (collide-actor)))
-            (and collide-info
-                 (bind-values (new-center slide-collisions fall-collisions) collide-info
-                   (and (not (hit-action slide-collisions))
-                        (begin
-                          (hit-collisions new-center slide-collisions fall-collisions)
-                          (if (not alive?)
-                              (begin
+            (define (hit-action slide-collisions)
+              (define (find-actionable)
+                (continuation-capture
+                  (lambda (found)
+                    (for-each (lambda (collision)
+                                (let ((poly (get-polygon collision)))
+                                  (when (= (decode-id (get-data1 poly)) 90)
+                                    (continuation-return found poly))))
+                              slide-collisions)
+                    #f)))
+              
+              (let ((poly (find-actionable)))
+                (and poly
+                     (let ((id (decode-id (get-data1 poly)))
+                           (pos (polygon-position poly)))
+                       (cond ;; portal
+                             ((= id 90)
+                              (world.generation:invoke-block-action pos 'teleport))
+                             (else
+                              #f))))))
+            
+            (define (hit-collisions new-center slide-collisions fall-collisions)
+              (define (ground-update flag velocity)
+                (when (neq? ground? flag)
+                  (set! ground? flag)
+                  (if velocity
+                      (begin
+                        (set! override-gravity #f)
+                        (hit-ground self velocity))
+                    (leave-ground self))))
+              
+              (hit self slide-collisions)
+              (let ((floor-level (and floor-level (+ floor-level (get-radius-y self))))
+                    (velocity (copy-vertex fall-velocity)))
+                (if (and floor-level (< (vertex-y new-center) floor-level) (not fly?))
+                    (begin
+                      (hit-floor self velocity)
+                      (vertex-y-set! new-center floor-level)
+                      (vertex! fall-velocity 0. 0. 0.)
+                      (set! jumping? #f)
+                      (ground-update #t velocity))
+                  (let ((fall-collided? (not-null? fall-collisions))
+                        (water-only? (null? (filter-water-collisions fall-collisions #f))))
+                    (if (not fall-collided?)
+                        (ground-update #f #f)
+                      (vertex! fall-velocity 0. 0. 0.)
+                      (set! jumping? #f)
+                      (ground-update (not water-only?) velocity))))))
+            
+            (define (filter-water-collisions fall-collisions slide?)
+              (define (not-water? collision)
+                (liquid-filter (get-polygon collision)))
+              
+              ;; optimize the by far most common case
+              (if (or (not swimable?) (every? not-water? fall-collisions))
+                  (if slide?
+                      (values fall-collisions #f)
+                    fall-collisions)
+                (let ((new-collisions (collect-if not-water? fall-collisions)))
+                  (if slide?
+                      (values new-collisions #t)
+                    new-collisions))))
+            
+            (define (foot-step fall-collisions)
+              (when (and me? (get-steps? model) (or ground? @not-really-nice ladder?) (and swimable? (or (not water?) shallow-water?)) morphing)
+                (let ((speed (vertex-norm& velocity)))
+                  (when (> speed 0.)
+                    ;; two steps for each animation
+                    (let ((step-time (/ (effective-duration morphing) 2.)))
+                      (when (> (- time last-step) step-time)
+                        (set! last-step time)
+                        (let ((kind (cond @not-really-nice
+                                      (ladder?
+                                       'ladder)
+                                      ((and swimable? water? shallow-water?)
+                                       'water)
+                                      ((null? fall-collisions)
+                                       'stone)
+                                      (else
+                                       (let ((collision (car fall-collisions)))
+                                         (let ((id (decode-id (get-data1 (get-polygon collision)))))
+                                           (case id
+                                             ((2) 'grass)
+                                             ((5) 'wood)
+                                             ((12 13) 'dirt)
+                                             ((78 79 80) 'snow)
+                                             (else 'stone))))))))
+                          (let ((step (random-step kind)))
+                            (when step
+                              (play-ambient-sound step volume: .075))))))))))
+            
+            (define (move-actor new-center (calculate? #t))
+              (let ((movement (vertex- new-center center)))
+                (let ((new-position (vertex+& position movement))
+                      (old-position (vertex-copy& position))
+                      (old-velocity (vertex-copy& effective-velocity))
+                      (old-fall-velocity (vertex-copy& fall-velocity)))
+                  (vertex+! effective-velocity velocity fall-velocity)
+                  (when (and calculate? (moving? commands))
+                    (set! velocity-angle (abs (- 90. (radian->degree (vector-angle (vertex*& (vertex-& new-position old-position) (vertex& 1. 0. 1.)) (get-sight lookat)))))))
+                  (set-position self new-position)
+                  (vertex-copy! center new-center)
+                  (unless (vertex-near? old-position new-position)
+                    (refresh-compass world))
+                  (world.changes:move-change seconds self commands elapse old-position new-position old-velocity velocity old-fall-velocity fall-velocity old-ground? ground?)
+                  movement)))
+            
+            (define (rotate-model movement)
+              (when me?
+                (let ((distance (/ (dot-product& (get-sight lookat) movement) (get-radius self))))
+                  (define (set-x-rotation model name)
+                    (let ((model (child model name)))
+                      (vertex-x-set! (get-rotation model) rotation)
+                      (update-matrix model)))
+                  
+                  (when (/= distance 0.)
+                    (decrease! rotation distance)
+                    (when (and (eq? (get-name model) 'Orb) (not fly?))
+                      (set-x-rotation model 'body))
+                    (when (memq? (vehicle-name self) '(Wheels Hummer))
+                      (set-x-rotation (cache-model vehicle) 'wheel1)
+                      (set-x-rotation (cache-model vehicle) 'wheel2)
+                      (set-x-rotation (cache-model vehicle) 'wheel3)
+                      (set-x-rotation (cache-model vehicle) 'wheel4))))))
+            
+            (define (realign-actor slide-collisions fall-collisions)
+              (when (and gravity? (not fly?))
+                (update-world-up world gravity)
+                (case @until-horizontal-debugged orientation 'vertical
+                  ((vertical)
+                   (realign-lookat self (gravity-up& gravity)))
+                  ((horizontal)
+                   (when (or (not-null? slide-collisions)
+                             (not-null? fall-collisions))
+                     (let ()
+                       (define (average-normal)
+                         (let ((factor-sum 0.)
+                               (dir-sum (make-zero-vertex)))
+                           (define (process-collisions collisions)
+                             (for-each (lambda (collision)
+                                         (let ((plane (get-plane collision)))
+                                           (let ((origin (get-origin plane))
+                                                 (normal (get-normal plane)))
+                                             (let ((dist (vertex-distance& origin center)))
+                                               (let ((factor (/ (+ 1. dist))))
+                                                 (increase! factor-sum factor)
+                                                 (vertex+! dir-sum dir-sum (vertex-scalar*& normal factor-sum)))))))
+                                       collisions))
+                           
+                           (process-collisions slide-collisions)
+                           (process-collisions fall-collisions)
+                           (vertex-scalar/& dir-sum factor-sum)))
+                       
+                       ;; this is clearly buggy and can create an up with y != 1 on a flat floor (AM)
+                       (remove-lookat-up-roll self (average-normal) lookat)))))))
+            
+            (define (realign-horizon)
+              (when (and gravity? (not fly?) motion-target? (is? motion Person-Motion) camera)
+                (let ((final-gravity (compute-gravity world center)))
+                  (set-lookat camera (realign-lookat-horizon& (get-lookat camera) (get-up lookat) gravity final-gravity))
+                  (camera-update camera))))
+            
+            (define (center-eye)
+              (when motion-target?
+                (without-roll self
+                  (lambda ()
+                    (eye-center-player motion)))))
+            
+            (define (verify-death)
+              (when (and swimable? lava?)
+                (damage self 1. #f))
+              (when (and die-bottom (< (get-y self) die-bottom))
+                (damage self 100. #f)
+                ;; this death is client responsibility
+                (when (and (client?) (<= life 0.))
+                  (world.changes:die-change self))))
+            
+            (process-commands)
+            (process-velocity)
+            (process-gravity)
+            (when (not animation)
+              (animate/change time :context))
+            (let ((collide-info (collide-actor)))
+              (and collide-info
+                   (bind-values (new-center slide-collisions fall-collisions) collide-info
+                     (and (not (hit-action slide-collisions))
+                          (begin
+                            (hit-collisions new-center slide-collisions fall-collisions)
+                            (if (not alive?)
+                                (begin
+                                  (free-collisions$ slide-collisions)
+                                  (free-collisions$ fall-collisions)
+                                  #f)
+                              (when playable?
+                                (foot-step fall-collisions))
+                              (let ((movement (move-actor new-center)))
+                                (rotate-model movement)
+                                (realign-actor slide-collisions fall-collisions)
                                 (free-collisions$ slide-collisions)
                                 (free-collisions$ fall-collisions)
-                                #f)
-                            (when playable?
-                              (foot-step fall-collisions))
-                            (let ((movement (move-actor new-center)))
-                              (rotate-model movement)
-                              (realign-actor slide-collisions fall-collisions)
-                              (free-collisions$ slide-collisions)
-                              (free-collisions$ fall-collisions)
-                              (unless (lookat-near? old-lookat lookat)
-                                (refresh-compass world))
-                              (world.changes:lookat-change seconds self commands elapse old-lookat lookat)
-                              (and (not (vertex-zero? movement))
-                                   (begin
-                                     (realign-horizon)
-                                     (center-eye)
-                                     (verify-death)
-                                     collide-info)))))))))))))
+                                (unless (lookat-near? old-lookat lookat)
+                                  (refresh-compass world))
+                                (world.changes:lookat-change seconds self commands elapse old-lookat lookat)
+                                (and (not (vertex-zero? movement))
+                                     (begin
+                                       (realign-horizon)
+                                       (center-eye)
+                                       (verify-death)
+                                       collide-info))))))))))))))
   
   
   (method package virtual (tick-slice self)
