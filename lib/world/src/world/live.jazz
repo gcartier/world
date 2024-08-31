@@ -64,6 +64,7 @@
         (world)
         (world.actor)
         (world.ambience)
+        (world.area)
         (world.asset)
         (world.atlas)
         (world.autoload)
@@ -1054,7 +1055,8 @@
   
   (method package (run-player self task <Task>)
     (declare (proper-tail-calls))
-    (let ((history (current-history)))
+    (let ((me (current-me))
+          (history (current-history)))
       (with-task task
         (lambda (exit)
           (set! player-task task)
@@ -1065,12 +1067,10 @@
               (when player-ready?
                 (let ((elapse (- time previous)))
                   (unless (> elapse max-elapse)
-                    (with-task-mutex
-                      (lambda ()
-                        (unless (stopping? task)
-                          (let ((start (current-monotonic)))
-                            (process-player self history time elapse)
-                            (increase! duration (- (current-monotonic) start))))))))
+                    (unless (stopping? task)
+                      (let ((start (current-monotonic)))
+                        (process-player self history time elapse)
+                        (increase! duration (- (current-monotonic) start))))))
                 (when player-boost?
                   (unboost-player self)
                   (boost-render self)))
@@ -1081,23 +1081,25 @@
   (method (process-player self history time elapse)
     (site player
       (when (participant?)
-        (unless bot?
-          (process-mouse-run self)
-          (when (world-focused?)
-            (process-keys self))
-          (unless (get-paused? history)
-            (let ((me (current-me)))
-              (tick-sliced self me commands time elapse)
-              (reset-commands self)
+        (let ((me (current-me)))
+          (with-physical-mutex
+            (lambda ()
+              (unless bot?
+                (process-mouse-run self)
+                (when (world-focused?)
+                  (process-keys self))
+                (unless (get-paused? history)
+                  (let ((me (current-me)))
+                    (tick-sliced self me commands time elapse)
+                    (reset-commands self))))
+              (update-transformation-time elapse)
+              (let ((motion (current-motion)))
+                (restore-desired-distance motion elapse)
+                (restore-roll motion me))
               (animate me elapse)
               (let ((vehicle (get-vehicle me)))
                 (when vehicle
-                  (animate vehicle elapse (get-position me)))))))
-        (update-transformation-time elapse)
-        (let ((me (current-me))
-              (motion (current-motion)))
-          (restore-desired-distance motion elapse)
-          (restore-roll motion me)))))
+                  (animate vehicle elapse (get-position me))))))))))
   
   
   (method package (tick-sliced self actor commands time elapse)
@@ -2365,10 +2367,8 @@
           (let (iter)
             (let ((time (current-monotonic))
                   (camera (current-camera)))
-              (with-task-mutex
-                (lambda ()
-                  (unless (stopping? task)
-                    (process-render self window zone camera))))
+              (unless (stopping? task)
+                (process-render self window zone camera))
               (unboost-render self)
               (let ((period (if application-active? render-period render-period-inactive))
                     (duration (- (current-monotonic) time)))
@@ -2379,15 +2379,16 @@
   
   (method (process-render self window zone camera)
     (site render
-      (update-stable camera camera-stable-delay)
-      (when render-trim?
-        (let ((trimmed (trim-generate)))
-          (when (> trimmed 0)
-            (decrease-sectors-generating zone trimmed)))
-        (set! render-trim? #f)
-        (eye-update))
-      (render-frame self)
-      (render-sync window)))
+      (unless working?
+        (update-stable camera camera-stable-delay)
+        (when render-trim?
+          (let ((trimmed (trim-generate)))
+            (when (> trimmed 0)
+              (decrease-sectors-generating zone trimmed)))
+          (set! render-trim? #f)
+          (eye-update))
+        (render-frame self)
+        (render-sync window))))
   
   
   (method package (render-frame self)
@@ -3221,7 +3222,7 @@
                 (duration 0.))
             (let ((elapse (- time previous)))
               (unless (> elapse max-elapse)
-                (with-task-mutex
+                (with-physical-mutex
                   (lambda ()
                     (unless (stopping? task)
                       (let ((start (current-monotonic)))
@@ -5253,13 +5254,15 @@
     (let ((space (current-space))
           (me (current-controlled+ self))
           (motion (current-motion)))
-      (unless (mouse-track space dx dy)
-        (cond ((and (is-tracking? self) (person-motion?))
-               (track-actor motion me dx dy realign?)
-               (boost-player self)
-               (set! realign? #f))
-              (else
-               (track-camera motion dx dy))))))
+      (with-reentrant-physical-mutex
+        (lambda ()
+          (unless (mouse-track space dx dy)
+            (cond ((and (is-tracking? self) (person-motion?))
+                   (track-actor motion me dx dy realign?)
+                   (boost-player self)
+                   (set! realign? #f))
+                  (else
+                   (track-camera motion dx dy))))))))
   
   
   (method package virtual (mouse-up self h v)
@@ -6343,7 +6346,7 @@
   
   
   (method (working-lock! self)
-    (mutex-lock! working-mutex #f #f))
+    (mutex-lock! working-mutex @convert-me #f @convert-me #f))
   
   
   (method (working-unlock! self)
