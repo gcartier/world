@@ -14,14 +14,16 @@
 (module world.live.streaming jazz
 
 
-(import (jazz.json)
+(import (jazz.event)
+        (jazz.json)
         (jazz.network.websocket)
         (jazz.stream)
         (jazz.syntax (phase syntax))
         (world)
         (world.autoload)
         (world.context)
-        (world.settings))
+        (world.settings)
+        (world.task))
 
 
 ;;;
@@ -56,7 +58,17 @@
     (stop-live-streaming)))
 
 
-(definition protected (start-live-streaming)
+(definition (start-live-streaming)
+  (start-chatbot)
+  (start-streaming))
+
+
+(definition (stop-live-streaming)
+  (stop-chatbot)
+  (stop-streaming))
+
+
+(definition protected (start-streaming)
   (let ((world (current-world)))
     (cond ((not twitch-server)
            (display-error world "Missing world.twitch-server setting"))
@@ -90,17 +102,15 @@
                (gst_element_set_state pipeline GST_STATE_PLAYING)
                (set! live-streaming? #t)
                (set! live-streaming-pipeline pipeline)
-               (start-chatbot)
                (update-state-visible? world)
                (display-on/off world "Live streaming" live-streaming?)))))))
 
 
-(definition protected (stop-live-streaming)
+(definition protected (stop-streaming)
   (let ((world (current-world)))
     (gst_element_release live-streaming-pipeline)
     (set! live-streaming-pipeline #f)
     (set! live-streaming? #f)
-    (stop-chatbot)
     (update-state-visible? world)
     (display-on/off world "Live streaming" live-streaming?)))
 
@@ -114,7 +124,7 @@
   "1133144351")
 
 (definition OAUTH_TOKEN
-  "3jx5hljwk8kiol7z30wex9kvu15p32")
+  "b7xwxamzky5bw3je43pbi7wipgub17")
 
 (definition CLIENT_ID
   "r3lin67u8s6r4wknhw19vtc4ue2qti")
@@ -140,7 +150,7 @@
       (let ((thread
               (new-thread
                 (lambda ()
-                  (validate-auth)
+                  (validate-token)
                   (format conn "GET /ws HTTP/1.1{%}")
                   (format conn "Host: eventsub.wss.twitch.tv{%}")
                   (format conn "Sec-WebSocket-Version: 13{%}")
@@ -168,8 +178,9 @@
   (set! chatbot-port #f))
 
 
-(definition (validate-auth)
-  (let ((port (open-process
+(definition (validate-token)
+  (let ((world (current-world)))
+    (let ((port (open-process
                   (list
                     path: "/usr/bin/curl"
                     arguments: (list
@@ -177,8 +188,14 @@
                                  "--request" "GET"
                                  "--header" (string-append "Authorization: OAuth " OAUTH_TOKEN)
                                  "https://id.twitch.tv/oauth2/validate")))))
-    (let ((status (process-status port)))
-      (assert (= status 0)))))
+      (let ((status (process-status port)))
+        (if (= status 0)
+            (let ((response (string->json (read-line port))))
+              (let ((status (table-ref response "status" #f)))
+                (if (and status (/= status 200))
+                    (display-error world "Token is not valid"))))
+          (display-error "Unable to connect to twitch")
+          #f)))))
 
 
 (definition (read-chatbot conn)
@@ -195,9 +212,8 @@
                 (call-with-input-u8vector (list init: text readtable: json-readtable)
                   (lambda (port)
                     (read-json port)))))))
-      ((connection-close)
-       (tell 'connection-close)
-       (exit)))))
+      (else
+       #f))))
 
 
 (definition (process-chatbot conn)
@@ -215,13 +231,16 @@
                    (let ((subscription-type (table-ref metadata "subscription_type")))
                      (cond ((equal? subscription-type "channel.chat.message")
                             (let ((message (table-ref (table-ref (table-ref (table-ref json "payload") "event") "message") "text")))
-                              (tell 'message message)
+                              (tell message (current-thread) (task-mutex-owner?))
+                              @w
+                              (delay-event
+                                (lambda ()
+                                  (with-task-mutex
+                                    (lambda ()
+                                      (chat-show (current-world) message)))))
                               (let ((trimmed (trim-whitespace message)))
                                 (cond ((equal? trimmed "Hey")
-                                       (send-chat-message "Mmmmm yes sweetie?")))))))))
-                  (else
-                   (print-json json (current-output-port))
-                   (newline))))))
+                                       (send-chat-message "Mmmmm yes sweetie?")))))))))))))
       (loop))))
 
 
