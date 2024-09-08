@@ -26,32 +26,6 @@
         (world.task))
 
 
-;;;
-;;;; Streaming
-;;;
-
-
-(definition protected twitch-server
-  (world-setting 'world.twitch-server #f))
-
-(definition protected twitch-key
-  (world-setting 'world.twitch-key #f))
-
-
-(definition protected live-streaming-framerate
-  (world-setting 'world.live-streaming-framerate 30))
-
-(definition protected live-streaming-bitrate
-  (world-setting 'world.live-streaming-bitrate 4096))
-
-
-(definition protected live-streaming?
-  #f)
-
-(definition protected live-streaming-pipeline
-  #f)
-
-
 (definition public (live-streaming)
   (if (not live-streaming?)
       (start-live-streaming)
@@ -68,6 +42,35 @@
   (stop-streaming))
 
 
+;;;
+;;;; Streaming
+;;;
+
+
+(definition protected twitch-server
+  (world-setting 'twitch.server #f))
+
+(definition protected twitch-key
+  (world-setting 'twitch.key #f))
+
+(definition protected twitch-chatonly?
+  (world-setting 'twitch.chatonly? #f))
+
+
+(definition protected live-streaming-framerate
+  (world-setting 'world.live-streaming-framerate 30))
+
+(definition protected live-streaming-bitrate
+  (world-setting 'world.live-streaming-bitrate 4096))
+
+
+(definition protected live-streaming?
+  #f)
+
+(definition protected live-streaming-pipeline
+  #f)
+
+
 (definition protected (start-streaming)
   (let ((world (current-world)))
     (cond ((not twitch-server)
@@ -77,42 +80,45 @@
           (else
            (let ((framerate live-streaming-framerate)
                  (bitrate live-streaming-bitrate))
-             (let ((pipeline (gst-pipeline (cond-expand
-                                             (mac "avfvideosrc capture-screen=true capture-screen-cursor=true capture-screen-mouse-clicks=true name=src")
-                                             (windows "dx9screencapsrc name=src")
-                                             (else "v4l2src name=src"))
-                                           (tie "videorate max-rate={framerate}")
-                                           ;; first step just on mac
-                                           (cond-expand
-                                             (mac (tie "video/x-raw, format=BGRA"))
-                                             (else #f))
-                                           "videoconvert"
-                                           (gst-element "vtenc_h264"
-                                                        bitrate: bitrate
-                                                        name: "enc")
-                                           "flvmux name=mux"
-                                           (tie "rtmpsink location='{twitch-server}/{twitch-key} live=true'")
-                                           (list
-                                             ;"osxaudiosrc"
-                                             "audiotestsrc wave=silence"
-                                             "queue"
-                                             "avenc_aac"
-                                             "mux^."))))
-               (gst_object_set_name pipeline "live-streaming")
-               (gst_element_set_state pipeline GST_STATE_PLAYING)
+             (let ((pipeline (and (not twitch-chatonly?)
+                                  (gst-pipeline (cond-expand
+                                                  (mac "avfvideosrc capture-screen=true capture-screen-cursor=true capture-screen-mouse-clicks=true name=src")
+                                                  (windows "dx9screencapsrc name=src")
+                                                  (else "v4l2src name=src"))
+                                                (tie "videorate max-rate={framerate}")
+                                                ;; first step just on mac
+                                                (cond-expand
+                                                  (mac (tie "video/x-raw, format=BGRA"))
+                                                  (else #f))
+                                                "videoconvert"
+                                                (gst-element "vtenc_h264"
+                                                             bitrate: bitrate
+                                                             name: "enc")
+                                                "flvmux name=mux"
+                                                (tie "rtmpsink location='{twitch-server}/{twitch-key} live=true'")
+                                                (list
+                                                  ;"osxaudiosrc"
+                                                  "audiotestsrc wave=silence"
+                                                  "queue"
+                                                  "avenc_aac"
+                                                  "mux^.")))))
+               (unless twitch-chatonly?
+                 (gst_object_set_name pipeline "live-streaming")
+                 (gst_element_set_state pipeline GST_STATE_PLAYING))
                (set! live-streaming? #t)
                (set! live-streaming-pipeline pipeline)
                (update-state-visible? world)
-               (display-on/off world "Live streaming" live-streaming?)))))))
+               (display-on/off world (format "Live {a}" (if twitch-chatonly? "chat" "streaming")) live-streaming?)))))))
 
 
 (definition protected (stop-streaming)
   (let ((world (current-world)))
-    (gst_element_release live-streaming-pipeline)
+    (unless twitch-chatonly?
+      (gst_element_release live-streaming-pipeline))
     (set! live-streaming-pipeline #f)
     (set! live-streaming? #f)
     (update-state-visible? world)
-    (display-on/off world "Live streaming" live-streaming?)))
+    (display-on/off world (format "Live {a}" (if twitch-chatonly? "chat" "streaming")) live-streaming?)))
 
 
 ;;;
@@ -120,23 +126,35 @@
 ;;;
 
 
-(definition BOT_USER_ID
-  "1133144351")
+;; twitch token --user-token --scopes "user:read:chat user:write:chat"
 
-(definition OAUTH_TOKEN
-  "b7xwxamzky5bw3je43pbi7wipgub17")
+
+(definition BOT_USER_ID
+  (world-setting 'twitch.chatbot-userid #f))
 
 (definition CLIENT_ID
-  "r3lin67u8s6r4wknhw19vtc4ue2qti")
+  (world-setting 'twitch.chatbot-clientid #f))
+
+(definition CLIENT_SECRET
+  (world-setting 'twitch.chatbot-clientsecret #f))
+
+(definition OAUTH_TOKEN
+  (world-setting 'twitch.chatbot-token #f))
+
+(definition REFRESH_TOKEN
+  (world-setting 'twitch.chatbot-refresh-token #f))
 
 (definition CHAT_CHANNEL_USER_ID
- "1133144351")
+  (world-setting 'twitch.chatbot-channel-userid #f))
 
 
 (definition chatbot-thread
   #f)
 
 (definition chatbot-port
+  #f)
+
+(definition chatbot-token
   #f)
 
 
@@ -150,22 +168,24 @@
       (let ((thread
               (new-thread
                 (lambda ()
-                  (validate-token)
-                  (format conn "GET /ws HTTP/1.1{%}")
-                  (format conn "Host: eventsub.wss.twitch.tv{%}")
-                  (format conn "Sec-WebSocket-Version: 13{%}")
-                  (format conn "Sec-WebSocket-Key: KsdA5iqIpLtQH8DmsoX6og=={%}")
-                  (format conn "Connection: keep-alive, Upgrade{%}")
-                  (format conn "Cookie: session=KOsEJNuflw4Rd9BDNrVmvwBF9rEijeE2{%}")
-                  (format conn "Upgrade: websocket{%}")
-                  (format conn "{%}")
-                  (force-output conn)
-                  (let (loop)
-                    (let ((line (read-line conn)))
-                      (if (equal? line "")
-                          (process-chatbot conn)
-                        (loop)))))
-                'process)))
+                  (let ((token (refresh-token)))
+                    (set! chatbot-token token)
+                    (tell 'got 'token token)
+                    (format conn "GET /ws HTTP/1.1{%}")
+                    (format conn "Host: eventsub.wss.twitch.tv{%}")
+                    (format conn "Sec-WebSocket-Version: 13{%}")
+                    (format conn "Sec-WebSocket-Key: KsdA5iqIpLtQH8DmsoX6og=={%}")
+                    (format conn "Connection: keep-alive, Upgrade{%}")
+                    (format conn "Cookie: session=KOsEJNuflw4Rd9BDNrVmvwBF9rEijeE2{%}")
+                    (format conn "Upgrade: websocket{%}")
+                    (format conn "{%}")
+                    (force-output conn)
+                    (let (loop)
+                      (let ((line (read-line conn)))
+                        (if (equal? line "")
+                            (run-chatbot conn)
+                          (loop))))))
+                'live)))
         (set! chatbot-thread thread)
         (set! chatbot-port conn)
         (thread-start! thread)))))
@@ -178,6 +198,32 @@
   (set! chatbot-port #f))
 
 
+(definition protected (refresh-token)
+  (let ((world (current-world)))
+    (let ((data (string-append
+                  #"grant_type=refresh_token&refresh_token="#
+                  REFRESH_TOKEN
+                  #"&client_id="#
+                  CLIENT_ID
+                  #"&client_secret="#
+                  CLIENT_SECRET)))
+      (let ((port (open-process
+                    (list
+                      path: "/usr/bin/curl"
+                      arguments: (list
+                                   "--silent"
+                                   "--request" "POST"
+                                   ;; -H 'Content-Type: application/x-www-form-urlencoded' \
+                                   "--data" data
+                                   "https://id.twitch.tv/oauth2/token")))))
+        (let ((status (process-status port)))
+          (if (= status 0)
+              (let ((response (string->json (read-line port))))
+                (table-ref response "access_token"))
+            (display-error "Unable to connect to twitch")
+            #f))))))
+
+
 (definition (validate-token)
   (let ((world (current-world)))
     (let ((port (open-process
@@ -186,7 +232,7 @@
                     arguments: (list
                                  "--silent"
                                  "--request" "GET"
-                                 "--header" (string-append "Authorization: OAuth " OAUTH_TOKEN)
+                                 "--header" (string-append "Authorization: OAuth " chatbot-token)
                                  "https://id.twitch.tv/oauth2/validate")))))
       (let ((status (process-status port)))
         (if (= status 0)
@@ -216,79 +262,95 @@
        #f))))
 
 
-(definition (process-chatbot conn)
+(definition (run-chatbot conn)
   (declare (proper-tail-calls))
   (let (loop)
     (let ((json (read-chatbot conn)))
       (when json
-        (let ((metadata (table-ref json "metadata")))
-          (let ((message-type (table-ref metadata "message_type")))
-            (cond ((equal? message-type "session_welcome")
-                   (let ((session-id (table-ref (table-ref (table-ref json "payload") "session") "id")))
-                     (register-eventsub session-id)))
-                  ((equal? message-type "session_keepalive"))
-                  ((equal? message-type "notification")
-                   (let ((subscription-type (table-ref metadata "subscription_type")))
-                     (cond ((equal? subscription-type "channel.chat.message")
-                            (let ((message (table-ref (table-ref (table-ref (table-ref json "payload") "event") "message") "text")))
-                              (tell message (current-thread) (task-mutex-owner?))
-                              @w
-                              (delay-event
-                                (lambda ()
-                                  (with-task-mutex
-                                    (lambda ()
-                                      (chat-show (current-world) message)))))
-                              (let ((trimmed (trim-whitespace message)))
-                                (cond ((equal? trimmed "Hey")
-                                       (send-chat-message "Mmmmm yes sweetie?")))))))))))))
-      (loop))))
+        (process-chatbot json)))
+    (loop)))
+
+
+(definition (process-chatbot json)
+  (let ((metadata (table-ref json "metadata")))
+    (let ((message-type (table-ref metadata "message_type")))
+      (cond ((equal? message-type "session_welcome")
+             (let ((session-id (table-ref (table-ref (table-ref json "payload") "session") "id")))
+               (register-eventsub session-id)))
+            ((equal? message-type "session_keepalive"))
+            ((equal? message-type "notification")
+             (let ((subscription-type (table-ref metadata "subscription_type")))
+               (cond ((equal? subscription-type "channel.chat.message")
+                      (let ((message (table-ref (table-ref (table-ref (table-ref json "payload") "event") "message") "text")))
+                        (delay-event
+                          (lambda ()
+                            (with-task-mutex
+                              (lambda ()
+                                (chat-show (current-world) message)))))
+                        (let ((trimmed (trim-whitespace message)))
+                          (cond ((equal? trimmed "Hey")
+                                 (send-chat-message "Mmmmm yes sweetie?")))))))))))))
 
 
 (definition (register-eventsub session-id)
-  (let ((data (string-append
-                #"{"type":"channel.chat.message","version":"1","condition":{"broadcaster_user_id":""#
-                CHAT_CHANNEL_USER_ID
-                #"","user_id":""#
-                BOT_USER_ID
-                #""},"transport":{"method":"websocket","session_id":""#
-                session-id
-                #""}}"#)))
-    (let ((port (open-process
-                  (list
-                    path: "/usr/bin/curl"
-                    arguments: (list
-                                 "--silent"
-                                 "--request" "POST"
-                                 "--header" (string-append "Authorization: Bearer " OAUTH_TOKEN)
-                                 "--header" (string-append "Client-Id: " CLIENT_ID)
-                                 "--header" "Content-Type: application/json"
-                                 "--data" data
-                                 "https://api.twitch.tv/helix/eventsub/subscriptions")
-                    show-console: #f))))
-      (let ((status (process-status port)))
-        (assert (= status 0))))))
+  (let ((world (current-world)))
+    (let ((data (string-append
+                  #"{"type":"channel.chat.message","version":"1","condition":{"broadcaster_user_id":""#
+                  CHAT_CHANNEL_USER_ID
+                  #"","user_id":""#
+                  BOT_USER_ID
+                  #""},"transport":{"method":"websocket","session_id":""#
+                  session-id
+                  #""}}"#)))
+      (let ((port (open-process
+                    (list
+                      path: "/usr/bin/curl"
+                      arguments: (list
+                                   "--silent"
+                                   "--request" "POST"
+                                   "--header" (string-append "Authorization: Bearer " chatbot-token)
+                                   "--header" (string-append "Client-Id: " CLIENT_ID)
+                                   "--header" "Content-Type: application/json"
+                                   "--data" data
+                                   "https://api.twitch.tv/helix/eventsub/subscriptions")
+                      show-console: #f))))
+        (let ((status (process-status port)))
+          (if (= status 0)
+              (let ((response (string->json (read-line port))))
+                (let ((status (table-ref response "status" #f)))
+                  (if (and status (/= status 202))
+                      (display-error world "Failed to subscribe to channel.chat.message"))))
+            (display-error "Unable to connect to twitch")
+            #f))))))
 
 
 (definition (send-chat-message message)
-  (let ((data (string-append
-                #"{"broadcaster_id":""#
-                CHAT_CHANNEL_USER_ID
-                #"","sender_id":""#
-                BOT_USER_ID
-                #"","message":""#
-                message
-                #""}"#)))
-    (let ((port (open-process
-                  (list
-                    path: "/usr/bin/curl"
-                    arguments: (list
-                                 "--silent"
-                                 "--request" "POST"
-                                 "--header" (string-append "Authorization: Bearer " OAUTH_TOKEN)
-                                 "--header" (string-append "Client-Id: " CLIENT_ID)
-                                 "--header" "Content-Type: application/json"
-                                 "--data" data
-                                 "https://api.twitch.tv/helix/chat/messages")
-                    show-console: #f))))
-      (let ((status (process-status port)))
-        (assert (= status 0)))))))
+  (let ((world (current-world)))
+    (let ((data (string-append
+                  #"{"broadcaster_id":""#
+                  CHAT_CHANNEL_USER_ID
+                  #"","sender_id":""#
+                  BOT_USER_ID
+                  #"","message":""#
+                  message
+                  #""}"#)))
+      (let ((port (open-process
+                    (list
+                      path: "/usr/bin/curl"
+                      arguments: (list
+                                   "--silent"
+                                   "--request" "POST"
+                                   "--header" (string-append "Authorization: Bearer " chatbot-token)
+                                   "--header" (string-append "Client-Id: " CLIENT_ID)
+                                   "--header" "Content-Type: application/json"
+                                   "--data" data
+                                   "https://api.twitch.tv/helix/chat/messages")
+                      show-console: #f))))
+        (let ((status (process-status port)))
+          (if (= status 0)
+              (let ((response (string->json (read-line port))))
+                (let ((status (table-ref response "status" #f)))
+                  (if (and status (/= status 200))
+                      (display-error world "Failed to send chat message"))))
+            (display-error "Unable to connect to twitch")
+            #f)))))))
