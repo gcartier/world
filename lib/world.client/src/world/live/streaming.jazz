@@ -15,15 +15,23 @@
 
 
 (import (jazz.event)
+        (jazz.io)
         (jazz.json)
         (jazz.network.websocket)
         (jazz.stream)
+        (jazz.stream.syntax (phase syntax))
         (jazz.syntax (phase syntax))
         (world)
+        (world.audio)
         (world.autoload)
+        (world.circle)
+        (world.client.udp)
         (world.context)
         (world.settings)
-        (world.task))
+        (world.streamer)
+        (world.task)
+        (world.udp)
+        (world.video))
 
 
 (definition public (live-streaming)
@@ -53,15 +61,12 @@
 (definition protected twitch-key
   (world-setting 'twitch.key #f))
 
-(definition protected twitch-chatonly?
-  (world-setting 'twitch.chatonly? #f))
-
 
 (definition protected live-streaming-framerate
   (world-setting 'world.live-streaming-framerate 30))
 
 (definition protected live-streaming-bitrate
-  (world-setting 'world.live-streaming-bitrate 6000))
+  (world-setting 'world.live-streaming-bitrate 4096))
 
 
 (definition protected live-streaming?
@@ -71,61 +76,113 @@
   #f)
 
 
+(definition protected (set-live-streaming? flag)
+  (let ((world (current-world)))
+    (set! live-streaming? flag)
+    (update-state-visible? world)
+    (display-on/off world "Live streaming" live-streaming?)))
+
+
+(definition protected videos-dir
+  {Directory Documents "videos"})
+
+
+(definition (link-proxies sink-pipeline src-pipeline name)
+  (with-unref ((micsrc (gst_bin_get_by_name src-pipeline name)))
+    (g_object_set_pointer micsrc "proxysink" (gst_bin_get_by_name sink-pipeline name))))
+
+
+(definition (offset-pad sink-pipeline src-pipeline name)
+  (let ((pipeline-running (gst_pipeline_get_running_time sink-pipeline)))
+    (let ((offset (- pipeline-running)))
+      (tell 'offsetting name (timestamp->flonum offset))
+      (with-unref ((src (gst_bin_get_by_name src-pipeline name)))
+        (with-unref ((pad (gst_element_get_static_pad src "src")))
+          (gst_pad_set_offset pad offset))))))
+
+
 (definition protected (start-streaming)
   (let ((world (current-world)))
-    (cond ((not twitch-server)
+    (cond ((not current-circle-name)
+           (display-error world "You need to be in a circle to live stream"))
+          ((not (acquire-microphone-pipeline))
+           (display-error world "You need to turn on your microphone to live stream"))
+          ((not (locate-screen-stream))
+           (display-error world "You need to turn on screen share to live stream"))
+          ((not twitch-server)
            (display-error world "Missing world.twitch-server setting"))
           ((not twitch-key)
            (display-error world "Missing world.twitch-key setting"))
           (else
+           (create-directories videos-dir)
            (let ((framerate live-streaming-framerate)
-                 (bitrate live-streaming-bitrate))
-             (let ((pipeline (and (not twitch-chatonly?)
-                                  (gst-pipeline (cond-expand
-                                                  (mac "avfvideosrc capture-screen=true capture-screen-cursor=true capture-screen-mouse-clicks=true name=src")
-                                                  (windows "dx9screencapsrc name=src")
-                                                  (else "v4l2src name=src"))
-                                                (tie "videorate max-rate={framerate}")
-                                                ;; first step just on mac
-                                                (cond-expand
-                                                  (mac (tie "video/x-raw, format=BGRA"))
-                                                  (else #f))
-                                                "videoconvert"
-                                                (gst-element "vtenc_h264"
-                                                             bitrate: bitrate
-                                                             name: "enc")
-                                                "flvmux name=mux"
-                                                (tie "rtmpsink location='{twitch-server}/{twitch-key} live=true'")
-                                                (list
-                                                  "interaudiosrc channel=speaker"
-                                                  "queue"
-                                                  "mixer^.")
-                                                (list
-                                                  "interaudiosrc channel=mic"
-                                                  "queue"
-                                                  "mixer^.")
-                                                (list
-                                                  "audiomixer name=mixer"
-                                                  "audioconvert"
-                                                  "avenc_aac"
-                                                  "mux^.")))))
-               (unless twitch-chatonly?
-                 (gst_object_set_name pipeline "live-streaming")
-                 (gst_element_set_state pipeline GST_STATE_PLAYING))
-               (set! live-streaming? #t)
-               (set! live-streaming-pipeline pipeline)
-               (update-state-visible? world)
-               (display-on/off world (format "Live {a}" (if twitch-chatonly? "chat" "streaming")) live-streaming?)))))))
+                 (bitrate live-streaming-bitrate)
+                 (rtmp-location (tie "{twitch-server}/{twitch-key}"))
+                 (file-location (parse (timestamped-file videos-dir #f "mp4"))))
+             (cache-audio)
+             (let ((mic microphone-pipeline)
+                   (speaker (get-pipeline (cache-audio)))
+                   (screen (get-pipeline (get-src (get-pipeline (locate-screen-channel (locate-screen-stream))))))
+                   (stream (gst-pipeline
+                               "proxysrc name=screenproxy"
+                               "h264parse"
+                               "tee name=tee"
+                               "queue"
+                               "flvmux enforce-increasing-timestamps=false name=mux"
+                               "rtmp2sink name=rtmpsink"
+                               (list
+                                 "proxysrc name=speakerproxy"
+                                 "queue"
+                                 "mixer.")
+                               (list
+                                 "proxysrc name=micproxy"
+                                 "queue"
+                                 "mixer.")
+                               (list
+                                 "audiomixer name=mixer"
+                                 "tee name=tee-speaker"
+                                 "queue"
+                                 "audioconvert"
+                                 "avenc_aac"
+                                 "mux.")
+                               (list
+                                 "tee-speaker."
+                                 "queue"
+                                 "audioconvert"
+                                 "avenc_aac"
+                                 "video-mux.")
+                               (list
+                                 "tee."
+                                 "video/x-h264"
+                                 "queue max-size-time=200000000"
+                                 "qtmux name=video-mux"
+                                 (tie "filesink name=filesink")))))
+               (with-unref ((rtmpsink (gst_bin_get_by_name stream "rtmpsink"))
+                            (filesink (gst_bin_get_by_name stream "filesink")))
+                 (g_object_set_utf-8-string rtmpsink "location" rtmp-location)
+                 (g_object_set_utf-8-string filesink "location" file-location))
+               (link-proxies mic stream "micproxy")
+               (link-proxies speaker stream "speakerproxy")
+               (link-proxies screen stream "screenproxy")
+               ;(offset-pad mic stream "micproxy")
+               ;(offset-pad speaker stream "speakerproxy")
+               ;(offset-pad screen stream "screenproxy")
+               (gst_object_set_name stream "live")
+               (gst_element_set_state stream GST_STATE_PLAYING)
+               (set-live-streaming? #t)
+               (set! live-streaming-pipeline stream)))))))
 
 
 (definition protected (stop-streaming)
-  (let ((world (current-world)))
-    (unless twitch-chatonly?
-      (gst_element_release live-streaming-pipeline))
+  (let ((world (current-world))
+        (udp (current-udp)))
+    (gst_element_send_event live-streaming-pipeline (gst_event_new_eos))
+    ;; quick hack as somehow waiting for eos doesn't ensure
+    ;; all data has been processed and saved to the filesink
+    (sleep 1)
+    (gst_element_release live-streaming-pipeline)
     (set! live-streaming-pipeline #f)
-    (set! live-streaming? #f)
-    (update-state-visible? world)
-    (display-on/off world (format "Live {a}" (if twitch-chatonly? "chat" "streaming")) live-streaming?)))
+    (set-live-streaming? #f)))
 
 
 ;;;
