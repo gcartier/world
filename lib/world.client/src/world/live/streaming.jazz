@@ -72,8 +72,14 @@
 (definition protected live-streaming?
   #f)
 
+(definition protected live-streaming-kind
+  #f)
+
 (definition protected live-streaming-pipeline
   #f)
+
+(definition protected live-streaming-pipelines
+  '())
 
 
 (definition protected (set-live-streaming? flag)
@@ -100,88 +106,161 @@
           (gst_pad_set_offset pad offset))))))
 
 
+(definition (make-mic)
+  (let ((mic
+          (gst-pipeline
+            "osxaudiosrc name=src"
+            "proxysink name=micproxy")))
+    (gst_object_set_name mic "live.mic")
+    mic))
+
+
+(definition (make-audio)
+  (let ((audio
+          (gst-pipeline
+            "audiotestsrc is-live=true wave=silence volume=.05 name=src"
+            "audio/x-raw, format=S16LE, layout=interleaved, rate=48000, channels=2"
+            "proxysink name=audioproxy")))
+    (gst_object_set_name audio "live.audio")
+    audio))
+
+
+(definition (make-sound)
+  (let ((sound
+          (gst-pipeline
+            "osxaudiosrc device=87 name=src"
+            "audioconvert"
+            "audioresample"
+            "audio/x-raw, format=S16LE, layout=interleaved, rate=48000, channels=2"
+            "proxysink name=soundproxy")))
+    (gst_object_set_name sound "live.sound")
+    sound))
+
+
+(definition (make-screen)
+  (let ((screen
+          (gst-pipeline
+            "avfvideosrc capture-screen=true capture-screen-cursor=true capture-screen-mouse-clicks=true name=src"
+            (tie "video/x-raw, framerate={screen-share-live-framerate}/1")
+            (tie "vtenc_h264 bitrate={screen-share-live-bitrate} name=enc")
+            "video/x-h264, stream-format=(string)avc"
+            "proxysink name=screenproxy")))
+    (gst_object_set_name screen "live.screen")
+    screen))
+
+
+(definition (make-live kind mic audio screen)
+  (create-directories videos-dir)
+  (let ((framerate live-streaming-framerate)
+        (bitrate live-streaming-bitrate)
+        (rtmp-location (tie "{twitch-server}/{twitch-key}"))
+        (file-location (parse (timestamped-file videos-dir #f "mp4"))))
+    (let ((live
+            (gst-pipeline
+              "proxysrc name=screenproxy"
+              "h264parse"
+              "tee name=tee"
+              "queue"
+              "flvmux enforce-increasing-timestamps=false name=flvmux"
+              "rtmp2sink name=rtmpsink"
+              (list
+                "proxysrc name=audioproxy"
+                "queue"
+                "mixer.")
+              (list
+                "proxysrc name=micproxy"
+                "queue"
+                "mixer.")
+              (list
+                "audiomixer min-upstream-latency=40000000 latency=100000000 name=mixer"
+                "tee name=tee-audio"
+                "queue"
+                "audioconvert"
+                "avenc_aac"
+                "flvmux.")
+              (list
+                "tee-audio."
+                "queue"
+                "audioconvert"
+                "avenc_aac"
+                "videomux.")
+              (list
+                "tee."
+                "video/x-h264"
+                "queue max-size-time=200000000"
+                "qtmux name=videomux"
+                (tie "filesink name=filesink")))))
+      (gst_object_set_name live "live")
+      (with-unref ((rtmpsink (gst_bin_get_by_name live "rtmpsink"))
+                   (filesink (gst_bin_get_by_name live "filesink")))
+        (g_object_set_utf-8-string rtmpsink "location" rtmp-location)
+        (g_object_set_utf-8-string filesink "location" file-location))
+      (link-proxies mic live "micproxy")
+      (link-proxies audio live "audioproxy")
+      (link-proxies screen live "screenproxy")
+      (when (eq? kind 'free)
+        (gst_element_set_state mic GST_STATE_PLAYING)
+        (gst_element_set_state audio GST_STATE_PLAYING)
+        (gst_element_set_state screen GST_STATE_PLAYING))
+      (offset-pad mic live "micproxy")
+      (offset-pad audio live "audioproxy")
+      (offset-pad screen live "screenproxy")
+      (gst_element_set_state live GST_STATE_PLAYING)
+      live)))
+
+
+(definition (stream-free)
+  (let ((kind 'free)
+        (mic (make-mic))
+        (audio (make-audio))
+        (screen (make-screen)))
+    (let ((live (make-live kind mic audio screen)))
+      (set-live-streaming? #t)
+      (set! live-streaming-kind kind)
+      (set! live-streaming-pipeline live)
+      (set! live-streaming-pipelines (list mic audio screen)))))
+
+
+(definition (stream-circle)
+  (cache-audio)
+  (let ((kind 'circle)
+        (mic microphone-pipeline)
+        (audio (get-pipeline (cache-audio)))
+        (screen (get-pipeline (get-src (get-pipeline (locate-screen-channel (locate-screen-stream)))))))
+    (let ((live (make-live kind mic audio screen)))
+      (set-live-streaming? #t)
+      (set! live-streaming-kind kind)
+      (set! live-streaming-pipeline live)
+      (set! live-streaming-pipelines '()))))
+
+
 (definition protected (start-streaming)
   (let ((world (current-world)))
-    (cond ((not current-circle-name)
-           (display-error world "You need to be in a circle to live stream"))
+    (cond ((not twitch-server)
+           (display-error world "Missing world.twitch-server setting"))
+          ((not twitch-key)
+           (display-error world "Missing world.twitch-key setting"))
+          ((not current-circle-name)
+           (stream-free))
           ((not (acquire-microphone-pipeline))
            (display-error world "You need to turn on your microphone to live stream"))
           ((not (locate-screen-stream))
            (display-error world "You need to turn on screen share to live stream"))
-          ((not twitch-server)
-           (display-error world "Missing world.twitch-server setting"))
-          ((not twitch-key)
-           (display-error world "Missing world.twitch-key setting"))
           (else
-           (create-directories videos-dir)
-           (let ((framerate live-streaming-framerate)
-                 (bitrate live-streaming-bitrate)
-                 (rtmp-location (tie "{twitch-server}/{twitch-key}"))
-                 (file-location (parse (timestamped-file videos-dir #f "mp4"))))
-             (cache-audio)
-             (let ((mic microphone-pipeline)
-                   (speaker (get-pipeline (cache-audio)))
-                   (screen (get-pipeline (get-src (get-pipeline (locate-screen-channel (locate-screen-stream))))))
-                   (stream (gst-pipeline
-                               "proxysrc name=screenproxy"
-                               "h264parse"
-                               "tee name=tee"
-                               "queue"
-                               "flvmux enforce-increasing-timestamps=false name=flvmux"
-                               "rtmp2sink name=rtmpsink"
-                               (list
-                                 "proxysrc name=speakerproxy"
-                                 "queue"
-                                 "mixer.")
-                               (list
-                                 "proxysrc name=micproxy"
-                                 "queue"
-                                 "mixer.")
-                               (list
-                                 "audiomixer min-upstream-latency=40000000 latency=100000000 name=mixer"
-                                 "tee name=tee-speaker"
-                                 "queue"
-                                 "audioconvert"
-                                 "avenc_aac"
-                                 "flvmux.")
-                               (list
-                                 "tee-speaker."
-                                 "queue"
-                                 "audioconvert"
-                                 "avenc_aac"
-                                 "videomux.")
-                               (list
-                                 "tee."
-                                 "video/x-h264"
-                                 "queue max-size-time=200000000"
-                                 "qtmux name=videomux"
-                                 (tie "filesink name=filesink")))))
-               (with-unref ((rtmpsink (gst_bin_get_by_name stream "rtmpsink"))
-                            (filesink (gst_bin_get_by_name stream "filesink")))
-                 (g_object_set_utf-8-string rtmpsink "location" rtmp-location)
-                 (g_object_set_utf-8-string filesink "location" file-location))
-               (link-proxies mic stream "micproxy")
-               (link-proxies speaker stream "speakerproxy")
-               (link-proxies screen stream "screenproxy")
-               (offset-pad mic stream "micproxy")
-               (offset-pad speaker stream "speakerproxy")
-               (offset-pad screen stream "screenproxy")
-               (gst_object_set_name stream "live")
-               (gst_element_set_state stream GST_STATE_PLAYING)
-               (set-live-streaming? #t)
-               (set! live-streaming-pipeline stream)))))))
+           (stream-circle)))))
 
 
 (definition protected (stop-streaming)
-  (let ((world (current-world))
-        (udp (current-udp)))
-    (gst_element_send_event live-streaming-pipeline (gst_event_new_eos))
-    ;; quick hack as somehow waiting for eos doesn't ensure
-    ;; all data has been processed and saved to the filesink
-    (sleep 1)
-    (gst_element_release live-streaming-pipeline)
-    (set! live-streaming-pipeline #f)
-    (set-live-streaming? #f)))
+  (gst_element_send_event live-streaming-pipeline (gst_event_new_eos))
+  ;; quick hack as somehow waiting for eos doesn't ensure
+  ;; all data has been processed and saved to the filesink
+  (sleep 1)
+  (for-each gst_bin_release live-streaming-pipelines)
+  (gst_bin_release live-streaming-pipeline)
+  (set! live-streaming-kind #f)
+  (set! live-streaming-pipeline #f)
+  (set! live-streaming-pipelines '())
+  (set-live-streaming? #f))
 
 
 ;;;
