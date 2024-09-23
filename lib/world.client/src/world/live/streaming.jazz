@@ -62,6 +62,10 @@
   (world-setting 'twitch.key #f))
 
 
+(definition protected twitch-sound-device
+  (world-setting 'twitch.sound-device #f))
+
+
 (definition protected live-streaming-framerate
   (world-setting 'world.live-streaming-framerate 30))
 
@@ -126,15 +130,16 @@
 
 
 (definition (make-sound)
-  (let ((sound
-          (gst-pipeline
-            "osxaudiosrc device=87 name=src"
-            "audioconvert"
-            "audioresample"
-            "audio/x-raw, format=S16LE, layout=interleaved, rate=48000, channels=2"
-            "proxysink name=soundproxy")))
-    (gst_object_set_name sound "live.sound")
-    sound))
+  (and twitch-sound-device
+       (let ((sound
+               (gst-pipeline
+                 (tie "osxaudiosrc device={twitch-sound-device} name=src")
+                 "audioconvert"
+                 "audioresample"
+                 "audio/x-raw, format=S16LE, layout=interleaved, rate=48000, channels=2"
+                 "proxysink name=soundproxy")))
+         (gst_object_set_name sound "live.sound")
+         sound)))
 
 
 (definition (make-screen)
@@ -149,7 +154,7 @@
     screen))
 
 
-(definition (make-live kind mic audio screen)
+(definition (make-live kind mic audio sound screen)
   (create-directories videos-dir)
   (let ((framerate live-streaming-framerate)
         (bitrate live-streaming-bitrate)
@@ -167,6 +172,11 @@
                 "proxysrc name=audioproxy"
                 "queue"
                 "mixer.")
+              (and sound
+                   (list
+                     "proxysrc name=soundproxy"
+                     "queue"
+                     "mixer."))
               (list
                 "proxysrc name=micproxy"
                 "queue"
@@ -197,13 +207,19 @@
         (g_object_set_utf-8-string filesink "location" file-location))
       (link-proxies mic live "micproxy")
       (link-proxies audio live "audioproxy")
+      (when sound
+        (link-proxies sound live "soundproxy"))
       (link-proxies screen live "screenproxy")
       (when (eq? kind 'free)
         (gst_element_set_state mic GST_STATE_PLAYING)
         (gst_element_set_state audio GST_STATE_PLAYING)
+        (when sound
+          (gst_element_set_state sound GST_STATE_PLAYING))
         (gst_element_set_state screen GST_STATE_PLAYING))
       (offset-pad mic live "micproxy")
       (offset-pad audio live "audioproxy")
+      (when sound
+        (offset-pad sound live "soundproxy"))
       (offset-pad screen live "screenproxy")
       (gst_element_set_state live GST_STATE_PLAYING)
       live)))
@@ -213,12 +229,13 @@
   (let ((kind 'free)
         (mic (make-mic))
         (audio (make-audio))
+        (sound (make-sound))
         (screen (make-screen)))
-    (let ((live (make-live kind mic audio screen)))
+    (let ((live (make-live kind mic audio sound screen)))
       (set-live-streaming? #t)
       (set! live-streaming-kind kind)
       (set! live-streaming-pipeline live)
-      (set! live-streaming-pipelines (list mic audio screen)))))
+      (set! live-streaming-pipelines (list mic audio sound screen)))))
 
 
 (definition (stream-circle)
@@ -226,12 +243,13 @@
   (let ((kind 'circle)
         (mic microphone-pipeline)
         (audio (get-pipeline (cache-audio)))
+        (sound (make-sound))
         (screen (get-pipeline (get-src (get-pipeline (locate-screen-channel (locate-screen-stream)))))))
-    (let ((live (make-live kind mic audio screen)))
+    (let ((live (make-live kind mic audio sound screen)))
       (set-live-streaming? #t)
       (set! live-streaming-kind kind)
       (set! live-streaming-pipeline live)
-      (set! live-streaming-pipelines '()))))
+      (set! live-streaming-pipelines (list sound)))))
 
 
 (definition protected (start-streaming)
@@ -255,7 +273,10 @@
   ;; quick hack as somehow waiting for eos doesn't ensure
   ;; all data has been processed and saved to the filesink
   (sleep 1)
-  (for-each gst_bin_release live-streaming-pipelines)
+  (for-each (lambda (pipeline)
+              (when pipeline
+                (gst_bin_release pipeline)))
+            live-streaming-pipelines)
   (gst_bin_release live-streaming-pipeline)
   (set! live-streaming-kind #f)
   (set! live-streaming-pipeline #f)
