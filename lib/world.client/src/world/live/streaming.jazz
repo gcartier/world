@@ -14,13 +14,16 @@
 (module world.live.streaming jazz
 
 
-(import (jazz.event)
+(import (jazz.component)
+        (jazz.event)
+        (jazz.graphic)
         (jazz.io)
         (jazz.json)
         (jazz.network.websocket)
         (jazz.stream)
         (jazz.stream.syntax (phase syntax))
         (jazz.syntax (phase syntax))
+        (jazz.view)
         (world)
         (world.audio)
         (world.autoload)
@@ -114,6 +117,52 @@
              #t)))))
 
 
+(definition protected (music-quieter)
+  (let ((world (current-world)))
+    (let ((output (locate-music-output)))
+      (if (not output)
+          (display-error world "No music playing")
+        (let ((volume (max 0. (- (get-volume output) .1))))
+          (let ((stream (get-stream (get-channel output))))
+            (let ((video-output (get-video-output stream)))
+              (let ((circle-view (get-root (get-interface-pane video-output))))
+                (let ((volume-view (child circle-view 'volume)))
+                  (set-volume output volume)
+                  (setup-knob volume-view volume)
+                  (invalidate-view volume-view)
+                  (display-status world (format "{r precision: 1}" volume)))))))))))
+
+
+(definition protected (music-louder)
+  (let ((world (current-world)))
+    (let ((output (locate-music-output)))
+      (if (not output)
+          (display-error world "No music playing")
+        (let ((volume (min 1. (+ (get-volume output) .1))))
+          (let ((stream (get-stream (get-channel output))))
+            (let ((video-output (get-video-output stream)))
+              (let ((circle-view (get-root (get-interface-pane video-output))))
+                (let ((volume-view (child circle-view 'volume)))
+                  (set-volume output volume)
+                  (setup-knob volume-view volume)
+                  (invalidate-view volume-view)
+                  (display-status world (format "{r precision: 1}" volume)))))))))))
+
+
+(definition protected (music-pause)
+  (let ((world (current-world)))
+    (let ((output (locate-music-output)))
+      (if (not output)
+          (display-error world "No music playing")
+        (let ((stream (get-stream (get-channel output))))
+          (let ((video-output (get-video-output stream)))
+            (let ((circle-view (get-root (get-interface-pane video-output))))
+              (let ((paused? (toggle-paused circle-view)))
+                (let ((title (if paused? "Music paused" "Music playing"))
+                      (color (if paused? {Color Red} {Color Green})))
+                  (display-message world title color: color))))))))))
+
+
 (definition protected (set-live-streaming? flag)
   (let ((world (current-world)))
     (set! live-streaming? flag)
@@ -136,11 +185,33 @@
 
 
 (definition (offset-pad sink-pipeline src-pipeline name)
-  (let ((pipeline-running (gst_pipeline_get_running_time sink-pipeline)))
-    (let ((offset (- pipeline-running)))
+  (let ((sink-running (gst_pipeline_get_running_time sink-pipeline)))
+    (let ((offset (- sink-running)))
       (with-unref ((src (gst_bin_get_by_name src-pipeline name)))
         (with-unref ((pad (gst_element_get_static_pad src "src")))
           (gst_pad_set_offset pad offset))))))
+
+(definition (offset-running sink-pipeline src-pipeline name)
+  (let ((sink-running (gst_pipeline_get_running_time sink-pipeline))
+        (src-running (gst_pipeline_get_running_time src-pipeline)))
+    (let ((offset (- src-running sink-running)))
+      (with-unref ((src (gst_bin_get_by_name src-pipeline name)))
+        (with-unref ((pad (gst_element_get_static_pad src "src")))
+          (gst_pad_set_offset pad offset))))))
+
+
+(definition protected live-silence-pipeline
+  #f)
+
+
+(definition (make-silence)
+  (let ((silence
+          (gst-pipeline
+            "audiotestsrc is-live=true wave=silence name=src"
+            "audio/x-raw, format=S16LE, layout=interleaved, rate=48000, channels=2"
+            "proxysink name=musicproxy")))
+    (gst_object_set_name silence "live.silence")
+    silence))
 
 
 (definition (make-music)
@@ -154,6 +225,29 @@
                  "proxysink name=musicproxy")))
          (gst_object_set_name music "live.music")
          music)))
+
+
+(definition protected (stop-silence)
+  (when live-silence-pipeline
+    (unlink-proxies live-streaming-pipeline "musicproxy")
+    (gst_bin_release live-silence-pipeline)
+    (set! live-silence-pipeline #f)))
+
+
+(definition protected (replace-music)
+  (stop-silence)
+  (let ((music
+          (gst-pipeline
+            (tie "osxaudiosrc device={effective-music-device} name=src")
+            "audioconvert"
+            "audioresample"
+            "audio/x-raw, format=S16LE, layout=interleaved, rate=48000, channels=2"
+            "proxysink name=musicproxy")))
+    (gst_object_set_name music "live.music")
+    (link-proxies music live-streaming-pipeline "musicproxy")
+    (gst_element_set_state music GST_STATE_PLAYING)
+    (offset-running music live-streaming-pipeline "musicproxy")
+    music))
 
 
 @soon
@@ -212,28 +306,18 @@
                      "proxysrc name=micproxy"
                      "queue"
                      "mixer."))
-              (and (not music)
-                   (list
-                     "audiomixer min-upstream-latency=40000000 latency=100000000 name=mixer"
-                     "tee name=videoaudio"
-                     "queue"
-                     "audioconvert"
-                     "avenc_aac"
-                     "flvmux."))
-              (and music
-                   (list
-                     "audiomixer min-upstream-latency=40000000 latency=100000000 name=mixer"
-                     "tee name=videoaudio"
-                     "queue"
-                     "audiomixer min-upstream-latency=40000000 latency=100000000 name=livemixer"
-                     "audioconvert"
-                     "avenc_aac"
-                     "flvmux."))
-              (and music
-                   (list
-                     "proxysrc name=musicproxy"
-                     "queue"
-                     "livemixer."))
+              (list
+                "audiomixer min-upstream-latency=40000000 latency=100000000 name=mixer"
+                "tee name=videoaudio"
+                "queue"
+                "audiomixer min-upstream-latency=40000000 latency=100000000 name=livemixer"
+                "audioconvert"
+                "avenc_aac"
+                "flvmux.")
+              (list
+                "proxysrc name=musicproxy"
+                "queue"
+                "livemixer.")
               (list
                 "videoaudio."
                 "queue"
@@ -290,16 +374,18 @@
 
 (definition (stream-live)
   (cache-audio)
-  (let ((kind 'live)
-        (mic microphone-pipeline)
-        (audio (get-pipeline (cache-audio)))
-        (music (locate-music-pipeline))
-        (screen (make-screen)))
-    (let ((live (make-live mic audio music screen)))
-      (set-live-streaming? #t)
-      (set! live-streaming-kind kind)
-      (set! live-streaming-pipeline live)
-      (set! live-streaming-pipelines (list screen)))))
+  (let ((music-output (locate-music-output)))
+    (let ((kind 'live)
+          (mic microphone-pipeline)
+          (audio (get-pipeline (cache-audio)))
+          (music (if music-output (get-pipeline music-output) (make-music)))
+          (screen (make-screen)))
+      (let ((live (make-live mic audio music screen)))
+        (set-live-streaming? #t)
+        (set! live-streaming-kind kind)
+        (set! live-streaming-pipeline live)
+        (set! live-streaming-pipelines (if music-output (list screen) (list music screen)))
+        (set! live-silence-pipeline (and (not music-output) music))))))
 
 
 (definition protected (start-streaming)
