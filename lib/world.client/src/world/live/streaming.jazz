@@ -37,44 +37,12 @@
         (world.video))
 
 
-(definition public (live-streaming)
-  (if (not live-streaming?)
-      (start-live-streaming)
-    (stop-live-streaming)))
-
-
-(definition (start-live-streaming)
-  (let ((world (current-world)))
-    (cond ((not twitch-server)
-           (display-error world "Missing world.twitch-server setting"))
-          ((not twitch-key)
-           (display-error world "Missing world.twitch-key setting"))
-          (else
-           (start-chatbot)
-           (start-update)
-           (start-streaming)))))
-
-
-(definition (stop-live-streaming)
-  (stop-chatbot)
-  (stop-update)
-  (stop-streaming))
-
-
-;;;
-;;;; Streaming
-;;;
-
-
 (definition protected twitch-server
   (world-setting 'twitch.server #f))
 
 (definition protected twitch-key
   (world-setting 'twitch.key #f))
 
-
-(definition protected twitch-starting-soon
-  (world-setting 'twitch.starting-soon #f))
 
 (definition protected twitch-music-device
   (world-setting 'twitch.music-device #f))
@@ -98,6 +66,101 @@
 
 (definition protected live-streaming-pipelines
   '())
+
+
+;;;
+;;;; Streaming
+;;;
+
+
+(definition public (live-streaming)
+  (if (not live-streaming?)
+      (start-live-streaming 'starting make-starting)
+    (stop-live-streaming)))
+
+
+(definition (start-live-streaming kind screen-make)
+  (let ((world (current-world)))
+    (cond ((not twitch-server)
+           (display-error world "Missing world.twitch-server setting"))
+          ((not twitch-key)
+           (display-error world "Missing world.twitch-key setting"))
+          ((not (acquire-microphone-pipeline))
+           (display-error world "Unable to acquire microphone"))
+          ((not (setup-music-device))
+           (display-error world "Unable to find music device"))
+          (else
+           (let ((err (setup-screens)))
+             (if err
+                 (display-error world (format "Unable to find {a}" err))
+               (start-chatbot)
+               (start-update)
+               (start-streaming kind screen-make)))))))
+
+
+(definition (stop-live-streaming)
+  (stop-chatbot)
+  (stop-update)
+  (stop-streaming))
+
+
+(definition public (live-start)
+  (if (not live-streaming?)
+      (start-live-streaming 'starting make-starting)
+    (replace-screen 'starting (make-starting))))
+
+
+(definition public (live-pause)
+  (if (not live-streaming?)
+      (start-live-streaming 'paused make-paused)
+    (replace-screen 'paused (make-paused))))
+
+
+(definition public (live-resume)
+  (if (not live-streaming?)
+      (start-live-streaming 'live make-screen)
+    (replace-screen 'live (make-screen))))
+
+
+(definition public (live-end)
+  (if (not live-streaming?)
+      (start-live-streaming 'ended make-ended)
+    (replace-screen 'ended (make-ended))))
+
+
+;;;
+;;;; GStreamer
+;;;
+
+
+(definition (link-proxies sink-pipeline src-pipeline name)
+  (with-unref ((src-proxy (gst_bin_get_by_name src-pipeline name)))
+    (g_object_set_pointer src-proxy "proxysink" (gst_bin_get_by_name sink-pipeline name))))
+
+(definition (unlink-proxies src-pipeline name)
+  (with-unref ((src-proxy (gst_bin_get_by_name_aux src-pipeline name)))
+    (when src-proxy
+      (g_object_set_pointer src-proxy "proxysink" #f))))
+
+
+(definition (offset-pad sink-pipeline src-pipeline name)
+  (let ((sink-running (gst_pipeline_get_running_time sink-pipeline)))
+    (let ((offset (- sink-running)))
+      (with-unref ((src (gst_bin_get_by_name src-pipeline name)))
+        (with-unref ((pad (gst_element_get_static_pad src "src")))
+          (gst_pad_set_offset pad offset))))))
+
+(definition (offset-running sink-pipeline src-pipeline name)
+  (let ((sink-running (gst_pipeline_get_running_time sink-pipeline))
+        (src-running (gst_pipeline_get_running_time src-pipeline)))
+    (let ((offset (- src-running sink-running)))
+      (with-unref ((sink (gst_bin_get_by_name sink-pipeline name)))
+        (g_object_set_int64 sink "timestamp-offset" offset)))))
+
+
+;;;
+;;;; Music
+;;;
 
 
 (definition protected effective-music-device
@@ -163,43 +226,6 @@
                   (display-message world title color: color))))))))))
 
 
-(definition protected (set-live-streaming? flag)
-  (let ((world (current-world)))
-    (set! live-streaming? flag)
-    (update-state-visible? world)
-    (display-on/off world "Live streaming" live-streaming?)))
-
-
-(definition protected videos-dir
-  {Directory Documents "videos"})
-
-
-(definition (link-proxies sink-pipeline src-pipeline name)
-  (with-unref ((src-proxy (gst_bin_get_by_name src-pipeline name)))
-    (g_object_set_pointer src-proxy "proxysink" (gst_bin_get_by_name sink-pipeline name))))
-
-(definition (unlink-proxies src-pipeline name)
-  (with-unref ((src-proxy (gst_bin_get_by_name_aux src-pipeline name)))
-    (when src-proxy
-      (g_object_set_pointer src-proxy "proxysink" #f))))
-
-
-(definition (offset-pad sink-pipeline src-pipeline name)
-  (let ((sink-running (gst_pipeline_get_running_time sink-pipeline)))
-    (let ((offset (- sink-running)))
-      (with-unref ((src (gst_bin_get_by_name src-pipeline name)))
-        (with-unref ((pad (gst_element_get_static_pad src "src")))
-          (gst_pad_set_offset pad offset))))))
-
-(definition (offset-running sink-pipeline src-pipeline name)
-  (let ((sink-running (gst_pipeline_get_running_time sink-pipeline))
-        (src-running (gst_pipeline_get_running_time src-pipeline)))
-    (let ((offset (- src-running sink-running)))
-      (with-unref ((src (gst_bin_get_by_name src-pipeline name)))
-        (with-unref ((pad (gst_element_get_static_pad src "src")))
-          (gst_pad_set_offset pad offset))))))
-
-
 (definition protected live-silence-pipeline
   #f)
 
@@ -250,36 +276,105 @@
     music))
 
 
-@soon
-(definition (make-soon)
-  (and twitch-starting-soon
-       (exists? twitch-starting-soon)
-       (let ((location (parse twitch-starting-soon)))
-         (let ((soon
-                 (gst-pipeline
-                   "filesrc name=src"
-                   "jpegdec"
-                   "videoconvertscale"
-                   "imagefreeze"
-                   (tie "vtenc_h264 bitrate={screen-share-live-bitrate} name=enc")
-                   "video/x-h264, stream-format=(string)avc"
-                   "proxysink name=screenproxy")))
-           (gst_object_set_name soon "live.soon")
-           (with-unref ((filesrc (gst_bin_get_by_name soon "src")))
-             (g_object_set_utf-8-string filesrc "location" location))
-           soon))))
+;;;
+;;;; Screen
+;;;
+
+
+(definition live-screen-pipeline
+  #f)
+
+
+(definition screen-images
+  (make-table test: eq?))
+
+
+(definition (setup-screens)
+  (define (setup name path)
+    (let ((file (new-file {Directory Documents} path)))
+      (cond ((not (exists? file))
+             path)
+            (else
+             (table-set! screen-images name file)
+             #f))))
+  
+  (or (setup 'starting "screens/starting.png")
+      (setup 'paused   "screens/paused.png")
+      (setup 'resumed  "screens/resumed.png")
+      (setup 'ended    "screens/ended.png")))
+
+
+(definition (make-starting)
+  (let ((location (parse {File Documents "screens/starting.png"})))
+    (let ((pipeline
+            (gst-pipeline "filesrc name=src"
+                          "pngdec"
+                          "videoconvert"
+                          "imagefreeze is-live=true"
+                          "video/x-raw, format=I420, width=2992, height=1934, framerate=30/1, multiview-mode=(string)mono"
+                          "proxysink name=screenproxy")))
+      (with-unref ((filesrc (gst_bin_get_by_name pipeline "src")))
+        (g_object_set_utf-8-string filesrc "location" location))
+      pipeline)))
+
+
+(definition (make-paused)
+  (let ((location (parse {File Documents "screens/paused.png"})))
+    (let ((pipeline
+            (gst-pipeline "filesrc name=src"
+                          "pngdec"
+                          "videoconvert"
+                          "imagefreeze is-live=true"
+                          "video/x-raw, format=I420, width=2992, height=1934, framerate=30/1, multiview-mode=(string)mono"
+                          "proxysink name=screenproxy")))
+      (with-unref ((filesrc (gst_bin_get_by_name pipeline "src")))
+        (g_object_set_utf-8-string filesrc "location" location))
+      pipeline)))
+
+
+(definition (make-ended)
+  (let ((location (parse {File Documents "screens/ended.png"})))
+    (let ((pipeline
+            (gst-pipeline "filesrc name=src"
+                          "pngdec"
+                          "videoconvert"
+                          "imagefreeze is-live=true"
+                          "video/x-raw, format=I420, width=2992, height=1934, framerate=30/1, multiview-mode=(string)mono"
+                          "proxysink name=screenproxy")))
+      (with-unref ((filesrc (gst_bin_get_by_name pipeline "src")))
+        (g_object_set_utf-8-string filesrc "location" location))
+      pipeline)))
 
 
 (definition (make-screen)
   (let ((screen
           (gst-pipeline
             "avfvideosrc capture-screen=true capture-screen-cursor=true capture-screen-mouse-clicks=true name=src"
-            (tie "video/x-raw, framerate={screen-share-live-framerate}/1")
-            (tie "vtenc_h264 bitrate={screen-share-live-bitrate} name=enc")
-            "video/x-h264, stream-format=(string)avc"
+            "videoconvert"
+            "video/x-raw, format=I420, width=2992, height=1934, framerate=30/1, multiview-mode=(string)mono"
             "proxysink name=screenproxy")))
     (gst_object_set_name screen "live.screen")
     screen))
+
+
+(definition protected (replace-screen kind screen)
+  (unlink-proxies live-streaming-pipeline "screenproxy")
+  (gst_bin_release live-screen-pipeline)
+  (set! live-screen-pipeline #f)
+  (link-proxies screen live-streaming-pipeline "screenproxy")
+  (gst_element_set_state screen GST_STATE_PLAYING)
+  (offset-running screen live-streaming-pipeline "screenproxy")
+  (set! live-streaming-kind kind)
+  (set! live-screen-pipeline screen))
+
+
+;;;
+;;;; Live
+;;;
+
+
+(definition protected videos-dir
+  {Directory Documents "videos"})
 
 
 (definition (make-live mic audio music screen)
@@ -291,7 +386,9 @@
     (let ((live
             (gst-pipeline
               "proxysrc name=screenproxy"
-              "h264parse"
+              (tie "vtenc_h264 bitrate={screen-share-live-bitrate} name=enc")
+              "video/x-h264, stream-format=(string)avc"
+              ;"h264parse"
               "tee name=tee"
               "queue"
               "flvmux enforce-increasing-timestamps=false streamable=true name=flvmux"
@@ -362,42 +459,24 @@
       live)))
 
 
-@soon
-(definition (stream-soon)
-  (let ((kind 'soon)
-        (music (make-music))
-        (soon (make-soon)))
-    (let ((live (make-live #f #f music soon)))
-      (set-live-streaming? #t)
-      (set! live-streaming-kind kind)
-      (set! live-streaming-pipeline live)
-      (set! live-streaming-pipelines (list music soon)))))
-
-
-(definition (stream-live)
+(definition (stream-live kind screen-make)
   (cache-audio)
   (let ((music-output (locate-music-output)))
-    (let ((kind 'live)
-          (mic microphone-pipeline)
+    (let ((mic microphone-pipeline)
           (audio (get-pipeline (cache-audio)))
           (music (if music-output (get-pipeline music-output) (make-silence)))
-          (screen (make-screen)))
+          (screen (screen-make)))
       (let ((live (make-live mic audio music screen)))
         (set-live-streaming? #t)
         (set! live-streaming-kind kind)
         (set! live-streaming-pipeline live)
         (set! live-streaming-pipelines (if music-output (list screen) (list music screen)))
-        (set! live-silence-pipeline (and (not music-output) music))))))
+        (set! live-silence-pipeline (and (not music-output) music))
+        (set! live-screen-pipeline screen)))))
 
 
-(definition protected (start-streaming)
-  (let ((world (current-world)))
-    (cond ((not (acquire-microphone-pipeline))
-           (display-error world "Unable to acquire microphone"))
-          ((not (setup-music-device))
-           (display-error world "Unable to find music device"))
-          (else
-           (stream-live)))))
+(definition protected (start-streaming kind screen-make)
+  (stream-live kind screen-make))
 
 
 (definition protected (stop-streaming)
@@ -419,8 +498,15 @@
   (set-live-streaming? #f))
 
 
+(definition protected (set-live-streaming? flag)
+  (let ((world (current-world)))
+    (set! live-streaming? flag)
+    (update-state-visible? world)
+    (display-on/off world "Live streaming" live-streaming?)))
+
+
 ;;;
-;;;; Chatbot
+;;;; Chat
 ;;;
 
 
