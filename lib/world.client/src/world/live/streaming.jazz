@@ -58,14 +58,30 @@
 (definition protected live-streaming?
   #f)
 
-(definition protected live-streaming-kind
+(definition protected live-scene
   #f)
 
-(definition protected live-streaming-pipeline
+(definition protected live-pipeline
   #f)
 
-(definition protected live-streaming-pipelines
+(definition protected live-free-pipelines
   '())
+
+
+(definition protected live-mic-pipeline
+  #f)
+
+(definition protected live-audio-pipeline
+  #f)
+
+(definition protected live-music-stream
+  #f)
+
+(definition protected live-music-pipeline
+  #f)
+
+(definition protected live-video-pipeline
+  #f)
 
 
 ;;;
@@ -75,11 +91,35 @@
 
 (definition public (live-streaming)
   (if (not live-streaming?)
-      (start-live-streaming 'starting make-starting)
+      (start-live-streaming 'starting)
     (stop-live-streaming)))
 
 
-(definition (start-live-streaming kind screen-make)
+(definition public (live-start)
+  (if (not live-streaming?)
+      (start-live-streaming 'starting)
+    (replace-scene 'starting)))
+
+
+(definition public (live-pause)
+  (if (not live-streaming?)
+      (start-live-streaming 'paused)
+    (replace-scene 'paused)))
+
+
+(definition public (live-resume)
+  (if (not live-streaming?)
+      (start-live-streaming 'screen)
+    (replace-scene 'screen)))
+
+
+(definition public (live-end)
+  (if (not live-streaming?)
+      (start-live-streaming 'ended)
+    (replace-scene 'ended)))
+
+
+(definition (start-live-streaming scene)
   (let ((world (current-world)))
     (cond ((not twitch-server)
            (display-error world "Missing world.twitch-server setting"))
@@ -90,42 +130,18 @@
           ((not (setup-music-device))
            (display-error world "Unable to find music device"))
           (else
-           (let ((err (setup-screens)))
+           (let ((err (setup-scenes)))
              (if err
                  (display-error world (format "Unable to find {a}" err))
                (start-chatbot)
                (start-update)
-               (start-streaming kind screen-make)))))))
+               (start-streaming scene)))))))
 
 
 (definition (stop-live-streaming)
   (stop-chatbot)
   (stop-update)
   (stop-streaming))
-
-
-(definition public (live-start)
-  (if (not live-streaming?)
-      (start-live-streaming 'starting make-starting)
-    (replace-screen 'starting (make-starting))))
-
-
-(definition public (live-pause)
-  (if (not live-streaming?)
-      (start-live-streaming 'paused make-paused)
-    (replace-screen 'paused (make-paused))))
-
-
-(definition public (live-resume)
-  (if (not live-streaming?)
-      (start-live-streaming 'live make-screen)
-    (replace-screen 'live (make-screen))))
-
-
-(definition public (live-end)
-  (if (not live-streaming?)
-      (start-live-streaming 'ended make-ended)
-    (replace-screen 'ended (make-ended))))
 
 
 ;;;
@@ -154,8 +170,59 @@
   (let ((sink-running (gst_pipeline_get_running_time sink-pipeline))
         (src-running (gst_pipeline_get_running_time src-pipeline)))
     (let ((offset (- src-running sink-running)))
-      (with-unref ((sink (gst_bin_get_by_name sink-pipeline name)))
-        (g_object_set_int64 sink "timestamp-offset" offset)))))
+      (with-unref ((src (gst_bin_get_by_name src-pipeline name)))
+        (with-unref ((pad (gst_element_get_static_pad src "src")))
+          (gst_pad_set_offset pad offset))))))
+
+
+(definition (free-pipeline? pipeline)
+  (memq? pipeline live-free-pipelines))
+
+
+(definition (release-free-pipeline pipeline)
+  (when (free-pipeline? pipeline)
+    (gst_bin_release pipeline)
+    (set! live-free-pipelines (remove! pipeline live-free-pipelines))))
+
+
+;;;
+;;;; Mic
+;;;
+
+
+(definition (replace-mic mic)
+  (unless (eq? mic live-mic-pipeline)
+    (unlink-proxies live-pipeline "micproxy")
+    (release-free-pipeline live-mic-pipeline)
+    (link-proxies mic live-pipeline "micproxy")
+    (gst_element_set_state mic GST_STATE_PLAYING)
+    (offset-running mic live-pipeline "micproxy")
+    (set! live-mic-pipeline mic)))
+
+
+;;;
+;;;; Audio
+;;;
+
+
+(definition (make-silence name)
+  (let ((silence
+          (gst-pipeline
+            "audiotestsrc is-live=true wave=silence name=src"
+            "audio/x-raw, format=S16LE, layout=interleaved, rate=48000, channels=2"
+            (tie "proxysink name={name}proxy"))))
+    (gst_object_set_name silence (tie "live.{name}"))
+    silence))
+
+
+(definition (replace-audio audio)
+  (unless (eq? audio live-audio-pipeline)
+    (unlink-proxies live-pipeline "audioproxy")
+    (release-free-pipeline live-audio-pipeline)
+    (link-proxies audio live-pipeline "audioproxy")
+    (gst_element_set_state audio GST_STATE_PLAYING)
+    (offset-running audio live-pipeline "audioproxy")
+    (set! live-audio-pipeline audio)))
 
 
 ;;;
@@ -226,20 +293,6 @@
                   (display-message world title color: color))))))))))
 
 
-(definition protected live-silence-pipeline
-  #f)
-
-
-(definition (make-silence)
-  (let ((silence
-          (gst-pipeline
-            "audiotestsrc is-live=true wave=silence name=src"
-            "audio/x-raw, format=S16LE, layout=interleaved, rate=48000, channels=2"
-            "proxysink name=musicproxy")))
-    (gst_object_set_name silence "live.silence")
-    silence))
-
-
 (definition (make-music)
   (and effective-music-device
        (let ((music
@@ -253,94 +306,68 @@
          music)))
 
 
-(definition protected (stop-silence)
-  (when live-silence-pipeline
-    (unlink-proxies live-streaming-pipeline "musicproxy")
-    (gst_bin_release live-silence-pipeline)
-    (set! live-silence-pipeline #f)))
+(definition protected (stop-music)
+  (when live-music-pipeline
+    (unlink-proxies live-pipeline "musicproxy")
+    (release-free-pipeline live-music-pipeline)
+    (set! live-music-pipeline #f)
+    (set! live-music-stream #f)))
 
 
 (definition protected (replace-music)
-  (stop-silence)
-  (let ((music
-          (gst-pipeline
-            (tie "osxaudiosrc device={effective-music-device} name=src")
-            "audioconvert"
-            "audioresample"
-            "audio/x-raw, format=S16LE, layout=interleaved, rate=48000, channels=2"
-            "proxysink name=musicproxy")))
-    (gst_object_set_name music "live.music")
-    (link-proxies music live-streaming-pipeline "musicproxy")
-    (gst_element_set_state music GST_STATE_PLAYING)
-    (offset-running music live-streaming-pipeline "musicproxy")
-    music))
+  (let ((world (current-world)))
+    (let ((music-output (locate-music-output)))
+      (if (not music-output)
+          (display-error world "No music playing")
+        (stop-music)
+        (let ((music (get-bin music-output)))
+          (link-proxies music live-pipeline "musicproxy")
+          (gst_element_set_state music GST_STATE_PLAYING)
+          (offset-running music live-pipeline "musicproxy")
+          (set! live-music-pipeline music)
+          music)))))
+
+
+(definition protected (stop-live-music stream)
+  (when (eq? live-music-stream stream)
+    (stop-music)))
+
+
+(definition protected (replace-live-music)
+  (when live-streaming?
+    (replace-music)))
 
 
 ;;;
-;;;; Screen
+;;;; Video
 ;;;
-
-
-(definition live-screen-pipeline
-  #f)
-
-
-(definition screen-images
-  (make-table test: eq?))
-
-
-(definition (setup-screens)
-  (define (setup name path)
-    (let ((file (new-file {Directory Documents} path)))
-      (cond ((not (exists? file))
-             path)
-            (else
-             (table-set! screen-images name file)
-             #f))))
-  
-  (or (setup 'starting "screens/starting.png")
-      (setup 'paused   "screens/paused.png")
-      (setup 'resumed  "screens/resumed.png")
-      (setup 'ended    "screens/ended.png")))
 
 
 (definition (make-starting)
-  (let ((location (parse {File Documents "screens/starting.png"})))
+  (let ((location (parse (table-ref scene-images 'starting))))
     (let ((pipeline
             (gst-pipeline "filesrc name=src"
                           "pngdec"
                           "videoconvert"
                           "imagefreeze is-live=true"
                           "video/x-raw, format=I420, width=2992, height=1934, framerate=30/1, multiview-mode=(string)mono"
-                          "proxysink name=screenproxy")))
+                          "proxysink name=videoproxy")))
+      (gst_object_set_name pipeline "live.video")
       (with-unref ((filesrc (gst_bin_get_by_name pipeline "src")))
         (g_object_set_utf-8-string filesrc "location" location))
       pipeline)))
 
 
 (definition (make-paused)
-  (let ((location (parse {File Documents "screens/paused.png"})))
+  (let ((location (parse (table-ref scene-images 'paused))))
     (let ((pipeline
             (gst-pipeline "filesrc name=src"
                           "pngdec"
                           "videoconvert"
                           "imagefreeze is-live=true"
                           "video/x-raw, format=I420, width=2992, height=1934, framerate=30/1, multiview-mode=(string)mono"
-                          "proxysink name=screenproxy")))
-      (with-unref ((filesrc (gst_bin_get_by_name pipeline "src")))
-        (g_object_set_utf-8-string filesrc "location" location))
-      pipeline)))
-
-
-(definition (make-ended)
-  (let ((location (parse {File Documents "screens/ended.png"})))
-    (let ((pipeline
-            (gst-pipeline "filesrc name=src"
-                          "pngdec"
-                          "videoconvert"
-                          "imagefreeze is-live=true"
-                          "video/x-raw, format=I420, width=2992, height=1934, framerate=30/1, multiview-mode=(string)mono"
-                          "proxysink name=screenproxy")))
+                          "proxysink name=videoproxy")))
+      (gst_object_set_name pipeline "live.video")
       (with-unref ((filesrc (gst_bin_get_by_name pipeline "src")))
         (g_object_set_utf-8-string filesrc "location" location))
       pipeline)))
@@ -352,20 +379,113 @@
             "avfvideosrc capture-screen=true capture-screen-cursor=true capture-screen-mouse-clicks=true name=src"
             "videoconvert"
             "video/x-raw, format=I420, width=2992, height=1934, framerate=30/1, multiview-mode=(string)mono"
-            "proxysink name=screenproxy")))
-    (gst_object_set_name screen "live.screen")
+            "proxysink name=videoproxy")))
+    (gst_object_set_name screen "live.video")
     screen))
 
 
-(definition protected (replace-screen kind screen)
-  (unlink-proxies live-streaming-pipeline "screenproxy")
-  (gst_bin_release live-screen-pipeline)
-  (set! live-screen-pipeline #f)
-  (link-proxies screen live-streaming-pipeline "screenproxy")
-  (gst_element_set_state screen GST_STATE_PLAYING)
-  (offset-running screen live-streaming-pipeline "screenproxy")
-  (set! live-streaming-kind kind)
-  (set! live-screen-pipeline screen))
+(definition (make-ended)
+  (let ((location (parse (table-ref scene-images 'ended))))
+    (let ((pipeline
+            (gst-pipeline "filesrc name=src"
+                          "pngdec"
+                          "videoconvert"
+                          "imagefreeze is-live=true"
+                          "video/x-raw, format=I420, width=2992, height=1934, framerate=30/1, multiview-mode=(string)mono"
+                          "proxysink name=videoproxy")))
+      (gst_object_set_name pipeline "live.video")
+      (with-unref ((filesrc (gst_bin_get_by_name pipeline "src")))
+        (g_object_set_utf-8-string filesrc "location" location))
+      pipeline)))
+
+
+(definition protected (replace-video video)
+  (unless (eq? video live-video-pipeline)
+    (unlink-proxies live-pipeline "videoproxy")
+    (release-free-pipeline live-video-pipeline)
+    (link-proxies video live-pipeline "videoproxy")
+    (gst_element_set_state video GST_STATE_PLAYING)
+    (offset-running video live-pipeline "videoproxy")
+    (set! live-video-pipeline video)))
+
+
+;;;
+;;;; Scene
+;;;
+
+
+(definition scene-images
+  (make-table test: eq?))
+
+
+(definition (setup-scenes)
+  (define (setup name path)
+    (let ((file (new-file {Directory Documents} path)))
+      (cond ((not (exists? file))
+             path)
+            (else
+             (table-set! scene-images name file)
+             #f))))
+  
+  (or (setup 'starting "scenes/starting.png")
+      (setup 'paused   "scenes/paused.png")
+      (setup 'ended    "scenes/ended.png")))
+
+
+(definition (replace-live)
+  )
+
+
+(definition (replace-starting)
+  (let ((mic (make-silence "mic"))
+        (audio (make-silence "audio"))
+        (video (make-starting)))
+    (replace-mic mic)
+    (replace-audio audio)
+    (replace-video video)
+    (set! live-scene 'starting)
+    (set! live-free-pipelines (list mic audio video))))
+
+
+(definition (replace-paused)
+  (let ((mic (make-silence "mic"))
+        (audio (make-silence "audio"))
+        (video (make-paused)))
+    (replace-mic mic)
+    (replace-audio audio)
+    (replace-video video)
+    (set! live-scene 'paused)
+    (set! live-free-pipelines (list mic audio video))))
+
+
+(definition (replace-screen)
+  (let ((mic microphone-pipeline)
+        (audio (get-pipeline (cache-audio)))
+        (video (make-screen)))
+    (replace-mic mic)
+    (replace-audio audio)
+    (replace-video video)
+    (set! live-scene 'screen)
+    (set! live-free-pipelines (list video))))
+
+
+(definition (replace-ended)
+  (let ((mic (make-silence "mic"))
+        (audio (make-silence "audio"))
+        (video (make-ended)))
+    (replace-mic mic)
+    (replace-audio audio)
+    (replace-video video)
+    (set! live-scene 'ended)
+    (set! live-free-pipelines (list mic audio video))))
+
+
+(definition protected (replace-scene scene)
+  (case scene
+    ((starting) (replace-starting))
+    ((paused) (replace-paused))
+    ((screen) (replace-screen))
+    ((ended) (replace-ended))))
 
 
 ;;;
@@ -373,42 +493,39 @@
 ;;;
 
 
-(definition protected videos-dir
+(definition protected save-dir
   {Directory Documents "videos"})
 
 
-(definition (make-live mic audio music screen)
-  (create-directories videos-dir)
+(definition (make-live mic audio music video)
+  (create-directories save-dir)
   (let ((framerate live-streaming-framerate)
         (bitrate live-streaming-bitrate)
         (rtmp-location (tie "{twitch-server}/{twitch-key}"))
-        (file-location (parse (timestamped-file videos-dir #f "mp4"))))
+        (file-location (parse (timestamped-file save-dir #f "mp4"))))
     (let ((live
             (gst-pipeline
-              "proxysrc name=screenproxy"
+              "proxysrc name=videoproxy"
               (tie "vtenc_h264 bitrate={screen-share-live-bitrate} name=enc")
               "video/x-h264, stream-format=(string)avc"
-              ;"h264parse"
               "tee name=tee"
               "queue"
               "flvmux enforce-increasing-timestamps=false streamable=true name=flvmux"
               "rtmp2sink name=rtmpsink"
-              (and audio
-                   (list
-                     "proxysrc name=audioproxy"
-                     "queue"
-                     "mixer."))
-              (and mic
-                   (list
-                     "proxysrc name=micproxy"
-                     "queue"
-                     "mixer."))
               (list
-                "audiomixer min-upstream-latency=40000000 latency=100000000 name=mixer"
-                "audio/x-raw, format=S16LE, layout=interleaved, rate=48000, channels=2"
-                "tee name=videoaudio"
+                "proxysrc name=micproxy"
                 "queue"
-                "audiomixer min-upstream-latency=40000000 latency=100000000 name=livemixer"
+                "mixer.")
+              (list
+                "proxysrc name=audioproxy"
+                "queue"
+                "mixer.")
+              (list
+                "audiomixer ignore-inactive-pads=true min-upstream-latency=40000000 latency=100000000 name=mixer"
+                "audio/x-raw, format=S16LE, layout=interleaved, rate=48000, channels=2"
+                "tee name=saveaudio"
+                "queue"
+                "audiomixer ignore-inactive-pads=true min-upstream-latency=40000000 latency=100000000 name=livemixer"
                 "audio/x-raw, format=S16LE, layout=interleaved, rate=48000, channels=2"
                 "audioconvert"
                 "avenc_aac"
@@ -418,16 +535,16 @@
                 "queue"
                 "livemixer.")
               (list
-                "videoaudio."
+                "saveaudio."
                 "queue"
                 "audioconvert"
                 "avenc_aac"
-                "videomux.")
+                "savemux.")
               (list
                 "tee."
                 "video/x-h264"
                 "queue max-size-time=200000000"
-                "qtmux name=videomux"
+                "qtmux name=savemux"
                 (tie "filesink name=filesink")))))
       (gst_object_set_name live "live")
       (with-unref ((rtmpsink (gst_bin_get_by_name live "rtmpsink"))
@@ -440,61 +557,122 @@
         (link-proxies audio live "audioproxy"))
       (when music
         (link-proxies music live "musicproxy"))
-      (link-proxies screen live "screenproxy")
+      (link-proxies video live "videoproxy")
       (when mic
         (gst_element_set_state mic GST_STATE_PLAYING))
       (when audio
         (gst_element_set_state audio GST_STATE_PLAYING))
       (when music
         (gst_element_set_state music GST_STATE_PLAYING))
-      (gst_element_set_state screen GST_STATE_PLAYING)
+      (gst_element_set_state video GST_STATE_PLAYING)
       (when mic
         (offset-pad mic live "micproxy"))
       (when audio
         (offset-pad audio live "audioproxy"))
       (when music
         (offset-pad music live "musicproxy"))
-      (offset-pad screen live "screenproxy")
+      (offset-pad video live "videoproxy")
       (gst_element_set_state live GST_STATE_PLAYING)
       live)))
 
 
-(definition (stream-live kind screen-make)
+(definition (stream-live-starting)
+  (let ((music-output (locate-music-output)))
+    (let ((mic (make-silence "mic"))
+          (audio (make-silence "audio"))
+          (music (if music-output (get-bin music-output) (make-silence "music")))
+          (video (make-starting)))
+      (let ((live (make-live mic audio music video)))
+        (set-live-streaming? #t)
+        (set! live-scene 'starting)
+        (set! live-pipeline live)
+        (set! live-free-pipelines (if music-output (list mic audio video) (list mic audio music video)))
+        (set! live-mic-pipeline mic)
+        (set! live-audio-pipeline audio)
+        (set! live-music-stream (and music-output (get-stream (get-channel music-output))))
+        (set! live-music-pipeline music)
+        (set! live-video-pipeline video)))))
+
+
+(definition (stream-live-paused)
+  (let ((music-output (locate-music-output)))
+    (let ((mic (make-silence "mic"))
+          (audio (make-silence "audio"))
+          (music (if music-output (get-bin music-output) (make-silence "music")))
+          (video (make-paused)))
+      (let ((live (make-live mic audio music video)))
+        (set-live-streaming? #t)
+        (set! live-scene 'paused)
+        (set! live-pipeline live)
+        (set! live-free-pipelines (if music-output (list mic audio video) (list mic audio music video)))
+        (set! live-mic-pipeline mic)
+        (set! live-audio-pipeline audio)
+        (set! live-music-stream (and music-output (get-stream (get-channel music-output))))
+        (set! live-music-pipeline music)
+        (set! live-video-pipeline video)))))
+
+
+(definition (stream-live-screen)
   (cache-audio)
   (let ((music-output (locate-music-output)))
     (let ((mic microphone-pipeline)
           (audio (get-pipeline (cache-audio)))
-          (music (if music-output (get-pipeline music-output) (make-silence)))
-          (screen (screen-make)))
-      (let ((live (make-live mic audio music screen)))
+          (music (if music-output (get-bin music-output) (make-silence "music")))
+          (video (make-screen)))
+      (let ((live (make-live mic audio music video)))
         (set-live-streaming? #t)
-        (set! live-streaming-kind kind)
-        (set! live-streaming-pipeline live)
-        (set! live-streaming-pipelines (if music-output (list screen) (list music screen)))
-        (set! live-silence-pipeline (and (not music-output) music))
-        (set! live-screen-pipeline screen)))))
+        (set! live-scene 'screen)
+        (set! live-pipeline live)
+        (set! live-free-pipelines (if music-output (list video) (list music video)))
+        (set! live-mic-pipeline mic)
+        (set! live-audio-pipeline audio)
+        (set! live-music-stream (and music-output (get-stream (get-channel music-output))))
+        (set! live-music-pipeline music)
+        (set! live-video-pipeline video)))))
 
 
-(definition protected (start-streaming kind screen-make)
-  (stream-live kind screen-make))
+(definition (stream-live-ended)
+  (let ((music-output (locate-music-output)))
+    (let ((mic (make-silence "mic"))
+          (audio (make-silence "audio"))
+          (music (if music-output (get-bin music-output) (make-silence "music")))
+          (video (make-ended)))
+      (let ((live (make-live mic audio music video)))
+        (set-live-streaming? #t)
+        (set! live-scene 'ended)
+        (set! live-pipeline live)
+        (set! live-free-pipelines (if music-output (list mic audio video) (list mic audio music video)))
+        (set! live-mic-pipeline mic)
+        (set! live-audio-pipeline audio)
+        (set! live-music-stream (and music-output (get-stream (get-channel music-output))))
+        (set! live-music-pipeline music)
+        (set! live-video-pipeline video)))))
+
+
+(definition protected (start-streaming scene)
+  (case scene
+    ((starting) (stream-live-starting))
+    ((paused) (stream-live-paused))
+    ((screen) (stream-live-screen))
+    ((ended) (stream-live-ended))))
 
 
 (definition protected (stop-streaming)
-  (unlink-proxies live-streaming-pipeline "micproxy")
-  (unlink-proxies live-streaming-pipeline "audioproxy")
-  (unlink-proxies live-streaming-pipeline "musicproxy")
-  (unlink-proxies live-streaming-pipeline "screenproxy")
-  (gst_element_send_event live-streaming-pipeline (gst_event_new_eos))
-  (or (wait-eos live-streaming-pipeline)
+  (unlink-proxies live-pipeline "micproxy")
+  (unlink-proxies live-pipeline "audioproxy")
+  (unlink-proxies live-pipeline "musicproxy")
+  (unlink-proxies live-pipeline "videoproxy")
+  (gst_element_send_event live-pipeline (gst_event_new_eos))
+  (or (wait-eos live-pipeline)
       (tell 'did 'not 'receive 'eos 'message))
   (for-each (lambda (pipeline)
               (when pipeline
                 (gst_bin_release pipeline)))
-            live-streaming-pipelines)
-  (gst_bin_release live-streaming-pipeline)
-  (set! live-streaming-kind #f)
-  (set! live-streaming-pipeline #f)
-  (set! live-streaming-pipelines '())
+            live-free-pipelines)
+  (gst_bin_release live-pipeline)
+  (set! live-scene #f)
+  (set! live-pipeline #f)
+  (set! live-free-pipelines '())
   (set-live-streaming? #f))
 
 
