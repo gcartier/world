@@ -590,10 +590,10 @@
                 (when (and (= kind udp-video) (frame-keyframe? flags))
                   (trim-upload self channel))
                 (sending-media channel tier-no buffer dts pts duration flags
-                  (lambda (data)
+                  (lambda (parcel)
                     (if (= kind udp-audio)
-                        (push-time-upload self channel data)
-                      (push-upload self channel data)))))
+                        (push-time-upload self channel parcel)
+                      (push-upload self channel parcel)))))
               
               (define (advance-frame!)
                 (next-frame-sequence! channel))
@@ -670,7 +670,7 @@
       (lambda ()
         (with-record profile-media
           (let ((size (calculate-profile-media-size payload)))
-            (let ((data (make-u8vector size)))
+            (let ((data (borrow-parcel-length$ size)))
               (write-header-code data udp-code)
               (write-header-kind data udp-profile-media)
               (write-header-sender data tier-no)
@@ -686,7 +686,7 @@
       (lambda ()
         (with-record profile-media-pulse
           (let ((size (calculate-profile-media-pulse-size)))
-            (let ((data (make-u8vector size)))
+            (let ((data (borrow-parcel-length$ size)))
               (write-header-code data udp-code)
               (write-header-kind data udp-profile-media)
               (write-header-sender data tier-no)
@@ -701,7 +701,7 @@
       (lambda ()
         (with-record profile-dummy
           (let ((size (calculate-profile-dummy-size payload)))
-            (let ((data (make-u8vector size)))
+            (let ((data (borrow-parcel-length$ size)))
               (write-header-code data udp-code)
               (write-header-kind data udp-profile-dummy)
               (write-header-sender data tier-no)
@@ -732,10 +732,10 @@
   ;;;
   
   
-  (method (push-upload self channel data)
+  (method (push-upload self channel parcel)
     (unless upload-done?
-      (push upload-queue channel data)
-      (update upload-queue-rate (u8vector-length data))
+      (push upload-queue channel parcel)
+      (update upload-queue-rate (parcel-length parcel))
       (when record-events?
         (record-event udp-id-queue-rate
                       -1.
@@ -747,16 +747,16 @@
                       -1.))))
   
   
-  (method (push-time-upload self channel data)
+  (method (push-time-upload self channel parcel)
     (unless upload-done?
-      (push-time upload-queue channel data)
-      (update upload-queue-rate (u8vector-length data))))
+      (push-time upload-queue channel parcel)
+      (update upload-queue-rate (parcel-length parcel))))
   
   
-  (method (push-missing-upload self data)
+  (method (push-missing-upload self parcel)
     (unless upload-done?
-      (push-missing upload-queue data)
-      (update upload-queue-rate (u8vector-length data))))
+      (push-missing upload-queue parcel)
+      (update upload-queue-rate (parcel-length parcel))))
   
   
   (method (pop-upload self timeout)
@@ -771,16 +771,16 @@
     (increase! upload-bbr-update))
   
   
-  (method (send-upload-media self data was-empty?)
+  (method (send-upload-media self parcel was-empty?)
     (with-record media-ackable
       (let ((sent (current-monotonic))
             (order (next-media-order!)))
-        (write-media-ackable-order data order)
+        (write-media-ackable-order parcel order)
         (mutex-lock! write-mutex)
-        (send-data self data)
-        (update upload-send-rate (u8vector-length data))
+        (send-data self parcel)
+        (update upload-send-rate (parcel-length parcel))
         (mutex-unlock! write-mutex)
-        (bind-values (skb segs) (packet-sent bbr-state sent order data)
+        (bind-values (skb segs) (packet-sent bbr-state sent order parcel)
           (let ((timer (current-monotonic-jiffies)))
             (tcp_skb_sent upload-socket skb was-empty? order timer)
             (when record-bbr?
@@ -795,10 +795,10 @@
         (when record-events?
           (with-record media
             (record-event udp-id-bbr-media
-                          (fixnum->flonum (read-media-channel data))
-                          (fixnum->flonum (read-header-sender data))
-                          (fixnum->flonum (read-header-kind data))
-                          (fixnum->flonum (read-media-sequence data))
+                          (fixnum->flonum (read-media-channel parcel))
+                          (fixnum->flonum (read-header-sender parcel))
+                          (fixnum->flonum (read-header-kind parcel))
+                          (fixnum->flonum (read-media-sequence parcel))
                           (fixnum->flonum order)
                           -1.
                           -1.))
@@ -810,46 +810,46 @@
                         (fixnum->flonum order)
                         (average-mbps upload-send-rate)
                         -1.))
-        (bbr-updated self))))
+        (bbr-updated self)
+        (release-parcel$ parcel))))
   
   
   (method (send-upload-pulse self sent was-empty?)
-    (let ((order (next-media-order!)))
-      (let ((data (with-write-mutex self
-                    (lambda ()
-                      (with-record media-pulse
-                        (let ((size (calculate-media-pulse-size)))
-                          (let ((data (make-u8vector size)))
-                            (write-header-code data udp-code)
-                            (write-header-kind data udp-media-pulse)
-                            (write-header-sender data tier-no)
-                            (write-media-ackable-order data order)
-                            (send-data self data)
-                            (update upload-send-rate (u8vector-length data))
-                            data)))))))
-        (bind-values (skb segs) (packet-sent bbr-state sent order data)
-          (let ((timer (current-monotonic-jiffies)))
-            (tcp_skb_sent upload-socket skb was-empty? order timer)
-            (when record-bbr?
-              (record-event udp-id-bbr-pulsed
-                            -1.
-                            -1.
-                            -1.
-                            (fixnum->flonum segs)
-                            (fixnum->flonum order)
-                            (if was-empty? 1. 0.)
-                            (timestamp->flonum timer)))))
-        (when record-events?
-          (record-event udp-id-bbr-pulse
-                        -1.
-                        -1.
-                        -1.
-                        -1.
-                        (fixnum->flonum order)
-                        -1.
-                        -1.))
-        (pulse-sent bbr-state sent)
-        (bbr-updated self))))
+    (let ((order (next-media-order!))
+          (parcel (borrow-parcel-length$ (calculate-media-pulse-size))))
+      (with-write-mutex self
+        (lambda ()
+          (with-record media-pulse
+            (write-header-code parcel udp-code)
+            (write-header-kind parcel udp-media-pulse)
+            (write-header-sender parcel tier-no)
+            (write-media-ackable-order parcel order)
+            (send-data self parcel)
+            (update upload-send-rate (parcel-length parcel)))))
+      (bind-values (skb segs) (packet-sent bbr-state sent order parcel)
+        (let ((timer (current-monotonic-jiffies)))
+          (tcp_skb_sent upload-socket skb was-empty? order timer)
+          (when record-bbr?
+            (record-event udp-id-bbr-pulsed
+                          -1.
+                          -1.
+                          -1.
+                          (fixnum->flonum segs)
+                          (fixnum->flonum order)
+                          (if was-empty? 1. 0.)
+                          (timestamp->flonum timer)))))
+      (when record-events?
+        (record-event udp-id-bbr-pulse
+                      -1.
+                      -1.
+                      -1.
+                      -1.
+                      (fixnum->flonum order)
+                      -1.
+                      -1.))
+      (pulse-sent bbr-state sent)
+      (bbr-updated self)
+      (release-parcel$ parcel)))
   
   
   (method (receive-upload-ack self data)
@@ -903,13 +903,13 @@
     (with-task task
       (lambda (exit)
         (let ((now (current-monotonic)))
-          (let (loop (data (pop-upload self 0)) (was-empty? #f) (local-delivery-time now) (next-delivery-time now))
+          (let (loop (parcel (pop-upload self 0)) (was-empty? #f) (local-delivery-time now) (next-delivery-time now))
             (if upload-done?
                 (continuation-return exit #f)
-              (wake-upload self data was-empty? local-delivery-time next-delivery-time loop)))))))
+              (wake-upload self parcel was-empty? local-delivery-time next-delivery-time loop)))))))
   
   
-  (method (wake-upload self data was-empty? local-delivery-time next-delivery-time loop)
+  (method (wake-upload self parcel was-empty? local-delivery-time next-delivery-time loop)
     (declare (proper-tail-calls))
     (define (wait local-delivery-time)
       (sleep (- local-delivery-time (current-monotonic))))
@@ -922,12 +922,12 @@
     
     (mutex-lock! upload-mutex)
     (cond ;; no data
-          ((eof-object? data)
+          ((eof-object? parcel)
            (show ".")
            (mutex-unlock! upload-mutex)
-           (let ((data (pop-upload self #f))
+           (let ((parcel (pop-upload self #f))
                  (now (current-monotonic)))
-             (loop data #t now now)))
+             (loop parcel #t now now)))
           ;; data
           (else
            (cond ;; exceeding congestion window
@@ -936,14 +936,15 @@
                   (record-congested bbr-state #t)
                   (let ((now (current-monotonic)))
                     (cond ;; send pulse
-                          ((>= now (+ (get-last-sent-time bbr-state) .1))
+                          ((>= now (+ (get-last-sent-time bbr-state) @w .0001 .1))
+                           (tell 'PULSE)
                            (show "@")
                            (wait local-delivery-time)
                            (send-upload-pulse self now was-empty?)
                            (mutex-unlock! upload-mutex)
                            (mutex-lock! upload-ack-mutex)
                            (mutex-unlock! upload-ack-mutex upload-ack-condvar .1)
-                           (loop data was-empty? local-delivery-time next-delivery-time))
+                           (loop parcel was-empty? local-delivery-time next-delivery-time))
                           ;; do nothing
                           (else
                            (show "$")
@@ -951,16 +952,16 @@
                            (mutex-unlock! upload-mutex)
                            (mutex-lock! upload-ack-mutex)
                            (mutex-unlock! upload-ack-mutex upload-ack-condvar .1)
-                           (loop data was-empty? local-delivery-time next-delivery-time)))))
+                           (loop parcel was-empty? local-delivery-time next-delivery-time)))))
                  ;; send media
                  (else
                   (tcp_set_is_cwnd_limited upload-socket #f)
                   (record-congested bbr-state #f)
                   (set! upload-pace-lag (- local-delivery-time next-delivery-time))
-                  (let ((size (u8vector-length data)))
+                  (let ((size (parcel-length parcel)))
                     (show "^")
                     (wait local-delivery-time)
-                    (send-upload-media self data was-empty?)
+                    (send-upload-media self parcel was-empty?)
                     (let ((pace (pace size)))
                       (let ((next (+ next-delivery-time pace))
                             ;; never send faster locally than pace / 2
@@ -1120,7 +1121,7 @@
   
   
   (method protected (receive-data self data)
-    (if (or (< (u8vector-length data) 4)
+    (if (or (< (parcel-length data) 4)
             (/= (with-record header (read-header-code data)) udp-code))
         (increase! invalid-packets)
       (increase-received self data)
@@ -1169,7 +1170,7 @@
              (error "Unknown UDP kind: {s}" kind))))
         (when (and (/= kind udp-audio)
                    (/= kind udp-video))
-          (return-parcel$ data)))))
+          (release-parcel$ data)))))
   
   
   (method (receive-ack self data)
@@ -1235,18 +1236,20 @@
                         ordered)))
           
           (input-port-timeout-set! udp-port 0)
-          (let ((next (need-parcel$)))
+          (let ((next (borrow-parcel$)))
             (let ((parcel-read (udp-read-subu8vector next 0 parcel-size udp-port)))
               (input-port-timeout-set! udp-port #f)
               (cond ((not parcel-read)
-                     (return-parcel$ next)
+                     (release-parcel$ next)
                      (receive))
                     ((and (= (read-header-kind next) kind)
                           (= (read-media-channel next) no))
+                     (set-parcel-length next parcel-read)
                      (increase-received self next)
                      (loop (add-ordered! next (or ordered (list data)) key: (lambda (data)
                                                                               (read-media-sequence data)))))
                     (else
+                     (set-parcel-length next parcel-read)
                      (receive)
                      (receive-data self next)))))))))
   
@@ -1511,10 +1514,19 @@
     (set! popped 0))
   
   
+  (method override (destroy self)
+    (release-parcels$ self)
+    (nextmethod self))
+  
+  
   (method override (print self output readably)
     (print-unreadable self output
       (lambda (output)
         (format output "{a}" size))))
+  
+  
+  (method (release-parcels$ self)
+    (iterate-parcels self release-parcel$))
   
   
   (method public (empty? self)
@@ -1523,6 +1535,7 @@
   
   (method public (reset self)
     (prog1 size
+      (release-parcels$ self)
       (f64vector-fill! times +nan.0)
       (vector-fill! content #f)
       (set! head 0)
@@ -1609,7 +1622,18 @@
         (vector-set! content head #f)
         (set! head (modulo (+ head 1) count))
         (decrease! size)
-        (increase! popped)))))
+        (increase! popped))))
+  
+  
+  (method (iterate-parcels self proc)
+    (declare (proper-tail-calls))
+    (when (> count 0)
+      (let (loop (n 0))
+        (when (< n size)
+          (let ((pos (modulo (+ head n) count)))
+            (let ((parcel (vector-ref content pos)))
+              (proc parcel)
+              (loop (+ n 1)))))))))
 
 
 ;;;
@@ -2104,7 +2128,7 @@
     (debug-section self 'trial-amount trial-amount)
     (let ((count (fxceiling (/ (kbps->bytes trial-amount) (cast <fl> trial-size)))))
       (loop (repeat count)
-            (let ((data (make-u8vector trial-size)))
+            (let ((data (borrow-parcel-length$ (calculate-media-trial-size))))
               (with-record media-trial
                 (write-header-code data udp-code)
                 (write-header-kind data udp-media-trial)

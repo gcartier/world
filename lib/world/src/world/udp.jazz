@@ -476,17 +476,66 @@
   still8-minimum)
 
 
-;; relies on udp-datagram-max < parcel-size
-(definition public (parcel? obj)
-  (= (u8vector-length obj) parcel-size))
-
-
 (definition (allocate-parcel) <u8vector>
   (make-u8vector parcel-size))
 
 
 (define-pool parcel$
   allocate-parcel u8vector)
+
+
+;; relies on udp-datagram-max < parcel-size
+(definition public (parcel? obj)
+  (= (u8vector-length obj) parcel-size))
+
+
+(definition length-offset <fx>
+  (- parcel-size 8))
+
+
+(definition protected (get-parcel-length parcel)
+  (scan-u16 parcel length-offset))
+
+(definition protected (set-parcel-length parcel len)
+  (put-u16 parcel length-offset len))
+
+
+(definition public (parcel-length parcel)
+  (assert (parcel? parcel)
+    (get-parcel-length parcel)))
+
+
+(definition public (data-length data)
+  (if (parcel? data)
+      (parcel-length data)
+    (u8vector-length data)))
+
+
+(definition refcount-offset <fx>
+  (- parcel-size 4))
+
+
+(definition public (borrow-parcel$)
+  (let ((parcel (need-parcel$)))
+    (put-u8 parcel refcount-offset 1)
+    parcel))
+
+(definition public (borrow-parcel-length$ len)
+  (let ((parcel (borrow-parcel$)))
+    (set-parcel-length parcel len)
+    parcel))
+
+
+(definition public (retain-parcel$ parcel)
+  (let ((refcount (+ (scan-u8 parcel refcount-offset) 1)))
+    (put-u8 parcel refcount-offset refcount)))
+
+
+(definition public (release-parcel$ parcel)
+  (let ((refcount (- (scan-u8 parcel refcount-offset) 1)))
+    (if (> refcount 0)
+        (put-u8 parcel refcount-offset refcount)
+      (return-parcel$ parcel))))
 
 
 ;;;
@@ -542,33 +591,35 @@
 
 
 (definition protected (read-parcel port)
-  (let ((data (need-parcel$)))
-    (udp-read-subu8vector data 0 parcel-size port)
-    (when record-read/write?
-      (with-record header
-        (let ((sender (read-header-sender data))
-              (kind (read-header-kind data)))
-          (record-event udp-id-read-data
-                        -1.
-                        (fixnum->flonum sender)
-                        (fixnum->flonum kind)
-                        -1.
-                        -1.
-                        -1.
-                        (fixnum->flonum (u8vector-length data))))))
-    data))
+  (let ((parcel (borrow-parcel$)))
+    (let ((len (udp-read-subu8vector parcel 0 parcel-size port)))
+      (set-parcel-length parcel len)
+      (when record-read/write?
+        (with-record header
+          (let ((sender (read-header-sender parcel))
+                (kind (read-header-kind parcel)))
+            (record-event udp-id-read-data
+                          -1.
+                          (fixnum->flonum sender)
+                          (fixnum->flonum kind)
+                          -1.
+                          -1.
+                          -1.
+                          (fixnum->flonum len)))))
+      parcel)))
 
 
 (definition protected (write-data data port)
   ;; only media uses parcels
   (if (parcel? data)
-      (let ((size (determine-media-size data)))
+      (let ((size (parcel-length data)))
         (udp-write-subu8vector data 0 size port))
     (write data port))
   (when record-read/write?
     (with-record header
       (let ((sender (read-header-sender data))
-            (kind (read-header-kind data)))
+            (kind (read-header-kind data))
+            (len (data-length data)))
         (record-event udp-id-write-data
                       -1.
                       (fixnum->flonum sender)
@@ -576,7 +627,7 @@
                       -1.
                       -1.
                       -1.
-                      (fixnum->flonum (u8vector-length data)))))))
+                      (fixnum->flonum len))))))
 
 
 ;;;
@@ -1211,6 +1262,7 @@
   
   
   (method package (retain-media self data)
+    (retain-parcel$ data)
     (insert retain-ring data udp-id-retain-packet))
   
   
@@ -1232,24 +1284,24 @@
                       (let ((sequence (next-data-sequence! self))
                             (content-size (min remain max-content-size)))
                         (let ((size (+ header-size content-size)))
-                          (let ((data (need-parcel$)))
-                            (write-header-code data udp-code)
-                            (write-header-kind data media-kind)
-                            (write-header-sender data sender)
-                            (write-media-channel data no)
-                            (write-media-sequence data sequence)
-                            (write-media-frame data frame)
-                            (write-media-part data part)
-                            (write-media-total data total)
-                            (write-media-dts data dts)
-                            (write-media-pts data pts)
-                            (write-media-duration data duration)
+                          (let ((parcel (borrow-parcel-length$ size)))
+                            (write-header-code parcel udp-code)
+                            (write-header-kind parcel media-kind)
+                            (write-header-sender parcel sender)
+                            (write-media-channel parcel no)
+                            (write-media-sequence parcel sequence)
+                            (write-media-frame parcel frame)
+                            (write-media-part parcel part)
+                            (write-media-total parcel total)
+                            (write-media-dts parcel dts)
+                            (write-media-pts parcel pts)
+                            (write-media-duration parcel duration)
                             (if (not map)
-                                (write-media-subpayload data buffer pos content-size)
-                              (write-media-subpointer data pointer pos content-size))
-                            (write-media-flags data flags)
-                            (write-media-resent data 0)
-                            (send data)
+                                (write-media-subpayload parcel buffer pos content-size)
+                              (write-media-subpointer parcel pointer pos content-size))
+                            (write-media-flags parcel flags)
+                            (write-media-resent parcel 0)
+                            (send parcel)
                             (when record-events?
                               (recording-events
                                 (lambda (record)
@@ -1269,8 +1321,8 @@
                                           (fixnum->flonum total)
                                           (fixnum->flonum flags)
                                           (timestamp->flonum duration)))))
-                            (remember-media self data)
-                            (retain-media self data)
+                            (remember-media self parcel)
+                            (retain-media self parcel)
                             (loop-part (+ part 1) (+ pos content-size)))))))))))))))
   
   
@@ -1822,7 +1874,7 @@
   
   
   (method override (destroy self)
-    (return-parcels self)
+    (release-parcels$ self)
     (nextmethod self))
   
   
@@ -1839,16 +1891,16 @@
         (condition-variable-signal! wait-condvar))))
   
   
-  (method (return-parcels self)
+  (method (release-parcels$ self)
     (iterate-packets self
       (lambda (packet)
         (let ((data (get-data packet)))
           (when data
-            (return-parcel$ data))))))
+            (release-parcel$ data))))))
   
   
   (method protected virtual (empty self)
-    (return-parcels self)
+    (release-parcels$ self)
     (vector-fill! self.packets #f)
     (set! self.head 0)
     (set! self.tail 0)
@@ -2032,7 +2084,7 @@
         
         (cond ;; quick hack todo
               ((not local)
-               (return-parcel$ data))
+               (release-parcel$ data))
               ;; first time
               ((not last-sequence)
                (time-update)
@@ -2075,7 +2127,7 @@
                      (let ((actual-packet <UDP-Packet> (vector-ref packets pos)))
                        (if (get-data actual-packet)
                            (begin
-                             (return-parcel$ data)
+                             (release-parcel$ data)
                              (when record?
                                (let ((resent (read-media-resent data)))
                                  (record-event udp-id-duplicate-packet
@@ -2101,7 +2153,7 @@
                                              (fixnum->flonum resent)
                                              -1.)))
                            (condition-variable-signal! wait-condvar)))))
-                 (return-parcel$ data)
+                 (release-parcel$ data)
                  (when record?
                    (let ((resent (read-media-resent data)))
                      (record-event udp-id-reject-packet
@@ -2167,7 +2219,7 @@
       (when actual-packet
         (let ((actual-data (get-data actual-packet)))
           (when actual-data
-            (return-parcel$ actual-data)))))
+            (release-parcel$ actual-data)))))
     (vector-set! packets pos packet))
   
   
@@ -2548,11 +2600,11 @@
   
   
   (method package (increase-sent self data)
-    (increase! bytes-sent (u8vector-length data)))
+    (increase! bytes-sent (data-length data)))
   
   
   (method package (increase-received self data)
-    (increase! bytes-received (u8vector-length data))))
+    (increase! bytes-received (data-length data))))
 
 
 ;;;
