@@ -526,16 +526,28 @@
     parcel))
 
 
-(definition public (retain-parcel$ parcel)
-  (let ((refcount (+ (scan-u8 parcel refcount-offset) 1)))
-    (put-u8 parcel refcount-offset refcount)))
+(definition parcel-refcount-mutex
+  (make-mutex 'refcount))
 
 
-(definition public (release-parcel$ parcel)
-  (let ((refcount (- (scan-u8 parcel refcount-offset) 1)))
-    (if (> refcount 0)
-        (put-u8 parcel refcount-offset refcount)
-      (return-parcel$ parcel))))
+(definition public (ref-parcel$ parcel)
+  (mutex-lock! parcel-refcount-mutex)
+  (let ((refcount (scan-u8 parcel refcount-offset)))
+    (assert (> refcount 0)
+      (let ((new-refcount (+ refcount 1)))
+        (put-u8 parcel refcount-offset new-refcount))))
+  (mutex-unlock! parcel-refcount-mutex))
+
+
+(definition public (unref-parcel$ parcel)
+  (mutex-lock! parcel-refcount-mutex)
+  (let ((refcount (scan-u8 parcel refcount-offset)))
+    (assert (> refcount 0)
+      (let ((new-refcount (- refcount 1)))
+        (if (> new-refcount 0)
+            (put-u8 parcel refcount-offset new-refcount)
+          (return-parcel$ parcel)))))
+  (mutex-unlock! parcel-refcount-mutex))
 
 
 ;;;
@@ -1262,7 +1274,7 @@
   
   
   (method package (retain-media self data)
-    (retain-parcel$ data)
+    (ref-parcel$ data)
     (insert retain-ring data udp-id-retain-packet))
   
   
@@ -1323,6 +1335,7 @@
                                           (timestamp->flonum duration)))))
                             (remember-media self parcel)
                             (retain-media self parcel)
+                            (unref-parcel$ parcel)
                             (loop-part (+ part 1) (+ pos content-size)))))))))))))))
   
   
@@ -1874,7 +1887,7 @@
   
   
   (method override (destroy self)
-    (release-parcels$ self)
+    (unref-parcels$ self)
     (nextmethod self))
   
   
@@ -1891,16 +1904,16 @@
         (condition-variable-signal! wait-condvar))))
   
   
-  (method (release-parcels$ self)
+  (method (unref-parcels$ self)
     (iterate-packets self
       (lambda (packet)
         (let ((data (get-data packet)))
           (when data
-            (release-parcel$ data))))))
+            (unref-parcel$ data))))))
   
   
   (method protected virtual (empty self)
-    (release-parcels$ self)
+    (unref-parcels$ self)
     (vector-fill! self.packets #f)
     (set! self.head 0)
     (set! self.tail 0)
@@ -2084,7 +2097,7 @@
         
         (cond ;; quick hack todo
               ((not local)
-               (release-parcel$ data))
+               (unref-parcel$ data))
               ;; first time
               ((not last-sequence)
                (time-update)
@@ -2127,7 +2140,7 @@
                      (let ((actual-packet <UDP-Packet> (vector-ref packets pos)))
                        (if (get-data actual-packet)
                            (begin
-                             (release-parcel$ data)
+                             (unref-parcel$ data)
                              (when record?
                                (let ((resent (read-media-resent data)))
                                  (record-event udp-id-duplicate-packet
@@ -2153,7 +2166,7 @@
                                              (fixnum->flonum resent)
                                              -1.)))
                            (condition-variable-signal! wait-condvar)))))
-                 (release-parcel$ data)
+                 (unref-parcel$ data)
                  (when record?
                    (let ((resent (read-media-resent data)))
                      (record-event udp-id-reject-packet
@@ -2219,7 +2232,7 @@
       (when actual-packet
         (let ((actual-data (get-data actual-packet)))
           (when actual-data
-            (release-parcel$ actual-data)))))
+            (unref-parcel$ actual-data)))))
     (vector-set! packets pos packet))
   
   
@@ -2504,7 +2517,9 @@
                 (<= sequence highest)
                 (let ((pos (index self sequence)))
                   (let ((packet <UDP-Packet> (vector-ref packets pos)))
-                    (get-data packet))))
+                    (let ((data (get-data packet)))
+                      (ref-parcel$ data)
+                      data))))
       (mutex-unlock! mutex)))
   
   
